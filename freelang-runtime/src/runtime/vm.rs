@@ -1,10 +1,11 @@
 // Runtime Virtual Machine
 // Main execution engine
 
-use crate::core::Value;
+use crate::core::{Value, FunctionKind, UserFunction};
 use crate::memory::{MemoryAllocator, GarbageCollector, ReferenceCounter, MemoryStats};
 use crate::runtime::context::ExecutionContext;
 use crate::runtime::executor::Executor;
+use crate::runtime::callstack::CallStack;
 use crate::stdlib::FunctionRegistry;
 use std::time::Instant;
 
@@ -14,6 +15,8 @@ pub struct RuntimeStats {
     pub uptime_ms: u128,
     pub memory: MemoryStats,
     pub memory_usage: usize,
+    pub call_depth: usize,
+    pub call_count: u64,
 }
 
 /// FreeLang runtime engine
@@ -24,6 +27,7 @@ pub struct RuntimeEngine {
     context: ExecutionContext,
     executor: Executor,
     function_registry: FunctionRegistry,
+    call_stack: CallStack,
     started_at: Instant,
     execution_count: u64,
 }
@@ -38,6 +42,7 @@ impl RuntimeEngine {
             context: ExecutionContext::new(),
             executor: Executor::new(),
             function_registry: FunctionRegistry::new(),
+            call_stack: CallStack::new(),
             started_at: Instant::now(),
             execution_count: 0,
         }
@@ -116,7 +121,73 @@ impl RuntimeEngine {
                 gc_collected: 0,
             },
             memory_usage: self.memory.memory_usage(),
+            call_depth: self.call_stack.depth(),
+            call_count: self.call_stack.call_count(),
         }
+    }
+
+    /// Call a user-defined function
+    pub fn call_user_function(
+        &mut self,
+        func: &UserFunction,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        // Push function frame
+        self.call_stack.push(func.get_name().to_string())?;
+
+        // Bind arguments to parameters
+        let params = func.get_params();
+        if args.len() != params.len() {
+            self.call_stack.pop();
+            return Err(format!(
+                "Function {} expects {} arguments, got {}",
+                func.get_name(),
+                params.len(),
+                args.len()
+            ));
+        }
+
+        for (param, arg) in params.iter().zip(args.iter()) {
+            self.call_stack.set_local(param.clone(), arg.clone())?;
+        }
+
+        // Execute function body
+        let mut result = Value::Null;
+        for instruction in func.get_params() {
+            // TODO: Execute instructions from function body
+            result = Value::Null;
+        }
+
+        // Pop frame
+        self.call_stack.pop();
+
+        Ok(result)
+    }
+
+    /// Call a function (stdlib or user-defined)
+    pub fn call_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, String> {
+        // Try stdlib first
+        if self.function_registry.exists(name) {
+            return self.call_stdlib(name, args);
+        }
+
+        // For user functions, we would look them up in a function table
+        // This is a placeholder for future implementation
+        Err(format!("Function '{}' not found", name))
+    }
+
+    /// Get call stack depth
+    pub fn call_depth(&self) -> usize {
+        self.call_stack.depth()
+    }
+
+    /// Get call stack trace
+    pub fn get_call_trace(&self) -> String {
+        self.call_stack.get_trace()
     }
 
     /// Get execution count
