@@ -1,0 +1,441 @@
+// ============================================================================
+// FreeLang Package Manager - TOML Parser
+// ============================================================================
+//
+// freelang.toml 파일 파싱 (8개 함수)
+// 패키지 정보, 버전, 의존성 추출
+//
+// 작성일: 2026-04-06
+// 단계: Phase D.3 (Week 3)
+
+use crate::fpm::{
+    PackageMetadata, Dependency, Manifest, Version, FpmError,
+};
+
+// ============================================================================
+// Parser Data Structures
+// ============================================================================
+
+/// TOML 파싱 결과
+#[derive(Clone, Debug)]
+pub struct ParseResult {
+    pub manifest: Option<Manifest>,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+// ============================================================================
+// Core Parser Functions
+// ============================================================================
+
+/// freelang.toml 파일 파싱
+pub fn parse_toml(content: &str) -> Result<Manifest, FpmError> {
+    let mut lines = content.lines().peekable();
+    let mut current_section = "";
+    let mut pkg_metadata = None;
+    let mut dependencies = vec![];
+    let mut dev_dependencies = vec![];
+    let mut build_dependencies = vec![];
+
+    let mut name = String::new();
+    let mut version = String::new();
+    let mut author = String::new();
+    let mut description = String::new();
+    let mut repository = None;
+    let mut license = None;
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+
+        // 주석 무시
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        // 섹션 인식: [section_name]
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = &trimmed[1..trimmed.len()-1];
+            continue;
+        }
+
+        // 키=값 파싱
+        if let Some(eq_pos) = trimmed.find('=') {
+            let key = trimmed[..eq_pos].trim();
+            let value = trimmed[eq_pos+1..].trim();
+
+            // 값에서 따옴표 제거
+            let value_clean = if (value.starts_with('"') && value.ends_with('"')) ||
+                                (value.starts_with('\'') && value.ends_with('\'')) {
+                &value[1..value.len()-1]
+            } else {
+                value
+            };
+
+            match current_section {
+                "package" => {
+                    match key {
+                        "name" => name = value_clean.to_string(),
+                        "version" => version = value_clean.to_string(),
+                        "author" => author = value_clean.to_string(),
+                        "description" => description = value_clean.to_string(),
+                        "repository" => repository = Some(value_clean.to_string()),
+                        "license" => license = Some(value_clean.to_string()),
+                        _ => {}
+                    }
+                }
+                "dependencies" | "dev-dependencies" | "build-dependencies" => {
+                    // 의존성 추가
+                    let dep = Dependency {
+                        name: key.to_string(),
+                        version_range: value_clean.to_string(),
+                        optional: false,
+                    };
+
+                    match current_section {
+                        "dependencies" => dependencies.push(dep),
+                        "dev-dependencies" => dev_dependencies.push(dep),
+                        "build-dependencies" => build_dependencies.push(dep),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 필수 필드 검증
+    if name.is_empty() || version.is_empty() {
+        return Err(FpmError::ParseError(
+            "Missing required fields: name or version".to_string(),
+        ));
+    }
+
+    let package = PackageMetadata {
+        name,
+        version,
+        author,
+        description,
+        repository,
+        license,
+    };
+
+    Ok(Manifest {
+        package,
+        dependencies,
+        dev_dependencies,
+        build_dependencies,
+    })
+}
+
+/// SemVer 버전 문자열 파싱
+pub fn parse_version(version_str: &str) -> Result<Version, FpmError> {
+    Version::parse(version_str)
+        .ok_or_else(|| FpmError::ParseError(
+            format!("Invalid version format: {}", version_str),
+        ))
+}
+
+/// 의존성 목록 파싱 (TOML [dependencies] 섹션)
+pub fn parse_dependencies(
+    toml_content: &str,
+) -> Result<Vec<Dependency>, FpmError> {
+    let mut deps = vec![];
+    let mut in_deps_section = false;
+
+    for line in toml_content.lines() {
+        let trimmed = line.trim();
+
+        // [dependencies] 섹션 인식
+        if trimmed == "[dependencies]" {
+            in_deps_section = true;
+            continue;
+        }
+
+        // 다른 섹션으로 이동
+        if trimmed.starts_with('[') && in_deps_section {
+            break;
+        }
+
+        // 의존성 파싱
+        if in_deps_section && !trimmed.is_empty() && !trimmed.starts_with('#') {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let name = trimmed[..eq_pos].trim().to_string();
+                let version_range = trimmed[eq_pos+1..]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+
+                deps.push(Dependency {
+                    name,
+                    version_range,
+                    optional: false,
+                });
+            }
+        }
+    }
+
+    Ok(deps)
+}
+
+/// 매니페스트 검증
+pub fn validate_manifest(manifest: &Manifest) -> Result<(), FpmError> {
+    // 패키지 이름 검증: lowercase, kebab-case
+    if !manifest.package.name.chars().all(|c| c.is_lowercase() || c == '-' || c.is_numeric()) {
+        return Err(FpmError::ParseError(
+            "Package name must be lowercase with hyphens".to_string(),
+        ));
+    }
+
+    // 버전 검증: SemVer
+    if Version::parse(&manifest.package.version).is_none() {
+        return Err(FpmError::ParseError(
+            "Invalid version format (must be SemVer)".to_string(),
+        ));
+    }
+
+    // 의존성 버전 범위 검증
+    for dep in &manifest.dependencies {
+        if !is_valid_version_range(&dep.version_range) {
+            return Err(FpmError::ParseError(
+                format!("Invalid version range: {}", dep.version_range),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// 버전 범위 유효성 검증
+pub fn is_valid_version_range(range: &str) -> bool {
+    // ^X.Y.Z, ~X.Y.Z, =X.Y.Z, X.Y.Z 형식 검증
+    let range_trimmed = range.trim();
+
+    let version_part = if range_trimmed.starts_with('^') ||
+                          range_trimmed.starts_with('~') ||
+                          range_trimmed.starts_with('=') {
+        &range_trimmed[1..]
+    } else {
+        range_trimmed
+    };
+
+    Version::parse(version_part).is_some()
+}
+
+/// 패키지 이름 추출
+pub fn extract_package_name(manifest: &Manifest) -> String {
+    manifest.package.name.clone()
+}
+
+/// 버전 추출
+pub fn extract_version(manifest: &Manifest) -> String {
+    manifest.package.version.clone()
+}
+
+/// 모든 의존성 추출 (일반 + 개발 + 빌드)
+pub fn extract_all_deps(manifest: &Manifest) -> Vec<Dependency> {
+    let mut all_deps = manifest.dependencies.clone();
+    all_deps.extend(manifest.dev_dependencies.clone());
+    all_deps.extend(manifest.build_dependencies.clone());
+    all_deps
+}
+
+/// 매니페스트를 TOML 문자열로 직렬화
+pub fn manifest_to_string(manifest: &Manifest) -> String {
+    let mut result = String::new();
+
+    // [package] 섹션
+    result.push_str("[package]\n");
+    result.push_str(&format!("name = \"{}\"\n", manifest.package.name));
+    result.push_str(&format!("version = \"{}\"\n", manifest.package.version));
+    result.push_str(&format!("author = \"{}\"\n", manifest.package.author));
+    result.push_str(&format!("description = \"{}\"\n", manifest.package.description));
+
+    if let Some(repo) = &manifest.package.repository {
+        result.push_str(&format!("repository = \"{}\"\n", repo));
+    }
+
+    if let Some(license) = &manifest.package.license {
+        result.push_str(&format!("license = \"{}\"\n", license));
+    }
+
+    // [dependencies] 섹션
+    if !manifest.dependencies.is_empty() {
+        result.push_str("\n[dependencies]\n");
+        for dep in &manifest.dependencies {
+            result.push_str(&format!("{} = \"{}\"\n", dep.name, dep.version_range));
+        }
+    }
+
+    // [dev-dependencies] 섹션
+    if !manifest.dev_dependencies.is_empty() {
+        result.push_str("\n[dev-dependencies]\n");
+        for dep in &manifest.dev_dependencies {
+            result.push_str(&format!("{} = \"{}\"\n", dep.name, dep.version_range));
+        }
+    }
+
+    // [build-dependencies] 섹션
+    if !manifest.build_dependencies.is_empty() {
+        result.push_str("\n[build-dependencies]\n");
+        for dep in &manifest.build_dependencies {
+            result.push_str(&format!("{} = \"{}\"\n", dep.name, dep.version_range));
+        }
+    }
+
+    result
+}
+
+// ============================================================================
+// Test Suite
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_basic_toml() {
+        let content = r#"
+[package]
+name = "my-project"
+version = "1.0.0"
+author = "Kim"
+description = "A test project"
+"#;
+
+        let manifest = parse_toml(content).unwrap();
+        assert_eq!(manifest.package.name, "my-project");
+        assert_eq!(manifest.package.version, "1.0.0");
+        assert_eq!(manifest.package.author, "Kim");
+    }
+
+    #[test]
+    fn test_parse_with_dependencies() {
+        let content = r#"
+[package]
+name = "my-app"
+version = "2.0.0"
+author = "Developer"
+description = "App"
+
+[dependencies]
+freelang-json = "^1.0.0"
+freelang-http = "~2.1.0"
+"#;
+
+        let manifest = parse_toml(content).unwrap();
+        assert_eq!(manifest.dependencies.len(), 2);
+        assert_eq!(manifest.dependencies[0].name, "freelang-json");
+    }
+
+    #[test]
+    fn test_parse_version() {
+        let v = parse_version("1.2.3").unwrap();
+        assert_eq!(v.major, 1);
+        assert_eq!(v.minor, 2);
+        assert_eq!(v.patch, 3);
+    }
+
+    #[test]
+    fn test_version_range_validation() {
+        assert!(is_valid_version_range("^1.0.0"));
+        assert!(is_valid_version_range("~2.1.0"));
+        assert!(is_valid_version_range("=1.2.3"));
+        assert!(is_valid_version_range("1.2.3"));
+        assert!(!is_valid_version_range("invalid"));
+    }
+
+    #[test]
+    fn test_manifest_to_string() {
+        let content = r#"
+[package]
+name = "test"
+version = "1.0.0"
+author = "test"
+description = "test"
+"#;
+
+        let manifest = parse_toml(content).unwrap();
+        let output = manifest_to_string(&manifest);
+
+        assert!(output.contains("name = \"test\""));
+        assert!(output.contains("version = \"1.0.0\""));
+    }
+
+    #[test]
+    fn test_validate_manifest_success() {
+        let manifest = Manifest {
+            package: PackageMetadata {
+                name: "valid-name".to_string(),
+                version: "1.0.0".to_string(),
+                author: "test".to_string(),
+                description: "test".to_string(),
+                repository: None,
+                license: None,
+            },
+            dependencies: vec![],
+            dev_dependencies: vec![],
+            build_dependencies: vec![],
+        };
+
+        assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn test_validate_manifest_invalid_version() {
+        let manifest = Manifest {
+            package: PackageMetadata {
+                name: "test".to_string(),
+                version: "invalid".to_string(),
+                author: "test".to_string(),
+                description: "test".to_string(),
+                repository: None,
+                license: None,
+            },
+            dependencies: vec![],
+            dev_dependencies: vec![],
+            build_dependencies: vec![],
+        };
+
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn test_parse_dependencies_extraction() {
+        let content = r#"
+[dependencies]
+pkg-a = "^1.0.0"
+pkg-b = "~2.1.0"
+"#;
+
+        let deps = parse_dependencies(content).unwrap();
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "pkg-a");
+        assert_eq!(deps[1].version_range, "~2.1.0");
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// parser.fl 구현:
+// ✅ parse_toml - freelang.toml 전체 파싱
+// ✅ parse_version - SemVer 파싱
+// ✅ parse_dependencies - 의존성 섹션 파싱
+// ✅ validate_manifest - 매니페스트 검증
+// ✅ is_valid_version_range - 버전 범위 검증
+// ✅ extract_package_name - 이름 추출
+// ✅ extract_version - 버전 추출
+// ✅ manifest_to_string - 직렬화
+// ✅ 8개 테스트
+//
+// 특징:
+// ✓ 간단한 TOML 파서 (복잡한 구조 미지원)
+// ✓ [package], [dependencies] 등 섹션 파싱
+// ✓ SemVer 검증
+// ✓ 버전 범위 (^, ~, =) 지원
+//
+// 다음: resolver.fl (의존성 해결)
+//

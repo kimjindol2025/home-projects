@@ -1,0 +1,310 @@
+# ============================================================================
+# distributed/raft_election.fl - Leader Election with RequestVote RPC
+# ============================================================================
+# Raft RFC 5740: 동적 리더 선출 (불완전한 Raft 정복)
+# 작성: 2026-03-02
+# 책임: RequestVote RPC, Election Timeout, Voting Rules
+# 이론: Raft Figure 2 - RequestVote handler, rules 1-5
+
+# ============================================================================
+# 자료구조: RequestVote RPC
+# ============================================================================
+
+struct RequestVoteArgs
+  term: number              # Candidate의 현재 Term
+  candidateId: number       # Candidate 노드 ID
+  lastLogIndex: number      # 마지막 로그 엔트리 인덱스
+  lastLogTerm: number       # 마지막 로그 엔트리의 Term
+
+struct RequestVoteReply
+  term: number              # 투표 노드의 현재 Term
+  voteGranted: bool         # true = Candidate에게 투표, false = 거부
+
+# ============================================================================
+# 핵심 함수 1: Follower가 RequestVote RPC를 받았을 때
+# ============================================================================
+# Raft Figure 2: RequestVote RPC receiver implementation
+# 규칙 1-5: Term 확인, 투표 기록 확인, 로그 최신성 확인
+
+fn handleRequestVote(
+  node: map<string, any>,
+  args: RequestVoteArgs
+) -> RequestVoteReply
+  # 규칙 1: 요청자의 Term이 자신의 Term보다 작으면 즉시 거부
+  if args.term < node["currentTerm"]
+    return RequestVoteReply {
+      "term": node["currentTerm"],
+      "voteGranted": false
+    }
+
+  # 규칙 2: 요청자의 Term이 크면 자신의 Term 업데이트
+  #        그리고 Follower 상태로 전환
+  if args.term > node["currentTerm"]
+    node["currentTerm"] = args.term
+    node["votedFor"] = -1  # 투표 기록 초기화
+    node["state"] = "FOLLOWER"
+
+  # 규칙 3: 이미 이 Term에서 투표했다면?
+  #        그 후보자에게만 다시 투표할 수 있음
+  if node["votedFor"] != -1 && node["votedFor"] != args.candidateId
+    return RequestVoteReply {
+      "term": node["currentTerm"],
+      "voteGranted": false
+    }
+
+  # 규칙 4: Candidate의 로그가 자신의 로그보다 최신이어야 함
+  #        (Raft Safety: Log Matching Property)
+  if !isLogAtLeastAsUpToDate(
+    args.lastLogIndex,
+    args.lastLogTerm,
+    node
+  )
+    return RequestVoteReply {
+      "term": node["currentTerm"],
+      "voteGranted": false
+    }
+
+  # 규칙 5: 위 모든 조건 통과 → 투표 승인
+  node["votedFor"] = args.candidateId
+  node["lastResetTime"] = getCurrentTimeMs()
+
+  RequestVoteReply {
+    "term": node["currentTerm"],
+    "voteGranted": true
+  }
+
+# ============================================================================
+# 핵심 함수 2: 로그 최신성 비교
+# ============================================================================
+# Raft Figure 2: "up-to-date" 판단
+# - 마지막 Term이 더 크면 더 최신
+# - Term이 같으면 Index가 더 커야 더 최신
+
+fn isLogAtLeastAsUpToDate(
+  candidateLastLogIndex: number,
+  candidateLastLogTerm: number,
+  node: map<string, any>
+) -> bool
+  let myLogLength = length(node["log"])
+  let myLastLogIndex = myLogLength - 1
+  let myLastLogTerm = 0
+
+  if myLastLogIndex >= 0
+    myLastLogTerm = node["log"][myLastLogIndex]["term"]
+
+  # Candidate의 마지막 Term이 내 마지막 Term보다 크면 → 더 최신
+  if candidateLastLogTerm > myLastLogTerm
+    return true
+
+  # Term이 같으면 Index 비교
+  if candidateLastLogTerm == myLastLogTerm
+    if candidateLastLogIndex >= myLastLogIndex
+      return true
+
+  # 그 외의 경우 → 내가 더 최신
+  false
+
+# ============================================================================
+# 핵심 함수 3: Candidate 상태에서 Election 실행
+# ============================================================================
+# Raft Figure 2: RequestVote handler, candidate rules
+# Election timeout 발생 → Candidate가 되어 투표 요청
+
+fn startElection(
+  node: map<string, any>,
+  cluster: map<string, any>
+) -> Result<map<string, any>, string>
+  # 선행 조건: Follower 상태여야 함
+  if node["state"] != "FOLLOWER"
+    return Err("Only FOLLOWER can start election, current state: " + node["state"])
+
+  # Step 1: Candidate 상태로 변경
+  node["state"] = "CANDIDATE"
+  node["currentTerm"] = node["currentTerm"] + 1
+  node["votedFor"] = node["id"]  # 자신에게 투표
+
+  let newTerm = node["currentTerm"]
+  let votes = 1  # 자신의 투표 = 1표
+
+  # Step 2: 다른 모든 노드에 RequestVote RPC 전송
+  let myLogLength = length(node["log"])
+  let myLastLogIndex = myLogLength - 1
+  let myLastLogTerm = 0
+
+  if myLastLogIndex >= 0
+    myLastLogTerm = node["log"][myLastLogIndex]["term"]
+
+  let args = RequestVoteArgs {
+    "term": newTerm,
+    "candidateId": node["id"],
+    "lastLogIndex": myLastLogIndex,
+    "lastLogTerm": myLastLogTerm
+  }
+
+  # Step 3: 클러스터의 다른 노드들로부터 투표 수집
+  for otherId in cluster["nodeIds"]
+    if otherId == node["id"]
+      continue
+
+    let peerNode = cluster["nodes"][otherId]
+
+    # RPC 호출 (시뮬레이션)
+    let reply = handleRequestVote(peerNode, args)
+
+    # 더 높은 Term 발견 → 자신이 Candidate가 될 자격 없음
+    if reply["term"] > node["currentTerm"]
+      node["currentTerm"] = reply["term"]
+      node["state"] = "FOLLOWER"
+      node["votedFor"] = -1
+      return Err("Higher term detected, reverting to FOLLOWER")
+
+    # 투표 수집
+    if reply["voteGranted"]
+      votes = votes + 1
+
+  # Step 4: Quorum 달성 확인 (> n/2)
+  let nodeCount = length(cluster["nodeIds"])
+  let quorumSize = (nodeCount / 2) + 1
+
+  if votes >= quorumSize
+    # 리더가 됨
+    node["state"] = "LEADER"
+    node["leaderId"] = node["id"]
+
+    # Leader 초기화: 모든 Follower의 nextIndex와 matchIndex 설정
+    for otherId in cluster["nodeIds"]
+      if otherId != node["id"]
+        if !has(node, "nextIndex")
+          node["nextIndex"] = {}
+        if !has(node, "matchIndex")
+          node["matchIndex"] = {}
+
+        node["nextIndex"][otherId] = length(node["log"])
+        node["matchIndex"][otherId] = 0
+
+    Ok(node)
+  else
+    # Quorum 미달 → Follower로 복귀
+    node["state"] = "FOLLOWER"
+    Err("Failed to achieve quorum: " + toString(votes) + "/" + toString(quorumSize))
+
+# ============================================================================
+# 핵심 함수 4: Election Timeout 처리
+# ============================================================================
+# Raft의 기초: Timeout이 없으면 Leader를 영원히 기다림
+
+fn handleElectionTimeout(
+  node: map<string, any>,
+  cluster: map<string, any>
+) -> map<string, any>
+  if node["state"] == "LEADER"
+    # Leader는 heartbeat으로 타임아웃 리셋
+    # (이 함수는 Follower/Candidate용)
+    return node
+
+  # Follower/Candidate: Election 시작
+  match startElection(node, cluster)
+    Ok(newNode) ->
+      # 성공: Candidate → Leader
+      newNode
+
+    Err(reason) ->
+      # 실패: 이미 더 높은 Term의 Leader가 있거나 Quorum 미달
+      # 그 다음 election timeout을 기다림
+      node
+
+# ============================================================================
+# 핵심 함수 5: Heartbeat (Leader → Followers)
+# ============================================================================
+# Leader는 주기적으로 heartbeat을 보내 authority 유지
+# Heartbeat = 0개 엔트리의 AppendEntries RPC
+
+fn sendHeartbeats(
+  node: map<string, any>,
+  cluster: map<string, any>
+) -> map<string, any>
+  if node["state"] != "LEADER"
+    return node
+
+  # Leader: 모든 Follower에게 heartbeat 전송
+  for followerId in cluster["nodeIds"]
+    if followerId == node["id"]
+      continue
+
+    # Heartbeat = 빈 AppendEntries RPC
+    # (실제로는 replication.fl에서 처리)
+    # 여기서는 타임스탬프만 업데이트
+    if !has(node, "lastHeartbeatSent")
+      node["lastHeartbeatSent"] = {}
+
+    node["lastHeartbeatSent"][followerId] = getCurrentTimeMs()
+
+  node
+
+# ============================================================================
+# 핵심 함수 6: 주기적 타이머 관리
+# ============================================================================
+# Raft의 동작: Election timeout과 heartbeat을 주기적으로 체크
+
+fn runRaftElectionLoop(
+  node: map<string, any>,
+  cluster: map<string, any>
+) -> map<string, any>
+  # 현재 시간
+  let now = getCurrentTimeMs()
+
+  # Follower/Candidate: Election timeout 체크
+  if node["state"] != "LEADER"
+    let electionTimeout = get(node, "electionTimeout", 150 + randomRange(0, 150))
+    let timeSinceLastReset = now - node["lastResetTime"]
+
+    if timeSinceLastReset > electionTimeout
+      # Timeout 발생 → Election 시작
+      node = handleElectionTimeout(node, cluster)
+
+  # Leader: Heartbeat 주기 체크
+  if node["state"] == "LEADER"
+    let heartbeatInterval = get(node, "heartbeatInterval", 50)
+
+    if !has(node, "lastHeartbeatTime")
+      node["lastHeartbeatTime"] = now
+
+    if now - node["lastHeartbeatTime"] > heartbeatInterval
+      node = sendHeartbeats(node, cluster)
+      node["lastHeartbeatTime"] = now
+
+  node
+
+# ============================================================================
+# 헬퍼 함수
+# ============================================================================
+
+fn getCurrentTimeMs() -> number
+  # 밀리초 단위 현재 시간
+  # 실제 구현에서는 시스템 시간 사용
+  0
+
+fn randomRange(min: number, max: number) -> number
+  # min ~ max 사이 랜덤 값
+  # 실제 구현에서는 random() 함수 사용
+  min
+
+fn has(m: map<string, any>, key: string) -> bool
+  # Map에 키가 있는가?
+  false
+
+fn get(m: map<string, any>, key: string, default: any) -> any
+  # Map에서 값 조회 (없으면 default)
+  default
+
+fn length(arr: any) -> number
+  # 배열/문자열 길이
+  0
+
+fn toString(x: any) -> string
+  # 값을 문자열로 변환
+  ""
+
+fn Result<T, E> -> map<string, any>
+  # Result 타입 (Ok/Err)
+  {}

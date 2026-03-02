@@ -1,0 +1,278 @@
+# ============================================================================
+# distributed/distributed_monitor.fl - 분산 시스템 통합 모니터링
+# ============================================================================
+# Phase 4: 통합 API 레이어 - Raft + Replication + Sharding 메트릭
+# 작성: 2026-03-02
+# 책임: 분산 메트릭 수집, 헬스 대시보드, 이벤트 기록
+# 재사용: src/monitoring/metrics.fl - Metrics, recordRequest, findBottlenecks
+
+struct RaftMetrics
+  leaderElections: number
+  logAppends: number
+  snapshotsTaken: number
+  avgCommitLatencyMs: number
+  quorumSuccessRate: number
+
+struct ReplicationMetrics
+  quorumWrites: number
+  quorumFailures: number
+  failoversTriggered: number
+  activeReplicas: number
+
+struct ShardingMetrics
+  rebalancesTriggered: number
+  migrationsCompleted: number
+  balanceScore: number  # 0.0 (perfectly unbalanced) - 1.0 (perfectly balanced)
+  avgPartitionLoad: number
+
+struct DistributedMetrics
+  timestamp: number
+  raftMetrics: RaftMetrics
+  replicationMetrics: ReplicationMetrics
+  shardingMetrics: ShardingMetrics
+  apiMetrics: map<string, any>  # counts, latencies from Metrics struct
+
+struct DistributedHealthDashboard
+  metrics: DistributedMetrics
+  clusterHealth: map<string, any>              # ClusterHealthReport
+  replicationHealth: array<map<string, any>>   # PartitionHealth
+  overallStatus: string                        # "HEALTHY" | "DEGRADED" | "CRITICAL"
+  recommendations: array<string>
+
+# ============================================================================
+# RaftMetrics 초기화 및 조작
+# ============================================================================
+
+fn newRaftMetrics() -> RaftMetrics
+  {
+    "leaderElections": 0,
+    "logAppends": 0,
+    "snapshotsTaken": 0,
+    "avgCommitLatencyMs": 0.0,
+    "quorumSuccessRate": 100.0
+  }
+
+fn recordRaftEvent(metrics: DistributedMetrics, event: string, value: number) -> DistributedMetrics
+  match event
+    "LEADER_ELECTION" ->
+      metrics["raftMetrics"]["leaderElections"] = metrics["raftMetrics"]["leaderElections"] + 1
+      metrics["timestamp"] = currentTimeMs()
+      metrics
+
+    "LOG_APPEND" ->
+      metrics["raftMetrics"]["logAppends"] = metrics["raftMetrics"]["logAppends"] + 1
+      metrics
+
+    "SNAPSHOT" ->
+      metrics["raftMetrics"]["snapshotsTaken"] = metrics["raftMetrics"]["snapshotsTaken"] + 1
+      metrics
+
+    "COMMIT_LATENCY" ->
+      let oldAvg = metrics["raftMetrics"]["avgCommitLatencyMs"]
+      let count = metrics["raftMetrics"]["logAppends"]
+      metrics["raftMetrics"]["avgCommitLatencyMs"] = (oldAvg * (count - 1) + value) / count
+      metrics
+
+    "QUORUM_SUCCESS_RATE" ->
+      metrics["raftMetrics"]["quorumSuccessRate"] = value
+      metrics
+
+    _ ->
+      metrics
+
+# ============================================================================
+# ReplicationMetrics 초기화 및 조작
+# ============================================================================
+
+fn newReplicationMetrics() -> ReplicationMetrics
+  {
+    "quorumWrites": 0,
+    "quorumFailures": 0,
+    "failoversTriggered": 0,
+    "activeReplicas": 0
+  }
+
+fn recordReplicationEvent(metrics: DistributedMetrics, event: string, success: bool) -> DistributedMetrics
+  match event
+    "QUORUM_WRITE" ->
+      if success
+        metrics["replicationMetrics"]["quorumWrites"] = metrics["replicationMetrics"]["quorumWrites"] + 1
+      else
+        metrics["replicationMetrics"]["quorumFailures"] = metrics["replicationMetrics"]["quorumFailures"] + 1
+      metrics
+
+    "FAILOVER" ->
+      if success
+        metrics["replicationMetrics"]["failoversTriggered"] = metrics["replicationMetrics"]["failoversTriggered"] + 1
+      metrics
+
+    _ ->
+      metrics
+
+fn updateActiveReplicas(metrics: DistributedMetrics, count: number) -> DistributedMetrics
+  metrics["replicationMetrics"]["activeReplicas"] = count
+  metrics
+
+# ============================================================================
+# ShardingMetrics 초기화 및 조작
+# ============================================================================
+
+fn newShardingMetrics() -> ShardingMetrics
+  {
+    "rebalancesTriggered": 0,
+    "migrationsCompleted": 0,
+    "balanceScore": 1.0,
+    "avgPartitionLoad": 0.0
+  }
+
+fn recordShardingEvent(metrics: DistributedMetrics, event: string, balanceScore: number, load: number) -> DistributedMetrics
+  match event
+    "REBALANCE_TRIGGERED" ->
+      metrics["shardingMetrics"]["rebalancesTriggered"] = metrics["shardingMetrics"]["rebalancesTriggered"] + 1
+      metrics["shardingMetrics"]["balanceScore"] = balanceScore
+      metrics
+
+    "MIGRATION_COMPLETED" ->
+      metrics["shardingMetrics"]["migrationsCompleted"] = metrics["shardingMetrics"]["migrationsCompleted"] + 1
+      metrics
+
+    "LOAD_UPDATE" ->
+      let oldLoad = metrics["shardingMetrics"]["avgPartitionLoad"]
+      let count = metrics["shardingMetrics"]["migrationsCompleted"] + 1
+      metrics["shardingMetrics"]["avgPartitionLoad"] = (oldLoad * (count - 1) + load) / count
+      metrics
+
+    _ ->
+      metrics
+
+# ============================================================================
+# DistributedMetrics 생성 및 초기화
+# ============================================================================
+
+fn newDistributedMetrics() -> DistributedMetrics
+  {
+    "timestamp": currentTimeMs(),
+    "raftMetrics": newRaftMetrics(),
+    "replicationMetrics": newReplicationMetrics(),
+    "shardingMetrics": newShardingMetrics(),
+    "apiMetrics": {}
+  }
+
+# ============================================================================
+# 헬스 대시보드 생성
+# ============================================================================
+
+fn generateDistributedHealthDashboard(metrics: DistributedMetrics, clusterHealth: map<string, any>, replicationHealth: array<map<string, any>>) -> DistributedHealthDashboard
+  # Determine overall status based on cluster health
+  let overallStatus = clusterHealth["overallHealth"]
+
+  # Generate recommendations
+  let recommendations = array<string>()
+
+  if metrics["raftMetrics"]["quorumSuccessRate"] < 95.0
+    push(recommendations, "⚠️ Raft quorum success < 95%: check network")
+
+  if metrics["replicationMetrics"]["failoversTriggered"] > 5
+    push(recommendations, "⚠️ Failovers > 5: cluster instability detected")
+
+  if metrics["shardingMetrics"]["balanceScore"] < 0.7
+    push(recommendations, "⚠️ Load balance < 0.7: trigger rebalancing")
+
+  if length(clusterHealth["issues"]) > 0
+    push(recommendations, "⚠️ Cluster has " + toString(length(clusterHealth["issues"])) + " issues")
+
+  if length(recommendations) == 0
+    push(recommendations, "✓ All systems healthy")
+
+  {
+    "metrics": metrics,
+    "clusterHealth": clusterHealth,
+    "replicationHealth": replicationHealth,
+    "overallStatus": overallStatus,
+    "recommendations": recommendations
+  }
+
+# ============================================================================
+# 리포트 생성
+# ============================================================================
+
+fn reportDistributedMetrics(metrics: DistributedMetrics) -> string
+  let raft = metrics["raftMetrics"]
+  let repl = metrics["replicationMetrics"]
+  let shard = metrics["shardingMetrics"]
+
+  let report = "=== Distributed Metrics Report ===\n"
+  let report = report + "Timestamp: " + toString(metrics["timestamp"]) + "\n\n"
+
+  let report = report + "[Raft Consensus]\n"
+  let report = report + "  Leader Elections: " + toString(raft["leaderElections"]) + "\n"
+  let report = report + "  Log Appends: " + toString(raft["logAppends"]) + "\n"
+  let report = report + "  Snapshots Taken: " + toString(raft["snapshotsTaken"]) + "\n"
+  let report = report + "  Avg Commit Latency: " + toString(raft["avgCommitLatencyMs"]) + "ms\n"
+  let report = report + "  Quorum Success Rate: " + toString(raft["quorumSuccessRate"]) + "%\n\n"
+
+  let report = report + "[Replication]\n"
+  let report = report + "  Quorum Writes: " + toString(repl["quorumWrites"]) + "\n"
+  let report = report + "  Quorum Failures: " + toString(repl["quorumFailures"]) + "\n"
+  let report = report + "  Failovers Triggered: " + toString(repl["failoversTriggered"]) + "\n"
+  let report = report + "  Active Replicas: " + toString(repl["activeReplicas"]) + "\n\n"
+
+  let report = report + "[Sharding]\n"
+  let report = report + "  Rebalances Triggered: " + toString(shard["rebalancesTriggered"]) + "\n"
+  let report = report + "  Migrations Completed: " + toString(shard["migrationsCompleted"]) + "\n"
+  let report = report + "  Balance Score: " + toString(shard["balanceScore"]) + "\n"
+  let report = report + "  Avg Partition Load: " + toString(shard["avgPartitionLoad"]) + "\n"
+
+  report
+
+# ============================================================================
+# 성능 분석 헬퍼 함수
+# ============================================================================
+
+fn identifyBottlenecks(dashboard: DistributedHealthDashboard) -> array<map<string, string>>
+  let bottlenecks = array<map<string, string>>()
+
+  let metrics = dashboard["metrics"]
+  let quorumSuccessRate = metrics["raftMetrics"]["quorumSuccessRate"]
+  if quorumSuccessRate < 90.0
+    push(bottlenecks, {
+      "component": "Raft Consensus",
+      "severity": "CRITICAL",
+      "description": "Low quorum success rate: " + toString(quorumSuccessRate) + "%"
+    })
+
+  let commitLatency = metrics["raftMetrics"]["avgCommitLatencyMs"]
+  if commitLatency > 100.0
+    push(bottlenecks, {
+      "component": "Raft",
+      "severity": "HIGH",
+      "description": "High commit latency: " + toString(commitLatency) + "ms"
+    })
+
+  let balanceScore = metrics["shardingMetrics"]["balanceScore"]
+  if balanceScore < 0.5
+    push(bottlenecks, {
+      "component": "Sharding",
+      "severity": "HIGH",
+      "description": "Poor load balance: " + toString(balanceScore)
+    })
+
+  let failoverRate = metrics["replicationMetrics"]["failoversTriggered"]
+  let writes = metrics["replicationMetrics"]["quorumWrites"]
+  if writes > 0 && failoverRate / writes > 0.05
+    push(bottlenecks, {
+      "component": "Replication",
+      "severity": "MEDIUM",
+      "description": "High failover rate: " + toString(failoverRate / writes * 100) + "%"
+    })
+
+  bottlenecks
+
+# ============================================================================
+# Helper: 시간 가져오기
+# ============================================================================
+
+fn currentTimeMs() -> number
+  # FreeLang에서 현재 시간(ms)을 얻는 함수
+  # 임시 구현: Unix timestamp의 일부
+  0

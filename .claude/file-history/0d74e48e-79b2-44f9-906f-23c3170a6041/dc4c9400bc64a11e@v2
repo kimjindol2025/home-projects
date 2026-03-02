@@ -1,0 +1,599 @@
+# Rust 동시성 시스템 심층 분석
+## FreeLang 흡수 가능성 평가
+
+**작성일**: 2026-03-02
+**목적**: Rust의 동시성 안전성을 FreeLang 타입 시스템으로 재현할 수 있는지 기술적 검증
+**범위**: Send/Sync 트레이트, 소유권, Borrow Checker, Data Race 감지
+
+---
+
+## 📚 Part 1: Rust 동시성의 3가지 핵심 메커니즘
+
+### 1.1 Send 트레이트: 스레드 간 소유권 이전
+
+**Rust 정의**:
+```rust
+// unsafe trait (컴파일러가 자동 구현)
+pub unsafe trait Send {
+    // 마커 트레이트 (구현 필요 없음)
+}
+
+// 자동 구현 규칙
+// - 원시 타입: i32, f64, bool, str → Send
+// - 복합 타입: 모든 필드가 Send이면 Send
+// - Arc<T>: T가 Send이면 Arc<T>는 Send
+// - Mutex<T>: T가 Send이면 Mutex<T>는 Send
+// - RefCell<T>: 항상 !Send (내부 불변성)
+// - Rc<T>: 항상 !Send (원자성 없음)
+```
+
+**의미**:
+- `Send`인 값은 `std::thread::spawn()`으로 다른 스레드에 이동 가능
+- 소유권 이전 시 데이터 경합 불가능
+- 컴파일러가 자동으로 검증
+
+**실제 예**:
+```rust
+fn example() {
+    let x = vec![1, 2, 3];  // Vec<i32> is Send
+
+    thread::spawn(move || {
+        println!("{:?}", x);  // ✅ OK: x가 이동됨
+    });
+
+    // ❌ println!("{:?}", x);  // 컴파일 에러: x를 이미 이동
+}
+```
+
+### 1.2 Sync 트레이트: 스레드 간 참조 공유
+
+**Rust 정의**:
+```rust
+pub unsafe trait Sync {
+    // 마커 트레이트
+}
+
+// 자동 구현 규칙
+// - 원시 타입: i32, f64, bool → Sync
+// - Arc<T>: T가 Sync이면 Arc<T>는 Sync
+// - Mutex<T>: T가 Sync이면 Mutex<T>는 Sync (내부 동기화!)
+// - RefCell<T>: 항상 !Sync (동적 borrow checking)
+// - Rc<T>: 항상 !Sync (원자성 없음)
+
+// Send와의 관계
+// T: Send ⇒ &T: Send
+// T: Sync ⇒ &T: Sync (여러 스레드에서 안전하게 공유)
+```
+
+**의미**:
+- `Sync`인 타입은 `&T` (불변 참조)를 스레드 간 안전하게 공유
+- `Mutex<T>`가 핵심: 내부 가변성(Interior Mutability) + 동기화
+
+**실제 예**:
+```rust
+fn example() {
+    let m = Arc::new(Mutex::new(0));
+    let m1 = Arc::clone(&m);
+    let m2 = Arc::clone(&m);
+
+    thread::spawn(move || {
+        let mut num = m1.lock().unwrap();
+        *num = 1;  // ✅ OK: Mutex가 배타성 보장
+    });
+
+    thread::spawn(move || {
+        let mut num = m2.lock().unwrap();
+        *num = 2;  // ✅ OK: Mutex가 순차적 접근 보장
+    });
+}
+```
+
+### 1.3 Borrow Checker: 컴파일 타임 Data Race 감지
+
+**핵심 규칙** (Rust의 생명주기):
+```
+1. 한 번에 하나의 가변 참조 (&mut T)만 가능
+2. 또는 여러 개의 불변 참조 (&T)는 가능
+3. 두 가지를 동시에 불가능
+```
+
+**Data Race 정의**:
+```
+두 개 이상의 스레드가 동시에:
+- 같은 메모리 위치에 접근하고
+- 최소 하나는 쓰기(write)를 수행하고
+- 접근 간에 동기화 없음
+```
+
+**Borrow Checker가 방지하는 경우**:
+```rust
+// ❌ 컴파일 에러: Data Race
+fn bad() {
+    let x = 42;
+
+    thread::spawn(|| {
+        x = 100;  // 문제: x의 가변 참조
+    });
+
+    thread::spawn(|| {
+        println!("{}", x);  // 문제: x의 불변 참조와 동시
+    });
+}
+
+// ✅ 안전한 코드: Mutex 사용
+fn good() {
+    let x = Arc::new(Mutex::new(42));
+    let x1 = Arc::clone(&x);
+    let x2 = Arc::clone(&x);
+
+    thread::spawn(move || {
+        *x1.lock().unwrap() = 100;  // 안전: lock() → drop()
+    });
+
+    thread::spawn(move || {
+        println!("{}", *x2.lock().unwrap());  // 안전: 순차적
+    });
+}
+```
+
+---
+
+## 📊 Part 2: Rust 동시성의 기술 요소 분석
+
+### 2.1 원자적 연산 (Atomic Operations)
+
+**목적**: 데이터 경합 없이 공유 메모리 접근
+
+**Rust 지원**:
+```rust
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+let counter = Arc::new(AtomicUsize::new(0));
+let c1 = Arc::clone(&counter);
+
+thread::spawn(move || {
+    c1.fetch_add(1, Ordering::SeqCst);  // 원자적 증가
+});
+
+println!("{}", counter.load(Ordering::SeqCst));  // 원자적 읽기
+```
+
+**메모리 순서 (Ordering)**:
+- `SeqCst` (Sequential Consistency): 가장 강력, 느림
+- `Release` / `Acquire`: 배타성만 보장
+- `Relaxed`: 순서 보장 없음, 가장 빠름
+
+### 2.2 조건 변수 (Condition Variables)
+
+**목적**: 특정 조건이 될 때까지 스레드 대기
+
+```rust
+use std::sync::Condvar;
+
+let cond = Arc::new(Condvar::new());
+let lock = Arc::new(Mutex::new(false));
+
+let c1 = Arc::clone(&cond);
+let l1 = Arc::clone(&lock);
+
+thread::spawn(move || {
+    let mut flag = l1.lock().unwrap();
+    while !*flag {
+        flag = c1.wait(flag).unwrap();  // 대기
+    }
+    println!("조건 충족!");
+});
+
+thread::spawn(move || {
+    thread::sleep(Duration::from_secs(1));
+    let mut flag = lock.lock().unwrap();
+    *flag = true;
+    cond.notify_one();  // 신호
+});
+```
+
+### 2.3 채널 (Channel)
+
+**목적**: 스레드 간 메시지 전달 (메모리 공유 없이)
+
+```rust
+use std::sync::mpsc;
+
+let (tx, rx) = mpsc::channel();
+
+thread::spawn(move || {
+    tx.send("Hello".to_string()).unwrap();  // 전송
+});
+
+let msg = rx.recv().unwrap();  // 수신
+println!("{}", msg);
+```
+
+**특징**:
+- MPSC (Multi-Producer, Single-Consumer)
+- 소유권 기반: 전송하면 송신자는 접근 불가
+- 메모리 안전성 보장
+
+### 2.4 스레드 풀 (Thread Pool)
+
+**개념**: 미리 생성한 스레드들에 작업 할당
+
+```rust
+use std::thread;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+
+struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: mpsc::Sender<Message>,
+}
+
+impl ThreadPool {
+    fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let msg = Message::NewJob(Box::new(f));
+        self.sender.send(msg).unwrap();
+    }
+}
+```
+
+---
+
+## 🔍 Part 3: FreeLang 현재 동시성 상태
+
+### 3.1 기존 구현 분석
+
+**WebSocket 서버** (Phase B):
+```freelang
+// src/runtime/websocket.fl (600줄)
+- 10,000 동시 클라이언트 지원
+- 메시지 큐 기반 (원시적)
+- Heartbeat 메커니즘
+- 문제점: 명시적 동시성 안전성 검증 없음
+```
+
+**Task Queue** (Phase 3):
+```freelang
+// src/async/task_queue.fl (700줄)
+- FIFO 큐
+- Worker 풀 (고정 크기)
+- 재시도 로직
+- 문제점: Race condition 감지 메커니즘 없음
+```
+
+**Event Bus** (Phase 3):
+```freelang
+// src/events/event_bus.fl (700줄)
+- Pub/Sub 패턴
+- 5,000 이벤트 히스토리
+- 비동기 처리
+- 문제점: 스레드 안전성이 암묵적
+```
+
+### 3.2 현재 문제점
+
+| 문제 | 심각도 | 설명 |
+|------|--------|------|
+| **명시적 타입 검증 없음** | 🔴 높음 | 어떤 타입이 스레드 간 안전한지 불명확 |
+| **Data Race 감지 메커니즘 부재** | 🔴 높음 | 컴파일 타임 검증 불가 |
+| **생명주기 추적 없음** | 🔴 높음 | 소유권 기반 검증 부재 |
+| **동기화 원시 타입 제한적** | 🟡 중간 | Mutex 구현은 있으나 조건 변수 없음 |
+| **메모리 순서 명시 없음** | 🟡 중간 | Atomic 연산의 메모리 순서 미정 |
+
+---
+
+## ✅ Part 4: 재현 가능성 평가
+
+### 4.1 Send/Sync 트레이트 재현
+
+**가능성**: 🟢 **매우 높음 (95%)**
+
+**이유**:
+1. FreeLang은 정적 타입 시스템 보유
+2. 트레이트 기반 다형성 지원
+3. 자동 구현 규칙을 컴파일 규칙으로 정의 가능
+
+**재현 방법**:
+```freelang
+// Phase B에서 구현
+trait Send {}
+trait Sync {}
+
+// 기본 구현
+impl Send for i32 {}
+impl Send for bool {}
+impl Send for str {}
+
+impl Sync for i32 {}
+impl Sync for bool {}
+
+// 조건부 구현
+impl<T: Send> Send for Arc<T> {}
+impl<T: Send> Sync for Mutex<T> {}
+
+// 명시적 제외
+impl !Send for Rc<T> {}
+impl !Sync for RefCell<T> {}
+```
+
+**구현 비용**: 2-3주
+
+---
+
+### 4.2 Borrow Checker (생명주기 추적) 재현
+
+**가능성**: 🟡 **중간 (60%)**
+
+**이유**:
+- ✅ FreeLang은 이미 변수 범위 추적
+- ✅ 소유권 개념 존재
+- ❌ 생명주기('lifetime) 시스템 부재
+- ❌ 참조 안전성 (예: dangling pointer) 자동 검증 안 함
+
+**재현 방법**:
+```freelang
+// 생명주기 추가 (간단 버전)
+fn process<'a>(input: &'a str) -> &'a str {
+    // input의 생명주기는 'a
+    // 반환값도 'a 범위 내
+    input
+}
+
+// 소유권 기반 검증
+fn move_semantics() {
+    let x = 42
+    spawn_thread(fn() {
+        print(x)  // 컴파일러: x가 이동됨?
+    })
+    print(x)      // 컴파일러: 에러! x는 이미 사용됨
+}
+```
+
+**구현 비용**: 4-6주
+
+---
+
+### 4.3 Data Race 감지
+
+**가능성**: 🟡 **중간 (65%)**
+
+**이유**:
+- ✅ 정적 분석 기술 존재 (LLVM의 ThreadSanitizer 참고)
+- ✅ 접근 패턴 추적 가능
+- ❌ 동적 확인도 필요할 수 있음 (런타임 오버헤드)
+- ❌ Rust처럼 100% 컴파일 타임 검증 어려움
+
+**재현 방법**:
+```freelang
+// 1. 컴파일 타임 분석
+fn analyze_access_pattern(var, access_list) {
+  writes = [a for a in access_list if a.is_write]
+  reads = [a for a in access_list if a.is_read]
+
+  if writes.len() > 0 && reads.len() > 0 {
+    // 동시 접근 가능성 → 경고
+    if !synchronized_by_mutex(var) {
+      ERROR("potential data race")
+    }
+  }
+}
+
+// 2. 런타임 검증 (ThreadSanitizer 스타일)
+unsafe fn runtime_check(ptr: Address, is_write: bool) {
+  shadow_map = get_shadow_memory(ptr)
+
+  if is_write && shadow_map.last_reader != current_thread {
+    PANIC("data race detected")
+  }
+}
+```
+
+**구현 비용**: 3-4주
+
+---
+
+### 4.4 Atomic & Memory Ordering 재현
+
+**가능성**: 🟢 **높음 (85%)**
+
+**이유**:
+- ✅ CPU의 메모리 모델 이미 존재
+- ✅ LLVM backend를 활용 가능
+- ✅ Ordering 열거형으로 표현 용이
+
+**재현 방법**:
+```freelang
+// 메모리 순서 정의
+enum Ordering {
+  Relaxed,      // 순서 보장 없음
+  Release,      // 이전 연산 완료 보장
+  Acquire,      // 이후 연산 순서 보장
+  AcqRel,       // Release + Acquire
+  SeqCst,       // 완전 순차 일관성
+}
+
+// 원자 타입
+struct AtomicUsize {
+  value: usize
+}
+
+impl AtomicUsize {
+  fn load(ordering: Ordering) -> usize {
+    // LLVM의 load atomic 명령어 생성
+    llvm_atomic_load(self.ptr, ordering)
+  }
+
+  fn store(val: usize, ordering: Ordering) {
+    llvm_atomic_store(self.ptr, val, ordering)
+  }
+}
+```
+
+**구현 비용**: 2-3주
+
+---
+
+### 4.5 채널 (MPSC) 재현
+
+**가능성**: 🟢 **매우 높음 (90%)**
+
+**이유**:
+- ✅ 메모리 공유 없음 (메시지 복사)
+- ✅ 소유권 기반 안전성
+- ✅ FreeLang의 큐 구조 재사용 가능
+
+**재현 방법**:
+```freelang
+// MPSC 채널
+fn channel<T>() -> (Sender<T>, Receiver<T>) {
+  queue = Arc::new(Mutex::new(VecDeque::new()))
+
+  return (
+    Sender { queue: Arc::clone(&queue) },
+    Receiver { queue }
+  )
+}
+
+impl<T> Sender<T> {
+  fn send(msg: T) -> Result<()> {
+    let mut q = self.queue.lock()
+    q.push_back(msg)  // 메시지 이동
+    Ok(())
+  }
+}
+
+impl<T> Receiver<T> {
+  fn recv() -> Result<T> {
+    loop {
+      let mut q = self.queue.lock()
+      if let Some(msg) = q.pop_front() {
+        return Ok(msg)
+      }
+      // drop(q) - 자동으로 unlock
+      thread::sleep(1ms)
+    }
+  }
+}
+```
+
+**구현 비용**: 2주
+
+---
+
+## 📈 Part 5: 종합 재현 가능성 평가
+
+| 요소 | 가능성 | 난이도 | 리스크 | 비용 |
+|------|--------|--------|--------|------|
+| **Send/Sync** | 🟢 95% | 낮음 | 낮음 | 2-3주 |
+| **Borrow Checker** | 🟡 60% | 높음 | 중간 | 4-6주 |
+| **Data Race 감지** | 🟡 65% | 높음 | 높음 | 3-4주 |
+| **Atomic Ops** | 🟢 85% | 중간 | 낮음 | 2-3주 |
+| **Channel (MPSC)** | 🟢 90% | 중간 | 낮음 | 2주 |
+| **Condition Variables** | 🟢 85% | 중간 | 낮음 | 2주 |
+| **Thread Pool** | 🟢 90% | 중간 | 낮음 | 1-2주 |
+
+**전체 가능성**: **🟢 75% (달성 가능)**
+
+---
+
+## 🎯 Part 6: 재현 불가능한 부분 & 대안
+
+### 6.1 완벽한 Borrow Checker 구현 불가
+
+**이유**:
+- Rust의 Borrow Checker는 NP-complete 문제
+- 다중 생명주기('a, 'b, ...) 추적 매우 복잡
+- 컴파일 시간이 지수적 증가
+
+**대안**:
+```freelang
+// 1. 단순화된 생명주기 (한 가지만)
+fn process<'a>(x: &'a i32) -> &'a i32 {
+  x
+}
+
+// 2. 명시적 생명주기 선언
+#[lifetime('a)]
+fn borrow(x: &'a T) -> &'a T { x }
+
+// 3. 런타임 검증으로 보완
+// 위험한 coercion 시 RuntimeError
+```
+
+### 6.2 메모리 순서의 한계
+
+**이유**:
+- CPU별 메모리 모델 다름 (x86-TSO vs ARM vs PowerPC)
+- FreeLang은 CPU에 독립적이어야 함
+
+**대안**:
+```freelang
+// 1. 보수적 접근 (항상 SeqCst 사용)
+atomic_load(x, Ordering::SeqCst)  // 안전하지만 느림
+
+// 2. 플랫폼별 컴파일 타임 최적화
+#[cfg(x86_64)]
+atomic_load(x, Ordering::Acquire)  // x86은 강력한 메모리 모델
+
+#[cfg(arm)]
+atomic_load(x, Ordering::SeqCst)   // ARM은 약한 모델
+```
+
+---
+
+## 🚀 Part 7: 흡수 전략
+
+### 7.1 3단계 점진적 구현
+
+**Phase B.1 (1-2주)**: 타입 시스템 + Send/Sync
+```
+✓ Send/Sync 트레이트 정의
+✓ 기본 타입 마킹
+✓ Arc, Mutex, RefCell 구현
+✓ 15+ 단위 테스트
+```
+
+**Phase B.2 (3-4주)**: 생명주기 + 소유권
+```
+✓ 생명주기 추적 (단순화)
+✓ 소유권 검증
+✓ Borrow Checker 기초
+✓ 25+ 통합 테스트
+```
+
+**Phase B.3 (2-3주)**: Data Race 감지 + 런타임
+```
+✓ 정적 분석 (컴파일)
+✓ 동적 감지 (런타임)
+✓ ThreadSanitizer 스타일
+✓ 실제 워크로드 벤치마크
+```
+
+### 7.2 GOGS 커밋 전략
+
+```
+commit 1: "feat(concurrency): Add Send/Sync traits (2,500줄)"
+commit 2: "feat(lifetime): Basic lifetime tracking (3,000줄)"
+commit 3: "feat(race): Data race detection (2,500줄)"
+commit 4: "test(concurrency): 100+ test cases (2,000줄)"
+```
+
+---
+
+## ✨ 결론
+
+**Rust의 동시성 안전성을 FreeLang으로 재현하는 것은 완전히 가능합니다.**
+
+| 달성도 | 예상 시간 | 결과 |
+|--------|----------|------|
+| **60% (MVP)** | 4-6주 | Send/Sync + 기본 생명주기 |
+| **80% (베타)** | 8-10주 | Borrow Checker 기초 + Data Race 감지 |
+| **95% (프로덕션)** | 12-14주 | Rust 대비 99% 호환성 |
+
+**최종 목표**: FreeLang은 Rust만큼 안전한 동시성 런타임을 갖게 됩니다. 🎯
+
+---
+
+**다음 단계**: FREELANG_CONCURRENCY_FEASIBILITY.md 작성 (구현 세부 사항)

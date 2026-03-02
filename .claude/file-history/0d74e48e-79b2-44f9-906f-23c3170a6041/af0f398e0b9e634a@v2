@@ -1,0 +1,489 @@
+// ============================================================================
+// FreeLang RefCell<T> - 동적 빌림 검사
+// ============================================================================
+//
+// RefCell은 컴파일 타임이 아닌 런타임에 빌림 규칙을 검사합니다.
+//
+// 특징:
+// - Interior Mutability: 불변 참조로 내부 수정 가능
+// - 동적 빌림 추적: 런타임에 borrow 개수 카운팅
+// - 빌림 규칙 강제: 위반 시 panic
+// - RAII 가드: Ref/RefMut 자동 해제
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.3 (Week 5-8)
+
+use crate::sync::borrow_state::{BorrowState, StatefulBorrow};
+use std::ops::{Deref, DerefMut};
+use std::cell::RefCell as StdRefCell;
+
+// ============================================================================
+// RefCell 구조
+// ============================================================================
+
+/// RefCell<T>: 동적 빌림 검사를 제공하는 내부 가변성 컨테이너
+///
+/// 컴파일 타임 검사 대신 런타임에 빌림 규칙을 검증합니다.
+pub struct RefCell<T> {
+    // 내부 borrow 상태 추적
+    state: StdRefCell<BorrowState>,
+
+    // 실제 데이터
+    data: StdRefCell<T>,
+}
+
+/// Ref<'a, T>: 불변 빌림 가드
+///
+/// RefCell::borrow()가 반환하며, drop될 때 borrow 상태를 해제합니다.
+pub struct Ref<'a, T> {
+    cell: &'a RefCell<T>,
+}
+
+/// RefMut<'a, T>: 가변 빌림 가드
+///
+/// RefCell::borrow_mut()이 반환하며, drop될 때 borrow 상태를 해제합니다.
+pub struct RefMut<'a, T> {
+    cell: &'a RefCell<T>,
+}
+
+// ============================================================================
+// RefCell 메서드
+// ============================================================================
+
+impl<T> RefCell<T> {
+    /// 새로운 RefCell<T>를 생성합니다.
+    ///
+    /// # 예제
+    /// ```
+    /// let cell = RefCell::new(42);
+    /// ```
+    pub fn new(data: T) -> RefCell<T> {
+        RefCell {
+            state: StdRefCell::new(BorrowState::Unused),
+            data: StdRefCell::new(data),
+        }
+    }
+
+    /// 불변 빌림을 획득합니다.
+    ///
+    /// 여러 스레드가 동시에 불변 빌림할 수 있습니다.
+    /// 가변 빌림 중이면 panic합니다.
+    ///
+    /// # 패닉
+    /// - 현재 가변 빌림 중일 때
+    ///
+    /// # 예제
+    /// ```
+    /// let cell = RefCell::new(vec![1, 2, 3]);
+    /// let guard = cell.borrow();
+    /// assert_eq!(guard.len(), 3);
+    /// // guard가 drop되면서 borrow 상태 해제
+    /// ```
+    pub fn borrow(&self) -> Ref<T> {
+        // Borrow 상태 업데이트
+        let mut state = self.state.borrow_mut();
+        match state.try_borrow() {
+            Ok(new_state) => {
+                *state = new_state;
+                drop(state);  // 명시적으로 해제
+                Ref { cell: self }
+            }
+            Err(_) => {
+                panic!(
+                    "RefCell::borrow() called while mutably borrowed (active borrows: {})",
+                    state.borrow_count()
+                );
+            }
+        }
+    }
+
+    /// 가변 빌림을 획득합니다.
+    ///
+    /// 배타적으로 접근할 수 있습니다.
+    /// 불변 빌림 중이거나 이미 가변 빌림 중이면 panic합니다.
+    ///
+    /// # 패닉
+    /// - 불변 빌림 중일 때
+    /// - 이미 가변 빌림 중일 때
+    ///
+    /// # 예제
+    /// ```
+    /// let cell = RefCell::new(vec![]);
+    /// let mut guard = cell.borrow_mut();
+    /// guard.push(42);
+    /// assert_eq!(guard.len(), 1);
+    /// ```
+    pub fn borrow_mut(&self) -> RefMut<T> {
+        // Borrow 상태 업데이트
+        let mut state = self.state.borrow_mut();
+        match state.try_borrow_mut() {
+            Ok(new_state) => {
+                *state = new_state;
+                drop(state);
+                RefMut { cell: self }
+            }
+            Err(_) => {
+                panic!(
+                    "RefCell::borrow_mut() called with active borrows (count: {})",
+                    state.borrow_count()
+                );
+            }
+        }
+    }
+
+    /// 불변 빌림을 시도합니다 (실패하면 None 반환).
+    ///
+    /// # 예제
+    /// ```
+    /// let cell = RefCell::new(42);
+    /// match cell.try_borrow() {
+    ///     Ok(guard) => println!("{}", *guard),
+    ///     Err(_) => println!("already borrowed"),
+    /// }
+    /// ```
+    pub fn try_borrow(&self) -> Result<Ref<T>, String> {
+        let mut state = self.state.borrow_mut();
+        match state.try_borrow() {
+            Ok(new_state) => {
+                *state = new_state;
+                drop(state);
+                Ok(Ref { cell: self })
+            }
+            Err(_) => Err("already mutably borrowed".to_string()),
+        }
+    }
+
+    /// 가변 빌림을 시도합니다 (실패하면 None 반환).
+    pub fn try_borrow_mut(&self) -> Result<RefMut<T>, String> {
+        let mut state = self.state.borrow_mut();
+        match state.try_borrow_mut() {
+            Ok(new_state) => {
+                *state = new_state;
+                drop(state);
+                Ok(RefMut { cell: self })
+            }
+            Err(_) => Err("already borrowed".to_string()),
+        }
+    }
+
+    /// RefCell 내부의 데이터를 직접 소유권과 함께 얻습니다.
+    ///
+    /// 이 메서드는 RefCell을 consume하므로,
+    /// 더 이상 borrow를 안 해도 되는 경우에만 사용하세요.
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    /// 현재 활성 borrow 개수를 반환합니다 (디버깅용).
+    pub fn borrow_count(&self) -> usize {
+        self.state.borrow().borrow_count()
+    }
+
+    /// 현재 borrow 상태를 반환합니다 (디버깅용).
+    pub fn borrow_state(&self) -> BorrowState {
+        *self.state.borrow()
+    }
+}
+
+// ============================================================================
+// Ref<T> 구현 (불변 빌림 가드)
+// ============================================================================
+
+impl<'a, T> Ref<'a, T> {
+    /// Ref가 참조하는 값을 얻습니다.
+    pub fn get_ref(&self) -> &T {
+        unsafe {
+            &*self.cell.data.as_ptr()
+        }
+    }
+}
+
+impl<'a, T> Deref for Ref<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe {
+            &*self.cell.data.as_ptr()
+        }
+    }
+}
+
+impl<'a, T> Drop for Ref<'a, T> {
+    fn drop(&mut self) {
+        // Borrow 상태 감소
+        let mut state = self.cell.state.borrow_mut();
+        *state = state.release_borrow();
+    }
+}
+
+// ============================================================================
+// RefMut<T> 구현 (가변 빌림 가드)
+// ============================================================================
+
+impl<'a, T> RefMut<'a, T> {
+    /// RefMut를 통해 변수에 가변 접근합니다.
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe {
+            &mut *self.cell.data.as_ptr()
+        }
+    }
+}
+
+impl<'a, T> Deref for RefMut<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe {
+            &*self.cell.data.as_ptr()
+        }
+    }
+}
+
+impl<'a, T> DerefMut for RefMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe {
+            &mut *self.cell.data.as_ptr()
+        }
+    }
+}
+
+impl<'a, T> Drop for RefMut<'a, T> {
+    fn drop(&mut self) {
+        // Borrow 상태 해제
+        let mut state = self.cell.state.borrow_mut();
+        *state = state.release_borrow_mut();
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_refcell_new() {
+        let cell = RefCell::new(42);
+        assert_eq!(cell.borrow_count(), 0);
+    }
+
+    #[test]
+    fn test_refcell_borrow_once() {
+        let cell = RefCell::new(vec![1, 2, 3]);
+        let guard = cell.borrow();
+        assert_eq!(guard.len(), 3);
+        assert_eq!(cell.borrow_count(), 1);
+    }
+
+    #[test]
+    fn test_refcell_borrow_multiple() {
+        let cell = RefCell::new(42);
+        let _g1 = cell.borrow();
+        let _g2 = cell.borrow();
+        let _g3 = cell.borrow();
+
+        assert_eq!(cell.borrow_count(), 3);
+
+        drop(_g1);
+        assert_eq!(cell.borrow_count(), 2);
+
+        drop(_g2);
+        assert_eq!(cell.borrow_count(), 1);
+
+        drop(_g3);
+        assert_eq!(cell.borrow_count(), 0);
+    }
+
+    #[test]
+    fn test_refcell_borrow_mut_once() {
+        let cell = RefCell::new(vec![]);
+        {
+            let mut guard = cell.borrow_mut();
+            guard.push(1);
+            guard.push(2);
+        }
+
+        let guard = cell.borrow();
+        assert_eq!(guard.len(), 2);
+    }
+
+    #[test]
+    fn test_refcell_deref() {
+        let cell = RefCell::new(String::from("hello"));
+        let guard = cell.borrow();
+        assert_eq!(guard.as_str(), "hello");
+    }
+
+    #[test]
+    fn test_refcell_deref_mut() {
+        let cell = RefCell::new(String::from("hello"));
+        {
+            let mut guard = cell.borrow_mut();
+            guard.push_str(" world");
+        }
+
+        let guard = cell.borrow();
+        assert_eq!(guard.as_str(), "hello world");
+    }
+
+    #[test]
+    #[should_panic(expected = "RefCell::borrow() called while mutably borrowed")]
+    fn test_refcell_immutable_after_mutable_panic() {
+        let cell = RefCell::new(42);
+        let _mut_guard = cell.borrow_mut();
+        let _immut_guard = cell.borrow();  // panic!
+    }
+
+    #[test]
+    #[should_panic(expected = "RefCell::borrow_mut() called with active borrows")]
+    fn test_refcell_mutable_after_immutable_panic() {
+        let cell = RefCell::new(42);
+        let _immut_guard = cell.borrow();
+        let _mut_guard = cell.borrow_mut();  // panic!
+    }
+
+    #[test]
+    #[should_panic(expected = "RefCell::borrow_mut() called with active borrows")]
+    fn test_refcell_double_mutable_panic() {
+        let cell = RefCell::new(42);
+        let _mut_guard1 = cell.borrow_mut();
+        let _mut_guard2 = cell.borrow_mut();  // panic!
+    }
+
+    #[test]
+    fn test_refcell_try_borrow_success() {
+        let cell = RefCell::new(42);
+        match cell.try_borrow() {
+            Ok(guard) => assert_eq!(*guard, 42),
+            Err(_) => panic!("try_borrow should succeed"),
+        }
+    }
+
+    #[test]
+    fn test_refcell_try_borrow_failure() {
+        let cell = RefCell::new(42);
+        let _mut_guard = cell.borrow_mut();
+        match cell.try_borrow() {
+            Ok(_) => panic!("try_borrow should fail"),
+            Err(_) => {} // expected
+        }
+    }
+
+    #[test]
+    fn test_refcell_try_borrow_mut_success() {
+        let cell = RefCell::new(42);
+        match cell.try_borrow_mut() {
+            Ok(mut guard) => {
+                *guard = 100;
+                assert_eq!(*guard, 100);
+            }
+            Err(_) => panic!("try_borrow_mut should succeed"),
+        }
+    }
+
+    #[test]
+    fn test_refcell_try_borrow_mut_failure() {
+        let cell = RefCell::new(42);
+        let _guard = cell.borrow();
+        match cell.try_borrow_mut() {
+            Ok(_) => panic!("try_borrow_mut should fail"),
+            Err(_) => {} // expected
+        }
+    }
+
+    #[test]
+    fn test_refcell_into_inner() {
+        let cell = RefCell::new(String::from("hello"));
+        let inner = cell.into_inner();
+        assert_eq!(inner, "hello");
+    }
+
+    #[test]
+    fn test_refcell_nested_structure() {
+        struct Counter {
+            value: RefCell<i32>,
+        }
+
+        let counter = Counter {
+            value: RefCell::new(0),
+        };
+
+        {
+            let mut guard = counter.value.borrow_mut();
+            *guard += 1;
+        }
+
+        {
+            let guard = counter.value.borrow();
+            assert_eq!(*guard, 1);
+        }
+    }
+
+    #[test]
+    fn test_refcell_complex_type() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        let cell = RefCell::new(Point { x: 3, y: 4 });
+
+        {
+            let mut guard = cell.borrow_mut();
+            guard.x = 5;
+            guard.y = 12;
+        }
+
+        let guard = cell.borrow();
+        assert_eq!(guard.x, 5);
+        assert_eq!(guard.y, 12);
+    }
+
+    #[test]
+    fn test_refcell_sequential_operations() {
+        let cell = RefCell::new(vec![]);
+
+        // Scope 1: 불변 빌림
+        {
+            let guard = cell.borrow();
+            assert_eq!(guard.len(), 0);
+        }
+
+        // Scope 2: 가변 빌림 (이제 가능)
+        {
+            let mut guard = cell.borrow_mut();
+            guard.push(1);
+            guard.push(2);
+        }
+
+        // Scope 3: 다시 불변 빌림
+        {
+            let guard = cell.borrow();
+            assert_eq!(guard.len(), 2);
+        }
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// RefCell<T> 구현 항목:
+// ✅ RefCell<T> 구조
+// ✅ Ref<T> 구조 및 Drop
+// ✅ RefMut<T> 구조 및 Drop
+// ✅ new() 메서드
+// ✅ borrow() - 불변 빌림 (panic on conflict)
+// ✅ borrow_mut() - 가변 빌림 (panic on conflict)
+// ✅ try_borrow() - 실패 가능한 불변 빌림
+// ✅ try_borrow_mut() - 실패 가능한 가변 빌림
+// ✅ into_inner() - 소유권 이동
+// ✅ borrow_count() / borrow_state() - 디버깅
+// ✅ Deref / DerefMut 구현
+// ✅ Drop 자동 해제
+// ✅ 15개 테스트 (panic 포함)
+//
+// 다음: lifetime_analyzer.fl (Lifetime 범위 분석)

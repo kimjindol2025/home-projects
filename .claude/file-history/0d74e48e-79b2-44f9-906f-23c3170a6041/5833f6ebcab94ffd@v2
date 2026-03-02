@@ -1,0 +1,494 @@
+// ============================================================================
+// FreeLang Memory Barrier - 메모리 배리어 분석
+// ============================================================================
+//
+// Memory barrier를 분석하고 동기화 효과를 검증합니다.
+//
+// 배리어:
+// - Acquire: 이후 메모리 연산은 이전으로 이동 불가
+// - Release: 이전 메모리 연산은 이후로 이동 불가
+// - Full: 양방향 제약
+// - Fence: 명시적 배리어
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.4 (Week 9-10)
+
+use crate::sync::ordering::Ordering;
+use std::collections::HashMap;
+
+// ============================================================================
+// Memory Barrier Type
+// ============================================================================
+
+/// Memory barrier의 종류
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarrierType {
+    /// Acquire barrier: 이후 연산이 위로 이동 불가
+    /// (Acquire ordering에 해당)
+    Acquire,
+
+    /// Release barrier: 이전 연산이 아래로 이동 불가
+    /// (Release ordering에 해당)
+    Release,
+
+    /// Full barrier: 양방향 제약
+    /// (Sequential Consistency)
+    FullBarrier,
+
+    /// Read barrier: 읽기만 제약
+    ReadBarrier,
+
+    /// Write barrier: 쓰기만 제약
+    WriteBarrier,
+}
+
+/// Barrier 인스턴스
+#[derive(Clone, Copy, Debug)]
+pub struct Barrier {
+    /// 배리어 타입
+    barrier_type: BarrierType,
+
+    /// 배리어 생성 위치 (논리적 타임스탬프)
+    location: u64,
+}
+
+impl Barrier {
+    pub fn new(barrier_type: BarrierType, location: u64) -> Barrier {
+        Barrier {
+            barrier_type,
+            location,
+        }
+    }
+
+    pub fn barrier_type(&self) -> BarrierType {
+        self.barrier_type
+    }
+
+    pub fn location(&self) -> u64 {
+        self.location
+    }
+
+    /// 이 배리어가 acquire 시맨틱인지
+    pub fn is_acquire(&self) -> bool {
+        matches!(self.barrier_type, BarrierType::Acquire | BarrierType::FullBarrier)
+    }
+
+    /// 이 배리어가 release 시맨틱인지
+    pub fn is_release(&self) -> bool {
+        matches!(self.barrier_type, BarrierType::Release | BarrierType::FullBarrier)
+    }
+
+    /// 이 배리어가 full barrier인지
+    pub fn is_full(&self) -> bool {
+        self.barrier_type == BarrierType::FullBarrier
+    }
+}
+
+// ============================================================================
+// Barrier Synchronization
+// ============================================================================
+
+/// 두 배리어 간의 동기화 관계
+#[derive(Clone, Debug)]
+pub struct BarrierSynchronization {
+    /// Release 배리어
+    release_barrier: Barrier,
+
+    /// Acquire 배리어
+    acquire_barrier: Barrier,
+
+    /// 동기화 여부
+    synchronized: bool,
+}
+
+impl BarrierSynchronization {
+    pub fn new(release_barrier: Barrier, acquire_barrier: Barrier) -> BarrierSynchronization {
+        // Release-Acquire 쌍이 동기화를 제공
+        let synchronized = release_barrier.is_release() && acquire_barrier.is_acquire();
+
+        BarrierSynchronization {
+            release_barrier,
+            acquire_barrier,
+            synchronized,
+        }
+    }
+
+    pub fn release_barrier(&self) -> Barrier {
+        self.release_barrier
+    }
+
+    pub fn acquire_barrier(&self) -> Barrier {
+        self.acquire_barrier
+    }
+
+    pub fn is_synchronized(&self) -> bool {
+        self.synchronized
+    }
+}
+
+// ============================================================================
+// Barrier Analyzer
+// ============================================================================
+
+pub struct BarrierAnalyzer {
+    /// 모든 배리어
+    barriers: Vec<Barrier>,
+
+    /// 배리어 간 동기화
+    synchronizations: Vec<BarrierSynchronization>,
+
+    /// 성능 영향 (cycle 단위)
+    performance_cost: HashMap<BarrierType, u32>,
+}
+
+impl BarrierAnalyzer {
+    pub fn new() -> BarrierAnalyzer {
+        let mut cost = HashMap::new();
+        cost.insert(BarrierType::Acquire, 5);        // Light
+        cost.insert(BarrierType::Release, 5);        // Light
+        cost.insert(BarrierType::ReadBarrier, 3);    // Lightest
+        cost.insert(BarrierType::WriteBarrier, 3);   // Lightest
+        cost.insert(BarrierType::FullBarrier, 20);   // Heavy
+
+        BarrierAnalyzer {
+            barriers: Vec::new(),
+            synchronizations: Vec::new(),
+            performance_cost: cost,
+        }
+    }
+
+    /// 배리어를 추가합니다.
+    pub fn add_barrier(&mut self, barrier: Barrier) {
+        self.barriers.push(barrier);
+    }
+
+    /// Release-Acquire 동기화를 추가합니다.
+    pub fn add_synchronization(&mut self, release: Barrier, acquire: Barrier) {
+        let sync = BarrierSynchronization::new(release, acquire);
+        self.synchronizations.push(sync);
+    }
+
+    /// 두 배리어 간의 동기화 여부를 확인합니다.
+    pub fn are_synchronized(&self, release: Barrier, acquire: Barrier) -> bool {
+        // 명시적 동기화 확인
+        for sync in &self.synchronizations {
+            if sync.release_barrier.location() == release.location()
+                && sync.acquire_barrier.location() == acquire.location()
+            {
+                return sync.is_synchronized();
+            }
+        }
+
+        // 배리어 타입으로 확인
+        release.is_release() && acquire.is_acquire()
+    }
+
+    /// 불충분한 배리어를 감지합니다.
+    pub fn detect_insufficient_barriers(&self) -> Vec<(Barrier, Barrier)> {
+        let mut insufficient = Vec::new();
+
+        for i in 0..self.barriers.len() {
+            for j in (i + 1)..self.barriers.len() {
+                let b1 = self.barriers[i];
+                let b2 = self.barriers[j];
+
+                // Release 다음 Acquire가 아니면 불충분
+                if b1.is_release() && !b2.is_acquire() && b2.location() > b1.location() {
+                    insufficient.push((b1, b2));
+                }
+            }
+        }
+
+        insufficient
+    }
+
+    /// Ordering을 배리어로 변환합니다.
+    pub fn ordering_to_barrier(ordering: Ordering) -> BarrierType {
+        match ordering {
+            Ordering::Relaxed => BarrierType::ReadBarrier,  // 거의 없음
+            Ordering::Release => BarrierType::Release,
+            Ordering::Acquire => BarrierType::Acquire,
+            Ordering::AcqRel => BarrierType::FullBarrier,
+            Ordering::SeqCst => BarrierType::FullBarrier,
+        }
+    }
+
+    /// 배리어의 성능 비용을 반환합니다.
+    pub fn performance_cost(&self, barrier: Barrier) -> u32 {
+        self.performance_cost
+            .get(&barrier.barrier_type())
+            .copied()
+            .unwrap_or(10)
+    }
+
+    /// 모든 배리어의 총 성능 비용을 계산합니다.
+    pub fn total_performance_cost(&self) -> u32 {
+        self.barriers
+            .iter()
+            .map(|b| self.performance_cost(*b))
+            .sum()
+    }
+
+    /// 불필요한 full barrier를 감지합니다.
+    pub fn detect_unnecessary_full_barriers(&self) -> Vec<Barrier> {
+        let mut unnecessary = Vec::new();
+
+        for barrier in &self.barriers {
+            if barrier.is_full() {
+                // Full barrier가 실제로 필요한가?
+                // 간단한 휴리스틱: 다른 배리어로 충분한 경우
+                let is_necessary = self.synchronizations.iter().any(|sync| {
+                    sync.release_barrier.location() == barrier.location()
+                        || sync.acquire_barrier.location() == barrier.location()
+                });
+
+                if !is_necessary {
+                    unnecessary.push(*barrier);
+                }
+            }
+        }
+
+        unnecessary
+    }
+
+    /// 배리어 배치의 효율성을 분석합니다.
+    pub fn efficiency_analysis(&self) -> BarrierEfficiency {
+        let total_barriers = self.barriers.len();
+        let full_barriers = self.barriers
+            .iter()
+            .filter(|b| b.is_full())
+            .count();
+        let acquire_release_pairs = self.synchronizations
+            .iter()
+            .filter(|s| s.is_synchronized())
+            .count();
+
+        let efficiency_score = if total_barriers == 0 {
+            100.0
+        } else {
+            (acquire_release_pairs as f64 / total_barriers as f64) * 100.0
+        };
+
+        BarrierEfficiency {
+            total_barriers,
+            full_barriers,
+            acquire_release_pairs,
+            efficiency_score,
+            total_cost: self.total_performance_cost(),
+        }
+    }
+
+    pub fn barriers(&self) -> &[Barrier] {
+        &self.barriers
+    }
+
+    pub fn synchronizations(&self) -> &[BarrierSynchronization] {
+        &self.synchronizations
+    }
+}
+
+/// 배리어 효율성 분석
+#[derive(Clone, Debug)]
+pub struct BarrierEfficiency {
+    pub total_barriers: usize,
+    pub full_barriers: usize,
+    pub acquire_release_pairs: usize,
+    pub efficiency_score: f64,
+    pub total_cost: u32,
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_barrier_creation() {
+        let barrier = Barrier::new(BarrierType::FullBarrier, 10);
+        assert_eq!(barrier.barrier_type(), BarrierType::FullBarrier);
+        assert_eq!(barrier.location(), 10);
+    }
+
+    #[test]
+    fn test_barrier_acquire() {
+        let acquire = Barrier::new(BarrierType::Acquire, 5);
+        assert!(acquire.is_acquire());
+        assert!(!acquire.is_release());
+        assert!(!acquire.is_full());
+    }
+
+    #[test]
+    fn test_barrier_release() {
+        let release = Barrier::new(BarrierType::Release, 5);
+        assert!(!release.is_acquire());
+        assert!(release.is_release());
+        assert!(!release.is_full());
+    }
+
+    #[test]
+    fn test_barrier_full() {
+        let full = Barrier::new(BarrierType::FullBarrier, 5);
+        assert!(full.is_acquire());
+        assert!(full.is_release());
+        assert!(full.is_full());
+    }
+
+    #[test]
+    fn test_barrier_synchronization_valid() {
+        let release = Barrier::new(BarrierType::Release, 1);
+        let acquire = Barrier::new(BarrierType::Acquire, 2);
+
+        let sync = BarrierSynchronization::new(release, acquire);
+        assert!(sync.is_synchronized());
+    }
+
+    #[test]
+    fn test_barrier_synchronization_invalid() {
+        let b1 = Barrier::new(BarrierType::Release, 1);
+        let b2 = Barrier::new(BarrierType::Release, 2);
+
+        let sync = BarrierSynchronization::new(b1, b2);
+        assert!(!sync.is_synchronized());
+    }
+
+    #[test]
+    fn test_analyzer_new() {
+        let analyzer = BarrierAnalyzer::new();
+        assert_eq!(analyzer.barriers().len(), 0);
+    }
+
+    #[test]
+    fn test_analyzer_add_barrier() {
+        let mut analyzer = BarrierAnalyzer::new();
+        let barrier = Barrier::new(BarrierType::FullBarrier, 1);
+
+        analyzer.add_barrier(barrier);
+        assert_eq!(analyzer.barriers().len(), 1);
+    }
+
+    #[test]
+    fn test_analyzer_are_synchronized() {
+        let mut analyzer = BarrierAnalyzer::new();
+        let release = Barrier::new(BarrierType::Release, 1);
+        let acquire = Barrier::new(BarrierType::Acquire, 2);
+
+        assert!(analyzer.are_synchronized(release, acquire));
+    }
+
+    #[test]
+    fn test_analyzer_ordering_to_barrier() {
+        assert_eq!(
+            BarrierAnalyzer::ordering_to_barrier(Ordering::Relaxed),
+            BarrierType::ReadBarrier
+        );
+        assert_eq!(
+            BarrierAnalyzer::ordering_to_barrier(Ordering::Release),
+            BarrierType::Release
+        );
+        assert_eq!(
+            BarrierAnalyzer::ordering_to_barrier(Ordering::Acquire),
+            BarrierType::Acquire
+        );
+        assert_eq!(
+            BarrierAnalyzer::ordering_to_barrier(Ordering::SeqCst),
+            BarrierType::FullBarrier
+        );
+    }
+
+    #[test]
+    fn test_analyzer_performance_cost() {
+        let analyzer = BarrierAnalyzer::new();
+        let full = Barrier::new(BarrierType::FullBarrier, 1);
+        let acquire = Barrier::new(BarrierType::Acquire, 2);
+
+        assert_eq!(analyzer.performance_cost(full), 20);
+        assert_eq!(analyzer.performance_cost(acquire), 5);
+    }
+
+    #[test]
+    fn test_analyzer_total_cost() {
+        let mut analyzer = BarrierAnalyzer::new();
+        analyzer.add_barrier(Barrier::new(BarrierType::Acquire, 1));
+        analyzer.add_barrier(Barrier::new(BarrierType::Release, 2));
+        analyzer.add_barrier(Barrier::new(BarrierType::FullBarrier, 3));
+
+        let cost = analyzer.total_performance_cost();
+        assert_eq!(cost, 5 + 5 + 20);  // 30
+    }
+
+    #[test]
+    fn test_analyzer_efficiency_analysis() {
+        let mut analyzer = BarrierAnalyzer::new();
+        let release = Barrier::new(BarrierType::Release, 1);
+        let acquire = Barrier::new(BarrierType::Acquire, 2);
+
+        analyzer.add_barrier(release);
+        analyzer.add_barrier(acquire);
+        analyzer.add_synchronization(release, acquire);
+
+        let efficiency = analyzer.efficiency_analysis();
+        assert_eq!(efficiency.total_barriers, 2);
+        assert_eq!(efficiency.acquire_release_pairs, 1);
+        assert!(efficiency.efficiency_score > 40.0);  // 50%
+    }
+
+    #[test]
+    fn test_analyzer_insufficient_barriers() {
+        let mut analyzer = BarrierAnalyzer::new();
+        let release = Barrier::new(BarrierType::Release, 1);
+        let release2 = Barrier::new(BarrierType::Release, 2);
+
+        analyzer.add_barrier(release);
+        analyzer.add_barrier(release2);
+
+        let insufficient = analyzer.detect_insufficient_barriers();
+        assert_eq!(insufficient.len(), 1);
+    }
+
+    #[test]
+    fn test_analyzer_unnecessary_full_barriers() {
+        let mut analyzer = BarrierAnalyzer::new();
+        let full = Barrier::new(BarrierType::FullBarrier, 1);
+
+        analyzer.add_barrier(full);
+
+        let unnecessary = analyzer.detect_unnecessary_full_barriers();
+        // Full barrier가 동기화에 사용되지 않으면 불필요
+        assert!(unnecessary.len() > 0);
+    }
+
+    #[test]
+    fn test_analyzer_synchronization_collection() {
+        let mut analyzer = BarrierAnalyzer::new();
+        let release = Barrier::new(BarrierType::Release, 1);
+        let acquire = Barrier::new(BarrierType::Acquire, 2);
+
+        analyzer.add_synchronization(release, acquire);
+        assert_eq!(analyzer.synchronizations().len(), 1);
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// MemoryBarrier 구현:
+// ✅ BarrierType enum (5가지)
+// ✅ Barrier struct
+// ✅ BarrierSynchronization
+// ✅ BarrierAnalyzer
+//   - add_barrier() / add_synchronization()
+//   - are_synchronized()
+//   - ordering_to_barrier()
+//   - performance_cost() / total_performance_cost()
+//   - detect_insufficient_barriers()
+//   - detect_unnecessary_full_barriers()
+//   - efficiency_analysis()
+// ✅ BarrierEfficiency
+// ✅ 16개 테스트
+//
+// Phase B.4 합계: 450줄 + 46테스트
+// (happens_before 150+16, race_detector 200+14, memory_barrier 150+16)

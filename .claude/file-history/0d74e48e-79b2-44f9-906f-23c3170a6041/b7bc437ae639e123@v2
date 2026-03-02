@@ -1,0 +1,550 @@
+// ============================================================================
+// FreeLang Phase F Week 1: Runtime Integration
+// ============================================================================
+//
+// Phase E의 모든 모듈을 통합하여 완전한 런타임을 구성합니다.
+//
+// 통합 모듈:
+// - lexer: 소스코드 → 토큰
+// - evaluator: 토큰 → AST → FlValue
+// - stdlib_bindings: 30+ 표준 라이브러리 함수
+// - sync_bindings: 7가지 동시성 모듈
+// - error: 에러 처리 및 복구
+// - repl: 대화형 실행 환경
+//
+// 구현 일시: 2026-03-02
+// 단계: Phase F Week 1
+
+pub mod lexer;
+pub mod evaluator;
+pub mod stdlib_bindings;
+pub mod sync_bindings;
+pub mod error;
+pub mod repl;
+
+use std::path::Path;
+use std::fs;
+use std::collections::HashMap;
+
+pub use evaluator::{Evaluator, FlValue, RuntimeError, Environment};
+pub use error::{RuntimeError as Error, ErrorSeverity, ErrorContext};
+pub use repl::{Repl, ReplSession, ReplCommand};
+
+// ============================================================================
+// FreeLangRuntime: 통합 런타임
+// ============================================================================
+
+/// FreeLang 런타임의 메인 진입점
+///
+/// 소스코드를 실행하기 위한 모든 기능을 제공합니다:
+/// - 파일 실행
+/// - REPL 모드
+/// - 스크립트 실행
+/// - 에러 처리
+pub struct FreeLangRuntime {
+    /// 메인 평가기
+    evaluator: Evaluator,
+
+    /// 실행 옵션
+    config: RuntimeConfig,
+
+    /// 실행 통계
+    statistics: RuntimeStatistics,
+
+    /// 에러 히스토리
+    errors: Vec<RuntimeError>,
+}
+
+/// 런타임 설정
+#[derive(Clone, Debug)]
+pub struct RuntimeConfig {
+    /// 디버그 모드 활성화
+    pub debug: bool,
+
+    /// 최대 스택 깊이
+    pub max_stack_depth: usize,
+
+    /// 최대 메모리 (MB)
+    pub max_memory_mb: usize,
+
+    /// 타임아웃 (초)
+    pub timeout_secs: u64,
+
+    /// 색상 출력 지원
+    pub color_output: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            debug: false,
+            max_stack_depth: 10000,
+            max_memory_mb: 512,
+            timeout_secs: 300,
+            color_output: true,
+        }
+    }
+}
+
+/// 런타임 실행 통계
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeStatistics {
+    /// 실행된 코드 라인 수
+    pub lines_executed: usize,
+
+    /// 발생한 에러 수
+    pub errors_count: usize,
+
+    /// 경고 수
+    pub warnings_count: usize,
+
+    /// 정의된 함수 수
+    pub functions_count: usize,
+
+    /// 정의된 변수 수
+    pub variables_count: usize,
+
+    /// 실행 시간 (밀리초)
+    pub execution_time_ms: u128,
+}
+
+impl std::fmt::Display for RuntimeStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,
+            "📊 Runtime Statistics:\n  Lines: {}\n  Errors: {}\n  Warnings: {}\n  Functions: {}\n  Variables: {}\n  Time: {}ms",
+            self.lines_executed,
+            self.errors_count,
+            self.warnings_count,
+            self.functions_count,
+            self.variables_count,
+            self.execution_time_ms
+        )
+    }
+}
+
+impl FreeLangRuntime {
+    /// 새로운 런타임을 생성합니다
+    pub fn new() -> Self {
+        FreeLangRuntime::with_config(RuntimeConfig::default())
+    }
+
+    /// 사용자 정의 설정으로 런타임을 생성합니다
+    pub fn with_config(config: RuntimeConfig) -> Self {
+        FreeLangRuntime {
+            evaluator: Evaluator::new(),
+            config,
+            statistics: RuntimeStatistics::default(),
+            errors: Vec::new(),
+        }
+    }
+
+    // ========================================================================
+    // 메인 실행 인터페이스
+    // ========================================================================
+
+    /// 소스코드를 실행합니다
+    ///
+    /// # 예제
+    /// ```
+    /// let mut runtime = FreeLangRuntime::new();
+    /// let result = runtime.execute_source("let x = 42");
+    /// assert!(result.is_ok());
+    /// ```
+    pub fn execute_source(&mut self, source: &str) -> Result<FlValue, RuntimeError> {
+        let start_time = std::time::Instant::now();
+
+        // Lexer → Parser → Evaluator 파이프라인
+        match self.evaluator.eval_program(source) {
+            Ok(result) => {
+                self.statistics.lines_executed += source.lines().count();
+                self.statistics.execution_time_ms = start_time.elapsed().as_millis();
+                Ok(result)
+            },
+            Err(e) => {
+                self.errors.push(e.clone());
+                self.statistics.errors_count += 1;
+                Err(e)
+            }
+        }
+    }
+
+    /// 파일을 실행합니다
+    ///
+    /// # 예제
+    /// ```
+    /// let mut runtime = FreeLangRuntime::new();
+    /// let result = runtime.execute_file("program.fl");
+    /// ```
+    pub fn execute_file<P: AsRef<Path>>(&mut self, path: P) -> Result<FlValue, RuntimeError> {
+        let content = fs::read_to_string(&path)
+            .map_err(|e| RuntimeError::Runtime(
+                format!("Failed to read file: {}", e)
+            ))?;
+
+        self.execute_source(&content)
+    }
+
+    /// 여러 소스코드를 순차 실행합니다
+    pub fn execute_batch(&mut self, sources: Vec<&str>) -> Vec<Result<FlValue, RuntimeError>> {
+        sources.into_iter()
+            .map(|src| self.execute_source(src))
+            .collect()
+    }
+
+    /// REPL 모드를 시작합니다
+    pub fn start_repl(&mut self) {
+        let mut repl = Repl::new();
+        repl.start();
+    }
+
+    // ========================================================================
+    // 환경 조회 & 관리
+    // ========================================================================
+
+    /// 변수의 값을 조회합니다
+    pub fn get_variable(&self, name: &str) -> Option<FlValue> {
+        self.evaluator.get_variable(name)
+    }
+
+    /// 변수를 설정합니다
+    pub fn set_variable(&mut self, name: String, value: FlValue) {
+        self.evaluator.set_variable(name, value);
+    }
+
+    /// 모든 정의된 변수를 반환합니다
+    pub fn get_all_variables(&self) -> HashMap<String, FlValue> {
+        self.evaluator.get_all_variables()
+    }
+
+    /// 환경을 초기화합니다
+    pub fn reset_environment(&mut self) {
+        self.evaluator.reset_environment();
+        self.statistics = RuntimeStatistics::default();
+        self.errors.clear();
+    }
+
+    // ========================================================================
+    // 통계 & 진단
+    // ========================================================================
+
+    /// 런타임 통계를 반환합니다
+    pub fn get_statistics(&self) -> RuntimeStatistics {
+        self.statistics.clone()
+    }
+
+    /// 에러 히스토리를 반환합니다
+    pub fn get_errors(&self) -> Vec<RuntimeError> {
+        self.errors.clone()
+    }
+
+    /// 마지막 에러를 반환합니다
+    pub fn last_error(&self) -> Option<RuntimeError> {
+        self.errors.last().cloned()
+    }
+
+    /// 런타임 설정을 반환합니다
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
+
+    /// 런타임 설정을 변경합니다
+    pub fn set_config(&mut self, config: RuntimeConfig) {
+        self.config = config;
+    }
+
+    /// 현재 상태 정보를 출력합니다
+    pub fn print_status(&self) {
+        println!("📊 FreeLang Runtime Status");
+        println!("  Lines executed: {}", self.statistics.lines_executed);
+        println!("  Errors: {}", self.statistics.errors_count);
+        println!("  Variables: {}", self.statistics.variables_count);
+        println!("  Execution time: {}ms", self.statistics.execution_time_ms);
+    }
+
+    // ========================================================================
+    // 유틸리티 함수
+    // ========================================================================
+
+    /// 소스코드를 파싱하여 AST를 반환합니다 (평가하지 않음)
+    pub fn parse_only(&self, source: &str) -> Result<(), RuntimeError> {
+        self.evaluator.parse_only(source)
+    }
+
+    /// 현재 환경의 메모리 크기를 추정합니다 (바이트)
+    pub fn estimated_memory_usage(&self) -> usize {
+        self.evaluator.estimated_memory_usage()
+    }
+
+    /// 런타임을 초기화합니다
+    pub fn initialize(&mut self) {
+        // 표준 라이브러리 로드 (자동)
+        // sync 모듈 로드 (자동)
+        // 에러 처리 시스템 준비 (자동)
+    }
+
+    /// 런타임을 종료합니다
+    pub fn shutdown(&self) {
+        // 리소스 정리
+        // 통계 저장
+    }
+}
+
+// ============================================================================
+// 간편한 실행 함수들
+// ============================================================================
+
+/// 소스코드를 즉시 실행합니다 (RuntimeConfig 불필요)
+pub fn run(source: &str) -> Result<FlValue, RuntimeError> {
+    let mut runtime = FreeLangRuntime::new();
+    runtime.execute_source(source)
+}
+
+/// 파일을 즉시 실행합니다
+pub fn run_file<P: AsRef<Path>>(path: P) -> Result<FlValue, RuntimeError> {
+    let mut runtime = FreeLangRuntime::new();
+    runtime.execute_file(path)
+}
+
+/// REPL을 시작합니다
+pub fn start_repl_interactive() {
+    let mut runtime = FreeLangRuntime::new();
+    runtime.start_repl();
+}
+
+// ============================================================================
+// ExecutionContext: 실행 컨텍스트
+// ============================================================================
+
+/// 현재 실행 상태를 나타냅니다
+#[derive(Clone, Debug)]
+pub struct ExecutionContext {
+    /// 현재 실행 중인 파일
+    pub current_file: Option<String>,
+
+    /// 현재 라인 번호
+    pub current_line: usize,
+
+    /// 현재 컬럼 번호
+    pub current_column: usize,
+
+    /// 콜 스택
+    pub call_stack: Vec<String>,
+
+    /// 로컬 변수
+    pub local_variables: HashMap<String, FlValue>,
+}
+
+impl ExecutionContext {
+    pub fn new() -> Self {
+        ExecutionContext {
+            current_file: None,
+            current_line: 0,
+            current_column: 0,
+            call_stack: Vec::new(),
+            local_variables: HashMap::new(),
+        }
+    }
+
+    pub fn push_call(&mut self, function_name: String) {
+        self.call_stack.push(function_name);
+    }
+
+    pub fn pop_call(&mut self) -> Option<String> {
+        self.call_stack.pop()
+    }
+
+    pub fn call_stack_depth(&self) -> usize {
+        self.call_stack.len()
+    }
+}
+
+// ============================================================================
+// 프리셋 런타임 설정
+// ============================================================================
+
+impl RuntimeConfig {
+    /// 최소 리소스 사용 설정
+    pub fn minimal() -> Self {
+        RuntimeConfig {
+            debug: false,
+            max_stack_depth: 1000,
+            max_memory_mb: 64,
+            timeout_secs: 30,
+            color_output: false,
+        }
+    }
+
+    /// 개발용 설정 (디버그 모드)
+    pub fn development() -> Self {
+        RuntimeConfig {
+            debug: true,
+            max_stack_depth: 10000,
+            max_memory_mb: 512,
+            timeout_secs: 300,
+            color_output: true,
+        }
+    }
+
+    /// 프로덕션 설정
+    pub fn production() -> Self {
+        RuntimeConfig {
+            debug: false,
+            max_stack_depth: 5000,
+            max_memory_mb: 1024,
+            timeout_secs: 60,
+            color_output: false,
+        }
+    }
+
+    /// 벤치마크 설정
+    pub fn benchmark() -> Self {
+        RuntimeConfig {
+            debug: false,
+            max_stack_depth: 20000,
+            max_memory_mb: 2048,
+            timeout_secs: 600,
+            color_output: false,
+        }
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_runtime_creation() {
+        let runtime = FreeLangRuntime::new();
+        assert!(runtime.config.debug == false);
+    }
+
+    #[test]
+    fn test_runtime_with_config() {
+        let config = RuntimeConfig::development();
+        let runtime = FreeLangRuntime::with_config(config);
+        assert!(runtime.config.debug == true);
+    }
+
+    #[test]
+    fn test_execute_simple_integer() {
+        let mut runtime = FreeLangRuntime::new();
+        let result = runtime.execute_source("42");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_string() {
+        let mut runtime = FreeLangRuntime::new();
+        let result = runtime.execute_source("\"hello\"");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_variable_binding() {
+        let mut runtime = FreeLangRuntime::new();
+        let result = runtime.execute_source("let x = 42");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_execute_arithmetic() {
+        let mut runtime = FreeLangRuntime::new();
+        let result = runtime.execute_source("5 + 3");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multiple_statements() {
+        let mut runtime = FreeLangRuntime::new();
+        let code = "let x = 10\nlet y = 20\nx + y";
+        let result = runtime.execute_source(code);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_runtime_statistics() {
+        let mut runtime = FreeLangRuntime::new();
+        let _result = runtime.execute_source("1 + 1");
+        assert!(runtime.statistics.lines_executed > 0);
+    }
+
+    #[test]
+    fn test_error_recording() {
+        let mut runtime = FreeLangRuntime::new();
+        let result = runtime.execute_source("1 / 0");
+        assert!(result.is_err());
+        assert!(runtime.errors.len() > 0);
+    }
+
+    #[test]
+    fn test_variable_get_set() {
+        let mut runtime = FreeLangRuntime::new();
+        runtime.set_variable("x".to_string(), FlValue::Int(42));
+        let val = runtime.get_variable("x");
+        assert!(val.is_some());
+    }
+
+    #[test]
+    fn test_reset_environment() {
+        let mut runtime = FreeLangRuntime::new();
+        runtime.set_variable("x".to_string(), FlValue::Int(42));
+        runtime.reset_environment();
+        assert!(runtime.get_variable("x").is_none());
+    }
+
+    #[test]
+    fn test_config_presets() {
+        let minimal = RuntimeConfig::minimal();
+        let dev = RuntimeConfig::development();
+        let prod = RuntimeConfig::production();
+
+        assert!(minimal.max_memory_mb < dev.max_memory_mb);
+        assert!(dev.debug == true);
+        assert!(prod.debug == false);
+    }
+
+    #[test]
+    fn test_execution_context() {
+        let mut ctx = ExecutionContext::new();
+        ctx.push_call("foo".to_string());
+        ctx.push_call("bar".to_string());
+        assert_eq!(ctx.call_stack_depth(), 2);
+
+        ctx.pop_call();
+        assert_eq!(ctx.call_stack_depth(), 1);
+    }
+
+    #[test]
+    fn test_statistics_display() {
+        let stats = RuntimeStatistics {
+            lines_executed: 10,
+            errors_count: 1,
+            warnings_count: 0,
+            functions_count: 5,
+            variables_count: 3,
+            execution_time_ms: 100,
+        };
+        let display = stats.to_string();
+        assert!(display.contains("10"));
+        assert!(display.contains("1"));
+    }
+
+    #[test]
+    fn test_batch_execution() {
+        let mut runtime = FreeLangRuntime::new();
+        let sources = vec!["let x = 1", "let y = 2", "x + y"];
+        let results = runtime.execute_batch(sources);
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_last_error() {
+        let mut runtime = FreeLangRuntime::new();
+        let _result = runtime.execute_source("1 / 0");
+        assert!(runtime.last_error().is_some());
+    }
+}

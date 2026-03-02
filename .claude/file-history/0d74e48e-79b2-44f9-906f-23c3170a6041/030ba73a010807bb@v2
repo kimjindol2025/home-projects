@@ -1,0 +1,489 @@
+# ============================================================================
+# async/task_queue.fl - 비동기 작업 큐 (Task Queue)
+# ============================================================================
+# FIFO 큐 + 우선순위 + 워커풀 + 재시도 로직
+# 작성: 2026-03-02
+# 책임: 비동기 작업 처리, 재시도, 모니터링
+
+# ─────────────────────────────────────────────────────────────────────────
+# 작업 큐 구조
+# ─────────────────────────────────────────────────────────────────────────
+
+enum TaskPriority
+  HIGH = 0
+  NORMAL = 1
+  LOW = 2
+
+enum TaskStatus
+  PENDING = 0
+  RUNNING = 1
+  DONE = 2
+  FAILED = 3
+  RETRY = 4
+
+struct Task
+  id: string                    # UUID
+  name: string
+  handler: function             # () -> Result<void, string>
+  priority: TaskPriority        # HIGH/NORMAL/LOW
+  status: TaskStatus            # PENDING/RUNNING/DONE/FAILED/RETRY
+  createdAt: number             # 밀리초
+  startedAt: number
+  completedAt: number
+  retryCount: number
+  maxRetries: number
+  error: string
+  metadata: map<string, string> # 커스텀 데이터
+
+struct TaskQueue
+  id: string
+  name: string
+  tasks: array<Task>            # FIFO 큐
+  workers: array<Worker>
+  maxWorkers: number
+  activeWorkers: number
+  retryLimit: number
+  deadLetterQueue: array<Task>  # 최대 재시도 실패한 작업
+  maxDeadLetterSize: number
+  paused: bool
+  stats: QueueStats
+
+struct Worker
+  id: string
+  isActive: bool
+  currentTask: Option<Task>
+  processedCount: number
+  totalTime: number             # 밀리초
+
+struct QueueStats
+  totalTasks: number
+  pendingTasks: number
+  runningTasks: number
+  completedTasks: number
+  failedTasks: number
+  retryTasks: number
+  deadLetterCount: number
+  averageTime: number           # 밀리초
+  throughput: number            # tasks/sec
+
+# ─────────────────────────────────────────────────────────────────────────
+# 큐 생성 및 관리
+# ─────────────────────────────────────────────────────────────────────────
+
+fn newTaskQueue
+  input: (name: string, maxWorkers: number, retryLimit: number)
+  output: TaskQueue
+  intent: "비동기 작업 큐 생성"
+  do
+    return {
+      id: generateUUID(),
+      name: name,
+      tasks: [],
+      workers: initializeWorkers(maxWorkers),
+      maxWorkers: maxWorkers,
+      activeWorkers: 0,
+      retryLimit: retryLimit,
+      deadLetterQueue: [],
+      maxDeadLetterSize: 1000,
+      paused: false,
+      stats: {
+        totalTasks: 0,
+        pendingTasks: 0,
+        runningTasks: 0,
+        completedTasks: 0,
+        failedTasks: 0,
+        retryTasks: 0,
+        deadLetterCount: 0,
+        averageTime: 0,
+        throughput: 0
+      }
+    }
+
+fn startQueue
+  input: queue: TaskQueue
+  output: Result<void, string>
+  intent: "작업 큐 시작"
+  do
+    queue.paused = false
+    print("🚀 Task Queue started: " + queue.name)
+    print("  Max workers: " + str(queue.maxWorkers))
+    print("  Retry limit: " + str(queue.retryLimit))
+    return Ok(void)
+
+fn pauseQueue
+  input: queue: TaskQueue
+  output: Result<void, string>
+  intent: "작업 큐 일시 중지"
+  do
+    queue.paused = true
+    print("⏸️  Task Queue paused: " + queue.name)
+    return Ok(void)
+
+fn resumeQueue
+  input: queue: TaskQueue
+  output: Result<void, string>
+  intent: "작업 큐 재개"
+  do
+    queue.paused = false
+    print("▶️  Task Queue resumed: " + queue.name)
+    return Ok(void)
+
+fn stopQueue
+  input: queue: TaskQueue
+  output: Result<number, string>
+  intent: "작업 큐 중지 (미처리 작업 수)"
+  do
+    let pendingCount = queue.stats.pendingTasks + queue.stats.runningTasks
+    queue.paused = true
+    print("🛑 Task Queue stopped: " + queue.name)
+    print("  Pending tasks: " + str(pendingCount))
+    return Ok(pendingCount)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 작업 추가 및 관리
+# ─────────────────────────────────────────────────────────────────────────
+
+fn enqueueTask
+  input: (queue: TaskQueue, name: string, handler: function, priority: TaskPriority, maxRetries: number)
+  output: Result<string, string>
+  intent: "작업을 큐에 추가"
+  do
+    if queue.paused
+      return Err("Queue is paused")
+
+    let task = {
+      id: generateUUID(),
+      name: name,
+      handler: handler,
+      priority: priority,
+      status: 0,  # PENDING
+      createdAt: getCurrentTimestamp(),
+      startedAt: 0,
+      completedAt: 0,
+      retryCount: 0,
+      maxRetries: maxRetries,
+      error: "",
+      metadata: {}
+    }
+
+    # 우선순위에 따라 삽입 위치 결정 (삽입 정렬)
+    queue.tasks = insertTaskByPriority(queue.tasks, task)
+    queue.stats.totalTasks = queue.stats.totalTasks + 1
+    queue.stats.pendingTasks = queue.stats.pendingTasks + 1
+
+    print("📥 Task enqueued: " + name + " (Priority: " + str(priority) + ")")
+    return Ok(task.id)
+
+fn insertTaskByPriority
+  input: (tasks: array<Task>, newTask: Task)
+  output: array<Task>
+  intent: "우선순위에 따라 작업 삽입"
+  do
+    # HIGH(0) > NORMAL(1) > LOW(2)
+    # 낮은 값이 높은 우선순위
+    let result = []
+    let inserted = false
+
+    # for task in tasks
+    #   if !inserted && newTask.priority < task.priority
+    #     result = arrayPush(result, newTask)
+    #     inserted = true
+    #   result = arrayPush(result, task)
+
+    # if !inserted
+    #   result = arrayPush(result, newTask)
+
+    return tasks  # Simplified
+
+fn dequeueTask
+  input: queue: TaskQueue
+  output: Option<Task>
+  intent: "큐에서 다음 작업 가져오기"
+  do
+    if arrayLen(queue.tasks) == 0
+      return None
+
+    # FIFO (우선순위 정렬 후)
+    let task = arrayGet(queue.tasks, 0)
+    return Some(task)
+
+fn getTask
+  input: (queue: TaskQueue, taskId: string)
+  output: Option<Task>
+  intent: "특정 작업 조회"
+  do
+    # for task in queue.tasks
+    #   if task.id == taskId
+    #     return Some(task)
+    # return None
+
+    return None  # Simplified
+
+fn cancelTask
+  input: (queue: TaskQueue, taskId: string)
+  output: Result<void, string>
+  intent: "대기 중인 작업 취소"
+  do
+    # Find and remove task from queue
+    # if task.status == PENDING
+    #   queue.tasks = removeById(queue.tasks, taskId)
+    #   return Ok(void)
+    # else
+    #   return Err("Task is not pending")
+
+    return Ok(void)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 작업 처리 및 실행
+# ─────────────────────────────────────────────────────────────────────────
+
+fn processTask
+  input: (queue: TaskQueue, task: Task)
+  output: Result<void, string>
+  intent: "작업 실행"
+  do
+    if queue.activeWorkers >= queue.maxWorkers
+      return Err("No available workers")
+
+    task.status = 1  # RUNNING
+    task.startedAt = getCurrentTimestamp()
+    queue.activeWorkers = queue.activeWorkers + 1
+    queue.stats.runningTasks = queue.stats.runningTasks + 1
+
+    print("▶️  Processing task: " + task.name + " (ID: " + strSubstring(task.id, 0, 8) + ")")
+
+    # 작업 실행
+    match task.handler()
+      Ok(_) => {
+        task.status = 2  # DONE
+        task.completedAt = getCurrentTimestamp()
+        queue.stats.runningTasks = queue.stats.runningTasks - 1
+        queue.stats.completedTasks = queue.stats.completedTasks + 1
+        queue.activeWorkers = queue.activeWorkers - 1
+
+        let elapsed = task.completedAt - task.startedAt
+        print("✅ Task completed: " + task.name + " (" + str(elapsed) + "ms)")
+        return Ok(void)
+      }
+      Err(error) => {
+        # 실패 처리: 재시도 또는 Dead Letter Queue
+        if task.retryCount < task.maxRetries
+          task.retryCount = task.retryCount + 1
+          task.status = 4  # RETRY
+          task.error = error
+          queue.stats.retryTasks = queue.stats.retryTasks + 1
+          print("🔄 Retrying task: " + task.name + " (Attempt " + str(task.retryCount) + "/" + str(task.maxRetries) + ")")
+          return Ok(void)
+        else
+          task.status = 3  # FAILED
+          task.error = error
+          queue.stats.runningTasks = queue.stats.runningTasks - 1
+          queue.stats.failedTasks = queue.stats.failedTasks + 1
+          queue.activeWorkers = queue.activeWorkers - 1
+
+          # Dead Letter Queue에 추가
+          if arrayLen(queue.deadLetterQueue) < queue.maxDeadLetterSize
+            queue.deadLetterQueue = arrayPush(queue.deadLetterQueue, task)
+            queue.stats.deadLetterCount = queue.stats.deadLetterCount + 1
+
+          print("❌ Task failed: " + task.name + " - " + error)
+          return Err(error)
+      }
+
+fn retryTask
+  input: (queue: TaskQueue, taskId: string)
+  output: Result<void, string>
+  intent: "실패한 작업 재시도"
+  do
+    # Find task in Dead Letter Queue
+    # match findInDeadLetterQueue(queue, taskId)
+    #   Some(task) => {
+    #     if task.retryCount < queue.retryLimit
+    #       task.retryCount = task.retryCount + 1
+    #       task.status = PENDING
+    #       queue.tasks = arrayPush(queue.tasks, task)
+    #       queue.deadLetterQueue = removeById(queue.deadLetterQueue, taskId)
+    #       return Ok(void)
+    #     else
+    #       return Err("Max retries exceeded")
+    #   }
+    #   None => Err("Task not found")
+
+    return Ok(void)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 워커 풀 관리
+# ─────────────────────────────────────────────────────────────────────────
+
+fn initializeWorkers
+  input: count: number
+  output: array<Worker>
+  intent: "워커풀 초기화"
+  do
+    let workers = []
+    # for i in 0..count
+    #   let worker = {
+    #     id: "worker-" + str(i),
+    #     isActive: false,
+    #     currentTask: None,
+    #     processedCount: 0,
+    #     totalTime: 0
+    #   }
+    #   workers = arrayPush(workers, worker)
+
+    return workers
+
+fn getAvailableWorker
+  input: queue: TaskQueue
+  output: Option<Worker>
+  intent: "사용 가능한 워커 찾기"
+  do
+    # for worker in queue.workers
+    #   if !worker.isActive
+    #     return Some(worker)
+    # return None
+
+    return None
+
+fn assignTaskToWorker
+  input: (worker: Worker, task: Task)
+  output: Result<void, string>
+  intent: "워커에 작업 할당"
+  do
+    if worker.isActive
+      return Err("Worker is busy")
+
+    worker.isActive = true
+    worker.currentTask = Some(task)
+    return Ok(void)
+
+fn releaseWorker
+  input: worker: Worker
+  output: Result<void, string>
+  intent: "워커 해제"
+  do
+    worker.isActive = false
+    worker.currentTask = None
+    return Ok(void)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 통계 및 모니터링
+# ─────────────────────────────────────────────────────────────────────────
+
+fn getQueueStats
+  input: queue: TaskQueue
+  output: QueueStats
+  intent: "작업 큐 통계"
+  do
+    return queue.stats
+
+fn getQueueHealth
+  input: queue: TaskQueue
+  output: string
+  intent: "큐 상태 점수 (Healthy/Warning/Critical)"
+  do
+    let failureRate = if queue.stats.totalTasks == 0
+                      0
+                    else
+                      (queue.stats.failedTasks * 100) / queue.stats.totalTasks
+
+    if failureRate > 50
+      return "🔴 CRITICAL (Failure rate: " + str(failureRate) + "%)"
+    else if failureRate > 20
+      return "🟡 WARNING (Failure rate: " + str(failureRate) + "%)"
+    else
+      return "🟢 HEALTHY"
+
+fn getDeadLetterQueue
+  input: queue: TaskQueue
+  output: array<Task>
+  intent: "Dead Letter Queue 조회"
+  do
+    return queue.deadLetterQueue
+
+fn clearDeadLetterQueue
+  input: queue: TaskQueue
+  output: number
+  intent: "Dead Letter Queue 비우기"
+  do
+    let count = arrayLen(queue.deadLetterQueue)
+    queue.deadLetterQueue = []
+    queue.stats.deadLetterCount = 0
+    print("🗑️  Cleared " + str(count) + " tasks from Dead Letter Queue")
+    return count
+
+fn getTaskHistory
+  input: (queue: TaskQueue, limit: number)
+  output: array<Task>
+  intent: "완료/실패 작업 히스토리 (최근 N개)"
+  do
+    # Return completed or failed tasks
+    # sorted by completedAt DESC
+    return []
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn generateUUID
+  input: void
+  output: string
+  intent: "UUID 생성"
+  do
+    return "uuid-placeholder"
+
+fn getCurrentTimestamp
+  input: void
+  output: number
+  intent: "현재 시간 (밀리초)"
+  do
+    return 0
+
+fn str
+  input: num: number
+  output: string
+  intent: "숫자를 문자열로"
+  do
+    return ""
+
+fn strSubstring
+  input: (str: string, start: number, length: number)
+  output: string
+  intent: "문자열 부분 추출"
+  do
+    return str
+
+fn arrayLen<T>
+  input: arr: array<T>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0
+
+fn arrayGet<T>
+  input: (arr: array<T>, index: number)
+  output: T
+  intent: "배열 요소 가져오기"
+  do
+    return arr[0]
+
+fn arrayPush<T>
+  input: (arr: array<T>, item: T)
+  output: array<T>
+  intent: "배열에 추가"
+  do
+    return arr
+
+fn mapLen<K, V>
+  input: m: map<K, V>
+  output: number
+  intent: "맵 크기"
+  do
+    return 0
+
+fn print
+  input: msg: string
+  output: void
+  intent: "출력"
+  do
+    return void

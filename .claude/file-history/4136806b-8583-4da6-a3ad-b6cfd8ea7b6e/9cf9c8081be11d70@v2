@@ -1,0 +1,147 @@
+# FreeLang 벡터 DB 자체 구현 계획
+
+## Context
+FreeLang 백엔드 시스템(18,939줄)에 AI-native 기능을 추가하기 위해 순수 FreeLang 자체 벡터 DB 구현. 외부 의존성 없이 TF-IDF 임베딩 엔진 + LSH/Flat 인덱스 + 검색 엔진을 직접 구현. "기록이 증명된다" 철학.
+
+## 저장 경로
+`freelang-backend-system/src/vectordb/` (7개 파일)
+
+## 구현 파일 목록 (총 ~2,310줄, 30+테스트)
+
+| 순서 | 파일 | 줄 수 | 핵심 내용 |
+|------|------|--------|-----------|
+| 1 | `src/vectordb/vector.fl` | ~310줄 | Vector 타입, 내적/코사인/L2/맨해튼 거리 |
+| 2 | `src/vectordb/embedding.fl` | ~400줄 | TF-IDF 임베딩, 토큰화, IDF 가중치 |
+| 3 | `src/vectordb/index.fl` | ~450줄 | FlatIndex (완전탐색) + LSH (근사탐색) |
+| 4 | `src/vectordb/collection.fl` | ~350줄 | Collection CRUD, Document 관리 |
+| 5 | `src/vectordb/search.fl` | ~300줄 | Top-K 검색, 하이브리드 검색, 랭킹 |
+| 6 | `src/vectordb/mod.fl` | ~100줄 | 통합 VectorDBSystem API |
+| 7 | `tests/vectordb_test.fl` | ~400줄 | 30개 테스트 (그룹 A-E) |
+
+## 파일별 핵심 struct/enum
+
+```fl
+# vector.fl
+struct Vector { id, values: array<number>, dimension, metadata }
+enum DistanceMetric { COSINE=0, L2=1, DOT_PRODUCT=2, MANHATTAN=3 }
+
+# embedding.fl
+struct Vocabulary { wordToIndex, documentFreq, totalDocs, dimension }
+struct EmbeddingConfig { dimension=128, minWordLen=2, normalize=true }
+struct EmbedResult { vector, tokens, termFreq }
+
+# index.fl
+struct FlatIndex { vectors: array<Vector>, dimension, count }
+struct LSHHashFunction { hyperplane: Vector, bias: number }
+struct LSHIndex { hashFunctions, buckets, vectorStore, numHashFunctions=8 }
+struct ScoredVector { vector, score, rank }
+
+# collection.fl
+struct VectorDocument { id, vector, rawText: Option<string>, metadata, createdAt }
+struct Collection { name, dimension, indexType, flatIndex, lshIndex, documents }
+struct VectorDB { collections: map<string, Collection>, config }
+
+# search.fl
+struct SearchQuery { queryVector, queryText, metadataFilter, topK=10, metric, minScore }
+struct SearchResponse { results, totalFound, searchTimeMs }
+
+# mod.fl
+struct VectorDBSystem { db: VectorDB, vocab: Vocabulary, embeddingConfig }
+```
+
+## 핵심 알고리즘
+
+### TF-IDF 임베딩 (embedding.fl)
+```
+텍스트 → tokenize() → 소문자화, 공백 분리, minLen 필터
+tf(t,d) = count(t) / total_words
+idf(t) = ln((totalDocs+1) / (df+1))
+hashWordToIndex(word, 128) = FNV-1a hash → abs(hash) % 128
+vector[idx] += tf * idf
+```
+
+### LSH 인덱스 (index.fl)
+```
+# 결정론적 하이퍼플레인 (LCG 의사난수)
+state = (1664525 * state + 1013904223) mod 4294967296
+hyperplane.values[i] = state / 4294967296 * 2 - 1
+
+# 해시: 부호 기반 이진 해시
+lshHash(v, fn) = if dotProduct(v, fn.hyperplane) + fn.bias >= 0 then 1 else 0
+computeLSHKey(v) = "01101001" (8개 해시 함수 결과 연결)
+```
+
+### 검색 정렬 (search.fl)
+```
+# FreeLang에 sort() 없음 → 버블 정렬 직접 구현
+COSINE/DOT: 내림차순 (score 높을수록 유사)
+L2/MANHATTAN: 오름차순 (distance 낮을수록 유사)
+```
+
+## 의존성 순서 (DAG)
+
+```
+vector.fl
+   ↓         ↓
+embedding.fl  index.fl
+              ↓
+           collection.fl
+              ↓
+           search.fl
+              ↓
+            mod.fl
+              ↓
+        vectordb_test.fl
+```
+
+## 공개 API (mod.fl)
+
+```fl
+fn newVectorDBSystem(config) -> VectorDBSystem
+fn createVectorCollection(sys, name) -> Result<VectorDBSystem, string>
+fn insertText(sys, collection, text, metadata) -> Result<VectorDBSystem, string>
+fn searchByText(sys, collection, queryText, k) -> Result<SearchResponse, string>
+fn searchByVector(sys, collection, queryVec, k) -> Result<SearchResponse, string>
+fn searchWithFilter(sys, collection, text, filter, k) -> Result<SearchResponse, string>
+fn deleteVectorCollection(sys, name) -> Result<VectorDBSystem, string>
+fn getSystemStats(sys) -> map<string, number>
+```
+
+## 테스트 계획 (30개)
+
+| 그룹 | 개수 | 내용 |
+|------|------|------|
+| A: 벡터 수학 | 10개 | 내적, 노름, 코사인, L2, 맨해튼, 정규화, 덧셈/뺄셈 |
+| B: 임베딩 | 5개 | 토큰화, TF 계산, 차원 확인, 유사 텍스트 유사도 |
+| C: 인덱싱 | 5개 | FlatIndex CRUD, LSH 삽입/검색/해시 일관성 |
+| D: 검색 | 5개 | Top-K, 랭킹 순서, 필터 적용, minScore |
+| E: 통합 | 5개 | 전체 워크플로우, 컬렉션 격리, 메타데이터 검색 |
+
+## 참조 파일 (기존 패턴)
+
+- `src/layers/persistence.fl`: 4-키워드 함수 구조 기준
+- `src/caching/cache.fl`: `map<string, T>` 인메모리 저장소 패턴
+- `src/models.fl`: struct/enum, Option<T> 패턴
+- `tests/auth_test.fl`: `fn test* → bool` 테스트 패턴
+
+## 기술적 도전 해결책
+
+| 도전 | 해결책 |
+|------|--------|
+| sort() 없음 | 버블 정렬 직접 구현 |
+| 비트 XOR 없음 | FNV-1a 정수 곱셈으로 근사 해시 |
+| 의사난수 없음 | LCG (a=1664525, c=1013904223, m=2^32) |
+| 로그 함수 | `ln()` 표준 함수 활용 (FreeLang 내장) |
+| 파일 간 참조 | mod.fl에서 모든 하위 모듈 함수 직접 호출 |
+
+## 검증 방법
+
+1. `tests/vectordb_test.fl` 실행 → 30/30 PASS 확인
+2. 전체 워크플로우 검증:
+   ```
+   insertText("docs", "FreeLang 벡터 검색", {category: "tech"})
+   insertText("docs", "Python 머신러닝", {category: "ai"})
+   searchByText("docs", "언어 검색", k=1) → FreeLang 문서 1위
+   searchWithFilter("docs", "학습", {category: "ai"}, k=1) → Python 문서
+   ```
+3. GOGS 커밋: `feat(vectordb): FreeLang 자체 구현 벡터 DB 2,310줄 + 30테스트`

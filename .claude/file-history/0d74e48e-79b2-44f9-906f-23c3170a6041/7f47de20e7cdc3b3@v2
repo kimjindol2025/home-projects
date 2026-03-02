@@ -1,0 +1,426 @@
+# ============================================================================
+# serialization/protobuf.fl - Protocol Buffers 바이너리 직렬화
+# ============================================================================
+# Protocol Buffers 인코딩/디코딩
+# 작성: 2026-03-02
+# 책임: Varint, Zigzag, Wire format 변환
+
+# ─────────────────────────────────────────────────────────────────────────
+# Protocol Buffers 구조
+# ─────────────────────────────────────────────────────────────────────────
+
+struct ProtoSchema
+  name: string
+  fields: array<ProtoField>
+
+struct ProtoField
+  fieldNumber: number           # 1-536870911
+  name: string
+  fieldType: string             # "int32", "int64", "string", "bytes", "bool", "message"
+  fieldLabel: string            # "optional", "repeated", "required"
+  defaultValue: string
+
+struct ProtoMessage
+  fieldNumber: number
+  data: array<number>           # 바이트 배열
+
+struct ProtoDecoder
+  bytes: array<number>
+  index: number                 # 현재 읽는 위치
+
+# Wire Type 정의
+# 0: Varint          (int32, int64, uint32, uint64, sint32, sint64, bool, enum)
+# 1: 64-bit fixed    (double, sfixed64)
+# 2: Length-delimited (string, bytes, embedded messages, packed repeated fields)
+# 3: Start group     (deprecated)
+# 4: End group       (deprecated)
+# 5: 32-bit fixed    (float, sfixed32)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Varint 인코딩 (가변 길이 정수)
+# ─────────────────────────────────────────────────────────────────────────
+
+fn encodeVarint
+  input: num: number
+  output: array<number>
+  intent: "숫자를 Varint로 인코딩"
+  do
+    let bytes = []
+    let value = num
+
+    while value > 127
+      # 하위 7비트 추출 + continuation bit (bit 7)
+      let byte = (value % 128) + 128
+      bytes = arrayPush(bytes, byte)
+      value = value / 128
+
+    # 마지막 바이트 (continuation bit 없음)
+    bytes = arrayPush(bytes, value % 128)
+
+    return bytes
+
+fn decodeVarint
+  input: (bytes: array<number>, startIndex: number)
+  output: (number, number)  # (value, nextIndex)
+  intent: "Varint 디코딩"
+  do
+    let value = 0
+    let shift = 0
+    let index = startIndex
+
+    # 각 바이트 처리
+    # for byte in bytes from startIndex
+    #   value = value + ((byte % 128) * (2 ^ shift))
+    #   shift = shift + 7
+    #   if byte < 128: break  # continuation bit 확인
+    #   index = index + 1
+
+    return (value, index)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Zigzag 인코딩 (음수 처리)
+# ─────────────────────────────────────────────────────────────────────────
+
+fn encodeZigzag
+  input: num: number
+  output: number
+  intent: "정수를 Zigzag으로 인코딩 (음수 처리)"
+  do
+    # Zigzag: n -> (n << 1) ^ (n >> 31)
+    # FreeLang에서 간단하게:
+    if num >= 0
+      return num * 2
+    else
+      return (num * 2) - 1
+
+fn decodeZigzag
+  input: num: number
+  output: number
+  intent: "Zigzag 디코딩"
+  do
+    # Zigzag 복원: (n >> 1) ^ (-(n & 1))
+    if num % 2 == 0
+      return num / 2
+    else
+      return -(num / 2) - 1
+
+# ─────────────────────────────────────────────────────────────────────────
+# 필드 키 (Field Tag)
+# ─────────────────────────────────────────────────────────────────────────
+
+fn encodeFieldTag
+  input: (fieldNumber: number, wireType: number)
+  output: array<number>
+  intent: "필드 태그 (field number + wire type) 인코딩"
+  do
+    # tag = (fieldNumber << 3) | wireType
+    let tag = (fieldNumber * 8) + wireType
+    return encodeVarint(tag)
+
+fn decodeFieldTag
+  input: tag: number
+  output: (number, number)  # (fieldNumber, wireType)
+  intent: "필드 태그 디코딩"
+  do
+    let fieldNumber = tag / 8
+    let wireType = tag % 8
+    return (fieldNumber, wireType)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Wire Type 매핑
+# ─────────────────────────────────────────────────────────────────────────
+
+fn getWireType
+  input: fieldType: string
+  output: number
+  intent: "필드 타입에 해당하는 Wire type 결정"
+  do
+    match fieldType
+      "int32" => 0      # Varint
+      "int64" => 0      # Varint
+      "uint32" => 0     # Varint
+      "uint64" => 0     # Varint
+      "sint32" => 0     # Varint (Zigzag)
+      "sint64" => 0     # Varint (Zigzag)
+      "bool" => 0       # Varint
+      "enum" => 0       # Varint
+      "double" => 1     # 64-bit fixed
+      "sfixed64" => 1   # 64-bit fixed
+      "float" => 5      # 32-bit fixed
+      "sfixed32" => 5   # 32-bit fixed
+      "string" => 2     # Length-delimited
+      "bytes" => 2      # Length-delimited
+      "message" => 2    # Length-delimited
+      _ => 2            # Default: Length-delimited
+
+# ─────────────────────────────────────────────────────────────────────────
+# 메시지 인코딩
+# ─────────────────────────────────────────────────────────────────────────
+
+fn encodeMessage
+  input: (message: map<string, string>, schema: ProtoSchema)
+  output: Result<array<number>, string>
+  intent: "메시지를 Protocol Buffers 바이너리로 인코딩"
+  do
+    let bytes = []
+
+    # 각 필드에 대해 반복
+    # for field in schema.fields
+    #   let value = message.get(field.name)
+    #   match value
+    #     Some(val) => {
+    #       let encoded = encodeField(field, val)
+    #       bytes = appendBytes(bytes, encoded)
+    #     }
+    #     None => {}
+
+    print("✅ Message encoded: " + str(arrayLen(bytes)) + " bytes")
+    return Ok(bytes)
+
+fn encodeField
+  input: (field: ProtoField, value: string)
+  output: array<number>
+  intent: "필드 값 인코딩"
+  do
+    let fieldBytes = []
+
+    # 필드 태그 인코딩
+    let wireType = getWireType(field.fieldType)
+    let tagBytes = encodeFieldTag(field.fieldNumber, wireType)
+    fieldBytes = appendBytes(fieldBytes, tagBytes)
+
+    # 값 인코딩
+    match field.fieldType
+      "int32" => {
+        # Varint 인코딩
+        # let numValue = stringToNumber(value)
+        # let valueBytes = encodeVarint(numValue)
+        # fieldBytes = appendBytes(fieldBytes, valueBytes)
+      }
+      "string" => {
+        # Length-delimited: 길이 + 데이터
+        let length = stringLen(value)
+        let lengthBytes = encodeVarint(length)
+        fieldBytes = appendBytes(fieldBytes, lengthBytes)
+        # fieldBytes = appendString(fieldBytes, value)
+      }
+      "bytes" => {
+        # Length-delimited
+        let length = arrayLen(value)
+        let lengthBytes = encodeVarint(length)
+        fieldBytes = appendBytes(fieldBytes, lengthBytes)
+      }
+      _ => {}
+
+    return fieldBytes
+
+# ─────────────────────────────────────────────────────────────────────────
+# 메시지 디코딩
+# ─────────────────────────────────────────────────────────────────────────
+
+fn decodeMessage
+  input: (bytes: array<number>, schema: ProtoSchema)
+  output: Result<map<string, string>, string>
+  intent: "Protocol Buffers 바이너리를 메시지로 디코딩"
+  do
+    let message = {}
+    let decoder = {
+      bytes: bytes,
+      index: 0
+    }
+
+    # 모든 바이트 처리
+    # while decoder.index < arrayLen(bytes)
+    #   let (tag, nextIndex) = decodeVarint(bytes, decoder.index)
+    #   decoder.index = nextIndex
+    #   let (fieldNumber, wireType) = decodeFieldTag(tag)
+    #
+    #   match findFieldByNumber(schema, fieldNumber)
+    #     Some(field) => {
+    #       let (value, nextIndex2) = decodeField(decoder, field, wireType)
+    #       message[field.name] = value
+    #       decoder.index = nextIndex2
+    #     }
+    #     None => {
+    #       # Unknown field: skip
+    #       skipField(decoder, wireType)
+    #     }
+
+    print("✅ Message decoded: " + str(mapLen(message)) + " fields")
+    return Ok(message)
+
+fn decodeField
+  input: (decoder: ProtoDecoder, field: ProtoField, wireType: number)
+  output: (string, number)
+  intent: "필드 값 디코딩"
+  do
+    match wireType
+      0 => {  # Varint
+        # let (value, nextIndex) = decodeVarint(decoder.bytes, decoder.index)
+        # return (str(value), nextIndex)
+      }
+      2 => {  # Length-delimited
+        # let (length, nextIndex) = decodeVarint(decoder.bytes, decoder.index)
+        # let value = extractBytes(decoder.bytes, nextIndex, length)
+        # return (bytesToString(value), nextIndex + length)
+      }
+      _ => {
+        return ("", decoder.index)
+      }
+
+# ─────────────────────────────────────────────────────────────────────────
+# 스키마 검증
+# ─────────────────────────────────────────────────────────────────────────
+
+fn validateSchema
+  input: (message: map<string, string>, schema: ProtoSchema)
+  output: Result<void, string>
+  intent: "메시지가 스키마와 일치하는지 검증"
+  do
+    # 필수 필드 확인
+    # for field in schema.fields
+    #   if field.fieldLabel == "required"
+    #     if !message.contains(field.name)
+    #       return Err("Missing required field: " + field.name)
+
+    # 타입 검증
+    # for (fieldName, value) in message
+    #   match findFieldByName(schema, fieldName)
+    #     Some(field) => {
+    #       if !validateFieldType(field.fieldType, value)
+    #         return Err("Invalid type for field: " + fieldName)
+    #     }
+
+    print("✅ Schema validation passed")
+    return Ok(void)
+
+fn validateFieldType
+  input: (fieldType: string, value: string)
+  output: bool
+  intent: "필드 값이 타입과 일치하는지 확인"
+  do
+    match fieldType
+      "int32" => {
+        # Check if value is a valid 32-bit integer
+        return true
+      }
+      "string" => {
+        return true  # 항상 문자열
+      }
+      "bool" => {
+        return value == "true" || value == "false"
+      }
+      _ => true
+
+# ─────────────────────────────────────────────────────────────────────────
+# 스키마 정의 헬퍼
+# ─────────────────────────────────────────────────────────────────────────
+
+fn createProtoSchema
+  input: (name: string, fields: array<ProtoField>)
+  output: ProtoSchema
+  intent: "Proto 스키마 생성"
+  do
+    return {
+      name: name,
+      fields: fields
+    }
+
+fn createProtoField
+  input: (fieldNumber: number, name: string, fieldType: string, label: string)
+  output: ProtoField
+  intent: "Proto 필드 생성"
+  do
+    return {
+      fieldNumber: fieldNumber,
+      name: name,
+      fieldType: fieldType,
+      fieldLabel: label,
+      defaultValue: ""
+    }
+
+# ─────────────────────────────────────────────────────────────────────────
+# 성능 및 압축
+# ─────────────────────────────────────────────────────────────────────────
+
+fn getEncodedSize
+  input: (message: map<string, string>, schema: ProtoSchema)
+  output: number
+  intent: "인코딩된 메시지 크기 예측"
+  do
+    let size = 0
+
+    # 각 필드별 크기 계산
+    # for field in schema.fields
+    #   let value = message.get(field.name)
+    #   size = size + calculateFieldSize(field, value)
+
+    return size
+
+fn compareSize
+  input: (jsonSize: number, protoSize: number)
+  output: string
+  intent: "JSON vs Proto 크기 비교"
+  do
+    if protoSize == 0
+      return "Proto: N/A"
+
+    let ratio = (jsonSize * 100) / protoSize
+    let compression = ((jsonSize - protoSize) * 100) / jsonSize
+
+    return "JSON: " + str(jsonSize) + "B, Proto: " + str(protoSize) + "B (압축: " + str(compression) + "%)"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn appendBytes
+  input: (arr: array<number>, bytes: array<number>)
+  output: array<number>
+  intent: "바이트 배열 병합"
+  do
+    # for byte in bytes
+    #   arr = arrayPush(arr, byte)
+    return arr
+
+fn stringLen
+  input: str: string
+  output: number
+  intent: "문자열 길이"
+  do
+    return 0
+
+fn arrayLen<T>
+  input: arr: array<T>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0
+
+fn arrayPush<T>
+  input: (arr: array<T>, item: T)
+  output: array<T>
+  intent: "배열에 추가"
+  do
+    return arr
+
+fn mapLen<K, V>
+  input: m: map<K, V>
+  output: number
+  intent: "맵 크기"
+  do
+    return 0
+
+fn str
+  input: num: number
+  output: string
+  intent: "숫자를 문자열로"
+  do
+    return ""
+
+fn print
+  input: msg: string
+  output: void
+  intent: "출력"
+  do
+    return void

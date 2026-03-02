@@ -1,0 +1,198 @@
+# Phase 3: 분산 벡터 인덱스 (Distributed Vector Index)
+
+## Context
+Phase 1(REST API) + Phase 2(RAG 파이프라인) 완성 후,
+단일 노드 HybridIndexSystem을 3~5 노드 클러스터로 확장.
+Raft 합의 + 일관된 해싱 + 3x 복제로 99.99% 가용성 달성.
+
+---
+
+## 데이터 흐름
+
+```
+INSERT:
+  Coordinator.routeInsertRequest
+    → ShardRouter.getPartitionId (FNV-1a → 0~15)
+    → ShardRouter.getReplicaNodes → [primary, r1, r2]
+    → ReplicationManager.quorumWrite (2/3 성공)
+      → RaftIndexNode.appendVectorCommand
+        → (커밋 후) applyVectorCommand
+          → HybridIndex.hybridInsert ← Phase 1-2 재사용
+
+SEARCH:
+  Coordinator.routeSearchRequest
+    → 각 파티션 Primary: hybridSearch(query, topK)
+    → aggregateSearchResults → 글로벌 Top-K
+```
+
+---
+
+## 기존 재사용 코드
+
+| 파일 | 재사용 함수 |
+|------|------------|
+| `src/vectordb/index_hybrid.fl:207` | `hybridInsert(idx, v)` - 상태 기계 적용 |
+| `src/vectordb/index_hybrid.fl:230` | `hybridSearch(idx, q, k)` - 분산 검색 |
+| `src/vectordb/index_hybrid.fl:58` | `smartRouteIndex()` |
+| `freelang-distributed-system/Phase_B_Raft/raft_node.fl` | RaftNode 구조체 패턴 |
+| `Phase_B_Raft/leader_election.fl` | `VoteResult`, `tally_vote`, `calculate_majority` |
+| `Phase_B_Raft/snapshot.fl` | `compact_logs`, `restore_from_snapshot` |
+| `src/vectordb/mod.fl:ScoredVector` | 검색 결과 타입 (aggregation) |
+
+---
+
+## 구현 파일 (6개, 총 ~2,700줄)
+
+### 1. `src/distributed/sharding.fl` (400줄) - 외부 의존성 없음
+```
+struct VirtualNode, ConsistentHashRing, PartitionInfo, ShardRouter, PartitionMigration
+
+fn newConsistentHashRing(nodeIds, vnodeCount=150, partitionCount=16) → ConsistentHashRing
+fn fnv1aHash(key) → number         # FNV_prime=16777619, offset=2166136261
+fn getPartitionId(vectorId, total) → number   # 0..15
+fn getReplicaNodes(ring, partId, factor) → nodeIds[]   # [primary, r1, r2]
+fn routeVectorInsert(router, vectorId) → PartitionInfo
+fn addNodeToRing(ring, nodeId) → ConsistentHashRing
+fn removeNodeFromRing(ring, nodeId) → ConsistentHashRing
+fn computeRebalancePlan(router, added, removed) → PartitionMigration[]
+fn computeBalanceScore(distribution) → number  # 0~1 (표준편차 기반)
+fn reportShardingStatus(router) → string
+```
+
+### 2. `src/distributed/raft.fl` (600줄) - 의존: index_hybrid.fl
+```
+struct VectorIndexCommand, RaftIndexNode, IndexLogEntry, RaftIndexCluster
+
+fn createRaftIndexNode(id, peers, dimension, partitionIds)
+  → 내부: newHybridIndex() 호출
+fn startElection(node) → (node, RequestVoteRequest)
+fn handleRequestVote(node, req) → (node, RequestVoteResponse)
+fn becomeLeader(node) → RaftIndexNode
+fn appendVectorCommand(node, cmd) → Result<RaftIndexNode, string>  # Leader only
+fn handleAppendEntries(node, req) → (node, AppendEntriesResponse)
+fn updateCommitIndex(node, cluster) → RaftIndexNode
+fn applyCommittedCommands(node) → Result<RaftIndexNode, string>
+fn applyVectorCommand(node, cmd) → Result<RaftIndexNode, string>
+  # "INSERT" → hybridInsert(node.localIndex, vector)
+  # "DELETE" → 소프트 삭제 마킹
+fn takeIndexSnapshot(node) → Snapshot  # 벡터 목록 직렬화
+fn restoreFromIndexSnapshot(node, snap) → Result<RaftIndexNode, string>
+fn shouldTakeSnapshot(node) → bool     # log.length > 500
+fn sendHeartbeats(node, cluster) → RaftIndexCluster
+```
+
+### 3. `src/distributed/replication.fl` (450줄) - 의존: sharding.fl
+```
+struct ReplicaSet, ReplicationRequest, ReplicationResponse, QuorumResult
+struct FailoverState, ReplicationManager, PartitionHealth
+
+fn newReplicationManager(partitions[], replicationFactor) → ReplicationManager
+fn quorumWrite(mgr, req, cluster) → Result<QuorumResult, string>  # 2/3 성공
+fn sendReplicationRequest(targetNodeId, req, cluster) → ReplicationResponse
+fn collectQuorumResponses(responses, quorumSize) → QuorumResult
+fn readFromPrimary(partitionId, vectorId, cluster) → Result<Vector, string>
+fn readWithFallback(replicaSet, vectorId, cluster) → Result<Vector, string>
+fn detectNodeFailure(mgr, nodeId, cluster) → Result<FailoverState, string>
+fn initiateFailover(mgr, failedNodeId, cluster) → Result<ReplicationManager, string>
+fn selectReplacementNode(failedId, partitions, cluster) → Option<number>
+fn promoteReplica(mgr, partitionId, newPrimaryId) → Result<ReplicationManager, string>
+fn checkReplicationHealth(mgr, cluster) → PartitionHealth[]
+```
+
+### 4. `src/distributed/coordinator.fl` (350줄) - 의존: sharding + replication
+```
+struct ClusterNode, ClusterTopology, ClusterHealthReport, CoordinatorConfig, Coordinator
+
+fn newCoordinator(nodes[], config) → Result<Coordinator, string>
+  → 내부: newConsistentHashRing + newReplicationManager
+fn addNode(coord, node) → Result<Coordinator, string>
+fn markNodeDead(coord, nodeId) → Result<Coordinator, string>
+fn monitorHeartbeats(coord, currentTimeMs) → Coordinator
+fn routeInsertRequest(coord, vectorId, vector) → Result<nodeIds[], string>  # 브리지
+fn routeSearchRequest(coord, query, topK) → Result<PartitionInfo[], string>  # 브리지
+fn aggregateSearchResults(partialResults, topK) → ScoredVector[]
+fn triggerRebalanceIfNeeded(coord) → Result<Coordinator, string>
+fn collectHealthReport(coord) → ClusterHealthReport
+fn reportCoordinatorStats(coord) → string
+```
+
+### 5. `tests/distributed_test.fl` (400줄, 20개 테스트)
+```
+Group A: Raft 합의 (5개)
+  testRaftLeaderElection          # 3-node, 리더 1개
+  testRaftLogReplication          # INSERT 3노드 복제
+  testRaftSnapshotCompaction      # 500명령 → 스냅샷 → 복구
+  testRaftTermIncrement           # 선거 시 Term 증가
+  testRaftSingleLeaderPerTerm     # Safety 검증
+
+Group B: 샤딩 (4개)
+  testConsistentHashDistribution  # 1000 ID → balanceScore > 0.8
+  testVirtualNodeRouting          # 동일 ID → 항상 동일 파티션
+  testNodeAdditionMinimalRerouting # 추가 시 < 1/n 재배정
+  testPartitionReplicaCount       # 복제 수 == replicationFactor
+
+Group C: 복제 (4개)
+  testQuorumWriteSuccess          # 2/3 성공 → Ok
+  testQuorumWriteFailure          # 1/3 성공 → Err
+  testFailoverDetection           # Dead → Replica 승격
+  testReadAfterFailover           # Failover 후 읽기 성공
+
+Group D: Coordinator (4개)
+  testCoordinatorInitialization   # 3-node 초기화
+  testDistributedInsert           # 종단간 INSERT
+  testDistributedSearch           # 분산 검색 + 글로벌 Top-K
+  testRebalanceTrigger            # 불균형 → 재평형
+
+Group E: HybridIndex 통합 (3개)
+  testHybridIndexApplyCommand     # 명령 → localIndex 삽입
+  testDistributedHybridSearch     # 재현율 95%+
+  testSnapshotWithHybridIndex     # 스냅샷 직렬화/복원
+```
+
+### 6. `docs/DISTRIBUTED_GUIDE.md` (500줄)
+- ASCII 아키텍처 다이어그램
+- Raft + 샤딩 + 복제 원리
+- 클러스터 초기화 코드 예시
+- 운영 가이드 (노드 추가/제거, 스냅샷 주기 설정)
+- 성능 특성 (Raft ~5ms + HybridSearch 0.054ms)
+
+---
+
+## 구현 순서
+
+```
+Day 1-2: sharding.fl (의존성 없음, FNV-1a 해시부터)
+Day 2-4: raft.fl (applyVectorCommand → hybridInsert 연결)
+Day 4-5: replication.fl (quorumWrite, failover)
+Day 5-6: coordinator.fl (전체 브리지, aggregateSearchResults)
+Day 6-7: distributed_test.fl (20개 테스트)
+Day 7:   DISTRIBUTED_GUIDE.md + GOGS 커밋
+```
+
+## FreeLang 코딩 스타일 (vectordb 스타일 통일)
+```freelang
+fn functionName
+  input: (param1: Type1, param2: Type2)
+  output: Result<ReturnType, string>
+  intent: "함수 설명"
+  do
+    match someResult
+      Ok(v) => { return Ok(transformed) }
+      Err(e) => return Err("접두사: " + e)
+```
+
+## 핵심 도전과 해결책
+
+| 도전 | 해결책 |
+|------|--------|
+| 배열 불변성 → 로그 복사 비용 | 스냅샷 임계값 500 (낮게 설정) |
+| HybridIndex 직렬화 | 벡터 목록만 저장, 복구 시 hybridInsert 재호출 |
+| 실제 TCP RPC 없음 | 인메모리 함수 호출 시뮬레이션 (경계 명시) |
+| 글로벌 Top-K 병합 | partitions × topK 수집 후 점수 정렬 |
+
+## 검증 포인트
+1. `testRaftLeaderElection` → 클러스터에 리더 1개
+2. `testDistributedInsert` → quorum 달성 확인
+3. `testDistributedHybridSearch` → 재현율 95%+
+4. `testFailoverDetection` → Replica 자동 승격
+5. `testSnapshotWithHybridIndex` → 복구 후 검색 결과 동일

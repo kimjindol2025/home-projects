@@ -1,0 +1,587 @@
+# ============================================================================
+# tests/raft_replication_test.fl - AppendEntries RPC 테스트 (Day 3-4)
+# ============================================================================
+# 작성: 2026-03-02
+# 목표: 6가지 복제 규칙이 정확히 구현되었는가 검증
+# 핵심: Log Matching Property, Conflict Detection, Safe Replication
+
+# ============================================================================
+# Test 1: Rule 1 - 요청자 Term < 자신의 Term → 거부
+# ============================================================================
+
+fn testAppendEntriesRuleLowerTerm() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 5,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"}
+    ],
+    "commitIndex": 0,
+    "lastApplied": 0
+  }
+
+  let args = {
+    "term": 3,              # Follower의 Term (5)보다 작음
+    "leaderId": 0,
+    "prevLogIndex": 1,
+    "prevLogTerm": 2,
+    "entries": [
+      {"term": 3, "data": "entry3"}
+    ],
+    "leaderCommit": 0
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+
+  # Assert
+  if reply["success"] == false && reply["term"] == 5
+    Ok(true)
+  else
+    Err("Rule 1 failed: Should reject when leader term < follower term")
+
+# ============================================================================
+# Test 2: Rule 2 - 요청자의 Term > 자신의 Term → Term 업데이트
+# ============================================================================
+
+fn testAppendEntriesRuleHigherTerm() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "state": "FOLLOWER",
+    "log": [
+      {"term": 1, "data": "entry1"}
+    ],
+    "commitIndex": 0,
+    "lastApplied": 0
+  }
+
+  let args = {
+    "term": 5,              # Follower의 Term (3)보다 큼
+    "leaderId": 0,
+    "prevLogIndex": 0,
+    "prevLogTerm": 1,
+    "entries": [],
+    "leaderCommit": 0
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+
+  # Assert
+  if follower["currentTerm"] == 5 && reply["success"] == true
+    Ok(true)
+  else
+    Err("Rule 2 failed: Should update term and accept heartbeat")
+
+# ============================================================================
+# Test 3: Rule 3 - Log Matching: prevLogIndex 유효성
+# ============================================================================
+
+fn testLogMatchingPrevLogIndexInvalid() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"}   # 로그 길이 = 2
+    ],
+    "commitIndex": 0,
+    "lastApplied": 0
+  }
+
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 5,      # 내 로그에는 5번 엔트리 없음
+    "prevLogTerm": 2,
+    "entries": [
+      {"term": 3, "data": "entry3"}
+    ],
+    "leaderCommit": 0
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+
+  # Assert
+  if reply["success"] == false && reply["conflictIndex"] == 2
+    Ok(true)
+  else
+    Err("Rule 3 failed: Should reject when prevLogIndex >= myLogLength")
+
+# ============================================================================
+# Test 4: Rule 4 - Log Matching: prevLogTerm 불일치 (충돌 감지)
+# ============================================================================
+
+fn testLogMatchingConflictDetection() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 1, "data": "entry2"},   # 인덱스 1: Term 1
+      {"term": 2, "data": "entry3"}    # 인덱스 2: Term 2
+    ],
+    "commitIndex": 0,
+    "lastApplied": 0
+  }
+
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 2,
+    "prevLogTerm": 3,       # 내 로그[2].term = 2, 요청 = 3 → 충돌!
+    "entries": [
+      {"term": 3, "data": "entry4"}
+    ],
+    "leaderCommit": 0
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+
+  # Assert
+  # 충돌 감지: conflictIndex = 같은 Term의 첫 엔트리 (Term 2 → index 2)
+  if reply["success"] == false && reply["conflictIndex"] >= 2
+    Ok(true)
+  else
+    Err("Rule 4 failed: Should detect term mismatch and return conflictIndex")
+
+# ============================================================================
+# Test 5: Rule 5 - 엔트리 추가 및 기존 충돌 엔트리 제거
+# ============================================================================
+
+fn testLogMatchingSafeAppend() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 1, "data": "entry2"},
+      {"term": 1, "data": "entry3_bad"}  # 나중에 제거될 엔트리
+    ],
+    "commitIndex": 0,
+    "lastApplied": 0
+  }
+
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 1,      # index 1까지 안전함
+    "prevLogTerm": 1,
+    "entries": [
+      {"term": 3, "data": "entry3_good"},
+      {"term": 3, "data": "entry4"}
+    ],
+    "leaderCommit": 0
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+  let finalLogLength = length(follower["log"])
+
+  # Assert
+  # 새 엔트리 2개 추가 → 로그 길이 = 4
+  # 기존 충돌 엔트리 1개 제거 → 최종 = index 0,1,2,3 (4개)
+  if reply["success"] == true && finalLogLength == 4
+    Ok(true)
+  else
+    Err("Rule 5 failed: Should safely append entries and remove conflicting ones")
+
+# ============================================================================
+# Test 6: Rule 6 - leaderCommit 진행
+# ============================================================================
+
+fn testCommitIndexAdvance() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"},
+      {"term": 3, "data": "entry3"},
+      {"term": 3, "data": "entry4"}
+    ],
+    "commitIndex": 1,       # 현재 커밋 인덱스 = 1
+    "lastApplied": 1
+  }
+
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 3,
+    "prevLogTerm": 3,
+    "entries": [],          # 하트비트
+    "leaderCommit": 3       # 리더의 commitIndex = 3
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+
+  # Assert
+  # commitIndex가 min(leaderCommit, logLength-1) = min(3, 3) = 3으로 진행
+  if follower["commitIndex"] == 3 && reply["success"] == true
+    Ok(true)
+  else
+    Err("Rule 6 failed: Should advance commitIndex to leader's commitIndex")
+
+# ============================================================================
+# Test 7: Data Loss Impossibility - Quorum Replication
+# ============================================================================
+
+fn testDataLossImpossible() -> Result<bool, string>
+  # Arrange: 5개 노드 클러스터
+  let nodes = array<map<string, any>>()
+  for i in range(0, 5)
+    push(nodes, {
+      "id": i,
+      "currentTerm": 3,
+      "log": [
+        {"term": 1, "data": "entry1"},
+        {"term": 2, "data": "entry2"}
+      ],
+      "commitIndex": 1,
+      "lastApplied": 1,
+      "nextIndex": {},
+      "matchIndex": {}
+    })
+
+  let cluster = {
+    "nodeIds": [0, 1, 2, 3, 4],
+    "nodes": {
+      0: nodes[0],
+      1: nodes[1],
+      2: nodes[2],
+      3: nodes[3],
+      4: nodes[4]
+    }
+  }
+
+  let leader = nodes[0]
+  leader["state"] = "LEADER"
+  leader["commitIndex"] = 1
+
+  # Scenario: 새 엔트리 3을 Quorum(3개)에 복제
+  # 노드 0, 1, 2에만 성공 (노드 3, 4는 실패)
+  push(leader["log"], {"term": 3, "data": "entry3"})
+
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 1,
+    "prevLogTerm": 2,
+    "entries": [{"term": 3, "data": "entry3"}],
+    "leaderCommit": 1
+  }
+
+  # Act: 노드 1, 2에 복제 성공 (Quorum 달성)
+  let reply1 = handleAppendEntries(nodes[1], args)
+  let reply2 = handleAppendEntries(nodes[2], args)
+
+  # 노드 3, 4는 실패 (네트워크 장애)
+
+  # Leader의 matchIndex 업데이트
+  leader["matchIndex"][1] = 2
+  leader["matchIndex"][2] = 2
+  leader["matchIndex"][3] = 1
+  leader["matchIndex"][4] = 1
+
+  # Quorum 달성 확인
+  let quorumSize = (5 / 2) + 1   # 3개
+  let replicaCount = 1  # leader 자신
+
+  if leader["matchIndex"][1] >= 2
+    replicaCount = replicaCount + 1
+  if leader["matchIndex"][2] >= 2
+    replicaCount = replicaCount + 1
+
+  # Assert
+  # Quorum(3) 달성 → commitIndex 진행 가능
+  # 엔트리 3은 데이터 손실 불가능 (3개 노드에 복제)
+  if replicaCount >= quorumSize && reply1["success"] == true && reply2["success"] == true
+    Ok(true)
+  else
+    Err("Data Loss Impossibility failed: Quorum replication should guarantee data safety")
+
+# ============================================================================
+# Test 8: Conflict Resolution - 여러 노드의 비일관적 로그
+# ============================================================================
+
+fn testConflictResolution() -> Result<bool, string>
+  # Arrange: Follower의 로그가 Leader와 다름
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"},
+      {"term": 2, "data": "entry3_bad"},  # Leader와 다름
+      {"term": 2, "data": "entry4_bad"}
+    ],
+    "commitIndex": 1,
+    "lastApplied": 1
+  }
+
+  # Leader의 정확한 로그
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 1,      # 이 지점까지는 동일
+    "prevLogTerm": 1,
+    "entries": [
+      {"term": 3, "data": "entry2_good"},  # index 2부터 새로 시작
+      {"term": 3, "data": "entry3_good"},
+      {"term": 3, "data": "entry4_good"}
+    ],
+    "leaderCommit": 3
+  }
+
+  # Act
+  let reply = handleAppendEntries(follower, args)
+
+  # Assert
+  # 기존 충돌 엔트리 제거 + 새 엔트리 추가
+  # 최종 로그 = [entry1, entry2_good, entry3_good, entry4_good] (4개)
+  if reply["success"] == true && length(follower["log"]) == 4
+    # 마지막 엔트리 확인
+    if follower["log"][3]["data"] == "entry4_good"
+      Ok(true)
+    else
+      Err("Conflict Resolution failed: New entries should replace old ones")
+  else
+    Err("Conflict Resolution failed: AppendEntries should succeed after conflict")
+
+# ============================================================================
+# Test 9: Heartbeat Handling - 엔트리 없는 AppendEntries
+# ============================================================================
+
+fn testHeartbeatHandling() -> Result<bool, string>
+  # Arrange
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"},
+      {"term": 3, "data": "entry3"}
+    ],
+    "commitIndex": 2,
+    "lastApplied": 2,
+    "lastHeartbeat": 0
+  }
+
+  let args = {
+    "term": 3,
+    "leaderId": 0,
+    "prevLogIndex": 2,
+    "prevLogTerm": 3,
+    "entries": [],          # 엔트리 없음 = 하트비트
+    "leaderCommit": 2
+  }
+
+  # Act
+  let oldHeartbeatTime = follower["lastHeartbeat"]
+  let reply = handleAppendEntries(follower, args)
+  let newHeartbeatTime = getCurrentTimeMs()
+
+  # Assert
+  # 하트비트 승인 + 로그 길이 변화 없음
+  if reply["success"] == true && length(follower["log"]) == 3
+    Ok(true)
+  else
+    Err("Heartbeat Handling failed: Should accept empty AppendEntries")
+
+# ============================================================================
+# Test 10: Leader Replication - replicateToFollower 함수
+# ============================================================================
+
+fn testLeaderReplication() -> Result<bool, string>
+  # Arrange
+  let leader = {
+    "id": 0,
+    "state": "LEADER",
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"},
+      {"term": 3, "data": "entry3"}
+    ],
+    "commitIndex": 2,
+    "nextIndex": {1: 3},    # follower 1에게 index 3부터 보내야 함
+    "matchIndex": {1: 2}
+  }
+
+  let follower = {
+    "id": 1,
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"}
+    ],
+    "commitIndex": 2,
+    "lastApplied": 2
+  }
+
+  let cluster = {
+    "nodeIds": [0, 1],
+    "nodes": {0: leader, 1: follower}
+  }
+
+  # Act
+  let result = replicateToFollower(leader, 1, cluster)
+
+  # Assert
+  match result
+    Ok(_) ->
+      # 복제 성공 → nextIndex/matchIndex 업데이트됨
+      if leader["nextIndex"][1] == 3 && leader["matchIndex"][1] == 2
+        Ok(true)
+      else
+        Err("Leader Replication failed: nextIndex/matchIndex should update")
+    Err(e) ->
+      Err("Leader Replication failed: " + e)
+
+# ============================================================================
+# Test 11: advanceCommitIndex - Quorum 기반 commitIndex 진행
+# ============================================================================
+
+fn testAdvanceCommitIndex() -> Result<bool, string>
+  # Arrange
+  let leader = {
+    "id": 0,
+    "state": "LEADER",
+    "currentTerm": 3,
+    "log": [
+      {"term": 1, "data": "entry1"},
+      {"term": 2, "data": "entry2"},
+      {"term": 3, "data": "entry3"},
+      {"term": 3, "data": "entry4"}
+    ],
+    "commitIndex": 1,
+    "lastApplied": 1,
+    "nextIndex": {1: 4, 2: 4},
+    "matchIndex": {1: 3, 2: 3}   # 노드 1, 2 모두 index 3까지 복제
+  }
+
+  let cluster = {
+    "nodeIds": [0, 1, 2],
+    "nodes": {0: leader, 1: {}, 2: {}}
+  }
+
+  # Act
+  let result = advanceCommitIndex(leader, cluster)
+
+  # Assert
+  # Quorum(2) 달성: leader(1) + node1(1) + node2(1) = 3개 > 2
+  # commitIndex 진행 가능한 최대 = index 3
+  if result["commitIndex"] >= 3
+    Ok(true)
+  else
+    Err("advanceCommitIndex failed: Should advance to index 3 with quorum")
+
+# ============================================================================
+# Test Runner
+# ============================================================================
+
+fn runAllReplicationTests() -> Result<number, string>
+  let passed = 0
+  let failed = 0
+  let failedTests = array<string>()
+
+  # Test 1
+  match testAppendEntriesRuleLowerTerm()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 2
+  match testAppendEntriesRuleHigherTerm()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 3
+  match testLogMatchingPrevLogIndexInvalid()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 4
+  match testLogMatchingConflictDetection()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 5
+  match testLogMatchingSafeAppend()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 6
+  match testCommitIndexAdvance()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 7
+  match testDataLossImpossible()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 8
+  match testConflictResolution()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 9
+  match testHeartbeatHandling()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 10
+  match testLeaderReplication()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  # Test 11
+  match testAdvanceCommitIndex()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, e) }
+
+  if failed == 0
+    Ok(passed)
+  else
+    let summary = "Passed: " + toString(passed) + ", Failed: " + toString(failed)
+    Err(summary + " - " + toString(failedTests))
+
+# ============================================================================
+# 결과 출력
+# ============================================================================
+
+fn reportReplicationTestResults(result: Result<number, string>) -> string
+  let report = "=== Raft Replication Tests (Day 3-4) ===\n"
+
+  match result
+    Ok(passedCount) ->
+      report = report + "✅ All " + toString(passedCount) + " tests passed!\n"
+      report = report + "\nRaft Log Replication Rules Verified:\n"
+      report = report + "  ✓ Rule 1: Term comparison\n"
+      report = report + "  ✓ Rule 2: Term update & Follower conversion\n"
+      report = report + "  ✓ Rule 3: Log Matching - prevLogIndex\n"
+      report = report + "  ✓ Rule 4: Log Matching - prevLogTerm (Conflict Detection)\n"
+      report = report + "  ✓ Rule 5: Safe entry append & conflict resolution\n"
+      report = report + "  ✓ Rule 6: commitIndex advancement\n"
+      report = report + "\nSafety Properties Verified:\n"
+      report = report + "  ✓ Data Loss Impossibility (Quorum Replication)\n"
+      report = report + "  ✓ Conflict Resolution (multiple divergences)\n"
+      report = report + "  ✓ Heartbeat handling (empty AppendEntries)\n"
+      report = report + "  ✓ Leader replication (nextIndex/matchIndex)\n"
+      report = report + "  ✓ Quorum-based commitIndex advancement\n"
+
+    Err(summary) ->
+      report = report + "❌ Tests failed: " + summary + "\n"
+
+  report

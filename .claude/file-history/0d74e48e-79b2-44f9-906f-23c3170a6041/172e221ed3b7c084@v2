@@ -1,0 +1,434 @@
+// ============================================================================
+// FreeLang Borrow State - 동적 빌림 상태 관리
+// ============================================================================
+//
+// RefCell의 내부 빌림 상태를 추적합니다.
+//
+// 규칙:
+// - 불변 빌림: 0개 이상 동시 가능
+// - 가변 빌림: 0 또는 1 (배타적)
+// - 불변 + 가변: 불가능
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.3 (Week 5-8)
+
+use std::cell::Cell;
+
+// ============================================================================
+// Borrow 상태 열거형
+// ============================================================================
+
+/// 동적 빌림의 현재 상태
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorrowState {
+    /// 아무도 빌리지 않음
+    Unused,
+
+    /// n개의 불변 빌림 (Shared)
+    /// 0 < n
+    Shared(usize),
+
+    /// 1개의 가변 빌림 (Exclusive)
+    Exclusive,
+
+    /// 빌림 규칙 위반 상태 (panic 후)
+    Poisoned,
+}
+
+// ============================================================================
+// BorrowState 구현
+// ============================================================================
+
+impl BorrowState {
+    /// 새로운 미사용 상태를 생성합니다.
+    pub fn new() -> BorrowState {
+        BorrowState::Unused
+    }
+
+    /// 현재 상태를 문자열로 표현합니다.
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            BorrowState::Unused => "Unused",
+            BorrowState::Shared(n) => {
+                if *n == 1 {
+                    "Shared(1)"
+                } else if *n == 2 {
+                    "Shared(2)"
+                } else if *n <= 5 {
+                    "Shared(3-5)"
+                } else {
+                    "Shared(5+)"
+                }
+            }
+            BorrowState::Exclusive => "Exclusive",
+            BorrowState::Poisoned => "Poisoned",
+        }
+    }
+
+    /// 불변 빌림을 시도합니다.
+    ///
+    /// # 성공 조건
+    /// - 현재 상태가 Unused 또는 Shared
+    /// - Exclusive 중이면 실패
+    ///
+    /// # 반환값
+    /// - Ok(new_state): 새 불변 빌림 추가됨
+    /// - Err(old_state): 빌림 불가능 (이미 가변 빌림 중)
+    pub fn try_borrow(&self) -> Result<BorrowState, BorrowState> {
+        match self {
+            BorrowState::Unused => Ok(BorrowState::Shared(1)),
+            BorrowState::Shared(n) => Ok(BorrowState::Shared(n + 1)),
+            BorrowState::Exclusive => Err(*self),
+            BorrowState::Poisoned => Err(*self),
+        }
+    }
+
+    /// 가변 빌림을 시도합니다.
+    ///
+    /// # 성공 조건
+    /// - 현재 상태가 Unused
+    /// - Shared 또는 Exclusive이면 실패
+    ///
+    /// # 반환값
+    /// - Ok(new_state): 가변 빌림 획득
+    /// - Err(old_state): 빌림 불가능
+    pub fn try_borrow_mut(&self) -> Result<BorrowState, BorrowState> {
+        match self {
+            BorrowState::Unused => Ok(BorrowState::Exclusive),
+            BorrowState::Shared(_) => Err(*self),
+            BorrowState::Exclusive => Err(*self),
+            BorrowState::Poisoned => Err(*self),
+        }
+    }
+
+    /// 불변 빌림을 반환합니다.
+    ///
+    /// # 패닉
+    /// - 현재 상태가 Shared이 아니면 panic
+    pub fn release_borrow(&self) -> BorrowState {
+        match self {
+            BorrowState::Shared(n) => {
+                if *n > 1 {
+                    BorrowState::Shared(n - 1)
+                } else {
+                    BorrowState::Unused
+                }
+            }
+            _ => panic!("release_borrow: state is not Shared"),
+        }
+    }
+
+    /// 가변 빌림을 반환합니다.
+    ///
+    /// # 패닉
+    /// - 현재 상태가 Exclusive이 아니면 panic
+    pub fn release_borrow_mut(&self) -> BorrowState {
+        match self {
+            BorrowState::Exclusive => BorrowState::Unused,
+            _ => panic!("release_borrow_mut: state is not Exclusive"),
+        }
+    }
+
+    /// 현재 상태에서 불변 빌림이 가능한지 검사합니다.
+    pub fn can_borrow(&self) -> bool {
+        matches!(self, BorrowState::Unused | BorrowState::Shared(_))
+    }
+
+    /// 현재 상태에서 가변 빌림이 가능한지 검사합니다.
+    pub fn can_borrow_mut(&self) -> bool {
+        matches!(self, BorrowState::Unused)
+    }
+
+    /// 현재 빌림 개수를 반환합니다.
+    pub fn borrow_count(&self) -> usize {
+        match self {
+            BorrowState::Unused => 0,
+            BorrowState::Shared(n) => *n,
+            BorrowState::Exclusive => 1,
+            BorrowState::Poisoned => 0, // 또는 panic?
+        }
+    }
+
+    /// 상태를 Poisoned로 변경합니다.
+    pub fn poison(&mut self) {
+        *self = BorrowState::Poisoned;
+    }
+
+    /// Poisoned 상태인지 확인합니다.
+    pub fn is_poisoned(&self) -> bool {
+        matches!(self, BorrowState::Poisoned)
+    }
+}
+
+// ============================================================================
+// StatefulBorrow: Cell<BorrowState>를 감싼 구조
+// ============================================================================
+
+/// Borrow 상태를 내부 가변성으로 추적합니다.
+pub struct StatefulBorrow {
+    state: Cell<BorrowState>,
+}
+
+impl StatefulBorrow {
+    /// 새로운 StatefulBorrow를 생성합니다.
+    pub fn new() -> StatefulBorrow {
+        StatefulBorrow {
+            state: Cell::new(BorrowState::Unused),
+        }
+    }
+
+    /// 현재 상태를 읽습니다 (복사됨).
+    pub fn current_state(&self) -> BorrowState {
+        self.state.get()
+    }
+
+    /// 현재 상태를 설정합니다.
+    pub fn set_state(&self, new_state: BorrowState) {
+        self.state.set(new_state);
+    }
+
+    /// 불변 빌림을 시도하고, 성공하면 상태를 업데이트합니다.
+    ///
+    /// # 패닉
+    /// - 가변 빌림 중이거나 Poisoned 상태면 panic
+    pub fn acquire_borrow(&self) {
+        let current = self.state.get();
+        match current.try_borrow() {
+            Ok(new_state) => self.state.set(new_state),
+            Err(old_state) => {
+                panic!(
+                    "borrow() called on a RefCell that is already mutably borrowed ({})",
+                    old_state.to_string()
+                );
+            }
+        }
+    }
+
+    /// 가변 빌림을 시도하고, 성공하면 상태를 업데이트합니다.
+    ///
+    /// # 패닉
+    /// - 불변 빌림 중이거나 이미 가변 빌림 중이면 panic
+    pub fn acquire_borrow_mut(&self) {
+        let current = self.state.get();
+        match current.try_borrow_mut() {
+            Ok(new_state) => self.state.set(new_state),
+            Err(old_state) => {
+                panic!(
+                    "borrow_mut() called on a RefCell with active borrows ({})",
+                    old_state.to_string()
+                );
+            }
+        }
+    }
+
+    /// 불변 빌림을 해제합니다.
+    pub fn release_borrow(&self) {
+        let current = self.state.get();
+        match current {
+            BorrowState::Shared(_) => {
+                let new_state = current.release_borrow();
+                self.state.set(new_state);
+            }
+            _ => panic!("release_borrow() called but not in Shared state"),
+        }
+    }
+
+    /// 가변 빌림을 해제합니다.
+    pub fn release_borrow_mut(&self) {
+        let current = self.state.get();
+        match current {
+            BorrowState::Exclusive => {
+                let new_state = current.release_borrow_mut();
+                self.state.set(new_state);
+            }
+            _ => panic!("release_borrow_mut() called but not in Exclusive state"),
+        }
+    }
+
+    /// 불변 빌림 개수를 반환합니다.
+    pub fn active_borrow_count(&self) -> usize {
+        self.state.get().borrow_count()
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_borrow_state_new() {
+        let state = BorrowState::new();
+        assert_eq!(state, BorrowState::Unused);
+    }
+
+    #[test]
+    fn test_try_borrow_from_unused() {
+        let state = BorrowState::Unused;
+        let result = state.try_borrow();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BorrowState::Shared(1));
+    }
+
+    #[test]
+    fn test_try_borrow_from_shared() {
+        let state = BorrowState::Shared(2);
+        let result = state.try_borrow();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BorrowState::Shared(3));
+    }
+
+    #[test]
+    fn test_try_borrow_from_exclusive_fails() {
+        let state = BorrowState::Exclusive;
+        let result = state.try_borrow();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_borrow_mut_from_unused() {
+        let state = BorrowState::Unused;
+        let result = state.try_borrow_mut();
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), BorrowState::Exclusive);
+    }
+
+    #[test]
+    fn test_try_borrow_mut_from_shared_fails() {
+        let state = BorrowState::Shared(2);
+        let result = state.try_borrow_mut();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_borrow_mut_from_exclusive_fails() {
+        let state = BorrowState::Exclusive;
+        let result = state.try_borrow_mut();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_release_borrow() {
+        let state = BorrowState::Shared(3);
+        let new_state = state.release_borrow();
+        assert_eq!(new_state, BorrowState::Shared(2));
+
+        let state = BorrowState::Shared(1);
+        let new_state = state.release_borrow();
+        assert_eq!(new_state, BorrowState::Unused);
+    }
+
+    #[test]
+    fn test_release_borrow_mut() {
+        let state = BorrowState::Exclusive;
+        let new_state = state.release_borrow_mut();
+        assert_eq!(new_state, BorrowState::Unused);
+    }
+
+    #[test]
+    fn test_can_borrow() {
+        assert!(BorrowState::Unused.can_borrow());
+        assert!(BorrowState::Shared(5).can_borrow());
+        assert!(!BorrowState::Exclusive.can_borrow());
+        assert!(!BorrowState::Poisoned.can_borrow());
+    }
+
+    #[test]
+    fn test_can_borrow_mut() {
+        assert!(BorrowState::Unused.can_borrow_mut());
+        assert!(!BorrowState::Shared(1).can_borrow_mut());
+        assert!(!BorrowState::Exclusive.can_borrow_mut());
+        assert!(!BorrowState::Poisoned.can_borrow_mut());
+    }
+
+    #[test]
+    fn test_borrow_count() {
+        assert_eq!(BorrowState::Unused.borrow_count(), 0);
+        assert_eq!(BorrowState::Shared(5).borrow_count(), 5);
+        assert_eq!(BorrowState::Exclusive.borrow_count(), 1);
+    }
+
+    #[test]
+    fn test_stateful_borrow_new() {
+        let sb = StatefulBorrow::new();
+        assert_eq!(sb.current_state(), BorrowState::Unused);
+    }
+
+    #[test]
+    fn test_stateful_borrow_acquire_release() {
+        let sb = StatefulBorrow::new();
+
+        sb.acquire_borrow();
+        assert_eq!(sb.active_borrow_count(), 1);
+
+        sb.acquire_borrow();
+        assert_eq!(sb.active_borrow_count(), 2);
+
+        sb.release_borrow();
+        assert_eq!(sb.active_borrow_count(), 1);
+
+        sb.release_borrow();
+        assert_eq!(sb.active_borrow_count(), 0);
+    }
+
+    #[test]
+    fn test_stateful_borrow_mut_acquire_release() {
+        let sb = StatefulBorrow::new();
+
+        sb.acquire_borrow_mut();
+        assert_eq!(sb.active_borrow_count(), 1);
+
+        sb.release_borrow_mut();
+        assert_eq!(sb.active_borrow_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "borrow_mut() called on a RefCell with active borrows")]
+    fn test_stateful_borrow_conflict() {
+        let sb = StatefulBorrow::new();
+
+        sb.acquire_borrow();
+        sb.acquire_borrow_mut(); // panic!
+    }
+
+    #[test]
+    #[should_panic(expected = "borrow() called on a RefCell that is already mutably borrowed")]
+    fn test_stateful_borrow_mut_conflict() {
+        let sb = StatefulBorrow::new();
+
+        sb.acquire_borrow_mut();
+        sb.acquire_borrow(); // panic!
+    }
+
+    #[test]
+    fn test_poison_state() {
+        let mut state = BorrowState::Unused;
+        assert!(!state.is_poisoned());
+
+        state.poison();
+        assert!(state.is_poisoned());
+        assert!(!state.can_borrow());
+        assert!(!state.can_borrow_mut());
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// BorrowState 구현 항목:
+// ✅ BorrowState enum (Unused, Shared, Exclusive, Poisoned)
+// ✅ try_borrow() - 불변 빌림 시도
+// ✅ try_borrow_mut() - 가변 빌림 시도
+// ✅ release_borrow() - 불변 빌림 해제
+// ✅ release_borrow_mut() - 가변 빌림 해제
+// ✅ can_borrow() / can_borrow_mut()
+// ✅ borrow_count() - 활성 빌림 개수
+// ✅ poison() - 상태 오염
+// ✅ StatefulBorrow - Cell 기반 상태 추적
+// ✅ 16개 테스트
+//
+// 다음: refcell.fl (RefCell<T> 구현)

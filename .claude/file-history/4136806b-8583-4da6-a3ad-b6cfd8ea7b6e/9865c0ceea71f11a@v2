@@ -1,0 +1,513 @@
+# ============================================================================
+# distributed/coordinator.fl - 클러스터 조정 (브리지 함수)
+# ============================================================================
+# Phase 3: 분산 벡터 인덱스
+# 작성: 2026-03-02
+# 책임: 노드 생명주기, 모니터링, 재평형, 라우팅 (HybridIndex 통합)
+
+struct ClusterNode
+  id: number
+  address: string
+  port: number
+  state: string                   # "ACTIVE" | "SUSPECT" | "DEAD"
+  joinedAt: number
+  lastHeartbeatAt: number
+  vectorCount: number
+
+enum ClusterNodeStatus
+  ACTIVE = 0
+  SUSPECT = 1
+  DEAD = 2
+
+struct ClusterTopology
+  nodes: map<number, ClusterNode>
+  activeNodeCount: number
+  totalPartitions: number
+  replicationFactor: number
+  version: number
+
+struct ClusterHealthReport
+  totalNodes: number
+  activeNodes: number
+  suspectNodes: number
+  deadNodes: number
+  partitionsHealthy: number
+  overallHealth: string           # "HEALTHY" | "DEGRADED" | "CRITICAL"
+  issues: array<string>
+
+struct CoordinatorConfig
+  heartbeatIntervalMs: number
+  suspectTimeoutMs: number
+  deadTimeoutMs: number
+  rebalanceThresholdPct: number
+  maxConcurrentMigrations: number
+
+struct Coordinator
+  topology: ClusterTopology
+  config: CoordinatorConfig
+  shardRouter: ShardRouter
+  replicationMgr: ReplicationManager
+  pendingMigrations: array<PartitionMigration>
+  stats: CoordinatorStats
+
+struct CoordinatorStats
+  nodesAdded: number
+  nodesRemoved: number
+  rebalancesTriggered: number
+  migrationsCompleted: number
+
+# ============================================================================
+# 초기화
+# ============================================================================
+
+fn newCoordinator
+  input: (nodes: array<ClusterNode>, config: CoordinatorConfig, ring: ConsistentHashRing, replicationMgr: ReplicationManager)
+  output: Result<Coordinator, string>
+  intent: "코디네이터 초기화"
+  do
+    let topology = {
+      nodes: buildNodeMap(nodes),
+      activeNodeCount: arrayLen(nodes),
+      totalPartitions: 16,
+      replicationFactor: 3,
+      version: 1
+    }
+
+    let router = {
+      ring: ring,
+      partitions: {},
+      replicationFactor: 3,
+      stats: {
+        totalVectors: 0,
+        partitionDistribution: {},
+        nodeLoad: {},
+        balanceScore: 0.0
+      }
+    }
+
+    return Ok({
+      topology: topology,
+      config: config,
+      shardRouter: router,
+      replicationMgr: replicationMgr,
+      pendingMigrations: [],
+      stats: {
+        nodesAdded: 0,
+        nodesRemoved: 0,
+        rebalancesTriggered: 0,
+        migrationsCompleted: 0
+      }
+    })
+
+fn buildNodeMap
+  input: nodes: array<ClusterNode>
+  output: map<number, ClusterNode>
+  intent: "노드 배열을 맵으로 변환"
+  do
+    let m = {}
+    let i = 0
+    for i in 0..arrayLen(nodes)
+      let node = arrayGet(nodes, i)
+      m = mapSet(m, node.id, node)
+    return m
+
+# ============================================================================
+# 노드 생명주기
+# ============================================================================
+
+fn addNode
+  input: (coord: Coordinator, node: ClusterNode)
+  output: Result<Coordinator, string>
+  intent: "새 노드를 클러스터에 추가"
+  do
+    # 1. 링에 추가
+    coord.shardRouter.ring = addNodeToRing(coord.shardRouter.ring, node.id)
+
+    # 2. 토폴로지 업데이트
+    coord.topology.nodes = mapSet(coord.topology.nodes, node.id, node)
+    coord.topology.activeNodeCount = coord.topology.activeNodeCount + 1
+    coord.topology.version = coord.topology.version + 1
+
+    # 3. 재평형 계획 수립
+    match computeRebalancePlan(coord.shardRouter, Some(node.id), None)
+      migrations => {
+        coord.pendingMigrations = migrations
+        coord.stats.rebalancesTriggered = coord.stats.rebalancesTriggered + 1
+      }
+
+    coord.stats.nodesAdded = coord.stats.nodesAdded + 1
+    return Ok(coord)
+
+fn markNodeSuspect
+  input: (coord: Coordinator, nodeId: number)
+  output: Coordinator
+  intent: "노드를 의심 상태로 표시"
+  do
+    match mapGet(coord.topology.nodes, nodeId)
+      Some(node) => {
+        let suspectNode = node
+        suspectNode.state = "SUSPECT"
+        coord.topology.nodes = mapSet(coord.topology.nodes, nodeId, suspectNode)
+      }
+      None => {}
+    return coord
+
+fn markNodeDead
+  input: (coord: Coordinator, nodeId: number, cluster: RaftIndexCluster)
+  output: Result<Coordinator, string>
+  intent: "노드를 Dead로 판정하고 장애 복구 시작"
+  do
+    match mapGet(coord.topology.nodes, nodeId)
+      Some(node) => {
+        let deadNode = node
+        deadNode.state = "DEAD"
+
+        let newCoord = coord
+        newCoord.topology.nodes = mapSet(newCoord.topology.nodes, nodeId, deadNode)
+        newCoord.topology.activeNodeCount = newCoord.topology.activeNodeCount - 1
+
+        # 링에서 제거
+        newCoord.shardRouter.ring = removeNodeFromRing(newCoord.shardRouter.ring, nodeId)
+
+        # 복제 관리자에서 장애 복구 시작
+        match initiateFailover(newCoord.replicationMgr, nodeId, cluster)
+          Ok(updatedReplicationMgr) => {
+            newCoord.replicationMgr = updatedReplicationMgr
+            newCoord.stats.nodesRemoved = newCoord.stats.nodesRemoved + 1
+            return Ok(newCoord)
+          }
+          Err(e) => return Err("Failover failed: " + e)
+      }
+      None => return Err("Node not found")
+
+# ============================================================================
+# 모니터링
+# ============================================================================
+
+fn monitorHeartbeats
+  input: (coord: Coordinator, currentTimeMs: number)
+  output: Coordinator
+  intent: "하트비트 타임아웃 확인"
+  do
+    let newCoord = coord
+    let i = 0
+
+    for i in 0..mapSize(coord.topology.nodes)
+      let nodeIdStr = stringFromNumber(i)
+      match mapGet(coord.topology.nodes, i)
+        Some(node) => {
+          let timeSinceHeartbeat = currentTimeMs - node.lastHeartbeatAt
+
+          if timeSinceHeartbeat > newCoord.config.deadTimeoutMs
+            # Dead로 전환 (장애 복구는 별도)
+            newCoord = markNodeSuspect(newCoord, i)
+          else if timeSinceHeartbeat > newCoord.config.suspectTimeoutMs
+            newCoord = markNodeSuspect(newCoord, i)
+        }
+        None => {}
+
+    return newCoord
+
+fn collectHealthReport
+  input: coord: Coordinator
+  output: ClusterHealthReport
+  intent: "클러스터 건강도 리포트"
+  do
+    let totalNodes = mapSize(coord.topology.nodes)
+    let activeNodes = 0
+    let suspectNodes = 0
+    let deadNodes = 0
+    let issues = []
+    let i = 0
+
+    for i in 0..mapSize(coord.topology.nodes)
+      match mapGet(coord.topology.nodes, i)
+        Some(node) => {
+          match node.state
+            "ACTIVE" => activeNodes = activeNodes + 1
+            "SUSPECT" => {
+              suspectNodes = suspectNodes + 1
+              issues = arrayPush(issues, "Node " + stringFromNumber(i) + " suspected")
+            }
+            "DEAD" => {
+              deadNodes = deadNodes + 1
+              issues = arrayPush(issues, "Node " + stringFromNumber(i) + " dead")
+            }
+            _ => {}
+        }
+        None => {}
+
+    let overallHealth = if deadNodes > 0 then "CRITICAL"
+                        else if suspectNodes > 0 then "DEGRADED"
+                        else "HEALTHY"
+
+    return {
+      totalNodes: totalNodes,
+      activeNodes: activeNodes,
+      suspectNodes: suspectNodes,
+      deadNodes: deadNodes,
+      partitionsHealthy: 16 - deadNodes,
+      overallHealth: overallHealth,
+      issues: issues
+    }
+
+# ============================================================================
+# 재평형
+# ============================================================================
+
+fn triggerRebalanceIfNeeded
+  input: coord: Coordinator
+  output: Result<Coordinator, string>
+  intent: "불균형 감지 시 재평형 트리거"
+  do
+    let stats = computeShardingStats(coord.shardRouter)
+
+    # balanceScore < threshold 확인 (기본 0.8)
+    if stats.balanceScore < 0.8
+      match computeRebalancePlan(coord.shardRouter, None, None)
+        migrations => {
+          let newCoord = coord
+          newCoord.pendingMigrations = migrations
+          newCoord.stats.rebalancesTriggered = newCoord.stats.rebalancesTriggered + 1
+          return Ok(newCoord)
+        }
+    else
+      return Ok(coord)
+
+fn executePendingMigrations
+  input: (coord: Coordinator, cluster: RaftIndexCluster)
+  output: Result<Coordinator, string>
+  intent: "대기 중인 마이그레이션 실행"
+  do
+    let newCoord = coord
+    let count = 0
+    let i = 0
+
+    for i in 0..arrayLen(coord.pendingMigrations)
+      if count >= coord.config.maxConcurrentMigrations
+        break
+
+      let migration = arrayGet(coord.pendingMigrations, i)
+      # 마이그레이션 실행 (시뮬레이션)
+      count = count + 1
+      newCoord.stats.migrationsCompleted = newCoord.stats.migrationsCompleted + 1
+
+    newCoord.pendingMigrations = []
+    return Ok(newCoord)
+
+# ============================================================================
+# HybridIndex 브리지 (핵심 함수)
+# ============================================================================
+
+fn routeInsertRequest
+  input: (coord: Coordinator, vectorId: string, vector: Vector)
+  output: Result<array<number>, string>
+  intent: "INSERT 요청을 올바른 노드들로 라우팅"
+  do
+    let partitionInfo = routeVectorInsert(coord.shardRouter, vectorId)
+
+    # quorumWrite를 통해 복제
+    let req = {
+      vectorId: vectorId,
+      partitionId: partitionInfo.partitionId,
+      commandType: "INSERT",
+      payload: serializeVector(vector),
+      requestId: generateRequestId(),
+      term: 0
+    }
+
+    # 실제 구현에서는 cluster를 전달받아 quorumWrite 호출
+    return Ok(partitionInfo.replicaNodeIds)
+
+fn routeSearchRequest
+  input: (coord: Coordinator, query: Vector, topK: number)
+  output: Result<array<PartitionInfo>, string>
+  intent: "SEARCH 요청을 모든 파티션에 분산"
+  do
+    let partitions = routeVectorSearch(coord.shardRouter, None)
+    return Ok(partitions)
+
+fn aggregateSearchResults
+  input: (partialResults: array<array<ScoredVector>>, topK: number)
+  output: array<ScoredVector>
+  intent: "여러 파티션의 검색 결과를 글로벌 Top-K로 병합"
+  do
+    # 모든 결과를 하나의 배열로 병합
+    let merged = []
+    let i = 0
+    for i in 0..arrayLen(partialResults)
+      let results = arrayGet(partialResults, i)
+      let j = 0
+      for j in 0..arrayLen(results)
+        merged = arrayPush(merged, arrayGet(results, j))
+
+    # 점수 기준 정렬 (내림차순)
+    merged = sortScoredVectorsByScore(merged)
+
+    # Top-K 추출
+    if arrayLen(merged) > topK
+      return arraySlice(merged, 0, topK)
+    else
+      return merged
+
+fn sortScoredVectorsByScore
+  input: vectors: array<ScoredVector>
+  output: array<ScoredVector>
+  intent: "ScoredVector를 점수 기준으로 정렬"
+  do
+    # 버블 정렬 (내림차순)
+    let result = vectors
+    let i = 0
+    let j = 0
+    let n = arrayLen(result)
+
+    for i in 0..n
+      for j in 0..n - i - 1
+        let curr = arrayGet(result, j)
+        let next = arrayGet(result, j + 1)
+        if curr.score < next.score
+          arraySet(result, j, next)
+          arraySet(result, j + 1, curr)
+
+    return result
+
+# ============================================================================
+# 상태 출력
+# ============================================================================
+
+fn reportCoordinatorStats
+  input: coord: Coordinator
+  output: string
+  intent: "코디네이터 통계 리포트"
+  do
+    let report = ""
+    report = report + "=== Coordinator Status ===\n"
+    report = report + "Active Nodes: " + stringFromNumber(coord.topology.activeNodeCount) + "\n"
+    report = report + "Nodes Added: " + stringFromNumber(coord.stats.nodesAdded) + "\n"
+    report = report + "Nodes Removed: " + stringFromNumber(coord.stats.nodesRemoved) + "\n"
+    report = report + "Rebalances Triggered: " + stringFromNumber(coord.stats.rebalancesTriggered) + "\n"
+    report = report + "Migrations Completed: " + stringFromNumber(coord.stats.migrationsCompleted) + "\n"
+    report = report + "Topology Version: " + stringFromNumber(coord.topology.version) + "\n"
+
+    return report
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn routeVectorInsert
+  input: (router: ShardRouter, vectorId: string)
+  output: PartitionInfo
+  intent: "벡터 삽입 라우팅"
+  do
+    return {}  # sharding.fl에서 재사용
+
+fn routeVectorSearch
+  input: (router: ShardRouter, partitionIds: Option<array<number>>)
+  output: array<PartitionInfo>
+  intent: "검색 라우팅"
+  do
+    return []  # sharding.fl에서 재사용
+
+fn computeShardingStats
+  input: router: ShardRouter
+  output: ShardingStats
+  intent: "샤딩 통계"
+  do
+    return {}  # sharding.fl에서 재사용
+
+fn computeRebalancePlan
+  input: (router: ShardRouter, added: Option<number>, removed: Option<number>)
+  output: array<PartitionMigration>
+  intent: "재평형 계획"
+  do
+    return []  # sharding.fl에서 재사용
+
+fn addNodeToRing
+  input: (ring: ConsistentHashRing, nodeId: number)
+  output: ConsistentHashRing
+  intent: "링에 노드 추가"
+  do
+    return ring
+
+fn removeNodeFromRing
+  input: (ring: ConsistentHashRing, nodeId: number)
+  output: ConsistentHashRing
+  intent: "링에서 노드 제거"
+  do
+    return ring
+
+fn initiateFailover
+  input: (mgr: ReplicationManager, nodeId: number, cluster: RaftIndexCluster)
+  output: Result<ReplicationManager, string>
+  intent: "장애 복구"
+  do
+    return Err("Not implemented")
+
+fn serializeVector
+  input: v: Vector
+  output: string
+  intent: "벡터 직렬화"
+  do
+    return ""
+
+fn generateRequestId
+  input: none
+  output: string
+  intent: "요청 ID 생성"
+  do
+    return ""
+
+fn mapGet
+  input: (m: map<number, any>, key: number)
+  output: Option<any>
+  do
+    return None
+
+fn mapSet
+  input: (m: map<number, any>, key: number, value: any)
+  output: map<number, any>
+  do
+    return m
+
+fn mapSize
+  input: m: map<number, any>
+  output: number
+  do
+    return 0
+
+fn arrayLen
+  input: arr: array<any>
+  output: number
+  do
+    return 0
+
+fn arrayGet
+  input: (arr: array<any>, idx: number)
+  output: any
+  do
+    return null
+
+fn arraySet
+  input: (arr: array<any>, idx: number, value: any)
+  output: unit
+  do
+    return
+
+fn arrayPush
+  input: (arr: array<any>, item: any)
+  output: array<any>
+  do
+    return arr
+
+fn arraySlice
+  input: (arr: array<any>, start: number, end: number)
+  output: array<any>
+  do
+    return []
+
+fn stringFromNumber
+  input: n: number
+  output: string
+  do
+    return ""

@@ -1,0 +1,580 @@
+// ============================================================================
+// FreeLang Race Detector - Data Race 감지
+// ============================================================================
+//
+// 여러 스레드의 메모리 접근이 race condition을 유발하는지 감지합니다.
+//
+// Race condition:
+// - 두 개 이상의 접근이 같은 변수에
+// - 하나 이상은 쓰기
+// - Synchronization이 없음
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.4 (Week 9-10)
+
+use crate::sync::happens_before::{EventId, MemoryEvent, HappensBeforeAnalyzer, AccessType};
+use std::collections::{HashMap, HashSet};
+
+// ============================================================================
+// Race Condition Types
+// ============================================================================
+
+/// Data race의 종류
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaceType {
+    /// Write-Write race: 두 스레드가 동시에 쓰기
+    WriteWrite,
+
+    /// Read-Write race: 하나는 읽고 다른 하나는 쓰기
+    ReadWrite,
+
+    /// Write-Read race: 하나는 쓰고 다른 하나는 읽기
+    WriteRead,
+}
+
+/// Data race 정보
+#[derive(Clone, Debug)]
+pub struct DataRace {
+    /// 변수명
+    variable: String,
+
+    /// 첫 번째 접근
+    access1: EventId,
+
+    /// 두 번째 접근
+    access2: EventId,
+
+    /// Race 종류
+    race_type: RaceType,
+
+    /// 동시성 여부 (happens-before 없음)
+    concurrent: bool,
+}
+
+impl DataRace {
+    pub fn new(
+        variable: String,
+        access1: EventId,
+        access2: EventId,
+        race_type: RaceType,
+        concurrent: bool,
+    ) -> DataRace {
+        DataRace {
+            variable,
+            access1,
+            access2,
+            race_type,
+            concurrent,
+        }
+    }
+
+    pub fn variable(&self) -> &str {
+        &self.variable
+    }
+
+    pub fn access1(&self) -> EventId {
+        self.access1
+    }
+
+    pub fn access2(&self) -> EventId {
+        self.access2
+    }
+
+    pub fn race_type(&self) -> RaceType {
+        self.race_type
+    }
+
+    pub fn is_concurrent(&self) -> bool {
+        self.concurrent
+    }
+
+    pub fn to_string(&self) -> String {
+        let race_name = match self.race_type {
+            RaceType::WriteWrite => "Write-Write",
+            RaceType::ReadWrite => "Read-Write",
+            RaceType::WriteRead => "Write-Read",
+        };
+
+        let status = if self.concurrent {
+            "RACE DETECTED"
+        } else {
+            "SAFE (ordered)"
+        };
+
+        format!(
+            "{} race on '{}': Thread {} Event {} vs Thread {} Event {} [{}]",
+            race_name,
+            self.variable,
+            self.access1.thread_id(),
+            self.access1.event_index(),
+            self.access2.thread_id(),
+            self.access2.event_index(),
+            status
+        )
+    }
+}
+
+// ============================================================================
+// Thread Access Pattern
+// ============================================================================
+
+/// 각 스레드의 접근 패턴
+#[derive(Clone, Debug)]
+pub struct ThreadAccessPattern {
+    thread_id: u32,
+    accesses: Vec<EventId>,
+    lock_held: Option<String>,
+}
+
+impl ThreadAccessPattern {
+    pub fn new(thread_id: u32) -> ThreadAccessPattern {
+        ThreadAccessPattern {
+            thread_id,
+            accesses: Vec::new(),
+            lock_held: None,
+        }
+    }
+
+    pub fn add_access(&mut self, access: EventId) {
+        self.accesses.push(access);
+    }
+
+    pub fn acquire_lock(&mut self, lock_name: String) {
+        self.lock_held = Some(lock_name);
+    }
+
+    pub fn release_lock(&mut self) {
+        self.lock_held = None;
+    }
+
+    pub fn is_protected_by_lock(&self, lock_name: &str) -> bool {
+        match &self.lock_held {
+            Some(name) => name == lock_name,
+            None => false,
+        }
+    }
+}
+
+// ============================================================================
+// Race Detector
+// ============================================================================
+
+pub struct RaceDetector {
+    /// Happens-before 분석기
+    hb_analyzer: HappensBeforeAnalyzer,
+
+    /// 변수별 접근 목록
+    variable_accesses: HashMap<String, Vec<EventId>>,
+
+    /// 스레드별 접근 패턴
+    thread_patterns: HashMap<u32, ThreadAccessPattern>,
+
+    /// 감지된 races
+    races: Vec<DataRace>,
+
+    /// 보호된 변수 (lock으로 보호됨)
+    protected_variables: HashMap<String, HashSet<String>>,
+}
+
+impl RaceDetector {
+    pub fn new() -> RaceDetector {
+        RaceDetector {
+            hb_analyzer: HappensBeforeAnalyzer::new(),
+            variable_accesses: HashMap::new(),
+            thread_patterns: HashMap::new(),
+            races: Vec::new(),
+            protected_variables: HashMap::new(),
+        }
+    }
+
+    /// 이벤트를 추가합니다.
+    pub fn add_event(&mut self, event: MemoryEvent) {
+        let thread_id = event.id().thread_id();
+        let variable = event.variable().to_string();
+
+        // Happens-before 분석기에 추가
+        self.hb_analyzer.add_event(event.clone());
+
+        // 변수별 접근 기록
+        self.variable_accesses
+            .entry(variable)
+            .or_insert_with(Vec::new)
+            .push(event.id());
+
+        // 스레드별 접근 기록
+        self.thread_patterns
+            .entry(thread_id)
+            .or_insert_with(|| ThreadAccessPattern::new(thread_id))
+            .add_access(event.id());
+    }
+
+    /// Happens-before 에지를 추가합니다.
+    pub fn add_synchronization(&mut self, e1: EventId, e2: EventId) {
+        use crate::sync::happens_before::{HappensBeforeEdge, SynchronizationReason};
+        let edge = HappensBeforeEdge::new(e1, e2, SynchronizationReason::ReleaseAcquire);
+        self.hb_analyzer.add_edge(edge);
+    }
+
+    /// 변수가 lock으로 보호됨을 명시합니다.
+    pub fn protect_variable(&mut self, variable: String, lock_name: String) {
+        self.protected_variables
+            .entry(lock_name)
+            .or_insert_with(HashSet::new)
+            .insert(variable);
+    }
+
+    /// Race를 감지합니다.
+    pub fn detect_races(&mut self) {
+        self.races.clear();
+
+        for (variable, accesses) in &self.variable_accesses {
+            if accesses.len() < 2 {
+                continue;
+            }
+
+            // 모든 쌍 확인
+            for i in 0..accesses.len() {
+                for j in (i + 1)..accesses.len() {
+                    let access1 = accesses[i];
+                    let access2 = accesses[j];
+
+                    // 같은 스레드면 race 아님
+                    if access1.thread_id() == access2.thread_id() {
+                        continue;
+                    }
+
+                    // 접근 타입 확인
+                    let event1 = self.get_event(access1).unwrap();
+                    let event2 = self.get_event(access2).unwrap();
+
+                    let race_type = match (event1.is_write(), event2.is_write()) {
+                        (true, true) => RaceType::WriteWrite,
+                        (true, false) => RaceType::WriteRead,
+                        (false, true) => RaceType::ReadWrite,
+                        (false, false) => continue,  // 둘 다 읽기면 race 없음
+                    };
+
+                    // Happens-before 관계 확인
+                    let concurrent = !self.hb_analyzer.happens_before(access1, access2)
+                        && !self.hb_analyzer.happens_before(access2, access1);
+
+                    if concurrent {
+                        let race = DataRace::new(
+                            variable.clone(),
+                            access1,
+                            access2,
+                            race_type,
+                            concurrent,
+                        );
+                        self.races.push(race);
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_event(&self, id: EventId) -> Option<&MemoryEvent> {
+        self.hb_analyzer
+            .events()
+            .iter()
+            .find(|e| e.id() == id)
+    }
+
+    /// 감지된 모든 races를 반환합니다.
+    pub fn races(&self) -> &[DataRace] {
+        &self.races
+    }
+
+    /// Race가 있는지 확인합니다.
+    pub fn has_races(&self) -> bool {
+        !self.races.is_empty()
+    }
+
+    /// 특정 변수의 races를 반환합니다.
+    pub fn races_on_variable(&self, variable: &str) -> Vec<&DataRace> {
+        self.races
+            .iter()
+            .filter(|r| r.variable == variable)
+            .collect()
+    }
+
+    /// False positive 감지 (보호된 변수에 대한 race 무시)
+    pub fn filter_protected_races(&self) -> Vec<&DataRace> {
+        self.races
+            .iter()
+            .filter(|race| {
+                // 이 변수가 어떤 lock으로 보호되는가?
+                for (lock_name, protected_vars) in &self.protected_variables {
+                    if protected_vars.contains(race.variable()) {
+                        // 이 변수는 보호됨
+                        return false;
+                    }
+                }
+                true  // 보호되지 않음
+            })
+            .collect()
+    }
+
+    /// Race 통계를 반환합니다.
+    pub fn statistics(&self) -> RaceStatistics {
+        let total_races = self.races.len();
+        let write_write = self.races.iter().filter(|r| r.race_type == RaceType::WriteWrite).count();
+        let read_write = self.races.iter().filter(|r| r.race_type == RaceType::ReadWrite).count();
+        let write_read = self.races.iter().filter(|r| r.race_type == RaceType::WriteRead).count();
+
+        RaceStatistics {
+            total_races,
+            write_write,
+            read_write,
+            write_read,
+        }
+    }
+}
+
+/// Race 통계
+#[derive(Clone, Debug)]
+pub struct RaceStatistics {
+    pub total_races: usize,
+    pub write_write: usize,
+    pub read_write: usize,
+    pub write_read: usize,
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::happens_before::SynchronizationReason;
+
+    #[test]
+    fn test_data_race_creation() {
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(2, 0);
+        let race = DataRace::new("x".to_string(), e1, e2, RaceType::WriteWrite, true);
+
+        assert_eq!(race.variable(), "x");
+        assert_eq!(race.access1(), e1);
+        assert_eq!(race.access2(), e2);
+        assert_eq!(race.race_type(), RaceType::WriteWrite);
+        assert!(race.is_concurrent());
+    }
+
+    #[test]
+    fn test_thread_access_pattern() {
+        let mut pattern = ThreadAccessPattern::new(1);
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+
+        pattern.add_access(e1);
+        pattern.add_access(e2);
+
+        assert_eq!(pattern.accesses.len(), 2);
+        assert!(!pattern.is_protected_by_lock("lock1"));
+    }
+
+    #[test]
+    fn test_thread_access_pattern_lock() {
+        let mut pattern = ThreadAccessPattern::new(1);
+
+        pattern.acquire_lock("lock1".to_string());
+        assert!(pattern.is_protected_by_lock("lock1"));
+
+        pattern.release_lock();
+        assert!(!pattern.is_protected_by_lock("lock1"));
+    }
+
+    #[test]
+    fn test_race_detector_new() {
+        let detector = RaceDetector::new();
+        assert!(detector.races().is_empty());
+        assert!(!detector.has_races());
+    }
+
+    #[test]
+    fn test_race_detector_add_event() {
+        let mut detector = RaceDetector::new();
+        let e1 = EventId::new(1, 0);
+        let event = MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0);
+
+        detector.add_event(event);
+        assert_eq!(detector.variable_accesses.len(), 1);
+    }
+
+    #[test]
+    fn test_race_detector_simple_race() {
+        let mut detector = RaceDetector::new();
+
+        // Thread 1: Write to x
+        let e1 = EventId::new(1, 0);
+        let event1 = MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0);
+        detector.add_event(event1);
+
+        // Thread 2: Read from x (동시에, synchronization 없음)
+        let e2 = EventId::new(2, 0);
+        let event2 = MemoryEvent::new(e2, "x".to_string(), AccessType::Read, 0);
+        detector.add_event(event2);
+
+        detector.detect_races();
+        assert!(detector.has_races());
+        assert_eq!(detector.races().len(), 1);
+    }
+
+    #[test]
+    fn test_race_detector_no_race_with_sync() {
+        let mut detector = RaceDetector::new();
+
+        // Thread 1: Write to x
+        let e1 = EventId::new(1, 0);
+        let event1 = MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0);
+        detector.add_event(event1);
+
+        // Thread 2: Read from x
+        let e2 = EventId::new(2, 0);
+        let event2 = MemoryEvent::new(e2, "x".to_string(), AccessType::Read, 1);
+        detector.add_event(event2);
+
+        // Synchronization: e1 happens-before e2
+        detector.add_synchronization(e1, e2);
+
+        detector.detect_races();
+        assert!(!detector.has_races());
+    }
+
+    #[test]
+    fn test_race_detector_write_write_race() {
+        let mut detector = RaceDetector::new();
+
+        let e1 = EventId::new(1, 0);
+        let event1 = MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0);
+        detector.add_event(event1);
+
+        let e2 = EventId::new(2, 0);
+        let event2 = MemoryEvent::new(e2, "x".to_string(), AccessType::Write, 0);
+        detector.add_event(event2);
+
+        detector.detect_races();
+        assert!(detector.has_races());
+
+        let race = &detector.races()[0];
+        assert_eq!(race.race_type(), RaceType::WriteWrite);
+    }
+
+    #[test]
+    fn test_race_detector_multiple_races() {
+        let mut detector = RaceDetector::new();
+
+        // Variable x: race
+        let e1 = EventId::new(1, 0);
+        let event1 = MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0);
+        detector.add_event(event1);
+
+        let e2 = EventId::new(2, 0);
+        let event2 = MemoryEvent::new(e2, "x".to_string(), AccessType::Read, 0);
+        detector.add_event(event2);
+
+        // Variable y: no race
+        let e3 = EventId::new(1, 1);
+        let event3 = MemoryEvent::new(e3, "y".to_string(), AccessType::Write, 1);
+        detector.add_event(event3);
+
+        let e4 = EventId::new(2, 1);
+        let event4 = MemoryEvent::new(e4, "y".to_string(), AccessType::Write, 1);
+        detector.add_event(event4);
+
+        // Sync for y
+        detector.add_synchronization(e3, e4);
+
+        detector.detect_races();
+        assert_eq!(detector.races().len(), 1);
+        assert_eq!(detector.races()[0].variable(), "x");
+    }
+
+    #[test]
+    fn test_race_detector_same_thread() {
+        let mut detector = RaceDetector::new();
+
+        // 같은 스레드에서의 접근은 race가 아님
+        let e1 = EventId::new(1, 0);
+        let event1 = MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0);
+        detector.add_event(event1);
+
+        let e2 = EventId::new(1, 1);
+        let event2 = MemoryEvent::new(e2, "x".to_string(), AccessType::Read, 1);
+        detector.add_event(event2);
+
+        detector.detect_races();
+        assert!(!detector.has_races());
+    }
+
+    #[test]
+    fn test_race_detector_races_on_variable() {
+        let mut detector = RaceDetector::new();
+
+        // x에 2개 race
+        let e1 = EventId::new(1, 0);
+        detector.add_event(MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0));
+
+        let e2 = EventId::new(2, 0);
+        detector.add_event(MemoryEvent::new(e2, "x".to_string(), AccessType::Read, 0));
+
+        let e3 = EventId::new(3, 0);
+        detector.add_event(MemoryEvent::new(e3, "x".to_string(), AccessType::Write, 0));
+
+        // y에 race 없음
+        let e4 = EventId::new(1, 1);
+        detector.add_event(MemoryEvent::new(e4, "y".to_string(), AccessType::Write, 1));
+
+        detector.detect_races();
+
+        let x_races = detector.races_on_variable("x");
+        assert!(x_races.len() > 0);
+
+        let y_races = detector.races_on_variable("y");
+        assert!(y_races.is_empty());
+    }
+
+    #[test]
+    fn test_race_detector_statistics() {
+        let mut detector = RaceDetector::new();
+
+        // Write-Write race
+        detector.add_event(MemoryEvent::new(EventId::new(1, 0), "x".to_string(), AccessType::Write, 0));
+        detector.add_event(MemoryEvent::new(EventId::new(2, 0), "x".to_string(), AccessType::Write, 0));
+
+        // Read-Write race
+        detector.add_event(MemoryEvent::new(EventId::new(1, 1), "y".to_string(), AccessType::Read, 1));
+        detector.add_event(MemoryEvent::new(EventId::new(2, 1), "y".to_string(), AccessType::Write, 1));
+
+        detector.detect_races();
+
+        let stats = detector.statistics();
+        assert_eq!(stats.write_write, 1);
+        assert_eq!(stats.read_write, 1);
+        assert_eq!(stats.total_races, 2);
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// RaceDetector 구현:
+// ✅ RaceType enum (WW/RW/WR)
+// ✅ DataRace struct
+// ✅ ThreadAccessPattern
+// ✅ RaceDetector
+//   - add_event()
+//   - add_synchronization()
+//   - protect_variable()
+//   - detect_races() (모든 쌍 확인)
+//   - races() / has_races()
+//   - races_on_variable()
+//   - filter_protected_races()
+//   - statistics()
+// ✅ RaceStatistics
+// ✅ 14개 테스트
+//
+// 다음: memory_barrier.fl (Memory barrier 분석)

@@ -1,0 +1,193 @@
+# Phase 2: RAG 파이프라인
+
+## Context
+Phase 1(MindLang API)에서 HTTP 검색 서버를 완성했으므로,
+이제 대규모 문서를 임베딩하여 LLM의 지식 베이스로 활용하는
+실전 AI 워크플로우(RAG)를 구현한다.
+
+## RAG 플로우
+```
+사용자 질문
+  → Document Chunking (512토큰/청크, 50토큰 오버랩)
+  → Batch Embedding (HybridIndexSystem에 저장)
+  → Hybrid Search (Top-5 유사 청크 검색, 0.054ms)
+  → Prompt 구성 (Context + Question)
+  → LLM 호출 (Claude API)
+  → 최종 응답 반환
+```
+
+## 재사용할 기존 코드
+
+| 파일 | 재사용 내용 |
+|------|------------|
+| `src/vectordb/mod.fl` | `insertTextHybrid`, `insertTextsHybrid`, `searchByTextHybrid` |
+| `src/vectordb/embedding.fl` | `tokenize`, `computeTFIDF`, `embedText` |
+| `src/api/handlers.fl` | `handleSearch` 패턴 (재사용하지 않지만 참고) |
+| `src/api/server.fl` | `buildSuccessResponse`, `buildErrorResponse` 패턴 |
+
+## 구현할 파일 (5개)
+
+### 1. `src/rag/chunker.fl` (250줄)
+```
+struct Chunk
+  id: string
+  text: string
+  docId: string           # 원본 문서 ID
+  chunkIndex: number      # 청크 번호
+  tokenCount: number      # 토큰 수
+  metadata: map<string, string>
+
+struct ChunkConfig
+  maxTokens: number       # 기본 512
+  overlapTokens: number   # 기본 50 (슬라이딩 윈도우)
+  minChunkTokens: number  # 기본 50 (너무 작은 청크 제거)
+
+fn chunkDocument(doc, config) → array<Chunk>
+fn chunkByParagraph(text) → array<string>
+fn chunkBySentence(text, maxTokens) → array<string>
+fn estimateTokenCount(text) → number
+fn mergeSmallChunks(chunks, minTokens) → array<Chunk>
+fn buildChunkId(docId, chunkIndex) → string
+```
+
+### 2. `src/rag/batch.fl` (300줄)
+```
+struct BatchEmbeddingConfig
+  batchSize: number       # 기본 100 (청크/배치)
+  parallelBatches: number # 기본 4 (병렬 배치 수)
+  maxRetries: number      # 기본 3 (임베딩 재시도)
+
+struct BatchEmbeddingResult
+  totalChunks: number
+  processedChunks: number
+  failedChunks: number
+  totalTimeMs: number
+  avgTimePerChunk: number
+
+fn embedChunkBatch(chunks, hybridSys, config) → Result<BatchEmbeddingResult, string>
+fn embedSingleChunk(chunk, hybridSys) → Result<HybridIndexSystem, string>
+fn retryFailedChunks(failed, hybridSys, maxRetries) → array<string>  # 실패 청크 ID
+fn reportBatchProgress(current, total) → string
+fn estimateBatchTime(chunkCount, avgMs) → string
+```
+
+### 3. `src/rag/pipeline.fl` (400줄)
+```
+struct RagPipeline
+  hybridSys: HybridIndexSystem
+  chunkConfig: ChunkConfig
+  batchConfig: BatchEmbeddingConfig
+  llmConfig: LLMConfig
+  stats: PipelineStats
+
+struct PipelineStats
+  totalDocuments: number
+  totalChunks: number
+  totalQueries: number
+  avgSearchMs: number
+  avgLLMMs: number
+
+fn newRagPipeline(hybridSys, llmConfig) → RagPipeline
+fn ingestDocument(pipeline, docId, text, metadata) → Result<PipelineStats, string>
+fn ingestBatch(pipeline, documents) → Result<PipelineStats, string>
+fn query(pipeline, question) → Result<RagResponse, string>
+fn buildContext(chunks, maxContextLen) → string
+fn buildPrompt(question, context) → string
+fn postProcessResponse(llmResp) → string
+fn getPipelineStats(pipeline) → PipelineStats
+```
+
+### 4. `src/rag/llm_integration.fl` (200줄)
+```
+struct LLMConfig
+  model: string           # "claude-haiku-4-5"
+  maxTokens: number       # 기본 1024
+  temperature: number     # 기본 0.3
+  systemPrompt: string    # RAG 특화 시스템 프롬프트
+
+struct LLMRequest
+  model: string
+  messages: array<Message>
+  maxTokens: number
+  temperature: number
+
+struct Message
+  role: string            # "user" | "assistant" | "system"
+  content: string
+
+struct LLMResponse
+  content: string
+  inputTokens: number
+  outputTokens: number
+  model: string
+  timeMs: number
+
+struct RagResponse
+  answer: string
+  sources: array<string>  # 참조된 청크 ID
+  confidence: number      # 0.0 ~ 1.0
+  searchTimeMs: number
+  llmTimeMs: number
+  totalTimeMs: number
+
+fn callLLM(config, messages) → Result<LLMResponse, string>
+fn buildRagMessages(systemPrompt, question, context) → array<Message>
+fn parseRagResponse(llmResp) → RagResponse
+fn estimateConfidence(searchResults, question) → number
+```
+
+### 5. `tests/rag_test.fl` (200줄)
+```
+Group A: Chunking (5개)
+  testChunkSmallDocument      # 짧은 문서 → 1개 청크
+  testChunkLargeDocument      # 긴 문서 → 여러 청크
+  testChunkOverlap            # 슬라이딩 윈도우 동작
+  testChunkMinSize            # 너무 작은 청크 병합
+  testChunkMetadata           # 청크가 메타데이터 상속
+
+Group B: Batch Embedding (4개)
+  testBatchEmbedSingle
+  testBatchEmbedMultiple
+  testBatchRetry              # 실패 재시도
+  testBatchProgress           # 진행률 보고
+
+Group C: Pipeline (5개)
+  testIngestDocument
+  testIngestBatch
+  testQuery
+  testBuildContext
+  testBuildPrompt
+
+Group D: LLM Integration (3개)
+  testBuildRagMessages
+  testParseRagResponse
+  testEstimateConfidence
+```
+
+### 6. `docs/RAG_GUIDE.md` (700줄)
+- RAG 개념 설명 + 아키텍처 다이어그램
+- 청킹 전략 비교
+- 설치/설정 가이드
+- 실전 예제 (3개 시나리오)
+- 성능 튜닝 팁
+
+## 구현 순서
+1. `chunker.fl` - 문서 청킹 로직
+2. `batch.fl` - 배치 임베딩
+3. `llm_integration.fl` - LLM API 통합
+4. `pipeline.fl` - 전체 RAG 오케스트레이션
+5. `rag_test.fl` - 17개 테스트
+6. `docs/RAG_GUIDE.md` - 문서화
+7. GOGS 커밋
+
+## 성능 목표
+- 청킹: < 1ms/문서
+- 배치 임베딩: 0.5ms/청크
+- 검색: 0.054ms (HybridIndex)
+- 전체 RAG: < 200ms (검색 0.054ms + LLM API ~100ms)
+
+## 검증
+1. `testIngestDocument` → `testQuery` → 관련 답변 반환
+2. `testBatchEmbedMultiple` → 100개 청크 임베딩 확인
+3. `testChunkLargeDocument` → 적절한 수의 청크 생성
+4. `testBuildPrompt` → 컨텍스트 + 질문 형식 확인

@@ -1,0 +1,562 @@
+// ============================================================================
+// FreeLang Happens-Before Relationship - 동시성 순서 분석
+// ============================================================================
+//
+// 두 메모리 연산 간의 순서 관계를 정의합니다.
+//
+// 정의:
+// A happens-before B (A → B):
+//   - A의 결과가 B에서 보여짐
+//   - 병렬 실행 불가능
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.4 (Week 9-10)
+
+use crate::sync::ordering::Ordering;
+use std::collections::HashMap;
+
+// ============================================================================
+// Event: 메모리 연산
+// ============================================================================
+
+/// 메모리 연산 이벤트
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventId {
+    thread_id: u32,
+    event_index: u32,
+}
+
+impl EventId {
+    pub fn new(thread_id: u32, event_index: u32) -> EventId {
+        EventId { thread_id, event_index }
+    }
+
+    pub fn thread_id(&self) -> u32 {
+        self.thread_id
+    }
+
+    pub fn event_index(&self) -> u32 {
+        self.event_index
+    }
+}
+
+/// 메모리 접근 타입
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessType {
+    /// 읽기
+    Read,
+
+    /// 쓰기
+    Write,
+
+    /// 원자적 읽기 (load)
+    AtomicLoad(Ordering),
+
+    /// 원자적 쓰기 (store)
+    AtomicStore(Ordering),
+
+    /// Compare-and-Swap
+    CompareAndSwap(Ordering),
+
+    /// Acquire 시맨틱
+    Acquire,
+
+    /// Release 시맨틱
+    Release,
+
+    /// Memory barrier (fence)
+    Barrier,
+}
+
+/// 메모리 이벤트
+#[derive(Clone, Debug)]
+pub struct MemoryEvent {
+    /// 이벤트 ID
+    id: EventId,
+
+    /// 접근 변수
+    variable: String,
+
+    /// 접근 타입
+    access_type: AccessType,
+
+    /// 타임스탬프 (논리적 클록)
+    timestamp: u64,
+}
+
+impl MemoryEvent {
+    pub fn new(id: EventId, variable: String, access_type: AccessType, timestamp: u64) -> MemoryEvent {
+        MemoryEvent {
+            id,
+            variable,
+            access_type,
+            timestamp,
+        }
+    }
+
+    pub fn id(&self) -> EventId {
+        self.id
+    }
+
+    pub fn variable(&self) -> &str {
+        &self.variable
+    }
+
+    pub fn access_type(&self) -> AccessType {
+        self.access_type
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+
+    pub fn is_read(&self) -> bool {
+        matches!(self.access_type, AccessType::Read | AccessType::AtomicLoad(_) | AccessType::Acquire)
+    }
+
+    pub fn is_write(&self) -> bool {
+        matches!(self.access_type, AccessType::Write | AccessType::AtomicStore(_) | AccessType::CompareAndSwap(_) | AccessType::Release)
+    }
+
+    pub fn is_atomic(&self) -> bool {
+        matches!(self.access_type, AccessType::AtomicLoad(_) | AccessType::AtomicStore(_) | AccessType::CompareAndSwap(_))
+    }
+
+    pub fn is_synchronization(&self) -> bool {
+        matches!(self.access_type, AccessType::Acquire | AccessType::Release | AccessType::Barrier)
+    }
+}
+
+// ============================================================================
+// Happens-Before 관계
+// ============================================================================
+
+/// A happens-before B의 이유
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SynchronizationReason {
+    /// Program order: 같은 스레드에서 순차적
+    ProgramOrder,
+
+    /// Release-Acquire: Release 이전의 모든 쓰기가 Acquire 이후에 보임
+    ReleaseAcquire,
+
+    /// Sequential Consistency: 모든 스레드가 같은 순서를 봄
+    SequentialConsistency,
+
+    /// Mutex lock-unlock
+    LockUnlock,
+
+    /// Barrier: 모든 스레드가 대기
+    BarrierWait,
+
+    /// Thread join: 생성된 스레드가 완료될 때까지 대기
+    ThreadJoin,
+
+    /// Transitivity: 이행성 (A→B, B→C ⟹ A→C)
+    Transitivity,
+}
+
+/// Happens-Before 에지
+#[derive(Clone, Debug)]
+pub struct HappensBeforeEdge {
+    /// 선행 이벤트
+    before: EventId,
+
+    /// 후행 이벤트
+    after: EventId,
+
+    /// 동기화 이유
+    reason: SynchronizationReason,
+}
+
+impl HappensBeforeEdge {
+    pub fn new(before: EventId, after: EventId, reason: SynchronizationReason) -> HappensBeforeEdge {
+        HappensBeforeEdge { before, after, reason }
+    }
+
+    pub fn before(&self) -> EventId {
+        self.before
+    }
+
+    pub fn after(&self) -> EventId {
+        self.after
+    }
+
+    pub fn reason(&self) -> SynchronizationReason {
+        self.reason
+    }
+}
+
+// ============================================================================
+// Happens-Before Analyzer
+// ============================================================================
+
+pub struct HappensBeforeAnalyzer {
+    /// 모든 메모리 이벤트
+    events: Vec<MemoryEvent>,
+
+    /// Happens-before 에지
+    edges: Vec<HappensBeforeEdge>,
+
+    /// 캐시: A happens-before B?
+    cache: HashMap<(EventId, EventId), bool>,
+}
+
+impl HappensBeforeAnalyzer {
+    pub fn new() -> HappensBeforeAnalyzer {
+        HappensBeforeAnalyzer {
+            events: Vec::new(),
+            edges: Vec::new(),
+            cache: HashMap::new(),
+        }
+    }
+
+    /// 이벤트를 추가합니다.
+    pub fn add_event(&mut self, event: MemoryEvent) {
+        self.events.push(event);
+    }
+
+    /// Happens-before 에지를 추가합니다.
+    pub fn add_edge(&mut self, edge: HappensBeforeEdge) {
+        self.edges.push(edge);
+        self.cache.clear();  // 캐시 무효화
+    }
+
+    /// Program order: 같은 스레드에서 순차적 이벤트를 자동 추가
+    pub fn add_program_order(&mut self, thread_id: u32) {
+        let thread_events: Vec<_> = self.events
+            .iter()
+            .filter(|e| e.id.thread_id == thread_id)
+            .collect();
+
+        for i in 0..thread_events.len().saturating_sub(1) {
+            let e1 = thread_events[i].id;
+            let e2 = thread_events[i + 1].id;
+            self.add_edge(HappensBeforeEdge::new(e1, e2, SynchronizationReason::ProgramOrder));
+        }
+    }
+
+    /// Release-Acquire 동기화를 추가합니다.
+    pub fn add_release_acquire_sync(&mut self, release_id: EventId, acquire_id: EventId) {
+        self.add_edge(HappensBeforeEdge::new(
+            release_id,
+            acquire_id,
+            SynchronizationReason::ReleaseAcquire,
+        ));
+    }
+
+    /// A happens-before B인지 확인합니다.
+    pub fn happens_before(&mut self, a: EventId, b: EventId) -> bool {
+        if a == b {
+            return false;
+        }
+
+        // 캐시 확인
+        if let Some(&result) = self.cache.get(&(a, b)) {
+            return result;
+        }
+
+        // BFS로 경로 탐색
+        let result = self.find_path(a, b);
+        self.cache.insert((a, b), result);
+        result
+    }
+
+    fn find_path(&self, start: EventId, target: EventId) -> bool {
+        let mut queue = vec![start];
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(current) = queue.pop() {
+            if current == target {
+                return true;
+            }
+
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.insert(current);
+
+            // 현재 노드에서 나가는 모든 에지 찾기
+            for edge in &self.edges {
+                if edge.before == current {
+                    queue.push(edge.after);
+                }
+            }
+        }
+
+        false
+    }
+
+    /// 같은 변수에 대한 모든 접근을 가져옵니다.
+    pub fn accesses_to_variable(&self, variable: &str) -> Vec<&MemoryEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.variable == variable)
+            .collect()
+    }
+
+    /// 두 이벤트 간의 경로를 찾습니다.
+    pub fn find_path_between(&self, a: EventId, b: EventId) -> Option<Vec<SynchronizationReason>> {
+        self.find_path_recursive(a, b, &mut std::collections::HashSet::new())
+    }
+
+    fn find_path_recursive(
+        &self,
+        current: EventId,
+        target: EventId,
+        visited: &mut std::collections::HashSet<EventId>,
+    ) -> Option<Vec<SynchronizationReason>> {
+        if current == target {
+            return Some(Vec::new());
+        }
+
+        if visited.contains(&current) {
+            return None;
+        }
+        visited.insert(current);
+
+        for edge in &self.edges {
+            if edge.before == current {
+                if let Some(mut path) = self.find_path_recursive(edge.after, target, visited) {
+                    path.insert(0, edge.reason);
+                    return Some(path);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// 모든 에지를 반환합니다.
+    pub fn edges(&self) -> &[HappensBeforeEdge] {
+        &self.edges
+    }
+
+    /// 모든 이벤트를 반환합니다.
+    pub fn events(&self) -> &[MemoryEvent] {
+        &self.events
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_id_creation() {
+        let eid = EventId::new(1, 5);
+        assert_eq!(eid.thread_id(), 1);
+        assert_eq!(eid.event_index(), 5);
+    }
+
+    #[test]
+    fn test_access_type_read_write() {
+        assert!(AccessType::Read.eq(&AccessType::Read));
+        assert!(!AccessType::Read.eq(&AccessType::Write));
+    }
+
+    #[test]
+    fn test_memory_event_creation() {
+        let eid = EventId::new(1, 0);
+        let event = MemoryEvent::new(eid, "x".to_string(), AccessType::Write, 0);
+
+        assert_eq!(event.id(), eid);
+        assert_eq!(event.variable(), "x");
+        assert!(event.is_write());
+        assert!(!event.is_read());
+    }
+
+    #[test]
+    fn test_memory_event_atomic() {
+        let eid = EventId::new(1, 0);
+        let event = MemoryEvent::new(eid, "x".to_string(), AccessType::AtomicLoad(Ordering::SeqCst), 0);
+
+        assert!(event.is_atomic());
+        assert!(event.is_read());
+    }
+
+    #[test]
+    fn test_memory_event_synchronization() {
+        let eid = EventId::new(1, 0);
+        let event = MemoryEvent::new(eid, "x".to_string(), AccessType::Acquire, 0);
+
+        assert!(event.is_synchronization());
+        assert!(event.is_write());  // Release이므로
+    }
+
+    #[test]
+    fn test_happens_before_edge() {
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+        let edge = HappensBeforeEdge::new(e1, e2, SynchronizationReason::ProgramOrder);
+
+        assert_eq!(edge.before(), e1);
+        assert_eq!(edge.after(), e2);
+        assert_eq!(edge.reason(), SynchronizationReason::ProgramOrder);
+    }
+
+    #[test]
+    fn test_analyzer_new() {
+        let analyzer = HappensBeforeAnalyzer::new();
+        assert_eq!(analyzer.events().len(), 0);
+        assert_eq!(analyzer.edges().len(), 0);
+    }
+
+    #[test]
+    fn test_analyzer_add_event() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+        let eid = EventId::new(1, 0);
+        let event = MemoryEvent::new(eid, "x".to_string(), AccessType::Write, 0);
+
+        analyzer.add_event(event);
+        assert_eq!(analyzer.events().len(), 1);
+    }
+
+    #[test]
+    fn test_analyzer_direct_happens_before() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+
+        analyzer.add_edge(HappensBeforeEdge::new(e1, e2, SynchronizationReason::ProgramOrder));
+
+        assert!(analyzer.happens_before(e1, e2));
+        assert!(!analyzer.happens_before(e2, e1));
+    }
+
+    #[test]
+    fn test_analyzer_transitive_happens_before() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+        let e3 = EventId::new(1, 2);
+
+        analyzer.add_edge(HappensBeforeEdge::new(e1, e2, SynchronizationReason::ProgramOrder));
+        analyzer.add_edge(HappensBeforeEdge::new(e2, e3, SynchronizationReason::ProgramOrder));
+
+        // 이행성: e1 → e2 → e3 ⟹ e1 → e3
+        assert!(analyzer.happens_before(e1, e2));
+        assert!(analyzer.happens_before(e2, e3));
+        assert!(analyzer.happens_before(e1, e3));
+    }
+
+    #[test]
+    fn test_analyzer_program_order() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+
+        // Thread 1: e1, e2, e3
+        for i in 0..3 {
+            let eid = EventId::new(1, i);
+            let event = MemoryEvent::new(eid, "x".to_string(), AccessType::Read, i as u64);
+            analyzer.add_event(event);
+        }
+
+        analyzer.add_program_order(1);
+
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+        let e3 = EventId::new(1, 2);
+
+        assert!(analyzer.happens_before(e1, e2));
+        assert!(analyzer.happens_before(e2, e3));
+        assert!(analyzer.happens_before(e1, e3));
+    }
+
+    #[test]
+    fn test_analyzer_release_acquire() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+
+        let release = EventId::new(1, 0);
+        let acquire = EventId::new(2, 0);
+
+        analyzer.add_release_acquire_sync(release, acquire);
+
+        assert!(analyzer.happens_before(release, acquire));
+    }
+
+    #[test]
+    fn test_analyzer_accesses_to_variable() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+        let e3 = EventId::new(2, 0);
+
+        analyzer.add_event(MemoryEvent::new(e1, "x".to_string(), AccessType::Write, 0));
+        analyzer.add_event(MemoryEvent::new(e2, "y".to_string(), AccessType::Read, 1));
+        analyzer.add_event(MemoryEvent::new(e3, "x".to_string(), AccessType::Read, 2));
+
+        let x_accesses = analyzer.accesses_to_variable("x");
+        assert_eq!(x_accesses.len(), 2);
+
+        let y_accesses = analyzer.accesses_to_variable("y");
+        assert_eq!(y_accesses.len(), 1);
+    }
+
+    #[test]
+    fn test_analyzer_cache() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+
+        analyzer.add_edge(HappensBeforeEdge::new(e1, e2, SynchronizationReason::ProgramOrder));
+
+        // 첫 번째 호출: 계산
+        assert!(analyzer.happens_before(e1, e2));
+        // 두 번째 호출: 캐시에서 (검증 어려움, 성능 개선만 확인)
+        assert!(analyzer.happens_before(e1, e2));
+    }
+
+    #[test]
+    fn test_analyzer_find_path() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(1, 1);
+        let e3 = EventId::new(1, 2);
+
+        analyzer.add_edge(HappensBeforeEdge::new(e1, e2, SynchronizationReason::ProgramOrder));
+        analyzer.add_edge(HappensBeforeEdge::new(e2, e3, SynchronizationReason::ReleaseAcquire));
+
+        let path = analyzer.find_path_between(e1, e3);
+        assert!(path.is_some());
+
+        let path = path.unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0], SynchronizationReason::ProgramOrder);
+        assert_eq!(path[1], SynchronizationReason::ReleaseAcquire);
+    }
+
+    #[test]
+    fn test_analyzer_no_path() {
+        let mut analyzer = HappensBeforeAnalyzer::new();
+        let e1 = EventId::new(1, 0);
+        let e2 = EventId::new(2, 0);
+
+        let path = analyzer.find_path_between(e1, e2);
+        assert!(path.is_none());
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// Happens-Before 분석 구현:
+// ✅ EventId: 스레드 내 이벤트 ID
+// ✅ AccessType: 읽기/쓰기/원자적/동기화
+// ✅ MemoryEvent: 메모리 연산 이벤트
+// ✅ SynchronizationReason: 동기화 이유 (6가지)
+// ✅ HappensBeforeEdge: A→B 관계
+// ✅ HappensBeforeAnalyzer
+//   - add_event() / add_edge()
+//   - add_program_order() (자동)
+//   - add_release_acquire_sync()
+//   - happens_before() (이행성 + 캐시)
+//   - find_path_between()
+// ✅ 16개 테스트
+//
+// 다음: race_detector.fl (Race condition 감지)

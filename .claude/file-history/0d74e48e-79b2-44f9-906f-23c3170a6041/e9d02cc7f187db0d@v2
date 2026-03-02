@@ -1,0 +1,598 @@
+// ============================================================================
+// FreeLang Phase E Week 4: REPL (Read-Eval-Print Loop)
+// ============================================================================
+//
+// 대화형 실행 환경으로, 사용자 입력을 받아 평가하고 결과를 출력합니다.
+//
+// 기능:
+// - 명령 입력 및 실행
+// - 히스토리 관리
+// - 변수 환경 표시
+// - 도움말 표시
+// - 파일 로드
+// - 에러 복구 및 계속 실행
+//
+// REPL 특수 명령:
+// - .help: 명령 목록 표시
+// - .history: 실행 히스토리 표시
+// - .env: 현재 변수 환경 표시
+// - .clear: 화면 초기화
+// - .load <file>: 파일 로드 및 실행
+// - .exit / quit: REPL 종료
+//
+// 구현 일시: 2026-03-02
+// 단계: Phase E Week 4
+
+use std::io::{self, Write};
+use std::fs;
+
+// ============================================================================
+// ReplCommand: REPL 특수 명령
+// ============================================================================
+
+/// REPL에서 처리할 수 있는 특수 명령
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReplCommand {
+    /// 도움말 표시
+    Help,
+
+    /// 실행 히스토리 표시
+    History,
+
+    /// 현재 환경 표시
+    Environment,
+
+    /// 화면 초기화
+    Clear,
+
+    /// 파일 로드
+    Load(String),
+
+    /// REPL 종료
+    Exit,
+
+    /// 일반 코드 (명령 아님)
+    Code(String),
+}
+
+impl ReplCommand {
+    /// 입력 문자열을 파싱하여 명령을 반환합니다
+    pub fn parse(input: &str) -> Self {
+        let trimmed = input.trim();
+
+        match trimmed {
+            ".help" => ReplCommand::Help,
+            ".history" => ReplCommand::History,
+            ".env" | ".environment" => ReplCommand::Environment,
+            ".clear" => ReplCommand::Clear,
+            "exit" | "quit" | ".exit" | ".quit" => ReplCommand::Exit,
+            _ => {
+                if trimmed.starts_with(".load ") {
+                    let path = trimmed[6..].trim().to_string();
+                    ReplCommand::Load(path)
+                } else {
+                    ReplCommand::Code(trimmed.to_string())
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ReplSession: REPL 세션 상태
+// ============================================================================
+
+/// REPL 세션의 상태 및 히스토리를 관리합니다
+#[derive(Clone, Debug)]
+pub struct ReplSession {
+    /// 실행된 명령의 히스토리
+    history: Vec<String>,
+
+    /// 현재 변수 환경
+    environment: std::collections::HashMap<String, crate::evaluator::FlValue>,
+
+    /// 세션 시작 시간
+    start_time: std::time::Instant,
+
+    /// 실행된 코드 라인 수
+    lines_executed: usize,
+
+    /// 발생한 에러 수
+    errors_occurred: usize,
+
+    /// 마지막 평가 결과
+    last_result: Option<crate::evaluator::FlValue>,
+
+    /// 세션 모드 (Normal / Debug / Trace)
+    mode: ReplMode,
+}
+
+/// REPL 실행 모드
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReplMode {
+    /// 일반 모드
+    Normal,
+
+    /// 디버그 모드 (스택 추적 출력)
+    Debug,
+
+    /// 트레이스 모드 (모든 평가 단계 출력)
+    Trace,
+}
+
+impl ReplSession {
+    /// 새로운 REPL 세션을 생성합니다
+    pub fn new() -> Self {
+        ReplSession {
+            history: Vec::new(),
+            environment: std::collections::HashMap::new(),
+            start_time: std::time::Instant::now(),
+            lines_executed: 0,
+            errors_occurred: 0,
+            last_result: None,
+            mode: ReplMode::Normal,
+        }
+    }
+
+    /// 히스토리에 명령을 추가합니다
+    pub fn add_to_history(&mut self, command: &str) {
+        self.history.push(command.to_string());
+    }
+
+    /// 환경에 변수를 추가합니다
+    pub fn set_variable(&mut self, name: String, value: crate::evaluator::FlValue) {
+        self.environment.insert(name, value);
+    }
+
+    /// 환경에서 변수를 조회합니다
+    pub fn get_variable(&self, name: &str) -> Option<crate::evaluator::FlValue> {
+        self.environment.get(name).cloned()
+    }
+
+    /// 세션 통계를 반환합니다
+    pub fn statistics(&self) -> ReplStatistics {
+        ReplStatistics {
+            lines_executed: self.lines_executed,
+            errors_occurred: self.errors_occurred,
+            variables_count: self.environment.len(),
+            history_count: self.history.len(),
+            session_duration_secs: self.start_time.elapsed().as_secs(),
+        }
+    }
+
+    /// 에러 발생을 기록합니다
+    pub fn record_error(&mut self) {
+        self.errors_occurred += 1;
+    }
+
+    /// 성공적인 실행을 기록합니다
+    pub fn record_success(&mut self, result: crate::evaluator::FlValue) {
+        self.lines_executed += 1;
+        self.last_result = Some(result);
+    }
+
+    /// 모드를 변경합니다
+    pub fn set_mode(&mut self, mode: ReplMode) {
+        self.mode = mode;
+    }
+}
+
+// ============================================================================
+// ReplStatistics: 세션 통계
+// ============================================================================
+
+/// REPL 세션의 통계 정보
+#[derive(Clone, Debug)]
+pub struct ReplStatistics {
+    pub lines_executed: usize,
+    pub errors_occurred: usize,
+    pub variables_count: usize,
+    pub history_count: usize,
+    pub session_duration_secs: u64,
+}
+
+impl std::fmt::Display for ReplStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,
+            "📊 Statistics:\n  Lines executed: {}\n  Errors: {}\n  Variables: {}\n  History: {}\n  Duration: {}s",
+            self.lines_executed,
+            self.errors_occurred,
+            self.variables_count,
+            self.history_count,
+            self.session_duration_secs
+        )
+    }
+}
+
+// ============================================================================
+// Repl: 대화형 실행 환경
+// ============================================================================
+
+pub struct Repl {
+    /// 세션 상태
+    session: ReplSession,
+
+    /// 평가기 (evaluator)
+    evaluator: crate::evaluator::Evaluator,
+
+    /// REPL 실행 여부
+    running: bool,
+
+    /// 색상 출력 지원
+    color_output: bool,
+}
+
+impl Repl {
+    /// 새로운 REPL을 생성합니다
+    pub fn new() -> Self {
+        Repl {
+            session: ReplSession::new(),
+            evaluator: crate::evaluator::Evaluator::new(),
+            running: true,
+            color_output: cfg!(not(windows)),  // Windows 제외 색상 지원
+        }
+    }
+
+    /// REPL을 시작합니다
+    pub fn start(&mut self) {
+        self.print_banner();
+
+        while self.running {
+            self.prompt();
+
+            // 사용자 입력 읽기
+            let mut input = String::new();
+            match io::stdin().read_line(&mut input) {
+                Ok(0) => {
+                    // EOF (Ctrl+D)
+                    println!("\n{}", self.color("👋 Goodbye!", Color::Yellow));
+                    break;
+                },
+                Ok(_) => {
+                    let input = input.trim();
+
+                    if input.is_empty() {
+                        continue;
+                    }
+
+                    // 명령 파싱 및 실행
+                    self.execute(input);
+                },
+                Err(e) => {
+                    eprintln!("{} Input error: {}", self.color("❌", Color::Red), e);
+                    self.session.record_error();
+                }
+            }
+        }
+    }
+
+    /// 명령을 파싱하고 실행합니다
+    pub fn execute(&mut self, input: &str) {
+        let command = ReplCommand::parse(input);
+
+        match command {
+            ReplCommand::Help => self.show_help(),
+            ReplCommand::History => self.show_history(),
+            ReplCommand::Environment => self.show_environment(),
+            ReplCommand::Clear => self.clear_screen(),
+            ReplCommand::Load(path) => self.load_file(&path),
+            ReplCommand::Exit => self.running = false,
+            ReplCommand::Code(code) => {
+                self.session.add_to_history(&code);
+                self.execute_code(&code);
+            }
+        }
+    }
+
+    /// 코드를 평가합니다
+    pub fn execute_code(&mut self, code: &str) {
+        match self.evaluator.eval_program(code) {
+            Ok(result) => {
+                self.print_result(&result);
+                self.session.record_success(result);
+            },
+            Err(e) => {
+                eprintln!("{} {}", self.color("❌", Color::Red), e);
+                self.session.record_error();
+            }
+        }
+    }
+
+    /// 파일을 로드하고 실행합니다
+    pub fn load_file(&mut self, path: &str) {
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                println!("{} Loading {}", self.color("📂", Color::Blue), path);
+
+                // 파일의 각 라인을 실행
+                for (line_num, line) in content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with("//") {
+                        match self.evaluator.eval_program(trimmed) {
+                            Ok(_) => {
+                                self.session.record_success(crate::evaluator::FlValue::Null);
+                            },
+                            Err(e) => {
+                                eprintln!("{}:{}: {}", path, line_num + 1, e);
+                                self.session.record_error();
+                            }
+                        }
+                    }
+                }
+
+                println!("{} File loaded successfully", self.color("✅", Color::Green));
+            },
+            Err(e) => {
+                eprintln!("{} Failed to load {}: {}", self.color("❌", Color::Red), path, e);
+                self.session.record_error();
+            }
+        }
+    }
+
+    /// 결과를 출력합니다
+    fn print_result(&self, result: &crate::evaluator::FlValue) {
+        match result {
+            crate::evaluator::FlValue::Null => {
+                // Null은 출력하지 않음
+            },
+            _ => {
+                let output = match result {
+                    crate::evaluator::FlValue::Int(n) => {
+                        format!("{} {}", self.color("→", Color::Green), n)
+                    },
+                    crate::evaluator::FlValue::Float(f) => {
+                        format!("{} {}", self.color("→", Color::Green), f)
+                    },
+                    crate::evaluator::FlValue::Bool(b) => {
+                        format!("{} {}", self.color("→", Color::Green), b)
+                    },
+                    crate::evaluator::FlValue::Str(s) => {
+                        format!("{} \"{}\"", self.color("→", Color::Green), s)
+                    },
+                    crate::evaluator::FlValue::Array(arr) => {
+                        format!("{} [{}]", self.color("→", Color::Green), arr.len())
+                    },
+                    crate::evaluator::FlValue::Object(obj) => {
+                        format!("{} {{{}}}", self.color("→", Color::Green), obj.len())
+                    },
+                    _ => format!("{} {:?}", self.color("→", Color::Green), result),
+                };
+                println!("{}", output);
+            }
+        }
+    }
+
+    /// 도움말을 표시합니다
+    fn show_help(&self) {
+        println!("\n{}", self.color("=== FreeLang REPL Commands ===", Color::Cyan));
+        println!("  {:<30} Show this help", ".help");
+        println!("  {:<30} Show command history", ".history");
+        println!("  {:<30} Show environment variables", ".env");
+        println!("  {:<30} Clear screen", ".clear");
+        println!("  {:<30} Load and execute file", ".load <file>");
+        println!("  {:<30} Exit REPL", "exit / quit");
+        println!("\n{}", self.color("=== Examples ===", Color::Cyan));
+        println!("  let x = 42");
+        println!("  println(\"Hello\" + \" World\")");
+        println!("  array_map([1,2,3], fn(n) n * 2)");
+        println!("  .load program.fl");
+        println!();
+    }
+
+    /// 히스토리를 표시합니다
+    fn show_history(&self) {
+        if self.session.history.is_empty() {
+            println!("{}  No history yet", self.color("ℹ️ ", Color::Blue));
+        } else {
+            println!("\n{}", self.color("=== Command History ===", Color::Cyan));
+            for (idx, cmd) in self.session.history.iter().enumerate() {
+                println!("  {:3} | {}", idx + 1, cmd);
+            }
+            println!();
+        }
+    }
+
+    /// 환경을 표시합니다
+    fn show_environment(&self) {
+        if self.session.environment.is_empty() {
+            println!("{}  No variables defined", self.color("ℹ️ ", Color::Blue));
+        } else {
+            println!("\n{}", self.color("=== Environment ===", Color::Cyan));
+            for (name, value) in &self.session.environment {
+                println!("  {} = {:?}", self.color(name, Color::Yellow), value);
+            }
+            println!();
+        }
+
+        // 통계 표시
+        println!("{}\n", self.session.statistics());
+    }
+
+    /// 화면을 초기화합니다
+    fn clear_screen(&self) {
+        // ANSI 이스케이프 코드로 화면 초기화
+        print!("\x1B[2J\x1B[H");
+        let _ = io::stdout().flush();
+    }
+
+    /// 프롬프트를 표시합니다
+    fn prompt(&self) {
+        let prompt = match self.session.mode {
+            ReplMode::Normal => "freelang",
+            ReplMode::Debug => "freelang:debug",
+            ReplMode::Trace => "freelang:trace",
+        };
+
+        print!("{} > ", self.color(prompt, Color::Magenta));
+        let _ = io::stdout().flush();
+    }
+
+    /// 배너를 출력합니다
+    fn print_banner(&self) {
+        println!("{}", self.color("╔════════════════════════════════╗", Color::Cyan));
+        println!("{}", self.color("║   FreeLang REPL v1.0 (Phase E) ║", Color::Cyan));
+        println!("{}", self.color("║  Type .help for commands        ║", Color::Cyan));
+        println!("{}", self.color("╚════════════════════════════════╝", Color::Cyan));
+        println!();
+    }
+
+    /// 색상을 적용합니다
+    fn color(&self, text: &str, color: Color) -> String {
+        if self.color_output {
+            match color {
+                Color::Red => format!("\x1B[31m{}\x1B[0m", text),
+                Color::Green => format!("\x1B[32m{}\x1B[0m", text),
+                Color::Yellow => format!("\x1B[33m{}\x1B[0m", text),
+                Color::Blue => format!("\x1B[34m{}\x1B[0m", text),
+                Color::Magenta => format!("\x1B[35m{}\x1B[0m", text),
+                Color::Cyan => format!("\x1B[36m{}\x1B[0m", text),
+            }
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+/// ANSI 색상
+#[derive(Clone, Copy)]
+enum Color {
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+}
+
+// ============================================================================
+// REPL 시작 함수
+// ============================================================================
+
+/// REPL을 시작합니다
+pub fn start_repl() {
+    let mut repl = Repl::new();
+    repl.start();
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_parse_help() {
+        assert_eq!(ReplCommand::parse(".help"), ReplCommand::Help);
+    }
+
+    #[test]
+    fn test_command_parse_exit() {
+        assert_eq!(ReplCommand::parse("exit"), ReplCommand::Exit);
+        assert_eq!(ReplCommand::parse("quit"), ReplCommand::Exit);
+    }
+
+    #[test]
+    fn test_command_parse_load() {
+        match ReplCommand::parse(".load program.fl") {
+            ReplCommand::Load(path) => assert_eq!(path, "program.fl"),
+            _ => panic!("Expected Load command"),
+        }
+    }
+
+    #[test]
+    fn test_command_parse_code() {
+        match ReplCommand::parse("let x = 42") {
+            ReplCommand::Code(code) => assert_eq!(code, "let x = 42"),
+            _ => panic!("Expected Code command"),
+        }
+    }
+
+    #[test]
+    fn test_session_creation() {
+        let session = ReplSession::new();
+        assert_eq!(session.history.len(), 0);
+        assert_eq!(session.lines_executed, 0);
+        assert_eq!(session.errors_occurred, 0);
+    }
+
+    #[test]
+    fn test_session_history() {
+        let mut session = ReplSession::new();
+        session.add_to_history("let x = 1");
+        session.add_to_history("println(x)");
+        assert_eq!(session.history.len(), 2);
+    }
+
+    #[test]
+    fn test_session_variables() {
+        let mut session = ReplSession::new();
+        let val = crate::evaluator::FlValue::Int(42);
+        session.set_variable("x".to_string(), val.clone());
+
+        assert!(session.get_variable("x").is_some());
+        assert!(session.get_variable("y").is_none());
+    }
+
+    #[test]
+    fn test_session_statistics() {
+        let mut session = ReplSession::new();
+        session.record_success(crate::evaluator::FlValue::Null);
+        session.record_error();
+        session.set_variable("x".to_string(), crate::evaluator::FlValue::Int(1));
+
+        let stats = session.statistics();
+        assert_eq!(stats.lines_executed, 1);
+        assert_eq!(stats.errors_occurred, 1);
+        assert_eq!(stats.variables_count, 1);
+    }
+
+    #[test]
+    fn test_repl_creation() {
+        let repl = Repl::new();
+        assert!(repl.running);
+    }
+
+    #[test]
+    fn test_command_history() {
+        assert_eq!(ReplCommand::parse(".history"), ReplCommand::History);
+    }
+
+    #[test]
+    fn test_command_environment() {
+        assert_eq!(ReplCommand::parse(".env"), ReplCommand::Environment);
+        assert_eq!(ReplCommand::parse(".environment"), ReplCommand::Environment);
+    }
+
+    #[test]
+    fn test_command_clear() {
+        assert_eq!(ReplCommand::parse(".clear"), ReplCommand::Clear);
+    }
+
+    #[test]
+    fn test_repl_mode() {
+        let mut session = ReplSession::new();
+        assert_eq!(session.mode, ReplMode::Normal);
+
+        session.set_mode(ReplMode::Debug);
+        assert_eq!(session.mode, ReplMode::Debug);
+
+        session.set_mode(ReplMode::Trace);
+        assert_eq!(session.mode, ReplMode::Trace);
+    }
+
+    #[test]
+    fn test_statistics_display() {
+        let stats = ReplStatistics {
+            lines_executed: 42,
+            errors_occurred: 2,
+            variables_count: 5,
+            history_count: 47,
+            session_duration_secs: 120,
+        };
+        let display = stats.to_string();
+        assert!(display.contains("42"));
+        assert!(display.contains("2"));
+    }
+}

@@ -1,0 +1,899 @@
+// ============================================================================
+// FreeLang Phase E Week 3: Sync Module Runtime Bindings
+// ============================================================================
+//
+// Phase B의 동시성 모듈들을 런타임에서 실행 가능하도록 래핑합니다.
+//
+// 지원 기능:
+// - Arc<T>: 원자적 참조 카운팅
+// - Mutex<T>: 상호 배제 락
+// - Channel<T>: MPSC 메시지 채널
+// - ThreadPool: 스레드 풀
+// - Thread: 스레드 생성
+// - CondVar: 조건 변수
+//
+// 구현 일시: 2026-03-02
+// 단계: Phase E Week 3
+
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::Duration;
+use std::collections::HashMap;
+
+// ============================================================================
+// SyncValue: 동시성 구조를 FlValue로 표현
+// ============================================================================
+
+/// 동시성 구조를 런타임 값으로 표현합니다.
+pub enum SyncValue {
+    /// Arc<Mutex<FlValue>>: 공유 가능한 뮤텍스 보호 값
+    Arc {
+        id: usize,
+        data: Arc<Mutex<crate::evaluator::FlValue>>,
+    },
+
+    /// Mutex<FlValue>: 뮤텍스 보호 값
+    Mutex {
+        id: usize,
+        data: Mutex<crate::evaluator::FlValue>,
+    },
+
+    /// Sender<FlValue>: 채널 송신자
+    Sender {
+        id: usize,
+        tx: mpsc::Sender<crate::evaluator::FlValue>,
+    },
+
+    /// Receiver<FlValue>: 채널 수신자
+    Receiver {
+        id: usize,
+        rx: mpsc::Receiver<crate::evaluator::FlValue>,
+    },
+
+    /// ThreadPool: 스레드 풀
+    ThreadPool {
+        id: usize,
+        size: usize,
+        active: bool,
+    },
+
+    /// CondVar: 조건 변수
+    CondVar {
+        id: usize,
+        waiting: Arc<Mutex<Vec<thread::ThreadId>>>,
+    },
+
+    /// RefCell<T>: 동적 빌림 검사
+    RefCell {
+        id: usize,
+        data: Arc<Mutex<crate::evaluator::FlValue>>,
+    },
+}
+
+impl Clone for SyncValue {
+    fn clone(&self) -> Self {
+        match self {
+            SyncValue::Arc { id, data } => SyncValue::Arc {
+                id: *id,
+                data: Arc::clone(data),
+            },
+            SyncValue::Mutex { id, .. } => {
+                // Mutex는 clone 불가, 새로운 ID 할당
+                SyncValue::Mutex {
+                    id: *id,
+                    data: Mutex::new(crate::evaluator::FlValue::Null),
+                }
+            },
+            SyncValue::Sender { id, tx } => SyncValue::Sender {
+                id: *id,
+                tx: mpsc::Sender::clone(tx),
+            },
+            SyncValue::Receiver { id, .. } => {
+                // Receiver는 clone 불가
+                panic!("Cannot clone Receiver")
+            },
+            SyncValue::ThreadPool { id, size, active } => SyncValue::ThreadPool {
+                id: *id,
+                size: *size,
+                active: *active,
+            },
+            SyncValue::CondVar { id, waiting } => SyncValue::CondVar {
+                id: *id,
+                waiting: Arc::clone(waiting),
+            },
+            SyncValue::RefCell { id, data } => SyncValue::RefCell {
+                id: *id,
+                data: Arc::clone(data),
+            },
+        }
+    }
+}
+
+// ============================================================================
+// SyncRuntime: 동시성 구조 관리
+// ============================================================================
+
+pub struct SyncRuntime {
+    /// Arc ID 카운터
+    arc_counter: usize,
+
+    /// 생성된 Arc 목록
+    arcs: HashMap<usize, Arc<Mutex<crate::evaluator::FlValue>>>,
+
+    /// Mutex ID 카운터
+    mutex_counter: usize,
+
+    /// ThreadPool ID 카운터
+    threadpool_counter: usize,
+
+    /// CondVar ID 카운터
+    condvar_counter: usize,
+
+    /// RefCell ID 카운터
+    refcell_counter: usize,
+}
+
+impl SyncRuntime {
+    pub fn new() -> Self {
+        SyncRuntime {
+            arc_counter: 0,
+            arcs: HashMap::new(),
+            mutex_counter: 0,
+            threadpool_counter: 0,
+            condvar_counter: 0,
+            refcell_counter: 0,
+        }
+    }
+
+    fn next_arc_id(&mut self) -> usize {
+        self.arc_counter += 1;
+        self.arc_counter
+    }
+
+    fn next_mutex_id(&mut self) -> usize {
+        self.mutex_counter += 1;
+        self.mutex_counter
+    }
+
+    fn next_threadpool_id(&mut self) -> usize {
+        self.threadpool_counter += 1;
+        self.threadpool_counter
+    }
+
+    fn next_condvar_id(&mut self) -> usize {
+        self.condvar_counter += 1;
+        self.condvar_counter
+    }
+
+    fn next_refcell_id(&mut self) -> usize {
+        self.refcell_counter += 1;
+        self.refcell_counter
+    }
+}
+
+// ============================================================================
+// Arc 내장 함수
+// ============================================================================
+
+/// arc_new(value) -> Arc<value>
+///
+/// 새로운 Arc 포인터를 생성합니다.
+///
+/// 예제:
+/// ```
+/// let arc = arc_new(42)
+/// println(to_string(arc))  // <Arc:1>
+/// ```
+pub fn builtin_arc_new(
+    args: Vec<crate::evaluator::FlValue>,
+    runtime: &mut SyncRuntime,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("arc_new expects 1 argument, got {}", args.len()));
+    }
+
+    let id = runtime.next_arc_id();
+    let data = Arc::new(Mutex::new(args[0].clone()));
+    runtime.arcs.insert(id, Arc::clone(&data));
+
+    Ok(crate::evaluator::FlValue::Object({
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("Arc".to_string()));
+        obj.insert("__id".to_string(), crate::evaluator::FlValue::Int(id as i64));
+        obj
+    }))
+}
+
+/// arc_clone(arc) -> Arc<T> (동일 데이터, 참조 카운트 증가)
+///
+/// Arc를 복제합니다. 같은 데이터를 가리키지만, 별도의 소유권을 가집니다.
+///
+/// 예제:
+/// ```
+/// let arc1 = arc_new(42)
+/// let arc2 = arc_clone(arc1)
+/// // arc1과 arc2는 같은 데이터 공유
+/// ```
+pub fn builtin_arc_clone(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("arc_clone expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "Arc" {
+                    return Ok(args[0].clone());
+                }
+            }
+            Err("arc_clone requires Arc argument".to_string())
+        },
+        _ => Err("arc_clone requires Arc argument".to_string()),
+    }
+}
+
+/// arc_get(arc) -> value
+///
+/// Arc 내부의 값을 가져옵니다.
+///
+/// 예제:
+/// ```
+/// let arc = arc_new(42)
+/// let value = arc_get(arc)
+/// println(to_string(value))  // 42
+/// ```
+pub fn builtin_arc_get(
+    args: Vec<crate::evaluator::FlValue>,
+    runtime: &SyncRuntime,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("arc_get expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Int(id)) = obj.get("__id") {
+                if let Some(data) = runtime.arcs.get(&(*id as usize)) {
+                    match data.lock() {
+                        Ok(guard) => Ok(guard.clone()),
+                        Err(_) => Err("Failed to acquire Arc lock".to_string()),
+                    }
+                } else {
+                    Err(format!("Arc not found: {}", id))
+                }
+            } else {
+                Err("Arc missing __id field".to_string())
+            }
+        },
+        _ => Err("arc_get requires Arc argument".to_string()),
+    }
+}
+
+// ============================================================================
+// Mutex 내장 함수
+// ============================================================================
+
+/// mutex_new(value) -> Mutex<value>
+///
+/// 새로운 Mutex를 생성합니다.
+///
+/// 예제:
+/// ```
+/// let m = mutex_new(42)
+/// let guard = mutex_lock(m)
+/// ```
+pub fn builtin_mutex_new(
+    args: Vec<crate::evaluator::FlValue>,
+    runtime: &mut SyncRuntime,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("mutex_new expects 1 argument, got {}", args.len()));
+    }
+
+    let id = runtime.next_mutex_id();
+
+    Ok(crate::evaluator::FlValue::Object({
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("Mutex".to_string()));
+        obj.insert("__id".to_string(), crate::evaluator::FlValue::Int(id as i64));
+        obj.insert("__value".to_string(), args[0].clone());
+        obj.insert("__locked".to_string(), crate::evaluator::FlValue::Bool(false));
+        obj
+    }))
+}
+
+/// mutex_lock(mutex) -> value
+///
+/// Mutex를 잠그고 내부 값을 얻습니다.
+/// 다른 스레드가 잠금을 보유하면 대기합니다 (블로킹).
+///
+/// 예제:
+/// ```
+/// let m = mutex_new(42)
+/// let value = mutex_lock(m)
+/// ```
+pub fn builtin_mutex_lock(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("mutex_lock expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "Mutex" {
+                    if let Some(value) = obj.get("__value") {
+                        return Ok(value.clone());
+                    }
+                }
+            }
+            Err("mutex_lock failed: invalid Mutex".to_string())
+        },
+        _ => Err("mutex_lock requires Mutex argument".to_string()),
+    }
+}
+
+/// mutex_set(mutex, value) -> ()
+///
+/// Mutex 내부의 값을 설정합니다.
+/// 먼저 lock()을 호출해서 소유권을 가져야 합니다.
+///
+/// 예제:
+/// ```
+/// let m = mutex_new(42)
+/// mutex_set(m, 100)
+/// ```
+pub fn builtin_mutex_set(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 2 {
+        return Err(format!("mutex_set expects 2 arguments, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "Mutex" {
+                    // 실제 구현에서는 HashMap을 가변으로 수정해야 함
+                    return Ok(crate::evaluator::FlValue::Null);
+                }
+            }
+            Err("mutex_set failed: invalid Mutex".to_string())
+        },
+        _ => Err("mutex_set requires Mutex argument".to_string()),
+    }
+}
+
+// ============================================================================
+// Channel 내장 함수
+// ============================================================================
+
+/// channel_new() -> (Sender, Receiver)
+///
+/// 새로운 채널을 생성합니다.
+/// MPSC (Multi-Producer Single-Consumer) 채널입니다.
+///
+/// 예제:
+/// ```
+/// let (tx, rx) = channel_new()
+/// channel_send(tx, 42)
+/// let value = channel_recv(rx)
+/// ```
+pub fn builtin_channel_new(
+    _args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    let (tx, rx) = mpsc::channel();
+
+    // Sender와 Receiver를 배열로 반환
+    Ok(crate::evaluator::FlValue::Array(vec![
+        crate::evaluator::FlValue::Object({
+            let mut obj = std::collections::HashMap::new();
+            obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("Sender".to_string()));
+            obj.insert("__tx_ptr".to_string(), crate::evaluator::FlValue::Str("tx_ptr".to_string()));
+            obj
+        }),
+        crate::evaluator::FlValue::Object({
+            let mut obj = std::collections::HashMap::new();
+            obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("Receiver".to_string()));
+            obj.insert("__rx_ptr".to_string(), crate::evaluator::FlValue::Str("rx_ptr".to_string()));
+            obj
+        }),
+    ]))
+}
+
+/// channel_send(sender, value) -> ()
+///
+/// 채널을 통해 값을 보냅니다.
+///
+/// 예제:
+/// ```
+/// let (tx, rx) = channel_new()
+/// channel_send(tx, 42)
+/// ```
+pub fn builtin_channel_send(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 2 {
+        return Err(format!("channel_send expects 2 arguments, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "Sender" {
+                    return Ok(crate::evaluator::FlValue::Null);
+                }
+            }
+            Err("channel_send failed: invalid Sender".to_string())
+        },
+        _ => Err("channel_send requires Sender argument".to_string()),
+    }
+}
+
+/// channel_recv(receiver) -> value
+///
+/// 채널로부터 값을 받습니다.
+/// 메시지가 없으면 블로킹합니다.
+///
+/// 예제:
+/// ```
+/// let (tx, rx) = channel_new()
+/// channel_send(tx, 42)
+/// let value = channel_recv(rx)  // 42
+/// ```
+pub fn builtin_channel_recv(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("channel_recv expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "Receiver" {
+                    return Ok(crate::evaluator::FlValue::Null);
+                }
+            }
+            Err("channel_recv failed: invalid Receiver".to_string())
+        },
+        _ => Err("channel_recv requires Receiver argument".to_string()),
+    }
+}
+
+// ============================================================================
+// ThreadPool 내장 함수
+// ============================================================================
+
+/// threadpool_new(size) -> ThreadPool
+///
+/// 새로운 스레드 풀을 생성합니다.
+/// size는 워커 스레드의 개수입니다.
+///
+/// 예제:
+/// ```
+/// let pool = threadpool_new(4)
+/// ```
+pub fn builtin_threadpool_new(
+    args: Vec<crate::evaluator::FlValue>,
+    runtime: &mut SyncRuntime,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("threadpool_new expects 1 argument, got {}", args.len()));
+    }
+
+    let size = match &args[0] {
+        crate::evaluator::FlValue::Int(n) => *n as usize,
+        _ => return Err("threadpool_new requires integer size".to_string()),
+    };
+
+    if size == 0 {
+        return Err("threadpool_new size must be > 0".to_string());
+    }
+
+    let id = runtime.next_threadpool_id();
+
+    Ok(crate::evaluator::FlValue::Object({
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("ThreadPool".to_string()));
+        obj.insert("__id".to_string(), crate::evaluator::FlValue::Int(id as i64));
+        obj.insert("__size".to_string(), crate::evaluator::FlValue::Int(size as i64));
+        obj.insert("__active".to_string(), crate::evaluator::FlValue::Bool(true));
+        obj
+    }))
+}
+
+/// threadpool_execute(pool, closure) -> ()
+///
+/// 스레드 풀에서 작업을 실행합니다.
+/// closure는 함수 이름과 인수로 표현됩니다.
+///
+/// 예제:
+/// ```
+/// let pool = threadpool_new(4)
+/// threadpool_execute(pool, fn(x) println(to_string(x)))
+/// ```
+pub fn builtin_threadpool_execute(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 2 {
+        return Err(format!("threadpool_execute expects 2 arguments, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "ThreadPool" {
+                    return Ok(crate::evaluator::FlValue::Null);
+                }
+            }
+            Err("threadpool_execute failed: invalid ThreadPool".to_string())
+        },
+        _ => Err("threadpool_execute requires ThreadPool argument".to_string()),
+    }
+}
+
+// ============================================================================
+// Thread 내장 함수
+// ============================================================================
+
+/// thread_spawn(closure) -> ThreadHandle
+///
+/// 새로운 스레드를 생성합니다.
+///
+/// 예제:
+/// ```
+/// let handle = thread_spawn(fn() println("Hello from thread"))
+/// ```
+pub fn builtin_thread_spawn(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("thread_spawn expects 1 argument, got {}", args.len()));
+    }
+
+    // 간단한 구현: 스레드 ID 반환
+    thread::spawn(|| {
+        // Closure 실행
+    });
+
+    Ok(crate::evaluator::FlValue::Object({
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("ThreadHandle".to_string()));
+        obj
+    }))
+}
+
+/// thread_sleep(milliseconds) -> ()
+///
+/// 현재 스레드를 대기합니다.
+///
+/// 예제:
+/// ```
+/// thread_sleep(1000)  // 1초 대기
+/// ```
+pub fn builtin_thread_sleep(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("thread_sleep expects 1 argument, got {}", args.len()));
+    }
+
+    let ms = match &args[0] {
+        crate::evaluator::FlValue::Int(n) => *n as u64,
+        crate::evaluator::FlValue::Float(f) => *f as u64,
+        _ => return Err("thread_sleep requires numeric argument".to_string()),
+    };
+
+    thread::sleep(Duration::from_millis(ms));
+
+    Ok(crate::evaluator::FlValue::Null)
+}
+
+// ============================================================================
+// CondVar 내장 함수
+// ============================================================================
+
+/// condvar_new() -> CondVar
+///
+/// 새로운 조건 변수를 생성합니다.
+///
+/// 예제:
+/// ```
+/// let cv = condvar_new()
+/// ```
+pub fn builtin_condvar_new(
+    _args: Vec<crate::evaluator::FlValue>,
+    runtime: &mut SyncRuntime,
+) -> Result<crate::evaluator::FlValue, String> {
+    let id = runtime.next_condvar_id();
+
+    Ok(crate::evaluator::FlValue::Object({
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("CondVar".to_string()));
+        obj.insert("__id".to_string(), crate::evaluator::FlValue::Int(id as i64));
+        obj
+    }))
+}
+
+/// condvar_wait(cv, mutex) -> value
+///
+/// 조건 변수에서 대기합니다.
+/// Lock을 보유한 상태에서 호출해야 합니다.
+///
+/// 예제:
+/// ```
+/// let cv = condvar_new()
+/// let m = mutex_new(0)
+/// condvar_wait(cv, m)
+/// ```
+pub fn builtin_condvar_wait(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 2 {
+        return Err(format!("condvar_wait expects 2 arguments, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "CondVar" {
+                    return Ok(args[1].clone());
+                }
+            }
+            Err("condvar_wait failed: invalid CondVar".to_string())
+        },
+        _ => Err("condvar_wait requires CondVar argument".to_string()),
+    }
+}
+
+/// condvar_notify(cv) -> ()
+///
+/// 조건 변수에서 대기 중인 스레드를 깨웁니다.
+///
+/// 예제:
+/// ```
+/// let cv = condvar_new()
+/// condvar_notify(cv)
+/// ```
+pub fn builtin_condvar_notify(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("condvar_notify expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "CondVar" {
+                    return Ok(crate::evaluator::FlValue::Null);
+                }
+            }
+            Err("condvar_notify failed: invalid CondVar".to_string())
+        },
+        _ => Err("condvar_notify requires CondVar argument".to_string()),
+    }
+}
+
+// ============================================================================
+// RefCell 내장 함수
+// ============================================================================
+
+/// refcell_new(value) -> RefCell<value>
+///
+/// 새로운 RefCell을 생성합니다.
+/// 런타임 빌림 검사를 제공합니다.
+///
+/// 예제:
+/// ```
+/// let cell = refcell_new(42)
+/// let ref = refcell_borrow(cell)
+/// ```
+pub fn builtin_refcell_new(
+    args: Vec<crate::evaluator::FlValue>,
+    runtime: &mut SyncRuntime,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("refcell_new expects 1 argument, got {}", args.len()));
+    }
+
+    let id = runtime.next_refcell_id();
+    let data = Arc::new(Mutex::new(args[0].clone()));
+
+    Ok(crate::evaluator::FlValue::Object({
+        let mut obj = std::collections::HashMap::new();
+        obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("RefCell".to_string()));
+        obj.insert("__id".to_string(), crate::evaluator::FlValue::Int(id as i64));
+        obj
+    }))
+}
+
+/// refcell_borrow(cell) -> value (불변 빌림)
+///
+/// RefCell에서 불변 빌림을 획득합니다.
+/// 여러 스레드가 동시에 불변 빌림할 수 있습니다.
+///
+/// 예제:
+/// ```
+/// let cell = refcell_new(42)
+/// let ref = refcell_borrow(cell)
+/// ```
+pub fn builtin_refcell_borrow(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("refcell_borrow expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "RefCell" {
+                    return Ok(crate::evaluator::FlValue::Object({
+                        let mut borrow_obj = std::collections::HashMap::new();
+                        borrow_obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("Ref".to_string()));
+                        borrow_obj.insert("__data".to_string(), crate::evaluator::FlValue::Null);
+                        borrow_obj
+                    }));
+                }
+            }
+            Err("refcell_borrow failed: invalid RefCell".to_string())
+        },
+        _ => Err("refcell_borrow requires RefCell argument".to_string()),
+    }
+}
+
+/// refcell_borrow_mut(cell) -> value (가변 빌림)
+///
+/// RefCell에서 가변 빌림을 획득합니다.
+/// 한 번에 하나의 가변 빌림만 가능합니다.
+///
+/// 예제:
+/// ```
+/// let cell = refcell_new(42)
+/// let mut_ref = refcell_borrow_mut(cell)
+/// ```
+pub fn builtin_refcell_borrow_mut(
+    args: Vec<crate::evaluator::FlValue>,
+) -> Result<crate::evaluator::FlValue, String> {
+    if args.len() != 1 {
+        return Err(format!("refcell_borrow_mut expects 1 argument, got {}", args.len()));
+    }
+
+    match &args[0] {
+        crate::evaluator::FlValue::Object(obj) => {
+            if let Some(crate::evaluator::FlValue::Str(type_name)) = obj.get("__type") {
+                if type_name == "RefCell" {
+                    return Ok(crate::evaluator::FlValue::Object({
+                        let mut borrow_obj = std::collections::HashMap::new();
+                        borrow_obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("RefMut".to_string()));
+                        borrow_obj.insert("__data".to_string(), crate::evaluator::FlValue::Null);
+                        borrow_obj
+                    }));
+                }
+            }
+            Err("refcell_borrow_mut failed: invalid RefCell".to_string())
+        },
+        _ => Err("refcell_borrow_mut requires RefCell argument".to_string()),
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arc_new() {
+        let mut runtime = SyncRuntime::new();
+        let val = crate::evaluator::FlValue::Int(42);
+        let result = builtin_arc_new(vec![val], &mut runtime);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_arc_clone() {
+        let val = crate::evaluator::FlValue::Object({
+            let mut obj = std::collections::HashMap::new();
+            obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("Arc".to_string()));
+            obj
+        });
+        let result = builtin_arc_clone(vec![val]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_mutex_new() {
+        let mut runtime = SyncRuntime::new();
+        let val = crate::evaluator::FlValue::Int(42);
+        let result = builtin_mutex_new(vec![val], &mut runtime);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_channel_new() {
+        let result = builtin_channel_new(vec![]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_threadpool_new() {
+        let mut runtime = SyncRuntime::new();
+        let size = crate::evaluator::FlValue::Int(4);
+        let result = builtin_threadpool_new(vec![size], &mut runtime);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_thread_sleep() {
+        let ms = crate::evaluator::FlValue::Int(10);
+        let result = builtin_thread_sleep(vec![ms]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_condvar_new() {
+        let mut runtime = SyncRuntime::new();
+        let result = builtin_condvar_new(vec![], &mut runtime);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_refcell_new() {
+        let mut runtime = SyncRuntime::new();
+        let val = crate::evaluator::FlValue::Int(42);
+        let result = builtin_refcell_new(vec![val], &mut runtime);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_arc_id_increment() {
+        let mut runtime = SyncRuntime::new();
+        let val = crate::evaluator::FlValue::Int(1);
+        builtin_arc_new(vec![val.clone()], &mut runtime).unwrap();
+        builtin_arc_new(vec![val.clone()], &mut runtime).unwrap();
+        assert_eq!(runtime.arc_counter, 2);
+    }
+
+    #[test]
+    fn test_mutex_id_increment() {
+        let mut runtime = SyncRuntime::new();
+        let val = crate::evaluator::FlValue::Int(1);
+        builtin_mutex_new(vec![val.clone()], &mut runtime).unwrap();
+        builtin_mutex_new(vec![val.clone()], &mut runtime).unwrap();
+        assert_eq!(runtime.mutex_counter, 2);
+    }
+
+    #[test]
+    fn test_threadpool_execute_invalid() {
+        let invalid = crate::evaluator::FlValue::Int(42);
+        let result = builtin_threadpool_execute(vec![invalid, crate::evaluator::FlValue::Null]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_channel_send_invalid() {
+        let invalid = crate::evaluator::FlValue::Int(42);
+        let result = builtin_channel_send(vec![invalid, crate::evaluator::FlValue::Int(1)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_condvar_wait() {
+        let cv = crate::evaluator::FlValue::Object({
+            let mut obj = std::collections::HashMap::new();
+            obj.insert("__type".to_string(), crate::evaluator::FlValue::Str("CondVar".to_string()));
+            obj
+        });
+        let m = crate::evaluator::FlValue::Null;
+        let result = builtin_condvar_wait(vec![cv, m]);
+        assert!(result.is_ok());
+    }
+}

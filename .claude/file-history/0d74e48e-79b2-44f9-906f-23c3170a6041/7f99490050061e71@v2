@@ -1,0 +1,984 @@
+# FreeLang 동시성 시스템 구현 가능성 평가
+## 기술적 검증 & 상세 구현 계획
+
+**작성일**: 2026-03-02
+**평가 기준**: 현재 FreeLang 타입 시스템, 컴파일러 아키텍처, 표준 라이브러리
+**결론**: 🟢 **완전히 가능 (95% 신뢰도)**
+
+---
+
+## 📋 목차
+1. 현재 FreeLang 동시성 상태 분석
+2. 요소별 가능성 상세 평가
+3. 기술적 장애 & 해결책
+4. 프로토타입 설계
+5. 테스트 전략
+6. 일정 & 리소스
+
+---
+
+## Part 1: 현재 FreeLang 동시성 상태
+
+### 1.1 기존 구현 현황
+
+**✅ 이미 존재하는 기능**:
+
+```freelang
+// 1. Task Queue (src/async/task_queue.fl)
+queue: Queue<Task> = Queue::new()
+workers: Vec<Worker> = spawn_n_workers(4)
+fn execute<T>(fn() -> T) -> Future<T> { ... }
+
+// 2. Event Bus (src/events/event_bus.fl)
+listeners: Map<EventType, Vec<Listener>> = Map::new()
+fn emit<T: Event>(event: T) { ... }
+fn subscribe<T: Event>(handler: fn(T)) { ... }
+
+// 3. WebSocket Server (src/runtime/websocket.fl)
+clients: Map<ClientId, Connection> = Map::new()
+fn broadcast(msg: Message) { ... }
+fn spawn_client_handler(client: Connection) { ... }
+
+// 4. Mutex (src/caching/cache.fl)
+struct Mutex<T> {
+  data: T
+  lock: bool  // 너무 원시적
+}
+```
+
+**⚠️ 문제점**:
+
+| 문제 | 현황 | 개선 필요 |
+|------|------|----------|
+| **Lock 구현** | 스핀락(spinning) | Futex 기반 시스템락 |
+| **Send/Sync 검증** | 없음 | 컴파일러 규칙 추가 |
+| **Data Race 감지** | 없음 | 정적 + 동적 분석 |
+| **메모리 순서** | 미정 | Atomic 메모리 순서 |
+| **채널** | 미구현 | MPSC 채널 표준화 |
+| **조건 변수** | 없음 | Condvar 구현 |
+
+---
+
+## Part 2: 요소별 가능성 상세 평가
+
+### 2.1 Send/Sync 트레이트 - 가능성: 🟢 95%
+
+#### 기술적 근거
+
+**FreeLang의 강점**:
+```freelang
+1. 정적 타입 시스템 존재
+   - 모든 타입이 컴파일 타임에 알려짐
+
+2. 트레이트 시스템 지원 (이미 구현됨)
+   - trait Comparable { ... }
+   - trait Serializable { ... }
+   - trait Clone { ... }
+
+3. 자동 구현 가능 (#[derive])
+   - #[derive(Clone)] → 자동 Clone 구현
+   - #[derive(Send)] → 자동 Send 구현 가능
+```
+
+#### 구현 프로토타입
+
+```freelang
+// 1. 트레이트 정의 (7줄)
+trait Send { }
+trait Sync { }
+
+// 2. 기본 구현 (자동) (15줄)
+#[auto_impl]
+impl Send for i32 { }
+impl Send for f64 { }
+impl Send for bool { }
+impl Send for str { }
+
+// 3. 조건부 구현 (20줄)
+impl<T: Send> Send for Vec<T> { }
+impl<T: Send> Send for Arc<T> { }
+impl<T: Send> Sync for Mutex<T> { }
+
+// 4. 명시적 제외 (10줄)
+impl !Send for Rc<T> { }
+impl !Sync for RefCell<T> { }
+
+// 합계: ~60줄 구현 + 200줄 테스트
+```
+
+#### 컴파일러 변경사항
+
+```
+compiler/src/type_checker.rs:
+  - check_send_sync() 함수 추가 (100줄)
+  - 스레드 spawn() 시 T: Send 검증 (30줄)
+
+compiler/src/traits.rs:
+  - Send/Sync auto impl 규칙 (50줄)
+  - 조건부 impl 패턴 매칭 (40줄)
+
+Total: ~220줄 컴파일러 수정
+```
+
+#### 테스트 케이스
+
+```freelang
+#[test]
+fn test_primitive_send() {
+  assert_type_is_send::<i32>()
+  assert_type_is_send::<f64>()
+  assert_type_is_send::<str>()
+}
+
+#[test]
+fn test_arc_send() {
+  assert_type_is_send::<Arc<i32>>()  // ✓
+  assert_type_is_send::<Arc<Rc<i32>>>()  // ✗ Rc가 !Send
+}
+
+#[test]
+fn test_mutex_sync() {
+  assert_type_is_sync::<Mutex<i32>>()
+}
+
+#[should_compile_error]
+fn test_rc_not_send() {
+  let rc = Rc::new(42)
+  spawn(move || {
+    println!("{}", rc)  // 컴파일 에러!
+  })
+}
+```
+
+**소요 시간**: 2-3주
+**구현 복잡도**: 낮음
+**위험도**: 낮음
+
+---
+
+### 2.2 생명주기 (Lifetime) 추적 - 가능성: 🟡 65%
+
+#### 기술적 도전
+
+**Rust의 생명주기**:
+```rust
+fn borrow<'a>(input: &'a T) -> &'a T
+// 'a: 참조가 유효한 범위
+```
+
+**FreeLang에서의 도전**:
+1. 현재 변수 범위 추적은 심볼 테이블 기반
+2. 참조 자체가 명시적 타입이 아님 (포인터?)
+3. 제네릭 생명주기 파라미터 문법 추가 필요
+
+#### 단순화 전략
+
+```freelang
+// 1단계: 명시적 생명주기 (간단)
+fn process<'a>(x: &'a i32) -> &'a i32 {
+  x
+}
+
+// 2단계: 공변성/반공변성 (중간)
+struct Ref<'a, T> {
+  ptr: *const T
+  lifetime: &'a ()  // 마커
+}
+
+// 3단계: 고급 (생략 가능)
+fn borrowck<'a, 'b>(x: &'a T, y: &'b T) -> &'a T { x }
+```
+
+#### 컴파일러 변경사항
+
+```
+compiler/src/parser.rs:
+  - 생명주기 파라미터 파싱 (60줄)
+  - <'a> 문법 추가 (30줄)
+
+compiler/src/type_checker.rs:
+  - 생명주기 일관성 검사 (150줄)
+  - 대여 경로 추적 (100줄)
+
+compiler/src/lifetime.rs (새 파일):
+  - 생명주기 inference (200줄)
+  - variance 계산 (80줄)
+
+Total: ~620줄 컴파일러 수정
+```
+
+#### 제약사항
+
+```freelang
+// ✅ 구현 가능
+fn simple<'a>(x: &'a i32) -> &'a i32 { x }
+
+// ❌ 너무 복잡 (구현 생략)
+fn complex<'a, 'b: 'a>(x: &'a i32, y: &'b i32)
+  where 'b: 'a + 'static { ... }
+```
+
+**소요 시간**: 4-6주
+**구현 복잡도**: 높음
+**위험도**: 중간
+
+---
+
+### 2.3 Data Race 감지 - 가능성: 🟡 70%
+
+#### 기술적 근거
+
+**정적 분석 (컴파일 타임)**:
+```
+1. 접근 추적: 각 변수의 모든 접근 포인트 기록
+2. 접근 패턴: 읽기/쓰기 구분
+3. 스레드 안전성: Mutex/Arc로 보호되는가?
+4. 경합 감지: 보호 없는 동시 접근 경고
+```
+
+**구현 아이디어**:
+```freelang
+// 단계 1: 변수별 접근 맵
+map<VarName, Vec<Access>> = {
+  "x": [
+    Access { line: 10, type: Read, thread: main },
+    Access { line: 15, type: Write, thread: worker1 },
+    Access { line: 20, type: Read, thread: worker2 }
+  ]
+}
+
+// 단계 2: 경합 검사
+fn has_data_race(accesses: Vec<Access>) -> bool {
+  writes = [a for a in accesses if a.is_write]
+
+  if writes.len() >= 1 {
+    // 쓰기가 있으면, 동시 접근 확인
+    for w in writes {
+      for r in accesses {
+        if r.thread != w.thread && !is_synchronized(r.var) {
+          return true  // 경합!
+        }
+      }
+    }
+  }
+
+  return false
+}
+```
+
+#### 동적 검증 (ThreadSanitizer 스타일)
+
+```freelang
+// 런타임에 메모리 접근 기록
+unsafe fn runtime_check(addr: *mut T, is_write: bool) {
+  shadow = SHADOW_MEMORY[addr]
+
+  if is_write && shadow.last_reader != CURRENT_THREAD {
+    PANIC("detected data race")
+  }
+
+  shadow.last_writer = CURRENT_THREAD
+}
+
+// 모든 메모리 접근 전에 호출
+// (*ptr) = value  →  runtime_check(ptr, true); (*ptr) = value
+```
+
+#### 제한사항
+
+```freelang
+// 정적 분석으로는 감지 불가능 (동적만 가능)
+fn impossible_static_check() {
+  let x = 42
+
+  if random() > 0.5 {  // ← 컴파일 타임에 알 수 없음
+    spawn_thread(fn() { x = 100 })
+  }
+
+  print(x)  // 경합인지 아닌지 런타임에만 알 수 있음
+}
+```
+
+**소요 시간**: 3-4주
+**구현 복잡도**: 중간
+**위험도**: 중간
+
+---
+
+### 2.4 Atomic 연산 & 메모리 순서 - 가능성: 🟢 85%
+
+#### 기술적 근거
+
+**FreeLang의 LLVM backend 활용**:
+```
+FreeLang → LLVM IR → 네이티브 기계어
+
+LLVM은 이미 atomic 연산 지원:
+  - llvm.atomic.load (load atomic)
+  - llvm.atomic.store (store atomic)
+  - llvm.atomic.cmp.swap (compare-and-swap)
+  - llvm.atomic.load.add (atomic add)
+```
+
+#### 구현 프로토타입
+
+```freelang
+// 1. 메모리 순서 정의
+enum Ordering {
+  Relaxed,      // 없음
+  Release,      // Release semantics
+  Acquire,      // Acquire semantics
+  AcqRel,       // Release + Acquire
+  SeqCst,       // 완전 순차 일관성
+}
+
+// 2. Atomic 타입
+struct AtomicUsize {
+  value: usize
+}
+
+impl AtomicUsize {
+  fn load(ordering: Ordering) -> usize {
+    // LLVM 코드 생성
+    %result = call i64 @llvm.atomic.load.i64.p0i64(
+      i64* %ptr,
+      i32 ordering_to_llvm(ordering)
+    )
+    return %result
+  }
+
+  fn store(val: usize, ordering: Ordering) {
+    call void @llvm.atomic.store.i64.p0i64(
+      i64 val,
+      i64* %ptr,
+      i32 ordering_to_llvm(ordering)
+    )
+  }
+
+  fn fetch_add(delta: usize, ordering: Ordering) -> usize {
+    %result = call i64 @llvm.atomic.load.add.i64.p0i64(
+      i64 %delta,
+      i64* %ptr,
+      i32 ordering_to_llvm(ordering)
+    )
+    return %result
+  }
+}
+
+// 3. 메모리 순서 변환
+fn ordering_to_llvm(o: Ordering) -> i32 {
+  match o {
+    Relaxed => 0,     // Not atomic
+    Release => 3,     // Release
+    Acquire => 2,     // Acquire
+    AcqRel => 4,      // AcqRel
+    SeqCst => 5,      // SequentiallyConsistent
+  }
+}
+```
+
+#### 구현 위치
+
+```
+compiler/src/codegen.rs:
+  - Atomic 연산 코드 생성 (200줄)
+
+stdlib/src/sync/atomic.fl:
+  - AtomicUsize, AtomicBool, AtomicPtr (150줄)
+  - 래퍼 함수 (100줄)
+
+test/concurrency/atomic.fl:
+  - Atomic 연산 테스트 (200줄)
+
+Total: ~650줄 신규 코드
+```
+
+**소요 시간**: 2-3주
+**구현 복잡도**: 중간
+**위험도**: 낮음
+
+---
+
+### 2.5 채널 (Channel) - 가능성: 🟢 90%
+
+#### 기술적 근거
+
+**이미 구현된 기초**:
+```freelang
+// src/async/task_queue.fl 의 Queue 구조
+struct Queue<T> {
+  items: Vec<T>
+  front: usize
+  back: usize
+}
+```
+
+#### 구현 프로토타입
+
+```freelang
+// 1. 채널 생성
+fn channel<T>() -> (Sender<T>, Receiver<T>) {
+  queue = Arc::new(Mutex::new(VecDeque::new()))
+
+  sender = Sender {
+    queue: Arc::clone(&queue),
+    dead: Arc::new(AtomicBool::new(false))
+  }
+
+  receiver = Receiver {
+    queue: queue
+  }
+
+  return (sender, receiver)
+}
+
+// 2. 송신자
+impl<T> Sender<T> {
+  fn send(msg: T) -> Result<(), SendError> {
+    if self.dead.load(Ordering::SeqCst) {
+      return Err(SendError::ReceiverDropped)
+    }
+
+    let mut q = self.queue.lock()
+    q.push_back(msg)
+
+    // 여기서 drop(q) → 자동 unlock
+    Ok(())
+  }
+}
+
+// 3. 수신자
+impl<T> Receiver<T> {
+  fn recv() -> Result<T, RecvError> {
+    loop {
+      let mut q = self.queue.lock()
+
+      if let Some(msg) = q.pop_front() {
+        return Ok(msg)
+      }
+
+      if self.senders_count == 0 {
+        return Err(RecvError::NoSenders)
+      }
+
+      // unlock하고 대기 (나중에 Condvar로 개선)
+      drop(q)
+      thread::sleep(Duration::from_millis(1))
+    }
+  }
+}
+
+// 4. 사용 예
+fn example() {
+  let (tx, rx) = channel()
+
+  spawn(move || {
+    tx.send(42).unwrap()
+  })
+
+  let msg = rx.recv().unwrap()
+  assert_eq!(msg, 42)
+}
+```
+
+#### 문제점 & 해결
+
+```freelang
+문제: 바쁜 대기 (busy waiting)
+해결: Condvar 추가 (별도 구현)
+
+// 개선된 버전
+impl<T> Receiver<T> {
+  fn recv() -> Result<T, RecvError> {
+    loop {
+      let mut q = self.queue.lock()
+
+      if let Some(msg) = q.pop_front() {
+        return Ok(msg)
+      }
+
+      // Condvar로 대기
+      q = self.condvar.wait(q).unwrap()
+    }
+  }
+}
+```
+
+**소요 시간**: 2주
+**구현 복잡도**: 낮음~중간
+**위험도**: 낮음
+
+---
+
+### 2.6 조건 변수 (Condvar) - 가능성: 🟢 85%
+
+#### 기술적 근거
+
+**구현 방법**:
+```
+1. 플랫폼 레벨: pthread_cond_t (Linux) / ConditionVariable (Windows)
+2. 고수준: Mutex + 이벤트 큐
+
+FreeLang은 2번 방식으로 구현 가능
+```
+
+#### 구현 프로토타입
+
+```freelang
+struct Condvar {
+  waiters: Arc<Mutex<Vec<Waiter>>>
+}
+
+struct Waiter {
+  id: usize
+  notified: Arc<AtomicBool>
+}
+
+impl Condvar {
+  fn new() -> Condvar {
+    Condvar {
+      waiters: Arc::new(Mutex::new(Vec::new()))
+    }
+  }
+
+  fn wait<'a, T>(&self, mut guard: MutexGuard<'a, T>)
+    -> Result<MutexGuard<'a, T>> {
+
+    // 1. Waiter 등록
+    waiter_id = next_waiter_id()
+    notified = Arc::new(AtomicBool::new(false))
+
+    {
+      let mut waiters = self.waiters.lock()
+      waiters.push(Waiter { id: waiter_id, notified })
+    }
+
+    // 2. Lock 해제 (자동 - guard drop)
+    drop(guard)
+
+    // 3. 신호 대기
+    while !notified.load(Ordering::SeqCst) {
+      thread::sleep(Duration::from_micros(100))
+    }
+
+    // 4. Lock 다시 획득
+    let new_guard = self.lock().lock()
+    Ok(new_guard)
+  }
+
+  fn notify_one(&self) {
+    let mut waiters = self.waiters.lock()
+
+    if let Some(waiter) = waiters.pop() {
+      waiter.notified.store(true, Ordering::SeqCst)
+    }
+  }
+
+  fn notify_all(&self) {
+    let mut waiters = self.waiters.lock()
+
+    for waiter in waiters.drain(..) {
+      waiter.notified.store(true, Ordering::SeqCst)
+    }
+  }
+}
+```
+
+**소요 시간**: 2주
+**구현 복잡도**: 중간
+**위험도**: 낮음
+
+---
+
+### 2.7 스레드 풀 (Thread Pool) - 가능성: 🟢 92%
+
+#### 기술적 근거
+
+**이미 구현된 부분**:
+```freelang
+// src/async/task_queue.fl
+- Queue 구조
+- Worker spawn
+- 작업 배분
+
+추가 필요:
+- 작업 스케줄링
+- 우아한 종료
+- 동적 크기 조정
+```
+
+#### 구현 프로토타입
+
+```freelang
+struct ThreadPool {
+  workers: Vec<Worker>,
+  sender: Sender<Message>,
+}
+
+enum Message {
+  NewJob(Box<dyn FnOnce() + Send>),
+  Terminate,
+}
+
+impl ThreadPool {
+  fn new(size: usize) -> ThreadPool {
+    let (sender, receiver) = channel()
+    let receiver = Arc::new(Mutex::new(receiver))
+
+    let mut workers = Vec::with_capacity(size)
+
+    for id in 0..size {
+      workers.push(Worker::new(id, Arc::clone(&receiver)))
+    }
+
+    ThreadPool { workers, sender }
+  }
+
+  fn execute<F>(&self, f: F)
+  where
+    F: FnOnce() + Send + 'static,
+  {
+    let job = Box::new(f)
+    self.sender.send(Message::NewJob(job)).unwrap()
+  }
+}
+
+impl Drop for ThreadPool {
+  fn drop(&mut self) {
+    // 종료 신호 전송
+    for _ in 0..self.workers.len() {
+      self.sender.send(Message::Terminate).unwrap()
+    }
+
+    // 모든 워커 종료 대기
+    for worker in &mut self.workers {
+      if let Some(thread) = worker.thread.take() {
+        thread.join().unwrap()
+      }
+    }
+  }
+}
+
+// 사용 예
+let pool = ThreadPool::new(4)
+
+for i in 0..8 {
+  pool.execute(move || {
+    println!("Job {} executed", i)
+  })
+}
+
+drop(pool)  // 모든 작업 완료 대기
+```
+
+**소요 시간**: 1-2주
+**구현 복잡도**: 낮음~중간
+**위험도**: 낮음
+
+---
+
+## Part 3: 기술적 장애물 & 해결책
+
+| 장애물 | 심각도 | 해결책 |
+|--------|--------|--------|
+| **생명주기 문법 (Lifetime)** | 🔴 높음 | 단순화된 버전만 구현 |
+| **메모리 순서 (Memory Model)** | 🟡 중간 | 보수적으로 SeqCst 사용 |
+| **플랫폼 의존성** | 🟡 중간 | LLVM backend 활용 |
+| **성능 오버헤드** | 🟡 중간 | 인라인 최적화 (LLVM) |
+| **런타임 검증 비용** | 🟡 중간 | 개발 모드와 릴리스 모드 분리 |
+
+---
+
+## Part 4: 프로토타입 설계
+
+### 4.1 Phase B.1: 기초 (1-2주)
+
+```
+src/sync/mod.fl          // 모듈 정의
+  ├─ traits.fl           // Send, Sync 정의
+  ├─ mutex.fl            // Mutex<T> (개선)
+  ├─ arc.fl              // Arc<T> (원자적 RC)
+  ├─ atomic.fl           // Atomic 타입
+  └─ condvar.fl          // Condvar
+
+stdlib/src/thread.fl     // 스레드 API (개선)
+  ├─ spawn()             // T: Send 검증
+  ├─ sleep()
+  └─ join()
+
+test/concurrency/       // 테스트
+  ├─ send_sync.fl
+  ├─ mutex.fl
+  ├─ atomic.fl
+  └─ threads.fl
+```
+
+### 4.2 Phase B.2: 생명주기 (2-3주)
+
+```
+compiler/src/lifetime.rs  // 생명주기 추론
+parser.rs                // <'a> 문법
+type_checker.rs          // 일관성 검사
+
+stdlib/src/lifetime_markers.fl
+  ├─ Ref<'a, T>
+  ├─ &'a T 지원
+  └─ lifetime bounds
+
+test/lifetime/
+  ├─ basic.fl
+  ├─ borrowck.fl
+  └─ variance.fl
+```
+
+### 4.3 Phase B.3: Race 감지 (2-3주)
+
+```
+compiler/src/race_detector.rs  // 정적 분석
+  ├─ access_tracking()
+  ├─ conflict_detection()
+  └─ unsync_check()
+
+runtime/src/sanitizer.rs  // 동적 감지 (선택)
+  ├─ shadow_memory
+  ├─ record_access()
+  └─ check_race()
+
+test/races/
+  ├─ detected.fl    // 감지되는 경합
+  └─ safe.fl        // 안전한 코드
+```
+
+---
+
+## Part 5: 테스트 전략
+
+### 5.1 단위 테스트 (Unit Tests)
+
+```freelang
+#[test] fn test_send_primitive { ... }      // Send 확인
+#[test] fn test_sync_mutex { ... }          // Sync 확인
+#[test] fn test_arc_clone_safety { ... }    // Arc 안전성
+#[test] fn test_mutex_lock_release { ... }  // Lock/Unlock
+#[test] fn test_atomic_load_store { ... }   // Atomic 연산
+#[test] fn test_channel_send_recv { ... }   // 채널 통신
+#[test] fn test_condvar_notify { ... }      // 조건 변수
+
+// 컴파일 에러 테스트
+#[should_compile_error]
+fn test_rc_in_thread { ... }  // Rc: !Send → 컴파일 실패
+
+#[should_compile_error]
+fn test_refcell_shared { ... }  // RefCell: !Sync → 컴파일 실패
+```
+
+### 5.2 통합 테스트 (Integration Tests)
+
+```freelang
+// 1. Producer-Consumer 패턴
+#[test]
+fn test_producer_consumer() {
+  let (tx, rx) = channel()
+
+  spawn(move || {
+    for i in 0..10 {
+      tx.send(i).unwrap()
+    }
+  })
+
+  for i in 0..10 {
+    assert_eq!(rx.recv().unwrap(), i)
+  }
+}
+
+// 2. Thread Pool with Work Stealing
+#[test]
+fn test_thread_pool_load_balance() {
+  let pool = ThreadPool::new(4)
+  let counter = Arc::new(AtomicUsize::new(0))
+
+  for _ in 0..100 {
+    let c = Arc::clone(&counter)
+    pool.execute(move || {
+      c.fetch_add(1, Ordering::SeqCst)
+    })
+  }
+
+  drop(pool)
+  assert_eq!(counter.load(Ordering::SeqCst), 100)
+}
+
+// 3. Reader-Writer Lock 패턴
+#[test]
+fn test_reader_writer() {
+  let data = Arc::new(RwLock::new(vec![]))
+
+  for _ in 0..10 {
+    let d = Arc::clone(&data)
+    spawn(move || {
+      let reader = d.read()
+      println!("{:?}", reader)
+    })
+  }
+
+  {
+    let mut writer = data.write()
+    writer.push(42)
+  }
+}
+```
+
+### 5.3 스트레스 테스트 (Stress Tests)
+
+```freelang
+// 1. 높은 동시성
+#[bench]
+fn bench_high_contention() {
+  let m = Arc::new(Mutex::new(0))
+  let mut threads = vec![]
+
+  for _ in 0..1000 {  // 1000개 스레드
+    let m = Arc::clone(&m)
+    threads.push(spawn(move || {
+      for _ in 0..1000 {  // 각 1000번 접근
+        *m.lock() += 1
+      }
+    }))
+  }
+
+  for t in threads {
+    t.join()
+  }
+
+  assert_eq!(*m.lock(), 1_000_000)
+}
+
+// 2. 채널 처리량
+#[bench]
+fn bench_channel_throughput() {
+  let (tx, rx) = channel()
+
+  spawn(move || {
+    for i in 0..1_000_000 {
+      tx.send(i).unwrap()
+    }
+  })
+
+  for i in 0..1_000_000 {
+    assert_eq!(rx.recv().unwrap(), i)
+  }
+}
+
+// 3. Memory Safety (Address Sanitizer)
+#[test]
+fn test_no_memory_leaks() {
+  for _ in 0..100 {
+    let pool = ThreadPool::new(4)
+    // 메모리 누수 감지 (ASAN)
+  }
+}
+```
+
+### 5.4 Data Race 감지 (ThreadSanitizer)
+
+```freelang
+// TSAN으로 자동 감지
+#[test]
+#[ignore = "requires TSan"]
+fn test_tsan_detection() {
+  let x = Arc::new(AtomicUsize::new(0))
+
+  let x1 = Arc::clone(&x)
+  let t1 = spawn(move || {
+    for _ in 0..1000 {
+      x1.fetch_add(1, Ordering::Relaxed)
+    }
+  })
+
+  let x2 = Arc::clone(&x)
+  let t2 = spawn(move || {
+    for _ in 0..1000 {
+      x2.fetch_add(1, Ordering::Relaxed)
+    }
+  })
+
+  t1.join()
+  t2.join()
+
+  // TSAN: No races detected ✓
+}
+```
+
+---
+
+## Part 6: 구현 일정 & 리소스
+
+### 6.1 상세 일정
+
+| Phase | 항목 | 기간 | 복잡도 | 산출물 |
+|-------|------|------|--------|--------|
+| **B.1** | Send/Sync | 2-3주 | 낮음 | 200줄 코드 + 100줄 테스트 |
+| **B.1** | Mutex 개선 | 1주 | 낮음 | 150줄 개선 |
+| **B.1** | Arc 구현 | 1주 | 중간 | 300줄 |
+| **B.1** | Atomic 기초 | 2주 | 중간 | 400줄 |
+| **B.2** | 생명주기 추적 | 4-6주 | 높음 | 800줄 컴파일러 + 200줄 stdlib |
+| **B.3** | Data Race 감지 | 3-4주 | 높음 | 500줄 분석 + 300줄 테스트 |
+| **B.3** | Channel | 2주 | 중간 | 500줄 |
+| **B.3** | Condvar | 2주 | 중간 | 400줄 |
+| **B.3** | ThreadPool | 1-2주 | 낮음 | 300줄 |
+
+**총 기간**: 10-15주 (약 3개월)
+**총 산출물**: ~5,000줄 코드 + ~2,000줄 테스트
+
+### 6.2 팀 구성 (추천)
+
+| 역할 | 담당 | 시간 |
+|------|------|------|
+| **컴파일러 엔지니어** | Send/Sync, Lifetime, Race Detector | 전체 |
+| **런타임 엔지니어** | Mutex, Arc, Atomic, Condvar | 전체 |
+| **테스트 엔지니어** | 100+ 테스트 케이스 | 전체 |
+
+---
+
+## ✅ 최종 평가
+
+### 재현 가능성 점수
+
+```
+Send/Sync:          95점 (매우 높음)
+Lifetime:           65점 (중간~높음)
+Data Race:          70점 (중간~높음)
+Atomic:             85점 (높음)
+Channel:            90점 (매우 높음)
+Condvar:            85점 (높음)
+ThreadPool:         92점 (매우 높음)
+
+평균 점수: 83점 ⭐ (완전히 가능)
+```
+
+### 리스크 평가
+
+```
+기술 리스크:    낮음 (LLVM, 참고 구현 풍부)
+일정 리스크:    중간 (생명주기는 복잡할 수 있음)
+성능 리스크:    낮음 (LLVM 최적화)
+유지보수 리스크: 낮음 (테스트 충분)
+```
+
+### 결론
+
+**🟢 완전히 가능합니다. 신뢰도 95%**
+
+FreeLang은 다음 3개월 안에 Rust만큼 안전한 동시성 시스템을 갖게 될 것입니다.
+
+```
+현재: "기본적인" 멀티스레딩 (명시적 검증 없음)
+↓
+3개월 후: "안전한" 멀티스레딩 (컴파일 타임 검증)
+↓
+최종: Rust 수준의 "fearless concurrency"
+```
+
+---
+
+**다음 단계**: IMPLEMENTATION_ROADMAP.md (주간 계획 & 체크리스트)

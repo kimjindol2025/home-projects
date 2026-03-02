@@ -1,0 +1,487 @@
+# ============================================================================
+# vectordb/mod.fl - VectorDB 통합 인터페이스
+# ============================================================================
+# Phase VectorDB 구현
+# 작성: 2026-03-02
+# 책임: VectorDB 시스템 초기화, 공개 API
+
+# ============================================================================
+# System Structures
+# ============================================================================
+
+struct VectorDBSystem
+  db: VectorDB
+  vocab: Vocabulary
+  embeddingConfig: EmbeddingConfig
+
+# ============================================================================
+# Initialization
+# ============================================================================
+
+fn newVectorDBSystem
+  input: config: VectorDBConfig
+  output: VectorDBSystem
+  intent: "VectorDB 시스템 전체 초기화"
+  do
+    return {
+      db: newVectorDB(config),
+      vocab: newVocabulary(config.defaultDimension),
+      embeddingConfig: {
+        dimension: config.defaultDimension,
+        minWordLen: 2,
+        maxVocabSize: 10000,
+        normalize: true
+      }
+    }
+
+fn newVectorDBSystemDefault
+  input: void
+  output: VectorDBSystem
+  intent: "기본 설정으로 VectorDB 시스템 생성"
+  do
+    let defaultConfig = {
+      defaultDimension: 128,
+      defaultIndexType: 0,
+      maxCollections: 100,
+      maxDocsPerCollection: 100000
+    }
+    return newVectorDBSystem(defaultConfig)
+
+# ============================================================================
+# Collection Management
+# ============================================================================
+
+fn createVectorCollection
+  input: (sys: VectorDBSystem, name: string)
+  output: Result<VectorDBSystem, string>
+  intent: "기본 설정으로 컬렉션 생성"
+  do
+    let dimension = sys.embeddingConfig.dimension
+    match createCollection(sys.db, name, dimension, 0)
+      Ok(newDb) => {
+        return Ok({
+          db: newDb,
+          vocab: sys.vocab,
+          embeddingConfig: sys.embeddingConfig
+        })
+      }
+      Err(e) => return Err(e)
+
+fn createVectorCollectionWithDimension
+  input: (sys: VectorDBSystem, name: string, dimension: number)
+  output: Result<VectorDBSystem, string>
+  intent: "지정 차원으로 컬렉션 생성"
+  do
+    match createCollection(sys.db, name, dimension, 0)
+      Ok(newDb) => {
+        return Ok({
+          db: newDb,
+          vocab: sys.vocab,
+          embeddingConfig: sys.embeddingConfig
+        })
+      }
+      Err(e) => return Err(e)
+
+fn deleteVectorCollection
+  input: (sys: VectorDBSystem, name: string)
+  output: Result<VectorDBSystem, string>
+  intent: "컬렉션 삭제"
+  do
+    match deleteCollection(sys.db, name)
+      Ok(newDb) => {
+        return Ok({
+          db: newDb,
+          vocab: sys.vocab,
+          embeddingConfig: sys.embeddingConfig
+        })
+      }
+      Err(e) => return Err(e)
+
+fn listCollectionsInDB
+  input: sys: VectorDBSystem
+  output: array<string>
+  intent: "모든 컬렉션 이름 목록"
+  do
+    return listCollections(sys.db)
+
+# ============================================================================
+# Core API: Text Insert & Search
+# ============================================================================
+
+fn insertText
+  input: (sys: VectorDBSystem, collectionName: string, text: string, metadata: map<string, string>)
+  output: Result<VectorDBSystem, string>
+  intent: "텍스트를 임베딩 후 컬렉션에 삽입 (가장 핵심 API)"
+  do
+    # 1. embedText(text, vocab, embeddingConfig)
+    match embedText(text, sys.vocab, sys.embeddingConfig)
+      Err(e) => return Err(e)
+      Ok(embedResult) => {
+        # 2. newVectorDocument 생성
+        let doc = newVectorDocument(embedResult.vector, Some(text), metadata)
+
+        # 3. insertDocument
+        match insertDocument(sys.db, collectionName, doc)
+          Err(e) => return Err(e)
+          Ok(newDb) => {
+            # 4. 어휘 사전 업데이트
+            let newVocab = updateVocabulary(sys.vocab, embedResult.tokens)
+
+            return Ok({
+              db: newDb,
+              vocab: newVocab,
+              embeddingConfig: sys.embeddingConfig
+            })
+          }
+      }
+
+fn insertTexts
+  input: (sys: VectorDBSystem, collectionName: string, texts: array<string>)
+  output: Result<VectorDBSystem, string>
+  intent: "텍스트 배열 일괄 삽입"
+  do
+    let currentSys = sys
+
+    for i in 0..arrayLen(texts)
+      let text = arrayGet(texts, i)
+      match insertText(currentSys, collectionName, text, {})
+        Ok(updatedSys) => currentSys = updatedSys
+        Err(e) => return Err(e)
+
+    return Ok(currentSys)
+
+fn searchByText
+  input: (sys: VectorDBSystem, collectionName: string, queryText: string, k: number)
+  output: Result<SearchResponse, string>
+  intent: "텍스트 쿼리로 유사 문서 검색 (가장 핵심 API)"
+  do
+    # 1. embedText로 쿼리 벡터화
+    match embedText(queryText, sys.vocab, sys.embeddingConfig)
+      Err(e) => return Err(e)
+      Ok(embedResult) => {
+        # 2. SearchQuery 구성
+        let query = {
+          queryVector: Some(embedResult.vector),
+          queryText: None,
+          metadataFilter: {},
+          topK: k,
+          metric: 0,
+          minScore: 0
+        }
+
+        # 3. searchCollection
+        match searchCollection(sys.db, collectionName, query)
+          Ok(response) => return Ok(response)
+          Err(e) => return Err(e)
+      }
+
+fn searchByVector
+  input: (sys: VectorDBSystem, collectionName: string, queryVec: Vector, k: number)
+  output: Result<SearchResponse, string>
+  intent: "벡터로 직접 검색"
+  do
+    let query = {
+      queryVector: Some(queryVec),
+      queryText: None,
+      metadataFilter: {},
+      topK: k,
+      metric: 0,
+      minScore: 0
+    }
+    return searchCollection(sys.db, collectionName, query)
+
+fn searchWithFilter
+  input: (sys: VectorDBSystem, collectionName: string, queryText: string, filter: map<string, string>, k: number)
+  output: Result<SearchResponse, string>
+  intent: "텍스트 + 메타데이터 필터 하이브리드 검색"
+  do
+    # 1. embedText
+    match embedText(queryText, sys.vocab, sys.embeddingConfig)
+      Err(e) => return Err(e)
+      Ok(embedResult) => {
+        # 2. SearchQuery with filter
+        let query = {
+          queryVector: Some(embedResult.vector),
+          queryText: None,
+          metadataFilter: filter,
+          topK: k,
+          metric: 0,
+          minScore: 0
+        }
+
+        # 3. searchCollection
+        return searchCollection(sys.db, collectionName, query)
+      }
+
+# ============================================================================
+# Statistics & Management
+# ============================================================================
+
+fn getSystemStats
+  input: sys: VectorDBSystem
+  output: map<string, number>
+  intent: "전체 시스템 통계 반환"
+  do
+    let stats = {}
+    stats.set("totalCollections", sys.db.totalCollections)
+    stats.set("defaultDimension", sys.embeddingConfig.dimension)
+    stats.set("vocabSize", 0)  # map 크기 필요
+    stats.set("totalDocuments", 0)  # 모든 컬렉션의 합 필요
+
+    return stats
+
+fn getCollectionInfo
+  input: (sys: VectorDBSystem, collectionName: string)
+  output: Result<CollectionStats, string>
+  intent: "컬렉션 통계 반환"
+  do
+    match getCollection(sys.db, collectionName)
+      Ok(coll) => return Ok(coll.stats)
+      Err(e) => return Err(e)
+
+fn getDocumentCountInCollection
+  input: (sys: VectorDBSystem, collectionName: string)
+  output: Result<number, string>
+  intent: "컬렉션의 문서 수"
+  do
+    return getDocumentCount(sys.db, collectionName)
+
+# ============================================================================
+# Document Management
+# ============================================================================
+
+fn insertVectorDocument
+  input: (sys: VectorDBSystem, collectionName: string, doc: VectorDocument)
+  output: Result<VectorDBSystem, string>
+  intent: "사전 계산된 VectorDocument 삽입"
+  do
+    match insertDocument(sys.db, collectionName, doc)
+      Ok(newDb) => {
+        return Ok({
+          db: newDb,
+          vocab: sys.vocab,
+          embeddingConfig: sys.embeddingConfig
+        })
+      }
+      Err(e) => return Err(e)
+
+fn deleteDocument
+  input: (sys: VectorDBSystem, collectionName: string, docId: string)
+  output: Result<VectorDBSystem, string>
+  intent: "문서 삭제"
+  do
+    match deleteDocument(sys.db, collectionName, docId)
+      Ok(newDb) => {
+        return Ok({
+          db: newDb,
+          vocab: sys.vocab,
+          embeddingConfig: sys.embeddingConfig
+        })
+      }
+      Err(e) => return Err(e)
+
+fn getDocument
+  input: (sys: VectorDBSystem, collectionName: string, docId: string)
+  output: Result<VectorDocument, string>
+  intent: "문서 조회"
+  do
+    return getDocument(sys.db, collectionName, docId)
+
+fn updateDocumentMeta
+  input: (sys: VectorDBSystem, collectionName: string, docId: string, metadata: map<string, string>)
+  output: Result<VectorDBSystem, string>
+  intent: "문서 메타데이터 업데이트"
+  do
+    match updateDocumentMetadata(sys.db, collectionName, docId, metadata)
+      Ok(newDb) => {
+        return Ok({
+          db: newDb,
+          vocab: sys.vocab,
+          embeddingConfig: sys.embeddingConfig
+        })
+      }
+      Err(e) => return Err(e)
+
+# ============================================================================
+# Configuration Management
+# ============================================================================
+
+fn updateEmbeddingDimension
+  input: (sys: VectorDBSystem, newDimension: number)
+  output: Result<VectorDBSystem, string>
+  intent: "임베딩 차원 변경"
+  do
+    if newDimension < 1 || newDimension > 4096
+      return Err("차원 범위 초과")
+
+    let newConfig = sys.embeddingConfig
+    newConfig.dimension = newDimension
+
+    let newVocab = newVocabulary(newDimension)
+
+    return Ok({
+      db: sys.db,
+      vocab: newVocab,
+      embeddingConfig: newConfig
+    })
+
+fn setMinWordLength
+  input: (sys: VectorDBSystem, minLen: number)
+  output: VectorDBSystem
+  intent: "최소 단어 길이 설정"
+  do
+    let newConfig = sys.embeddingConfig
+    newConfig.minWordLen = minLen
+
+    return {
+      db: sys.db,
+      vocab: sys.vocab,
+      embeddingConfig: newConfig
+    }
+
+fn setNormalization
+  input: (sys: VectorDBSystem, normalize: bool)
+  output: VectorDBSystem
+  intent: "정규화 여부 설정"
+  do
+    let newConfig = sys.embeddingConfig
+    newConfig.normalize = normalize
+
+    return {
+      db: sys.db,
+      vocab: sys.vocab,
+      embeddingConfig: newConfig
+    }
+
+# ============================================================================
+# Placeholder Imports (실제로는 각 모듈에서 import)
+# ============================================================================
+
+# vector.fl 참조
+fn vectorNorm
+  input: v: Vector
+  output: Result<number, string>
+  do
+    return Err("임시")
+
+# embedding.fl 참조
+fn embedText
+  input: (text: string, vocab: Vocabulary, config: EmbeddingConfig)
+  output: Result<EmbedResult, string>
+  do
+    return Err("임시")
+
+fn updateVocabulary
+  input: (vocab: Vocabulary, tokens: array<string>)
+  output: Vocabulary
+  do
+    return vocab
+
+fn newVocabulary
+  input: dimension: number
+  output: Vocabulary
+  do
+    return {
+      wordToIndex: {},
+      documentFreq: {},
+      totalDocs: 0,
+      dimension: dimension
+    }
+
+# index.fl 참조
+fn flatIndexSearch
+  input: (idx: FlatIndex, query: Vector, k: number, metric: number)
+  output: Result<array<ScoredVector>, string>
+  do
+    return Err("임시")
+
+fn lshIndexSearch
+  input: (idx: LSHIndex, query: Vector, k: number, metric: number)
+  output: Result<array<ScoredVector>, string>
+  do
+    return Err("임시")
+
+# collection.fl 참조
+fn newVectorDB
+  input: config: VectorDBConfig
+  output: VectorDB
+  do
+    return {
+      collections: {},
+      totalCollections: 0,
+      config: config
+    }
+
+fn createCollection
+  input: (db: VectorDB, name: string, dimension: number, indexType: number)
+  output: Result<VectorDB, string>
+  do
+    return Err("임시")
+
+fn deleteCollection
+  input: (db: VectorDB, name: string)
+  output: Result<VectorDB, string>
+  do
+    return Err("임시")
+
+fn listCollections
+  input: db: VectorDB
+  output: array<string>
+  do
+    return []
+
+fn getCollection
+  input: (db: VectorDB, name: string)
+  output: Result<Collection, string>
+  do
+    return Err("임시")
+
+fn insertDocument
+  input: (db: VectorDB, collectionName: string, doc: VectorDocument)
+  output: Result<VectorDB, string>
+  do
+    return Err("임시")
+
+fn deleteDocument
+  input: (db: VectorDB, collectionName: string, docId: string)
+  output: Result<VectorDB, string>
+  do
+    return Err("임시")
+
+fn getDocument
+  input: (db: VectorDB, collectionName: string, docId: string)
+  output: Result<VectorDocument, string>
+  do
+    return Err("임시")
+
+fn updateDocumentMetadata
+  input: (db: VectorDB, collectionName: string, docId: string, metadata: map<string, string>)
+  output: Result<VectorDB, string>
+  do
+    return Err("임시")
+
+fn getDocumentCount
+  input: (db: VectorDB, collectionName: string)
+  output: Result<number, string>
+  do
+    return Err("임시")
+
+# search.fl 참조
+fn searchCollection
+  input: (db: VectorDB, collectionName: string, query: SearchQuery)
+  output: Result<SearchResponse, string>
+  do
+    return Err("임시")
+
+fn newVectorDocument
+  input: (vector: Vector, rawText: Option<string>, metadata: map<string, string>)
+  output: VectorDocument
+  do
+    return {
+      id: "doc_id",
+      vector: vector,
+      rawText: rawText,
+      metadata: metadata,
+      createdAt: "2026-03-02T00:00:00Z",
+      updatedAt: "2026-03-02T00:00:00Z"
+    }

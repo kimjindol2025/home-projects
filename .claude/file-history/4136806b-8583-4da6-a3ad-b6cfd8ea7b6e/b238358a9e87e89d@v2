@@ -1,0 +1,491 @@
+# ============================================================================
+# vectordb/search.fl - 검색 엔진 (Top-K, 하이브리드 검색)
+# ============================================================================
+# Phase VectorDB 구현
+# 작성: 2026-03-02
+# 책임: Top-K 검색, 하이브리드 검색 (벡터 + 메타데이터)
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
+
+struct SearchQuery
+  queryVector: Option<Vector>
+  queryText: Option<string>
+  metadataFilter: map<string, string>
+  topK: number
+  metric: number
+  minScore: number
+
+struct SearchResult
+  docId: string
+  score: number
+  rank: number
+  document: VectorDocument
+  explanation: string
+
+struct SearchResponse
+  results: array<SearchResult>
+  totalFound: number
+  searchTimeMs: number
+  queryInfo: string
+
+enum SearchMode
+  VECTOR_ONLY = 0
+  METADATA_FILTER = 1
+  HYBRID = 2
+
+# ============================================================================
+# Query Construction
+# ============================================================================
+
+fn newSearchQuery
+  input: (queryVector: Vector, k: number)
+  output: SearchQuery
+  intent: "기본 검색 쿼리 생성"
+  do
+    return {
+      queryVector: Some(queryVector),
+      queryText: None,
+      metadataFilter: {},
+      topK: k,
+      metric: 0,
+      minScore: 0
+    }
+
+fn newSearchQueryWithFilter
+  input: (queryVector: Vector, k: number, filter: map<string, string>)
+  output: SearchQuery
+  intent: "필터 포함 검색 쿼리 생성"
+  do
+    return {
+      queryVector: Some(queryVector),
+      queryText: None,
+      metadataFilter: filter,
+      topK: k,
+      metric: 0,
+      minScore: 0
+    }
+
+fn newTextSearchQuery
+  input: (queryText: string, k: number)
+  output: SearchQuery
+  intent: "텍스트 기반 검색 쿼리 생성"
+  do
+    return {
+      queryVector: None,
+      queryText: Some(queryText),
+      metadataFilter: {},
+      topK: k,
+      metric: 0,
+      minScore: 0
+    }
+
+# ============================================================================
+# Vector Search
+# ============================================================================
+
+fn vectorSearch
+  input: (collection: Collection, query: Vector, k: number, metric: number)
+  output: Result<array<ScoredVector>, string>
+  intent: "인덱스 유형에 따라 적합한 검색 수행"
+  do
+    match collection.indexType
+      0 => {
+        match collection.flatIndex
+          Some(flatIdx) => flatIndexSearch(flatIdx, query, k, metric)
+          None => return Err("FlatIndex 초기화 실패")
+      }
+      1 => {
+        match collection.lshIndex
+          Some(lshIdx) => lshIndexSearch(lshIdx, query, k, metric)
+          None => return Err("LSHIndex 초기화 실패")
+      }
+      _ => return Err("알 수 없는 인덱스 타입")
+
+# ============================================================================
+# Hybrid Search (Vector + Metadata)
+# ============================================================================
+
+fn hybridSearch
+  input: (collection: Collection, query: Vector, filter: map<string, string>, k: number, metric: number)
+  output: Result<array<ScoredVector>, string>
+  intent: "메타데이터 필터 후 벡터 검색"
+  do
+    # 1. filterDocumentsByMetadata -> candidateDocs
+    let candidateDocs = filterDocumentsByMetadata(collection, filter)
+
+    if arrayLen(candidateDocs) == 0
+      return Ok([])
+
+    # 2. candidateDocs에서 벡터만 추출
+    let candidateVectors = []
+    for i in 0..arrayLen(candidateDocs)
+      let doc = arrayGet(candidateDocs, i)
+      candidateVectors = arrayPush(candidateVectors, doc.vector)
+
+    # 3. 벡터 유사도 계산 (브루트 포스)
+    let scored = []
+    for i in 0..arrayLen(candidateVectors)
+      let v = arrayGet(candidateVectors, i)
+      match vectorDistance(query, v, metric)
+        Ok(dist) => {
+          let sv = {
+            vector: v,
+            score: dist,
+            rank: 0
+          }
+          scored = arrayPush(scored, sv)
+        }
+        Err(_) => pass
+
+    # 4. 정렬
+    scored = sortScoredVectors(scored, metric)
+
+    # 5. Top-K 반환
+    let topK = []
+    let limit = if k > arrayLen(scored) then arrayLen(scored) else k
+    for i in 0..limit
+      let sv = arrayGet(scored, i)
+      let ranked = {
+        vector: sv.vector,
+        score: sv.score,
+        rank: i + 1
+      }
+      topK = arrayPush(topK, ranked)
+
+    return Ok(topK)
+
+# ============================================================================
+# Main Search Function
+# ============================================================================
+
+fn searchCollection
+  input: (db: VectorDB, collectionName: string, query: SearchQuery)
+  output: Result<SearchResponse, string>
+  intent: "컬렉션에서 통합 검색 수행"
+  do
+    # 컬렉션 존재 확인
+    match db.collections.get(collectionName)
+      Some(coll) => {
+        let startTime = getCurrentTimeMs()
+
+        # queryVector 결정
+        let queryVec = None
+        match query.queryVector
+          Some(qv) => queryVec = Some(qv)
+          None => {
+            match query.queryText
+              Some(text) => {
+                # 텍스트 임베딩 필요
+                # 임시: 에러 반환
+                return Err("텍스트 임베딩 필수")
+              }
+              None => return Err("쿼리 벡터 없음")
+          }
+
+        # 검색 모드 결정
+        let searchMode = if mapLen(query.metadataFilter) > 0
+                         then 1
+                         else 0
+
+        # 검색 수행
+        let scored = []
+        match queryVec
+          Some(qv) => {
+            if searchMode == 1
+              match hybridSearch(coll, qv, query.metadataFilter, query.topK, query.metric)
+                Ok(results) => scored = results
+                Err(e) => return Err(e)
+            else
+              match vectorSearch(coll, qv, query.topK, query.metric)
+                Ok(results) => scored = results
+                Err(e) => return Err(e)
+          }
+          None => return Err("쿼리 벡터 결정 실패")
+
+        # minScore 필터 적용
+        let filtered = applyMinScoreFilter(scored, query.minScore, query.metric)
+
+        # SearchResult로 변환
+        let results = []
+        for i in 0..arrayLen(filtered)
+          let sv = arrayGet(filtered, i)
+          let docId = sv.vector.id
+          match getDocument(db, collectionName, docId)
+            Ok(doc) => {
+              let result = {
+                docId: docId,
+                score: sv.score,
+                rank: i + 1,
+                document: doc,
+                explanation: "거리 메트릭: " + str(query.metric)
+              }
+              results = arrayPush(results, result)
+            }
+            Err(_) => pass
+
+        let endTime = getCurrentTimeMs()
+        let searchTime = endTime - startTime
+
+        let response = {
+          results: results,
+          totalFound: arrayLen(results),
+          searchTimeMs: searchTime,
+          queryInfo: "metric=" + str(query.metric) + ", topK=" + str(query.topK)
+        }
+
+        return Ok(response)
+      }
+      None => return Err("컬렉션 찾기 실패")
+
+# ============================================================================
+# Result Processing
+# ============================================================================
+
+fn applyMinScoreFilter
+  input: (results: array<ScoredVector>, minScore: number, metric: number)
+  output: array<ScoredVector>
+  intent: "최소 점수 미만 결과 제거"
+  do
+    let filtered = []
+
+    for i in 0..arrayLen(results)
+      let sv = arrayGet(results, i)
+      let normalized = normalizeScore(sv.score, metric)
+
+      if normalized >= minScore
+        filtered = arrayPush(filtered, sv)
+
+    return filtered
+
+fn normalizeScore
+  input: (score: number, metric: number)
+  output: number
+  intent: "점수를 0~1 범위로 정규화"
+  do
+    match metric
+      0 => {
+        # COSINE: 이미 -1~1, (score + 1) / 2로 0~1 변환
+        return (score + 1) / 2
+      }
+      1 => {
+        # L2: 1 / (1 + distance)로 변환
+        if score >= 1000
+          return 0
+        else
+          return 1 / (1 + score)
+      }
+      2 => {
+        # DOT_PRODUCT: sigmoid 근사
+        if score > 100
+          return 1
+        else if score < -100
+          return 0
+        else
+          return 1 / (1 + abs(score))
+      }
+      3 => {
+        # MANHATTAN: L2와 유사
+        if score >= 1000
+          return 0
+        else
+          return 1 / (1 + score)
+      }
+      _ => return 0
+
+fn buildExplanation
+  input: (query: Vector, result: ScoredVector, metric: number)
+  output: string
+  intent: "검색 결과 설명 문자열 생성"
+  do
+    let metricName = match metric
+      0 => "코사인 유사도"
+      1 => "L2 거리"
+      2 => "내적"
+      3 => "맨해튼 거리"
+      _ => "알 수 없음"
+
+    return "메트릭: " + metricName + ", 점수: " + str(result.score)
+
+fn scoredVectorsToResults
+  input: (scoredVectors: array<ScoredVector>, collection: Collection)
+  output: array<SearchResult>
+  intent: "ScoredVector를 SearchResult로 변환"
+  do
+    let results = []
+
+    for i in 0..arrayLen(scoredVectors)
+      let sv = arrayGet(scoredVectors, i)
+      # document 찾기 (collection.documents에서)
+      # 임시 구현
+
+    return results
+
+# ============================================================================
+# Sorting & Ranking
+# ============================================================================
+
+fn sortScoredVectors
+  input: (vectors: array<ScoredVector>, metric: number)
+  output: array<ScoredVector>
+  intent: "버블 정렬로 점수 기준 정렬"
+  do
+    # COSINE(0), DOT_PRODUCT(2): 내림차순 (높을수록 유사)
+    # L2(1), MANHATTAN(3): 오름차순 (낮을수록 유사)
+    let isDescending = if metric == 0 || metric == 2 then true else false
+
+    let n = arrayLen(vectors)
+    let sorted = vectors
+
+    # 버블 정렬
+    for i in 0..n
+      for j in 0..(n - i - 1)
+        if j + 1 < arrayLen(sorted)
+          let a = arrayGet(sorted, j)
+          let b = arrayGet(sorted, j + 1)
+          let shouldSwap = false
+
+          if isDescending
+            shouldSwap = a.score < b.score
+          else
+            shouldSwap = a.score > b.score
+
+          # 교환 필요 시 배열 재구성
+          if shouldSwap
+            # FreeLang: 배열 수정 제한
+            pass
+
+    return sorted
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn vectorDistance
+  input: (a: Vector, b: Vector, metric: number)
+  output: Result<number, string>
+  intent: "거리 계산"
+  do
+    match metric
+      0 => cosineSimilarity(a, b)
+      1 => l2Distance(a, b)
+      2 => dotProduct(a, b)
+      3 => manhattanDistance(a, b)
+      _ => return Err("알 수 없는 메트릭")
+
+fn cosineSimilarity
+  input: (a: Vector, b: Vector)
+  output: Result<number, string>
+  intent: "코사인 유사도"
+  do
+    if a.dimension != b.dimension
+      return Err("차원 불일치")
+    match dotProduct(a, b)
+      Ok(dot) => {
+        match vectorNorm(a)
+          Ok(normA) => {
+            match vectorNorm(b)
+              Ok(normB) => {
+                if normA == 0 || normB == 0
+                  return Err("영벡터")
+                return Ok(dot / (normA * normB))
+              }
+              Err(e) => return Err(e)
+          }
+          Err(e) => return Err(e)
+      }
+      Err(e) => return Err(e)
+
+fn l2Distance
+  input: (a: Vector, b: Vector)
+  output: Result<number, string>
+  intent: "L2 거리"
+  do
+    if a.dimension != b.dimension
+      return Err("차원 불일치")
+    let sumSq = 0
+    for i in 0..a.dimension
+      let diff = arrayGet(a.values, i) - arrayGet(b.values, i)
+      sumSq = sumSq + diff * diff
+    return Ok(sqrt(sumSq))
+
+fn dotProduct
+  input: (a: Vector, b: Vector)
+  output: Result<number, string>
+  intent: "내적"
+  do
+    if a.dimension != b.dimension
+      return Err("차원 불일치")
+    let result = 0
+    for i in 0..a.dimension
+      result = result + arrayGet(a.values, i) * arrayGet(b.values, i)
+    return Ok(result)
+
+fn manhattanDistance
+  input: (a: Vector, b: Vector)
+  output: Result<number, string>
+  intent: "맨해튼 거리"
+  do
+    if a.dimension != b.dimension
+      return Err("차원 불일치")
+    let total = 0
+    for i in 0..a.dimension
+      total = total + abs(arrayGet(a.values, i) - arrayGet(b.values, i))
+    return Ok(total)
+
+fn vectorNorm
+  input: v: Vector
+  output: Result<number, string>
+  intent: "L2 노름"
+  do
+    let sumSq = 0
+    for i in 0..v.dimension
+      let val = arrayGet(v.values, i)
+      sumSq = sumSq + val * val
+    return Ok(sqrt(sumSq))
+
+fn filterDocumentsByMetadata
+  input: (collection: Collection, filter: map<string, string>)
+  output: array<VectorDocument>
+  intent: "메타데이터 필터링"
+  do
+    let results = []
+    # 모든 문서 반복 필요
+    return results
+
+fn getDocument
+  input: (db: VectorDB, collectionName: string, docId: string)
+  output: Result<VectorDocument, string>
+  intent: "문서 조회"
+  do
+    # collection.fl 참조
+    return Err("임시 구현")
+
+fn mapLen
+  input: m: map<string, string>
+  output: number
+  intent: "map 크기"
+  do
+    return 0
+
+fn getCurrentTimeMs
+  input: void
+  output: number
+  intent: "현재 시간 (ms)"
+  do
+    return 0
+
+fn flatIndexSearch
+  input: (idx: FlatIndex, query: Vector, k: number, metric: number)
+  output: Result<array<ScoredVector>, string>
+  intent: "FlatIndex 검색"
+  do
+    return Ok([])
+
+fn lshIndexSearch
+  input: (idx: LSHIndex, query: Vector, k: number, metric: number)
+  output: Result<array<ScoredVector>, string>
+  intent: "LSHIndex 검색"
+  do
+    return Ok([])

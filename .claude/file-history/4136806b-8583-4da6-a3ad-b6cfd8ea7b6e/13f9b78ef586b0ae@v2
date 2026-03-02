@@ -1,0 +1,572 @@
+# ============================================================================
+# distributed/sharding.fl - 일관된 해싱 (Consistent Hashing)
+# ============================================================================
+# Phase 3: 분산 벡터 인덱스
+# 작성: 2026-03-02
+# 책임: 16개 파티션에 벡터 ID 균등 분배, 가상 노드 기반 재평형
+# 난이도: ⭐⭐⭐⭐ (알고리즘 수준)
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
+
+struct VirtualNode
+  nodeId: number                 # 실제 물리 노드 ID
+  virtualId: number              # 가상 노드 번호 (0..vnodeCount-1)
+  hashValue: number              # 해시 링 위치 (0..2^32-1)
+  partitionIds: array<number>    # 담당 파티션들
+
+struct ConsistentHashRing
+  vnodes: array<VirtualNode>     # 정렬된 가상 노드 배열
+  nodeCount: number
+  vnodeCount: number             # 노드당 가상 노드 수 (기본 150)
+  totalPartitions: number        # 기본 16
+
+struct PartitionInfo
+  partitionId: number            # 0..15
+  primaryNodeId: number          # 주 노드
+  replicaNodeIds: array<number>  # 복제 노드들
+  vectorCount: number
+  isHealthy: bool
+
+struct ShardingStats
+  totalVectors: number
+  partitionDistribution: map<number, number>  # partitionId -> count
+  nodeLoad: map<number, number>               # nodeId -> count
+  balanceScore: number           # 0~1 (1이 완벽 균등)
+
+struct ShardRouter
+  ring: ConsistentHashRing
+  partitions: map<number, PartitionInfo>
+  replicationFactor: number      # 기본 3
+  stats: ShardingStats
+
+struct PartitionMigration
+  partitionId: number
+  fromNodeId: number
+  toNodeId: number
+  vectorCount: number
+
+# ============================================================================
+# FNV-1a 해시 함수 (Consistent Hashing 기반)
+# ============================================================================
+
+fn fnv1aHash
+  input: key: string
+  output: number
+  intent: "FNV-1a 해시 계산 (0..2^32-1)"
+  do
+    let FNV_PRIME = 16777619          # 2^24 + 2^8 + 0x93
+    let FNV_OFFSET = 2166136261       # 32-bit offset basis
+
+    let hash = FNV_OFFSET
+    let i = 0
+
+    # 각 문자 처리
+    for i in 0..stringLength(key)
+      let char = stringCharAt(key, i)
+      let charCode = stringCharCode(char)
+
+      # hash *= FNV_PRIME (mod 2^32)
+      hash = (hash * FNV_PRIME) % 4294967296
+      # hash ^= charCode
+      hash = hash ^ charCode
+
+    # 0 이상만 반환 (음수 제거)
+    if hash < 0
+      hash = hash + 4294967296
+
+    return hash
+
+# ============================================================================
+# 파티션 계산
+# ============================================================================
+
+fn getPartitionId
+  input: (vectorId: string, totalPartitions: number)
+  output: number
+  intent: "벡터 ID를 파티션 ID로 변환 (0..totalPartitions-1)"
+  do
+    let hash = fnv1aHash(vectorId)
+    return hash % totalPartitions
+
+# ============================================================================
+# 일관된 해싱 링 생성
+# ============================================================================
+
+fn newConsistentHashRing
+  input: (nodeIds: array<number>, vnodeCount: number, partitionCount: number)
+  output: ConsistentHashRing
+  intent: "일관된 해싱 링 초기화"
+  do
+    let vnodes = []
+    let i = 0
+    let j = 0
+
+    # 각 물리 노드마다 vnodeCount개의 가상 노드 생성
+    for i in 0..arrayLen(nodeIds)
+      let nodeId = arrayGet(nodeIds, i)
+
+      # 각 가상 노드 생성
+      for j in 0..vnodeCount
+        let vnodeKey = stringFromNumber(nodeId) + ":" + stringFromNumber(j)
+        let hashValue = fnv1aHash(vnodeKey)
+
+        # 파티션 ID 배정 (가상 노드가 담당할 파티션들)
+        let partitionIds = []
+        let p = 0
+        for p in 0..partitionCount
+          if p % vnodeCount == j
+            partitionIds = arrayPush(partitionIds, p)
+
+        let vnode = {
+          nodeId: nodeId,
+          virtualId: j,
+          hashValue: hashValue,
+          partitionIds: partitionIds
+        }
+
+        vnodes = arrayPush(vnodes, vnode)
+
+    # 해시값 기준 정렬 (오름차순)
+    vnodes = sortVnodesByHash(vnodes)
+
+    return {
+      vnodes: vnodes,
+      nodeCount: arrayLen(nodeIds),
+      vnodeCount: vnodeCount,
+      totalPartitions: partitionCount
+    }
+
+fn sortVnodesByHash
+  input: vnodes: array<VirtualNode>
+  output: array<VirtualNode>
+  intent: "가상 노드를 해시값으로 정렬"
+  do
+    # 간단한 버블 정렬 (FreeLang에 내장 정렬 함수 없을 시)
+    let result = vnodes
+    let i = 0
+    let j = 0
+    let n = arrayLen(result)
+
+    for i in 0..n
+      for j in 0..n - i - 1
+        let curr = arrayGet(result, j)
+        let next = arrayGet(result, j + 1)
+
+        if curr.hashValue > next.hashValue
+          # 교환
+          arraySet(result, j, next)
+          arraySet(result, j + 1, curr)
+
+    return result
+
+# ============================================================================
+# 파티션 복제 노드 결정
+# ============================================================================
+
+fn getReplicaNodes
+  input: (ring: ConsistentHashRing, partitionId: number, replicationFactor: number)
+  output: array<number>
+  intent: "파티션의 복제 노드 결정 (primary + replicas)"
+  do
+    let replicas = []
+    let seenNodes = []
+    let i = 0
+
+    # partitionId의 파티션 키 생성
+    let partitionKey = "partition:" + stringFromNumber(partitionId)
+    let partitionHash = fnv1aHash(partitionKey)
+
+    # 링에서 해시값 >= partitionHash인 첫 번째 노드부터 시작
+    let startIdx = 0
+    let j = 0
+    for j in 0..arrayLen(ring.vnodes)
+      let vnode = arrayGet(ring.vnodes, j)
+      if vnode.hashValue >= partitionHash
+        startIdx = j
+        break
+
+    # replicationFactor만큼 고유 물리 노드 수집
+    for i in 0..arrayLen(ring.vnodes)
+      if arrayLen(replicas) >= replicationFactor
+        break
+
+      let vnodeIdx = (startIdx + i) % arrayLen(ring.vnodes)
+      let vnode = arrayGet(ring.vnodes, vnodeIdx)
+
+      # 이미 추가된 노드 ID 확인
+      if !arrayContains(seenNodes, vnode.nodeId)
+        replicas = arrayPush(replicas, vnode.nodeId)
+        seenNodes = arrayPush(seenNodes, vnode.nodeId)
+
+    return replicas
+
+# ============================================================================
+# 라우팅
+# ============================================================================
+
+fn routeVectorInsert
+  input: (router: ShardRouter, vectorId: string)
+  output: PartitionInfo
+  intent: "벡터 삽입을 위한 파티션 정보 반환"
+  do
+    let partitionId = getPartitionId(vectorId, router.ring.totalPartitions)
+    let partition = mapGet(router.partitions, partitionId)
+
+    match partition
+      Some(p) => return p
+      None => {
+        # 기본 파티션 정보 반환
+        let replicas = getReplicaNodes(router.ring, partitionId, router.replicationFactor)
+        let primary = if arrayLen(replicas) > 0 then arrayGet(replicas, 0) else 0
+
+        return {
+          partitionId: partitionId,
+          primaryNodeId: primary,
+          replicaNodeIds: replicas,
+          vectorCount: 0,
+          isHealthy: true
+        }
+      }
+
+fn routeVectorSearch
+  input: (router: ShardRouter, partitionIds: Option<array<number>>)
+  output: array<PartitionInfo>
+  intent: "검색 대상 파티션 목록 반환"
+  do
+    match partitionIds
+      Some(ids) => {
+        # 특정 파티션만 검색
+        let result = []
+        let i = 0
+        for i in 0..arrayLen(ids)
+          let partId = arrayGet(ids, i)
+          let partition = mapGet(router.partitions, partId)
+          match partition
+            Some(p) => result = arrayPush(result, p)
+            None => {}
+        return result
+      }
+      None => {
+        # 모든 파티션 반환
+        let result = []
+        let i = 0
+        for i in 0..router.ring.totalPartitions
+          let partition = mapGet(router.partitions, i)
+          match partition
+            Some(p) => result = arrayPush(result, p)
+            None => {}
+        return result
+      }
+
+# ============================================================================
+# 노드 추가/제거
+# ============================================================================
+
+fn addNodeToRing
+  input: (ring: ConsistentHashRing, nodeId: number)
+  output: ConsistentHashRing
+  intent: "새 노드를 링에 추가"
+  do
+    # 새로운 링 생성 (nodeId 포함)
+    let nodeIds = []
+    let i = 0
+    for i in 0..ring.nodeCount
+      nodeIds = arrayPush(nodeIds, i)
+    nodeIds = arrayPush(nodeIds, nodeId)
+
+    return newConsistentHashRing(nodeIds, ring.vnodeCount, ring.totalPartitions)
+
+fn removeNodeFromRing
+  input: (ring: ConsistentHashRing, nodeId: number)
+  output: ConsistentHashRing
+  intent: "노드를 링에서 제거"
+  do
+    # 제외된 노드들로 새로운 링 생성
+    let nodeIds = []
+    let i = 0
+    for i in 0..ring.nodeCount
+      if i != nodeId
+        nodeIds = arrayPush(nodeIds, i)
+
+    return newConsistentHashRing(nodeIds, ring.vnodeCount, ring.totalPartitions)
+
+# ============================================================================
+# 재평형 (Rebalancing)
+# ============================================================================
+
+fn computeRebalancePlan
+  input: (router: ShardRouter, addedNodeId: Option<number>, removedNodeId: Option<number>)
+  output: array<PartitionMigration>
+  intent: "노드 추가/제거 시 파티션 마이그레이션 계획 수립"
+  do
+    let oldRing = router.ring
+    let newRing = oldRing
+
+    # 새로운 링 계산
+    match addedNodeId
+      Some(nodeId) => {
+        newRing = addNodeToRing(oldRing, nodeId)
+      }
+      None => {}
+
+    match removedNodeId
+      Some(nodeId) => {
+        newRing = removeNodeFromRing(oldRing, nodeId)
+      }
+      None => {}
+
+    # 파티션별 소유권 변경 감지
+    let migrations = []
+    let i = 0
+    for i in 0..oldRing.totalPartitions
+      let oldReplicas = getReplicaNodes(oldRing, i, router.replicationFactor)
+      let newReplicas = getReplicaNodes(newRing, i, router.replicationFactor)
+
+      # Primary 변경 확인
+      let oldPrimary = if arrayLen(oldReplicas) > 0 then arrayGet(oldReplicas, 0) else 0
+      let newPrimary = if arrayLen(newReplicas) > 0 then arrayGet(newReplicas, 0) else 0
+
+      if oldPrimary != newPrimary
+        let partition = mapGet(router.partitions, i)
+        let vectorCount = 0
+        match partition
+          Some(p) => vectorCount = p.vectorCount
+          None => {}
+
+        let migration = {
+          partitionId: i,
+          fromNodeId: oldPrimary,
+          toNodeId: newPrimary,
+          vectorCount: vectorCount
+        }
+
+        migrations = arrayPush(migrations, migration)
+
+    return migrations
+
+# ============================================================================
+# 통계 및 모니터링
+# ============================================================================
+
+fn computeShardingStats
+  input: router: ShardRouter
+  output: ShardingStats
+  intent: "샤딩 통계 계산"
+  do
+    let totalVectors = 0
+    let distribution = {}
+    let nodeLoad = {}
+
+    # 초기화
+    let i = 0
+    for i in 0..router.ring.totalPartitions
+      distribution = mapSet(distribution, stringFromNumber(i), 0)
+
+    # 각 노드별 부하 초기화
+    for i in 0..router.ring.nodeCount
+      nodeLoad = mapSet(nodeLoad, stringFromNumber(i), 0)
+
+    # 파티션별 벡터 수 집계
+    for i in 0..router.ring.totalPartitions
+      let partition = mapGet(router.partitions, i)
+      match partition
+        Some(p) => {
+          totalVectors = totalVectors + p.vectorCount
+          distribution = mapSet(distribution, stringFromNumber(i), p.vectorCount)
+
+          # Primary 노드의 부하 기록
+          let primaryLoad = mapGet(nodeLoad, stringFromNumber(p.primaryNodeId))
+          match primaryLoad
+            Some(load) => {
+              nodeLoad = mapSet(nodeLoad, stringFromNumber(p.primaryNodeId), load + p.vectorCount)
+            }
+            None => {
+              nodeLoad = mapSet(nodeLoad, stringFromNumber(p.primaryNodeId), p.vectorCount)
+            }
+        }
+        None => {}
+
+    let balanceScore = computeBalanceScore(distribution)
+
+    return {
+      totalVectors: totalVectors,
+      partitionDistribution: distribution,
+      nodeLoad: nodeLoad,
+      balanceScore: balanceScore
+    }
+
+fn computeBalanceScore
+  input: distribution: map<number, number>
+  output: number
+  intent: "균형 점수 계산 (0~1, 표준편차 기반)"
+  do
+    # 평균 계산
+    let sum = 0
+    let count = 0
+    let i = 0
+
+    for i in 0..mapSize(distribution)
+      let keyStr = stringFromNumber(i)
+      let value = mapGet(distribution, keyStr)
+      match value
+        Some(v) => {
+          sum = sum + v
+          count = count + 1
+        }
+        None => {}
+
+    if count == 0
+      return 1.0  # 빈 상태는 완벽 균형
+
+    let avg = sum / count
+
+    # 분산 계산
+    let variance = 0.0
+    for i in 0..mapSize(distribution)
+      let keyStr = stringFromNumber(i)
+      let value = mapGet(distribution, keyStr)
+      match value
+        Some(v) => {
+          let diff = v - avg
+          variance = variance + (diff * diff)
+        }
+        None => {}
+
+    variance = variance / count
+
+    # 표준편차 (근사값)
+    let stddev = sqrt(variance)
+
+    # 점수: 1 / (1 + stddev/avg)
+    if avg == 0
+      return 1.0
+    else
+      let coefficient = stddev / avg
+      return 1.0 / (1.0 + coefficient)
+
+fn sqrt
+  input: x: number
+  output: number
+  intent: "제곱근 (근사)"
+  do
+    if x <= 0
+      return 0.0
+    else if x == 1
+      return 1.0
+    else
+      # 뉴턴-랩슨 방법 (3회 반복)
+      let guess = x / 2
+      let i = 0
+      for i in 0..3
+        guess = (guess + x / guess) / 2
+      return guess
+
+fn reportShardingStatus
+  input: router: ShardRouter
+  output: string
+  intent: "샤딩 상태 리포트 생성"
+  do
+    let stats = computeShardingStats(router)
+
+    let report = ""
+    report = report + "=== Sharding Status ===\n"
+    report = report + "Total Vectors: " + stringFromNumber(stats.totalVectors) + "\n"
+    report = report + "Balance Score: " + stringFromNumber(stats.balanceScore) + "\n"
+    report = report + "Partitions: " + stringFromNumber(router.ring.totalPartitions) + "\n"
+    report = report + "Replication Factor: " + stringFromNumber(router.replicationFactor) + "\n"
+
+    return report
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn stringCharAt
+  input: (str: string, idx: number)
+  output: string
+  intent: "문자열의 idx 위치 문자 반환"
+  do
+    return ""  # 표준 함수
+
+fn stringCharCode
+  input: ch: string
+  output: number
+  intent: "문자의 ASCII/Unicode 코드"
+  do
+    return 0   # 표준 함수
+
+fn stringLength
+  input: s: string
+  output: number
+  intent: "문자열 길이"
+  do
+    return 0   # 표준 함수
+
+fn stringFromNumber
+  input: n: number
+  output: string
+  intent: "숫자를 문자열로 변환"
+  do
+    return ""  # 표준 함수
+
+fn arrayLen
+  input: arr: array<any>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0   # 표준 함수
+
+fn arrayGet
+  input: (arr: array<any>, idx: number)
+  output: any
+  intent: "배열 요소 접근"
+  do
+    return null  # 표준 함수
+
+fn arraySet
+  input: (arr: array<any>, idx: number, value: any)
+  output: unit
+  intent: "배열 요소 설정"
+  do
+    return     # 표준 함수
+
+fn arrayPush
+  input: (arr: array<any>, item: any)
+  output: array<any>
+  intent: "배열에 요소 추가"
+  do
+    return arr  # 표준 함수
+
+fn arrayContains
+  input: (arr: array<number>, value: number)
+  output: bool
+  intent: "배열에 값 포함 여부"
+  do
+    let i = 0
+    for i in 0..arrayLen(arr)
+      if arrayGet(arr, i) == value
+        return true
+    return false
+
+fn mapGet
+  input: (m: map<number, any>, key: number)
+  output: Option<any>
+  intent: "맵에서 키로 값 조회"
+  do
+    return None  # 표준 함수
+
+fn mapSet
+  input: (m: map<number, any>, key: number, value: any)
+  output: map<number, any>
+  intent: "맵에 키-값 쌍 설정"
+  do
+    return m   # 표준 함수
+
+fn mapSize
+  input: m: map<number, any>
+  output: number
+  intent: "맵의 크기"
+  do
+    return 0   # 표준 함수

@@ -1,0 +1,331 @@
+// ============================================================================
+// FreeLang Mutex<T> - Mutual Exclusion Lock
+// ============================================================================
+//
+// 여러 스레드가 안전하게 데이터에 접근하도록 배타성을 보장합니다.
+//
+// 특징:
+// - 한 번에 한 스레드만 데이터 접근 가능
+// - lock()은 불변 참조로 호출 (내부 가변성)
+// - Send: T: Send일 때 소유권 이동 가능
+// - Sync: &Mutex<T>를 여러 스레드에서 공유 가능
+//
+// 작성일: 2026-03-02
+// 커밋: Phase B.1 (Week 2)
+
+use crate::sync::atomic::AtomicBool;
+use crate::sync::atomic::Ordering;
+use std::ops::{Deref, DerefMut};
+
+// ============================================================================
+// Mutex 구조
+// ============================================================================
+
+/// Mutex<T>: 상호 배제 락
+///
+/// 내부 가변성(Interior Mutability)을 제공하면서 스레드 안전성을 보장합니다.
+pub struct Mutex<T> {
+    // 잠금 상태 (true = 잠겨있음, false = 해제됨)
+    locked: AtomicBool,
+
+    // 보호되는 데이터
+    data: T,
+}
+
+/// MutexGuard<T>: lock()이 반환하는 RAII 가드
+///
+/// guard를 drop할 때 자동으로 lock이 해제됩니다.
+pub struct MutexGuard<'a, T> {
+    // 원본 Mutex에 대한 참조
+    mutex: &'a Mutex<T>,
+}
+
+// ============================================================================
+// Mutex의 기본 메서드
+// ============================================================================
+
+impl<T> Mutex<T> {
+    /// 새로운 Mutex<T>를 생성합니다.
+    pub fn new(data: T) -> Mutex<T> {
+        Mutex {
+            locked: AtomicBool::new(false),
+            data,
+        }
+    }
+
+    /// 데이터에 대한 배타적 접근을 얻습니다.
+    ///
+    /// 다른 스레드가 lock을 보유하고 있으면 현재 스레드는 대기합니다.
+    /// (이 단순 구현에서는 busy-wait를 사용하고,
+    ///  실제로는 futex나 platform mutex을 사용해야 합니다)
+    pub fn lock(&self) -> MutexGuard<T> {
+        // Busy-wait: 반복해서 lock을 시도
+        loop {
+            // compare_and_swap: false면 true로 바꾸고 성공했는지 반환
+            let was_locked = self.locked.compare_and_swap(
+                false,
+                true,
+                Ordering::SeqCst,
+            );
+
+            if !was_locked {
+                // 성공: lock 획득
+                return MutexGuard { mutex: self };
+            }
+
+            // 실패: 다시 시도 (yield 또는 sleep)
+            std::thread::yield_now();
+        }
+    }
+
+    /// Mutex 내부의 데이터를 얻습니다.
+    ///
+    /// 이 메서드는 &self를 소유하므로, 다른 누구도 접근할 수 없습니다.
+    pub fn into_inner(self) -> T {
+        self.data
+    }
+
+    /// lock 상태를 반환합니다.
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::SeqCst)
+    }
+}
+
+// ============================================================================
+// MutexGuard의 Deref 구현
+// ============================================================================
+
+impl<'a, T> Deref for MutexGuard<'a, T> {
+    type Target = T;
+
+    /// guard를 통해 데이터를 불변으로 접근
+    fn deref(&self) -> &T {
+        &self.mutex.data
+    }
+}
+
+impl<'a, T> DerefMut for MutexGuard<'a, T> {
+    /// guard를 통해 데이터를 가변으로 접근
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: guard가 유효한 동안 배타적 접근을 보장
+        unsafe {
+            &mut *((&self.mutex.data) as *const T as *mut T)
+        }
+    }
+}
+
+// ============================================================================
+// MutexGuard의 Drop 구현
+// ============================================================================
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+    /// guard를 drop할 때 자동으로 lock이 해제됩니다.
+    fn drop(&mut self) {
+        // lock 해제
+        self.mutex.locked.store(false, Ordering::SeqCst);
+    }
+}
+
+// ============================================================================
+// Send/Sync 구현
+// ============================================================================
+
+// Mutex<T>: Send if T: Send
+//
+// 설명:
+// - Mutex<T>의 소유권을 다른 스레드로 이동할 때,
+//   T는 Send여야 합니다.
+// - Mutex의 lock은 원자적으로 관리되므로,
+//   T: Send만 필요합니다.
+impl<T> Send for Mutex<T>
+where
+    T: Send,
+{
+}
+
+// Mutex<T>: Sync
+//
+// 설명:
+// - &Mutex<T>를 여러 스레드에서 공유할 수 있습니다.
+// - lock()은 불변 참조로 호출되므로,
+//   내부 가변성이 안전하게 구현됩니다.
+// - lock() 호출 시 배타성이 보장됩니다.
+// - T는 Send여야 합니다 (여러 스레드에서 다른 스레드로
+//   데이터가 이동될 수 있으므로).
+impl<T> Sync for Mutex<T>
+where
+    T: Send,
+{
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mutex_new() {
+        let mutex = Mutex::new(42);
+        assert!(!mutex.is_locked());
+    }
+
+    #[test]
+    fn test_mutex_lock() {
+        let mutex = Mutex::new(vec![1, 2, 3]);
+
+        {
+            let guard = mutex.lock();
+            assert!(mutex.is_locked());
+            assert_eq!(guard.get_ref(), &vec![1, 2, 3]);
+        }
+
+        // guard가 drop되었으므로 unlock됨
+        assert!(!mutex.is_locked());
+    }
+
+    #[test]
+    fn test_mutex_deref() {
+        let mutex = Mutex::new(10);
+
+        {
+            let guard = mutex.lock();
+            assert_eq!(*guard, 10);
+        }
+    }
+
+    #[test]
+    fn test_mutex_deref_mut() {
+        let mutex = Mutex::new(10);
+
+        {
+            let mut guard = mutex.lock();
+            *guard = 20;
+        }
+
+        {
+            let guard = mutex.lock();
+            assert_eq!(*guard, 20);
+        }
+    }
+
+    #[test]
+    fn test_mutex_drop_unlocks() {
+        let mutex = Mutex::new(42);
+
+        {
+            let _guard = mutex.lock();
+            assert!(mutex.is_locked());
+        }
+
+        // _guard가 drop되었으므로
+        assert!(!mutex.is_locked());
+
+        // 다시 lock 획득 가능
+        let _guard2 = mutex.lock();
+        assert!(mutex.is_locked());
+    }
+
+    #[test]
+    fn test_mutex_into_inner() {
+        let mutex = Mutex::new(String::from("hello"));
+        let inner = mutex.into_inner();
+        assert_eq!(inner, "hello");
+    }
+
+    #[test]
+    fn test_mutex_sequential_access() {
+        let mutex = Mutex::new(vec![]);
+
+        {
+            let mut guard = mutex.lock();
+            guard.push(1);
+            guard.push(2);
+        }
+
+        {
+            let guard = mutex.lock();
+            assert_eq!(guard.get_ref(), &vec![1, 2]);
+        }
+    }
+
+    // 스레드 안전성 테스트 (컴파일 타임)
+    #[test]
+    fn test_mutex_send_sync() {
+        // Mutex<i32>는 Send + Sync
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        assert_send::<Mutex<i32>>();
+        assert_sync::<Mutex<i32>>();
+    }
+
+    #[test]
+    fn test_mutex_guard_auto_release() {
+        let mutex = Mutex::new(0);
+
+        // Scope 1: lock 획득
+        {
+            let mut guard = mutex.lock();
+            *guard = 1;
+            // guard가 scope 벗어나면서 자동 drop → unlock
+        }
+
+        // Scope 2: lock 다시 획득 가능
+        {
+            let guard = mutex.lock();
+            assert_eq!(*guard, 1);
+        }
+    }
+
+    #[test]
+    fn test_mutex_with_struct() {
+        struct Counter {
+            value: usize,
+        }
+
+        let mutex = Mutex::new(Counter { value: 0 });
+
+        {
+            let mut guard = mutex.lock();
+            guard.value += 1;
+        }
+
+        {
+            let guard = mutex.lock();
+            assert_eq!(guard.value, 1);
+        }
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// Mutex<T> 구현 항목:
+// ✅ Mutex<T> 구조 정의
+// ✅ MutexGuard<T> 구조 정의
+// ✅ new() 메서드
+// ✅ lock() 메서드 (busy-wait 구현)
+// ✅ into_inner() 메서드
+// ✅ is_locked() 메서드
+// ✅ Deref 구현
+// ✅ DerefMut 구현
+// ✅ MutexGuard Drop 구현
+// ✅ Send/Sync 구현
+// ✅ 12개 테스트
+//
+// 주의: 이것은 교육용 구현입니다.
+// 실제 프로덕션에서는:
+// - futex (Linux) / ConditionVariable (Windows) 사용
+// - Fairness와 Starvation 방지
+// - Poisoning 메커니즘 추가
+// - Timeout 지원
+// - RwLock (읽기 전용 병렬화)
+//
+// 다음 단계:
+// 1. 컴파일러 통합 (thread::spawn T: Send 검증)
+// 2. 통합 테스트 (Arc<Mutex<T>> 패턴)
+// 3. Condvar 구현

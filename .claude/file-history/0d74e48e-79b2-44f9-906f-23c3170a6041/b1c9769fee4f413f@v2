@@ -1,0 +1,543 @@
+// ============================================================================
+// FreeLang Phase F Week 2: CLI Main Entry Point
+// ============================================================================
+//
+// FreeLang 프로그램을 실행하기 위한 명령행 인터페이스입니다.
+//
+// 사용 방법:
+// $ freelang [OPTIONS] [FILE]
+//
+// 명령어:
+// $ freelang program.fl          # 파일 실행
+// $ freelang --repl              # REPL 모드
+// $ freelang --eval "1 + 1"      # 코드 직접 실행
+// $ freelang --debug program.fl  # 디버그 모드로 실행
+// $ freelang --version           # 버전 출력
+// $ freelang --help              # 도움말 출력
+//
+// 구현 일시: 2026-03-02
+// 단계: Phase F Week 2
+
+use std::env;
+use std::process;
+use std::fs;
+use std::time::Instant;
+
+mod r#mod {
+    pub use super::super::r#mod::*;
+}
+
+// ============================================================================
+// 버전 정보
+// ============================================================================
+
+const VERSION: &str = "1.0.0";
+const PROGRAM_NAME: &str = "FreeLang";
+const AUTHOR: &str = "Claude Code";
+
+// ============================================================================
+// 명령행 옵션
+// ============================================================================
+
+/// 명령행 인수로 파싱된 옵션
+#[derive(Clone, Debug)]
+pub struct CliArgs {
+    /// 입력 파일 경로
+    pub input_file: Option<String>,
+
+    /// --eval 옵션: 직접 실행할 코드
+    pub eval_code: Option<String>,
+
+    /// --repl 옵션: REPL 모드 활성화
+    pub repl_mode: bool,
+
+    /// --debug 옵션: 디버그 모드
+    pub debug_mode: bool,
+
+    /// --verbose 옵션: 상세 출력
+    pub verbose: bool,
+
+    /// --time 옵션: 실행 시간 측정
+    pub measure_time: bool,
+
+    /// --check 옵션: 파싱만 수행
+    pub check_only: bool,
+
+    /// --version 옵션
+    pub show_version: bool,
+
+    /// --help 옵션
+    pub show_help: bool,
+
+    /// 추가 인수들
+    pub extra_args: Vec<String>,
+}
+
+impl Default for CliArgs {
+    fn default() -> Self {
+        CliArgs {
+            input_file: None,
+            eval_code: None,
+            repl_mode: false,
+            debug_mode: false,
+            verbose: false,
+            measure_time: false,
+            check_only: false,
+            show_version: false,
+            show_help: false,
+            extra_args: Vec::new(),
+        }
+    }
+}
+
+impl CliArgs {
+    /// 명령행 인수를 파싱합니다
+    pub fn parse(args: Vec<String>) -> Self {
+        let mut parsed = CliArgs::default();
+        let mut i = 1;  // 프로그램 이름 건너뛰기
+
+        while i < args.len() {
+            let arg = &args[i];
+
+            match arg.as_str() {
+                "--repl" => parsed.repl_mode = true,
+                "--debug" => parsed.debug_mode = true,
+                "--verbose" | "-v" => parsed.verbose = true,
+                "--time" => parsed.measure_time = true,
+                "--check" => parsed.check_only = true,
+                "--version" => parsed.show_version = true,
+                "--help" | "-h" => parsed.show_help = true,
+
+                "--eval" | "-e" => {
+                    if i + 1 < args.len() {
+                        parsed.eval_code = Some(args[i + 1].clone());
+                        i += 1;
+                    } else {
+                        eprintln!("❌ Error: --eval requires an argument");
+                        process::exit(1);
+                    }
+                },
+
+                arg if arg.starts_with('-') => {
+                    eprintln!("❌ Error: Unknown option: {}", arg);
+                    process::exit(1);
+                },
+
+                _ => {
+                    if parsed.input_file.is_none() {
+                        parsed.input_file = Some(arg.clone());
+                    } else {
+                        parsed.extra_args.push(arg.clone());
+                    }
+                }
+            }
+
+            i += 1;
+        }
+
+        parsed
+    }
+
+    /// 이 옵션 조합이 유효한지 확인합니다
+    pub fn validate(&self) -> Result<(), String> {
+        let modes_count = [
+            self.input_file.is_some(),
+            self.eval_code.is_some(),
+            self.repl_mode,
+        ].iter().filter(|&&x| x).count();
+
+        if modes_count > 1 {
+            return Err("Error: Cannot mix file, --eval, and --repl modes".to_string());
+        }
+
+        Ok(())
+    }
+
+    /// REPL 모드인지 확인합니다
+    pub fn should_start_repl(&self) -> bool {
+        self.repl_mode || (
+            self.input_file.is_none() &&
+            self.eval_code.is_none() &&
+            !self.show_version &&
+            !self.show_help
+        )
+    }
+}
+
+// ============================================================================
+// ExitCode: 종료 코드
+// ============================================================================
+
+/// 프로그램 종료 코드
+#[derive(Clone, Copy, Debug)]
+pub enum ExitCode {
+    Success = 0,
+    UsageError = 1,
+    RuntimeError = 2,
+    IoError = 3,
+    ParseError = 4,
+    Timeout = 5,
+    Unknown = 99,
+}
+
+impl Into<i32> for ExitCode {
+    fn into(self) -> i32 {
+        self as i32
+    }
+}
+
+// ============================================================================
+// CLI 함수들
+// ============================================================================
+
+/// 도움말을 출력합니다
+fn print_help() {
+    println!("{} {} - Interactive Programming Language", PROGRAM_NAME, VERSION);
+    println!();
+    println!("USAGE:");
+    println!("    freelang [OPTIONS] [FILE]");
+    println!();
+    println!("EXAMPLES:");
+    println!("    freelang program.fl              # Run a file");
+    println!("    freelang --eval \"1 + 1\"         # Evaluate code");
+    println!("    freelang --repl                  # Start REPL");
+    println!("    freelang --debug program.fl      # Run with debug output");
+    println!("    freelang --check program.fl      # Parse only (no execution)");
+    println!();
+    println!("OPTIONS:");
+    println!("    --eval <CODE>, -e <CODE>         Evaluate code directly");
+    println!("    --repl                           Start interactive REPL");
+    println!("    --debug                          Enable debug mode");
+    println!("    --verbose, -v                    Verbose output");
+    println!("    --time                           Measure execution time");
+    println!("    --check                          Parse only (no execution)");
+    println!("    --version                        Show version");
+    println!("    --help, -h                       Show this help");
+    println!();
+    println!("ENVIRONMENT:");
+    println!("    FREELANG_DEBUG   Set to 1 to enable debug mode");
+    println!("    FREELANG_TIMEOUT Set timeout in seconds (default: 300)");
+    println!();
+    println!("For more information, visit: https://freelang.dev");
+}
+
+/// 버전 정보를 출력합니다
+fn print_version() {
+    println!("{} {}", PROGRAM_NAME, VERSION);
+    println!("Author: {}", AUTHOR);
+    println!("Built: 2026-03-02");
+}
+
+/// 파일을 실행합니다
+fn run_file(
+    path: &str,
+    args: &CliArgs,
+    runtime: &mut r#mod::FreeLangRuntime,
+) -> ExitCode {
+    if args.verbose {
+        println!("📂 Loading file: {}", path);
+    }
+
+    match fs::read_to_string(path) {
+        Ok(source) => {
+            if args.check_only {
+                if args.verbose {
+                    println!("🔍 Parsing file (check mode)...");
+                }
+                match runtime.parse_only(&source) {
+                    Ok(_) => {
+                        println!("✅ Syntax check passed");
+                        ExitCode::Success
+                    },
+                    Err(e) => {
+                        eprintln!("❌ Parse error: {}", e);
+                        ExitCode::ParseError
+                    }
+                }
+            } else {
+                let start = if args.measure_time { Some(Instant::now()) } else { None };
+
+                match runtime.execute_source(&source) {
+                    Ok(_) => {
+                        if let Some(start_time) = start {
+                            let elapsed = start_time.elapsed().as_millis();
+                            println!("⏱️  Execution time: {}ms", elapsed);
+                        }
+
+                        if args.verbose {
+                            println!("{}", runtime.get_statistics());
+                        }
+
+                        ExitCode::Success
+                    },
+                    Err(e) => {
+                        eprintln!("❌ Runtime error: {}", e);
+                        if args.debug_mode {
+                            eprintln!("Debug info: {:?}", e);
+                        }
+                        ExitCode::RuntimeError
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            eprintln!("❌ IO error: Cannot read file '{}': {}", path, e);
+            ExitCode::IoError
+        }
+    }
+}
+
+/// 코드를 직접 실행합니다
+fn run_eval(
+    code: &str,
+    args: &CliArgs,
+    runtime: &mut r#mod::FreeLangRuntime,
+) -> ExitCode {
+    if args.verbose {
+        println!("▶️  Evaluating code: {}", code);
+    }
+
+    if args.check_only {
+        match runtime.parse_only(code) {
+            Ok(_) => {
+                println!("✅ Syntax check passed");
+                ExitCode::Success
+            },
+            Err(e) => {
+                eprintln!("❌ Parse error: {}", e);
+                ExitCode::ParseError
+            }
+        }
+    } else {
+        let start = if args.measure_time { Some(Instant::now()) } else { None };
+
+        match runtime.execute_source(code) {
+            Ok(result) => {
+                println!("→ {:?}", result);
+
+                if let Some(start_time) = start {
+                    let elapsed = start_time.elapsed().as_millis();
+                    println!("⏱️  Execution time: {}ms", elapsed);
+                }
+
+                if args.verbose {
+                    println!("{}", runtime.get_statistics());
+                }
+
+                ExitCode::Success
+            },
+            Err(e) => {
+                eprintln!("❌ Runtime error: {}", e);
+                ExitCode::RuntimeError
+            }
+        }
+    }
+}
+
+/// REPL을 시작합니다
+fn run_repl(args: &CliArgs, runtime: &mut r#mod::FreeLangRuntime) -> ExitCode {
+    if args.verbose {
+        println!("🎯 Starting FreeLang REPL v{}", VERSION);
+    }
+
+    runtime.start_repl();
+    ExitCode::Success
+}
+
+/// 환경 변수에서 설정을 로드합니다
+fn load_env_config(args: &mut CliArgs) {
+    if env::var("FREELANG_DEBUG").is_ok() {
+        args.debug_mode = true;
+    }
+}
+
+// ============================================================================
+// main 함수
+// ============================================================================
+
+fn main() {
+    let args_vec: Vec<String> = env::args().collect();
+    let mut args = CliArgs::parse(args_vec);
+
+    // 환경 변수 설정 로드
+    load_env_config(&mut args);
+
+    // 옵션 검증
+    if let Err(e) = args.validate() {
+        eprintln!("❌ {}", e);
+        process::exit(ExitCode::UsageError as i32);
+    }
+
+    // 특수 옵션 처리
+    if args.show_help {
+        print_help();
+        process::exit(ExitCode::Success as i32);
+    }
+
+    if args.show_version {
+        print_version();
+        process::exit(ExitCode::Success as i32);
+    }
+
+    // 런타임 설정
+    let config = if args.debug_mode {
+        r#mod::RuntimeConfig::development()
+    } else {
+        r#mod::RuntimeConfig::default()
+    };
+
+    let mut runtime = r#mod::FreeLangRuntime::with_config(config);
+    runtime.initialize();
+
+    // 실행 모드 결정
+    let exit_code = if let Some(code) = args.eval_code {
+        // --eval 모드
+        run_eval(&code, &args, &mut runtime)
+    } else if let Some(file_path) = args.input_file {
+        // 파일 실행 모드
+        run_file(&file_path, &args, &mut runtime)
+    } else if args.should_start_repl() {
+        // REPL 모드
+        run_repl(&args, &mut runtime)
+    } else {
+        // 기본값: 파일 없으면 에러
+        eprintln!("❌ Error: No input file or command specified");
+        eprintln!("Use 'freelang --help' for usage information");
+        ExitCode::UsageError
+    };
+
+    runtime.shutdown();
+    process::exit(exit_code as i32);
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_args_default() {
+        let args = CliArgs::default();
+        assert!(args.input_file.is_none());
+        assert!(args.repl_mode == false);
+    }
+
+    #[test]
+    fn test_cli_args_parse_file() {
+        let args_vec = vec!["freelang".to_string(), "test.fl".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert_eq!(args.input_file, Some("test.fl".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_parse_eval() {
+        let args_vec = vec![
+            "freelang".to_string(),
+            "--eval".to_string(),
+            "1 + 1".to_string(),
+        ];
+        let args = CliArgs::parse(args_vec);
+        assert_eq!(args.eval_code, Some("1 + 1".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_parse_repl() {
+        let args_vec = vec!["freelang".to_string(), "--repl".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.repl_mode == true);
+    }
+
+    #[test]
+    fn test_cli_args_parse_debug() {
+        let args_vec = vec!["freelang".to_string(), "--debug".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.debug_mode == true);
+    }
+
+    #[test]
+    fn test_cli_args_parse_verbose() {
+        let args_vec = vec!["freelang".to_string(), "-v".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.verbose == true);
+    }
+
+    #[test]
+    fn test_cli_args_parse_time() {
+        let args_vec = vec!["freelang".to_string(), "--time".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.measure_time == true);
+    }
+
+    #[test]
+    fn test_cli_args_parse_check() {
+        let args_vec = vec!["freelang".to_string(), "--check".to_string(), "test.fl".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.check_only == true);
+    }
+
+    #[test]
+    fn test_cli_args_parse_version() {
+        let args_vec = vec!["freelang".to_string(), "--version".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.show_version == true);
+    }
+
+    #[test]
+    fn test_cli_args_parse_help() {
+        let args_vec = vec!["freelang".to_string(), "--help".to_string()];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.show_help == true);
+    }
+
+    #[test]
+    fn test_cli_args_validate_multiple_modes() {
+        let mut args = CliArgs::default();
+        args.input_file = Some("test.fl".to_string());
+        args.eval_code = Some("1 + 1".to_string());
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_cli_args_should_start_repl_default() {
+        let args = CliArgs::default();
+        assert!(args.should_start_repl() == true);
+    }
+
+    #[test]
+    fn test_cli_args_should_start_repl_with_file() {
+        let mut args = CliArgs::default();
+        args.input_file = Some("test.fl".to_string());
+        assert!(args.should_start_repl() == false);
+    }
+
+    #[test]
+    fn test_exit_code_success() {
+        let code: i32 = ExitCode::Success.into();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_exit_code_runtime_error() {
+        let code: i32 = ExitCode::RuntimeError.into();
+        assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn test_cli_args_parse_multiple_flags() {
+        let args_vec = vec![
+            "freelang".to_string(),
+            "--debug".to_string(),
+            "-v".to_string(),
+            "--time".to_string(),
+            "program.fl".to_string(),
+        ];
+        let args = CliArgs::parse(args_vec);
+        assert!(args.debug_mode == true);
+        assert!(args.verbose == true);
+        assert!(args.measure_time == true);
+        assert_eq!(args.input_file, Some("program.fl".to_string()));
+    }
+}

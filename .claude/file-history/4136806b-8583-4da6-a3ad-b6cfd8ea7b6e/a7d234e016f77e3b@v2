@@ -1,0 +1,483 @@
+# ============================================================================
+# distributed/replication.fl - 복제 관리 (Quorum + Failover)
+# ============================================================================
+# Phase 3: 분산 벡터 인덱스
+# 작성: 2026-03-02
+# 책임: 3x 복제, Quorum 읽기/쓰기, 자동 장애 복구
+# 난이도: ⭐⭐⭐⭐
+
+struct ReplicaSet
+  partitionId: number
+  primaryNodeId: number
+  replicaNodeIds: array<number>
+  replicationFactor: number
+  quorumSize: number             # ceil(replicationFactor / 2) + 1
+
+struct ReplicationRequest
+  vectorId: string
+  partitionId: number
+  commandType: string             # "INSERT" | "DELETE"
+  payload: string
+  requestId: string               # UUID (멱등성)
+  term: number
+
+struct ReplicationResponse
+  nodeId: number
+  success: bool
+  term: number
+  errorMessage: Option<string>
+
+struct QuorumResult
+  requestId: string
+  success: bool
+  successCount: number
+  quorumAchieved: bool
+  responses: array<ReplicationResponse>
+  latencyMs: number
+
+struct FailoverState
+  failedNodeId: number
+  detectedAt: number
+  replacement: Option<number>
+  status: string                  # "DETECTED" | "PROMOTING" | "COMPLETE"
+  affectedPartitions: array<number>
+
+struct ReplicationManager
+  replicaSets: map<number, ReplicaSet>
+  pendingRequests: map<string, ReplicationRequest>
+  failoverStates: map<number, FailoverState>
+  stats: ReplicationStats
+
+struct ReplicationStats
+  totalWrites: number
+  quorumSuccesses: number
+  quorumFailures: number
+  failovers: number
+  avgReplicationLatencyMs: number
+
+struct PartitionHealth
+  partitionId: number
+  isHealthy: bool
+  liveReplicas: number
+  issues: array<string>
+
+# ============================================================================
+# 초기화
+# ============================================================================
+
+fn newReplicationManager
+  input: (partitions: array<PartitionInfo>, replicationFactor: number)
+  output: ReplicationManager
+  intent: "복제 관리자 초기화"
+  do
+    let replicaSets = {}
+    let i = 0
+
+    for i in 0..arrayLen(partitions)
+      let partition = arrayGet(partitions, i)
+      let replicaSet = buildReplicaSet(partition, replicationFactor)
+      replicaSets = mapSet(replicaSets, partition.partitionId, replicaSet)
+
+    return {
+      replicaSets: replicaSets,
+      pendingRequests: {},
+      failoverStates: {},
+      stats: {
+        totalWrites: 0,
+        quorumSuccesses: 0,
+        quorumFailures: 0,
+        failovers: 0,
+        avgReplicationLatencyMs: 0
+      }
+    }
+
+fn buildReplicaSet
+  input: (partition: PartitionInfo, replicationFactor: number)
+  output: ReplicaSet
+  intent: "파티션의 복제 세트 구성"
+  do
+    let quorumSize = (replicationFactor / 2) + 1
+
+    return {
+      partitionId: partition.partitionId,
+      primaryNodeId: partition.primaryNodeId,
+      replicaNodeIds: partition.replicaNodeIds,
+      replicationFactor: replicationFactor,
+      quorumSize: quorumSize
+    }
+
+# ============================================================================
+# Quorum Write
+# ============================================================================
+
+fn quorumWrite
+  input: (mgr: ReplicationManager, req: ReplicationRequest, cluster: RaftIndexCluster)
+  output: Result<QuorumResult, string>
+  intent: "Quorum Write: 다수 복제 노드에 쓰기"
+  do
+    let startTime = 0  # getCurrentTimeMs()
+
+    # 복제 세트 조회
+    match mapGet(mgr.replicaSets, req.partitionId)
+      None => return Err("Partition not found")
+      Some(replicaSet) => {
+        let responses = []
+        let i = 0
+
+        # 각 복제 노드에 쓰기 요청
+        for i in 0..arrayLen(replicaSet.replicaNodeIds)
+          let nodeId = arrayGet(replicaSet.replicaNodeIds, i)
+          let response = sendReplicationRequest(nodeId, req, cluster)
+          responses = arrayPush(responses, response)
+
+        # Quorum 결과 수집
+        let quorumResult = collectQuorumResponses(responses, replicaSet.quorumSize)
+        quorumResult.requestId = req.requestId
+        quorumResult.latencyMs = 0  # startTime 이후 경과시간
+
+        if quorumResult.quorumAchieved
+          return Ok(quorumResult)
+        else
+          return Err("Quorum not achieved: " + stringFromNumber(quorumResult.successCount) + "/" + stringFromNumber(replicaSet.quorumSize))
+      }
+
+fn sendReplicationRequest
+  input: (targetNodeId: number, req: ReplicationRequest, cluster: RaftIndexCluster)
+  output: ReplicationResponse
+  intent: "개별 노드에 복제 요청 전송"
+  do
+    # 시뮬레이션: Raft AppendEntries를 통한 복제
+    match mapGet(cluster.nodes, targetNodeId)
+      None => {
+        return {
+          nodeId: targetNodeId,
+          success: false,
+          term: 0,
+          errorMessage: Some("Node not found")
+        }
+      }
+      Some(node) => {
+        # 명령을 RaftIndexNode에 추가
+        match appendVectorCommand(node, req.commandType, req.partitionId, req.payload)
+          Ok(_updatedNode) => {
+            return {
+              nodeId: targetNodeId,
+              success: true,
+              term: node.currentTerm,
+              errorMessage: None
+            }
+          }
+          Err(e) => {
+            return {
+              nodeId: targetNodeId,
+              success: false,
+              term: node.currentTerm,
+              errorMessage: Some(e)
+            }
+          }
+
+fn collectQuorumResponses
+  input: (responses: array<ReplicationResponse>, quorumSize: number)
+  output: QuorumResult
+  intent: "복제 응답 집계"
+  do
+    let successCount = 0
+    let i = 0
+
+    for i in 0..arrayLen(responses)
+      let resp = arrayGet(responses, i)
+      if resp.success
+        successCount = successCount + 1
+
+    let quorumAchieved = successCount >= quorumSize
+
+    return {
+      requestId: "",
+      success: quorumAchieved,
+      successCount: successCount,
+      quorumAchieved: quorumAchieved,
+      responses: responses,
+      latencyMs: 0
+    }
+
+# ============================================================================
+# Quorum Read
+# ============================================================================
+
+fn quorumRead
+  input: (mgr: ReplicationManager, partitionId: number, vectorId: string, cluster: RaftIndexCluster)
+  output: Result<Vector, string>
+  intent: "Quorum Read: Primary에서 읽기"
+  do
+    match mapGet(mgr.replicaSets, partitionId)
+      None => return Err("Partition not found")
+      Some(replicaSet) => {
+        # Primary에서 먼저 시도
+        return readFromPrimary(partitionId, vectorId, cluster)
+      }
+
+fn readFromPrimary
+  input: (partitionId: number, vectorId: string, cluster: RaftIndexCluster)
+  output: Result<Vector, string>
+  intent: "Primary 노드에서 읽기"
+  do
+    # 시뮬레이션: Primary 노드의 localIndex에서 조회
+    return Err("Primary read not implemented")
+
+fn readWithFallback
+  input: (replicaSet: ReplicaSet, vectorId: string, cluster: RaftIndexCluster)
+  output: Result<Vector, string>
+  intent: "Primary 실패 시 Replica에서 읽기"
+  do
+    # 각 replicas를 순서대로 시도
+    let i = 0
+    for i in 0..arrayLen(replicaSet.replicaNodeIds)
+      let nodeId = arrayGet(replicaSet.replicaNodeIds, i)
+      match mapGet(cluster.nodes, nodeId)
+        Some(node) => {
+          # node.localIndex.hybridSearch 호출 (시뮬레이션)
+          return Err("Fallback read not implemented")
+        }
+        None => {}
+
+    return Err("All replicas unavailable")
+
+# ============================================================================
+# 장애 감지 및 복구
+# ============================================================================
+
+fn detectNodeFailure
+  input: (mgr: ReplicationManager, nodeId: number, cluster: RaftIndexCluster)
+  output: Result<FailoverState, string>
+  intent: "노드 장애 감지"
+  do
+    # 영향 받는 파티션 찾기
+    let affectedPartitions = []
+    let i = 0
+
+    for i in 0..mapSize(mgr.replicaSets)
+      let keyStr = stringFromNumber(i)
+      match mapGet(mgr.replicaSets, i)
+        Some(replicaSet) => {
+          if replicaSet.primaryNodeId == nodeId
+            affectedPartitions = arrayPush(affectedPartitions, replicaSet.partitionId)
+        }
+        None => {}
+
+    if arrayLen(affectedPartitions) == 0
+      return Err("Node is not primary of any partition")
+
+    let failoverState = {
+      failedNodeId: nodeId,
+      detectedAt: 0,  # getCurrentTimeMs()
+      replacement: None,
+      status: "DETECTED",
+      affectedPartitions: affectedPartitions
+    }
+
+    return Ok(failoverState)
+
+fn initiateFailover
+  input: (mgr: ReplicationManager, failedNodeId: number, cluster: RaftIndexCluster)
+  output: Result<ReplicationManager, string>
+  intent: "장애 복구 시작: Replica 승격"
+  do
+    # 각 파티션별로 Replica 승격
+    let newMgr = mgr
+    let i = 0
+
+    for i in 0..mapSize(mgr.replicaSets)
+      match mapGet(mgr.replicaSets, i)
+        Some(replicaSet) => {
+          if replicaSet.primaryNodeId == failedNodeId
+            # 새 Primary 선택
+            match selectReplacementNode(failedNodeId, arrayPush(replicaSet.replicaNodeIds, replicaSet.primaryNodeId), cluster)
+              Some(newPrimary) => {
+                match promoteReplica(newMgr, replicaSet.partitionId, newPrimary)
+                  Ok(updatedMgr) => newMgr = updatedMgr
+                  Err(_e) => {}
+              }
+              None => {}
+        }
+        None => {}
+
+    newMgr.stats.failovers = newMgr.stats.failovers + 1
+    return Ok(newMgr)
+
+fn selectReplacementNode
+  input: (failedNodeId: number, candidateNodeIds: array<number>, cluster: RaftIndexCluster)
+  output: Option<number>
+  intent: "가장 부하가 낮은 정상 노드 선택"
+  do
+    let bestNodeId = None
+    let minLoad = 999999
+    let i = 0
+
+    for i in 0..arrayLen(candidateNodeIds)
+      let nodeId = arrayGet(candidateNodeIds, i)
+      if nodeId != failedNodeId
+        match mapGet(cluster.nodes, nodeId)
+          Some(node) => {
+            # 간단한 부하 추정: log 크기
+            let load = arrayLen(node.log)
+            if load < minLoad
+              minLoad = load
+              bestNodeId = Some(nodeId)
+          }
+          None => {}
+
+    return bestNodeId
+
+fn promoteReplica
+  input: (mgr: ReplicationManager, partitionId: number, newPrimaryId: number)
+  output: Result<ReplicationManager, string>
+  intent: "Replica를 새 Primary로 승격"
+  do
+    match mapGet(mgr.replicaSets, partitionId)
+      None => return Err("Partition not found")
+      Some(replicaSet) => {
+        let newReplicaSet = replicaSet
+        newReplicaSet.primaryNodeId = newPrimaryId
+
+        let newMgr = mgr
+        newMgr.replicaSets = mapSet(newMgr.replicaSets, partitionId, newReplicaSet)
+
+        return Ok(newMgr)
+      }
+
+fn completeFailover
+  input: (mgr: ReplicationManager, failedNodeId: number)
+  output: ReplicationManager
+  intent: "장애 복구 완료"
+  do
+    match mapGet(mgr.failoverStates, failedNodeId)
+      Some(state) => {
+        let newState = state
+        newState.status = "COMPLETE"
+        let newMgr = mgr
+        newMgr.failoverStates = mapSet(newMgr.failoverStates, failedNodeId, newState)
+        return newMgr
+      }
+      None => return mgr
+
+# ============================================================================
+# 상태 조회
+# ============================================================================
+
+fn getReplicaSet
+  input: (mgr: ReplicationManager, partitionId: number)
+  output: Option<ReplicaSet>
+  intent: "파티션의 복제 세트 조회"
+  do
+    return mapGet(mgr.replicaSets, partitionId)
+
+fn checkReplicationHealth
+  input: (mgr: ReplicationManager, cluster: RaftIndexCluster)
+  output: array<PartitionHealth>
+  intent: "복제 건강도 확인"
+  do
+    let healths = []
+    let i = 0
+
+    for i in 0..mapSize(mgr.replicaSets)
+      match mapGet(mgr.replicaSets, i)
+        Some(replicaSet) => {
+          let liveReplicas = 0
+          let issues = []
+          let j = 0
+
+          # 각 replica 확인
+          for j in 0..arrayLen(replicaSet.replicaNodeIds)
+            let nodeId = arrayGet(replicaSet.replicaNodeIds, j)
+            match mapGet(cluster.nodes, nodeId)
+              Some(_node) => liveReplicas = liveReplicas + 1
+              None => issues = arrayPush(issues, "Replica " + stringFromNumber(nodeId) + " unavailable")
+
+          let isHealthy = liveReplicas >= replicaSet.quorumSize
+
+          let health = {
+            partitionId: replicaSet.partitionId,
+            isHealthy: isHealthy,
+            liveReplicas: liveReplicas,
+            issues: issues
+          }
+
+          healths = arrayPush(healths, health)
+        }
+        None => {}
+
+    return healths
+
+fn reportReplicationStatus
+  input: mgr: ReplicationManager
+  output: string
+  intent: "복제 상태 리포트"
+  do
+    let report = ""
+    report = report + "=== Replication Status ===\n"
+    report = report + "Total Writes: " + stringFromNumber(mgr.stats.totalWrites) + "\n"
+    report = report + "Quorum Successes: " + stringFromNumber(mgr.stats.quorumSuccesses) + "\n"
+    report = report + "Quorum Failures: " + stringFromNumber(mgr.stats.quorumFailures) + "\n"
+    report = report + "Failovers: " + stringFromNumber(mgr.stats.failovers) + "\n"
+
+    return report
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn appendVectorCommand
+  input: (node: any, commandType: string, partitionId: number, payload: string)
+  output: Result<any, string>
+  intent: "노드에 벡터 명령 추가"
+  do
+    return Err("Not implemented")  # Raft.fl의 appendVectorCommand 호출
+
+fn mapGet
+  input: (m: map<number, any>, key: number)
+  output: Option<any>
+  intent: "맵에서 값 조회"
+  do
+    return None
+
+fn mapSet
+  input: (m: map<number, any>, key: number, value: any)
+  output: map<number, any>
+  intent: "맵에 값 설정"
+  do
+    return m
+
+fn mapSize
+  input: m: map<number, any>
+  output: number
+  intent: "맵의 크기"
+  do
+    return 0
+
+fn arrayLen
+  input: arr: array<any>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0
+
+fn arrayGet
+  input: (arr: array<any>, idx: number)
+  output: any
+  intent: "배열 요소"
+  do
+    return null
+
+fn arrayPush
+  input: (arr: array<any>, item: any)
+  output: array<any>
+  intent: "배열에 추가"
+  do
+    return arr
+
+fn stringFromNumber
+  input: n: number
+  output: string
+  intent: "숫자를 문자열로"
+  do
+    return ""

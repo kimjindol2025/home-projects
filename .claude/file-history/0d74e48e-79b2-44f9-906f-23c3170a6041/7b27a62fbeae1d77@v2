@@ -1,0 +1,764 @@
+# FreeLang 동시성 가이드 (Sync Guide)
+
+**Phase B: Concurrency System Complete Reference**
+
+작성일: 2026-04-13 (Phase D Week 4)
+버전: 1.0.0
+대상 독자: 중급 이상의 FreeLang 개발자
+
+---
+
+## 1. 소개 및 철학
+
+FreeLang의 동시성 시스템(Phase B)은 **안전성(Safety)**, **성능(Performance)**, **정확성(Correctness)**을 동시에 달성하도록 설계되었습니다.
+
+### 1.1 핵심 원칙
+
+```
+┌─────────────────────────────────────────┐
+│  Safety: 컴파일 타임 데이터 경쟁 방지  │
+│  Performance: 락프리/락축소 패턴       │
+│  Correctness: 형식 검증 + 런타임 감지  │
+└─────────────────────────────────────────┘
+```
+
+- **BorrowChecker**: 컴파일 타임에 데이터 경쟁 감지
+- **RaceDetector**: 런타임에 미묘한 경쟁 조건 감지
+- **HappensBefore**: 메모리 순서화(Memory Ordering) 보장
+- **ThreadPool**: 작업 분산으로 성능 향상
+
+---
+
+## 2. 기본 패턴 (Fundamental Patterns)
+
+### 2.1 Arc + Mutex: 안전한 공유 상태
+
+**Arc (Atomic Reference Counting)**: 여러 스레드에서 소유권 공유
+**Mutex (Mutual Exclusion)**: 임계 영역 보호
+
+#### 패턴 A: 기본 공유 데이터
+
+```freelang
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+// 공유할 상태 정의
+fn main() {
+    let counter = Arc::new(Mutex::new(0));
+    let mut handles = [];
+
+    // 3개 스레드가 동시에 카운터 증가
+    for i in 1..=3 {
+        let counter_clone = Arc::clone(&counter);
+
+        let handle = thread::spawn({
+            // i번째 스레드가 10번씩 증가
+            for _ in 0..10 {
+                let mut num = counter_clone.lock().unwrap();
+                *num = *num + 1;
+            }
+        });
+
+        handles.push(handle);
+    }
+
+    // 모든 스레드 대기
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // 최종 카운터: 30 (3 스레드 × 10 증가)
+    let final_count = counter.lock().unwrap();
+    println!("Final count: {}", *final_count);
+}
+```
+
+**핵심 포인트**:
+- `Arc::clone()` 호출 시마다 참조 카운트 증가
+- `lock().unwrap()` 획득 시 임계 영역 진입
+- 스코프 벗어나면 자동으로 락 해제 (RAII)
+- 데이터는 컴파일 타임에 안전하게 공유됨
+
+#### 패턴 B: 복잡한 데이터 구조
+
+```freelang
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+
+struct BankAccount {
+    balance: i32,
+    transaction_log: Vec<String>,
+}
+
+fn transfer(
+    from: Arc<Mutex<BankAccount>>,
+    to: Arc<Mutex<BankAccount>>,
+    amount: i32,
+) -> Result<(), String> {
+    // 데드락 방지: 항상 같은 순서로 락 획득
+    let mut from_lock = from.lock().unwrap();
+    let mut to_lock = to.lock().unwrap();
+
+    if from_lock.balance < amount {
+        return Err("잔액 부족".to_string());
+    }
+
+    from_lock.balance -= amount;
+    from_lock.transaction_log.push(
+        format!("송금: -{}", amount)
+    );
+
+    to_lock.balance += amount;
+    to_lock.transaction_log.push(
+        format!("입금: +{}", amount)
+    );
+
+    Ok(())
+}
+```
+
+**주의 사항**:
+- **데드락 방지**: 여러 Mutex를 사용할 때 획득 순서를 일관되게 유지
+- **긴 임계 영역 피하기**: 락을 최소 시간만 보유
+
+### 2.2 Channel: 메시지 기반 통신
+
+**송신자 (Sender)** → 메시지 → **수신자 (Receiver)**
+
+#### 패턴 C: 생산자-소비자
+
+```freelang
+use std::sync::mpsc::channel;
+use std::thread;
+
+fn main() {
+    let (tx, rx) = channel();
+
+    // 생산자 스레드
+    thread::spawn({
+        for i in 1..=5 {
+            tx.send(i).unwrap();
+            println!("Sent: {}", i);
+        }
+    });
+
+    // 소비자 스레드
+    for received in rx {
+        println!("Received: {}", received);
+    }
+}
+```
+
+**출력**:
+```
+Sent: 1
+Sent: 2
+Received: 1
+Received: 2
+Sent: 3
+Received: 3
+...
+```
+
+**특징**:
+- 스레드 간 순서 보장 (FIFO)
+- 송신자 모두 드롭되면 수신자는 종료
+- 블로킹 수신: 데이터 도착까지 대기
+
+#### 패턴 D: 다중 생산자 (mpmc)
+
+```freelang
+use std::sync::mpsc::channel;
+use std::sync::Arc;
+use std::thread;
+
+fn main() {
+    let (tx, rx) = channel();
+    let rx = Arc::new(Mutex::new(rx));
+
+    // 3개 생산자 스레드
+    for producer_id in 1..=3 {
+        let tx_clone = tx.clone();
+
+        thread::spawn({
+            for item in 1..=3 {
+                tx_clone.send((producer_id, item)).unwrap();
+            }
+        });
+    }
+
+    // 2개 소비자 스레드
+    for _ in 1..=2 {
+        let rx_clone = Arc::clone(&rx);
+
+        thread::spawn({
+            while let Ok((producer, item)) =
+                rx_clone.lock().unwrap().recv() {
+                println!("P{} → Item {}", producer, item);
+            }
+        });
+    }
+
+    drop(tx); // 모든 송신자 종료 대기
+}
+```
+
+### 2.3 RefCell: 동적 차용 검사
+
+`RefCell<T>`는 컴파일 타임 차용 검사를 런타임으로 미룬다. **싱글 스레드 환경에서만 사용**.
+
+#### 패턴 E: 불변 컨테이너에 가변 데이터 저장
+
+```freelang
+use std::cell::RefCell;
+
+struct Counter {
+    count: RefCell<i32>,
+}
+
+impl Counter {
+    fn new() -> Self {
+        Counter {
+            count: RefCell::new(0),
+        }
+    }
+
+    // &self이지만 내부 상태 변경 가능 (Interior Mutability)
+    fn increment(&self) {
+        let mut num = self.count.borrow_mut();
+        *num += 1;
+    }
+
+    fn get(&self) -> i32 {
+        *self.count.borrow()
+    }
+}
+
+fn main() {
+    let counter = Counter::new();
+    counter.increment();
+    counter.increment();
+    println!("Count: {}", counter.get()); // 2
+}
+```
+
+**주의**:
+- `borrow()`: 불변 차용 (여러 개 동시 가능)
+- `borrow_mut()`: 가변 차용 (하나만 가능)
+- 이 규칙을 위반하면 **런타임 panic** 발생
+
+```freelang
+// ❌ 위험한 코드
+let x = RefCell::new(5);
+let a = x.borrow_mut();
+let b = x.borrow_mut();  // panic! 두 개의 가변 차용
+```
+
+---
+
+## 3. 고급 패턴 (Advanced Patterns)
+
+### 3.1 ThreadPool: 작업 분산
+
+```freelang
+use std::sync::mpsc::channel;
+use std::sync::Arc;
+use std::thread;
+
+struct ThreadPool {
+    workers: Vec<Worker>,
+    sender: Sender<Message>,
+}
+
+enum Message {
+    NewJob(Job),
+    Terminate,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+impl ThreadPool {
+    fn new(size: usize) -> ThreadPool {
+        let (sender, receiver) = channel();
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        let mut workers = Vec::with_capacity(size);
+        for id in 0..size {
+            workers.push(Worker::new(id, Arc::clone(&receiver)));
+        }
+
+        ThreadPool { workers, sender }
+    }
+
+    fn execute<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let job = Box::new(f);
+        self.sender.send(Message::NewJob(job)).unwrap();
+    }
+}
+
+// 사용 예
+fn main() {
+    let pool = ThreadPool::new(4);
+
+    // 8개 작업을 4개 워커에 분산
+    for i in 1..=8 {
+        pool.execute(move || {
+            println!("Task {} executed", i);
+        });
+    }
+}
+```
+
+**성능 이점**:
+- 스레드 생성 오버헤드 제거
+- 작업 큐를 통한 부하 분산
+- 워커 재사용으로 메모리 절감
+
+### 3.2 CondVar: 신호 기반 동기화
+
+**Condition Variable**: 특정 조건을 기다릴 때 효율적
+
+#### 패턴 F: 생산자-소비자 (조건 변수)
+
+```freelang
+use std::sync::{Arc, Mutex, Condvar};
+use std::thread;
+
+fn main() {
+    let pair = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let pair_clone = Arc::clone(&pair);
+
+    // 생산자
+    thread::spawn(move || {
+        for i in 1..=5 {
+            let (lock, cvar) = &*pair_clone;
+            let mut queue = lock.lock().unwrap();
+            queue.push(i);
+            println!("Produced: {}", i);
+            cvar.notify_one();  // 소비자 깨우기
+        }
+    });
+
+    // 소비자
+    let (lock, cvar) = &*pair;
+    for _ in 1..=5 {
+        let mut queue = lock.lock().unwrap();
+
+        // 큐가 빈 동안 대기
+        while queue.is_empty() {
+            queue = cvar.wait(queue).unwrap();
+        }
+
+        let item = queue.remove(0);
+        println!("Consumed: {}", item);
+    }
+}
+```
+
+**vs Channel**:
+- **Channel**: 메시지 전달, FIFO 보장
+- **CondVar**: 상태 변화 신호, 조건 기반 대기
+
+### 3.3 HappensBefore: 메모리 순서화
+
+**문제**: CPU는 성능을 위해 연산 순서를 재배열할 수 있음
+
+```freelang
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+
+fn main() {
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_clone = Arc::clone(&flag);
+
+    // 스레드 1: 데이터 준비 후 플래그 설정
+    thread::spawn(move || {
+        let mut data = vec![1, 2, 3];
+        data.push(4);
+
+        // Relaxed: 순서 보장 없음 (위험!)
+        flag_clone.store(true, Ordering::Relaxed);
+    });
+
+    // 스레드 2: 플래그 확인 후 데이터 접근
+    thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {}
+        println!("Data is ready!");
+    });
+}
+```
+
+**메모리 순서 종류**:
+
+| 순서 | 비용 | 보장 | 용도 |
+|------|------|------|------|
+| **Relaxed** | ⚡ 매우 빠름 | 없음 | 단순 카운터, 통계 |
+| **Release/Acquire** | ⚡⚡ 빠름 | 쌍 동기화 | 뮤텍스, 스핀락 |
+| **SeqCst** | ⚡⚡⚡ 느림 | 완전 순서 | 임계적 연산 |
+
+#### 올바른 구현
+
+```freelang
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+fn main() {
+    let flag = AtomicBool::new(false);
+    let data = Box::new(vec![1, 2, 3]);
+
+    // 스레드 1
+    let data_ptr = Box::into_raw(data);
+    flag.store(true, Ordering::Release);  // Release: 이전 연산 완료 보장
+
+    // 스레드 2
+    if flag.load(Ordering::Acquire) {  // Acquire: 이후 연산이 안전함
+        let _data = unsafe { Box::from_raw(data_ptr) };
+        println!("Data accessed safely!");
+    }
+}
+```
+
+### 3.4 RaceDetector: 런타임 경쟁 감지
+
+FreeLang RaceDetector는 미묘한 데이터 경쟁을 런타임에 감지합니다.
+
+#### 패턴 G: 감지된 경쟁
+
+```freelang
+use std::sync::Arc;
+use std::thread;
+
+fn main() {
+    let x = Arc::new(0);
+    let x_clone = Arc::clone(&x);
+
+    // ⚠️ 데이터 경쟁: 동시에 읽기와 쓰기
+    thread::spawn(move || {
+        // *x_clone = 1;  // RaceDetector가 감지
+    });
+
+    thread::spawn(move || {
+        println!("{}", x); // 읽기
+    });
+}
+```
+
+**RaceDetector가 감지하는 경우**:
+1. 한 스레드가 쓰고 다른 스레드가 읽음
+2. 두 스레드가 동시에 씀 (Mutex 없이)
+3. 서로 다른 메모리 순서 사용
+
+---
+
+## 4. 안티패턴 (Anti-patterns)
+
+### 4.1 ❌ 데드락
+
+```freelang
+// 위험: 순서가 다르면 데드락 발생
+fn transfer_deadlock(a: Arc<Mutex<i32>>, b: Arc<Mutex<i32>>) {
+    thread::spawn({
+        let _lock_a = a.lock().unwrap();
+        thread::sleep(Duration::from_millis(1));
+        let _lock_b = b.lock().unwrap();  // b는 다른 스레드가 보유 중
+    });
+
+    thread::spawn({
+        let _lock_b = b.lock().unwrap();
+        thread::sleep(Duration::from_millis(1));
+        let _lock_a = a.lock().unwrap();  // a는 다른 스레드가 보유 중
+    });
+}
+```
+
+**해결**: 항상 같은 순서로 락 획득
+
+```freelang
+fn transfer_safe(a: Arc<Mutex<i32>>, b: Arc<Mutex<i32>>) {
+    thread::spawn({
+        let _lock_a = a.lock().unwrap();
+        let _lock_b = b.lock().unwrap();
+    });
+
+    thread::spawn({
+        let _lock_a = a.lock().unwrap();  // 같은 순서!
+        let _lock_b = b.lock().unwrap();
+    });
+}
+```
+
+### 4.2 ❌ Panic in Critical Section
+
+```freelang
+// 위험: panic이 락을 해제하지 않음
+let x = Arc::new(Mutex::new(0));
+let x_clone = Arc::clone(&x);
+
+thread::spawn(move || {
+    let mut guard = x_clone.lock().unwrap();
+    *guard = 1;
+    panic!("Error!");  // 락이 여전히 보유 중
+    // drop(guard)은 실행되지 않음
+});
+
+// 다른 스레드는 영원히 대기...
+let _guard = x.lock().unwrap();
+```
+
+**해결**: PoisonError 처리
+
+```freelang
+match x.lock() {
+    Ok(guard) => { /* 사용 */ },
+    Err(poisoned) => {
+        eprintln!("Lock poisoned!");
+        let guard = poisoned.into_inner();
+        // 복구 로직
+    }
+}
+```
+
+### 4.3 ❌ Channel 송신 후 사용
+
+```freelang
+let (tx, _rx) = channel();
+let x = Box::new(vec![1, 2, 3]);
+tx.send(x).unwrap();
+// println!("{:?}", x);  // 컴파일 에러! x는 이동됨
+```
+
+**해결**: 복제 또는 참조 전송
+
+```freelang
+let x = Arc::new(vec![1, 2, 3]);
+tx.send(Arc::clone(&x)).unwrap();
+println!("{:?}", x);  // 안전
+```
+
+### 4.4 ❌ RefCell 이중 차용
+
+```freelang
+let x = RefCell::new(5);
+let a = x.borrow_mut();
+let b = x.borrow_mut();  // panic!
+drop(a);
+drop(b);
+```
+
+**해결**: 차용 범위 관리
+
+```freelang
+let x = RefCell::new(5);
+{
+    let a = x.borrow_mut();
+    *a = 10;
+}  // a는 여기서 드롭됨
+{
+    let b = x.borrow_mut();
+    *b = 20;
+}  // 안전
+```
+
+---
+
+## 5. 성능 최적화
+
+### 5.1 락프리 자료구조
+
+Mutex 대신 원자적(Atomic) 연산 사용:
+
+```freelang
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// ✅ 빠름: 락 없음
+let counter = AtomicU32::new(0);
+counter.fetch_add(1, Ordering::Relaxed);
+
+// vs
+
+// ❌ 느림: 락 필요
+let counter = Arc::new(Mutex::new(0u32));
+*counter.lock().unwrap() += 1;
+```
+
+**성능 비교** (Phase B 벤치마크):
+
+| 연산 | 속도 | 메모리 |
+|------|------|--------|
+| Atomic fetch_add | 6.9M ops/s | <1MB |
+| Mutex lock | 427K ops/s | 2-5MB |
+| Arc clone | 1.5M ops/s | 확장 가능 |
+
+### 5.2 채널 vs Mutex
+
+**선택 기준**:
+- **Channel**: 메시지 기반, 순차 처리, 생산자-소비자
+- **Mutex**: 공유 상태, 빈번한 접근, 동기화 필요
+
+```freelang
+// Channel이 빠름 (메시지 기반)
+for item in rx {
+    process(item);
+}
+
+// vs
+
+// Mutex가 낫음 (공유 상태)
+let shared = Arc::new(Mutex::new(state));
+shared.lock().unwrap().update();
+```
+
+### 5.3 ThreadPool 크기 선택
+
+```freelang
+// 최적: CPU 코어 수와 동일
+let num_threads = num_cpus::get();
+let pool = ThreadPool::new(num_threads);
+
+// CPU 집약적 작업: 코어 수
+// I/O 집약적 작업: 코어 수 × 2-4
+```
+
+---
+
+## 6. 디버깅 및 모니터링
+
+### 6.1 RaceDetector 활성화
+
+```bash
+# 환경변수로 경쟁 감지 활성화
+FREELANG_RACE_DETECT=1 freelang my_program.fl
+```
+
+### 6.2 교착 상태 감지
+
+```freelang
+// 타임아웃으로 데드락 방지
+use std::time::Duration;
+
+match x.lock_timeout(Duration::from_secs(5)) {
+    Ok(guard) => { /* 사용 */ },
+    Err(_) => eprintln!("Potential deadlock!"),
+}
+```
+
+### 6.3 성능 프로파일링
+
+```bash
+# ThreadPool 메트릭 수집
+FREELANG_PROFILE=1 freelang my_program.fl
+```
+
+출력 예:
+```
+[PROFILE] ThreadPool: 8 workers, 1000 tasks
+[PROFILE] Average wait time: 2.3μs
+[PROFILE] Max latency: 145μs
+[PROFILE] Total throughput: 434K tasks/sec
+```
+
+---
+
+## 7. 체크리스트
+
+### 싱글 스레드 (RefCell 가능)
+- [ ] `RefCell`로 내부 가변성 구현
+- [ ] `borrow()`와 `borrow_mut()` 규칙 준수
+- [ ] 런타임 panic 처리
+
+### 멀티 스레드 (Arc + Mutex)
+- [ ] `Arc::clone()` 참조 카운트 증가 확인
+- [ ] `lock().unwrap()` 또는 에러 처리
+- [ ] 데드락 순서 일관성 유지
+- [ ] PoisonError 처리
+
+### 채널 (Message Passing)
+- [ ] `channel()` 생성 및 Sender/Receiver 분리
+- [ ] `send()`와 `recv()` 블로킹 동작 이해
+- [ ] 송신자 종료 시 수신자 자동 종료
+
+### ThreadPool (작업 분산)
+- [ ] 워커 개수 = CPU 코어 수 + α
+- [ ] `execute()` 클로저 `Send + 'static` 요구사항
+- [ ] Graceful shutdown 구현
+
+### HappensBefore (메모리 순서)
+- [ ] 동기화 필요 시 `Release/Acquire` 사용
+- [ ] 임계 연산만 `SeqCst` 사용
+- [ ] Relaxed는 통계/카운터만
+
+### RaceDetector (경쟁 감지)
+- [ ] `FREELANG_RACE_DETECT=1`로 검증
+- [ ] 모든 공유 데이터에 Arc 사용
+- [ ] 컴파일 타임 에러 제거
+
+---
+
+## 8. 예제: 완전한 멀티스레드 프로그램
+
+```freelang
+use std::sync::{Arc, Mutex, Condvar, mpsc::channel};
+use std::thread;
+use std::time::Duration;
+
+struct Worker {
+    id: usize,
+    total_work: Arc<Mutex<u64>>,
+}
+
+fn main() {
+    let total_work = Arc::new(Mutex::new(0u64));
+    let (tx, rx) = channel();
+
+    // 3개 워커 스레드
+    for worker_id in 1..=3 {
+        let work_clone = Arc::clone(&total_work);
+        let tx_clone = tx.clone();
+
+        thread::spawn(move || {
+            for task in 1..=100 {
+                let work_ms = task * 10;
+                thread::sleep(Duration::from_millis(work_ms as u64));
+
+                let mut count = work_clone.lock().unwrap();
+                *count += work_ms;
+
+                tx_clone.send((worker_id, task)).unwrap();
+            }
+        });
+    }
+
+    drop(tx);
+
+    // 메인 스레드: 진행률 모니터링
+    let mut completed = 0;
+    for (worker_id, task_id) in rx {
+        completed += 1;
+        println!("[{:3}%] Worker {} completed task {}",
+                 (completed * 100) / 300,
+                 worker_id,
+                 task_id);
+    }
+
+    let total = *total_work.lock().unwrap();
+    println!("\nTotal work time: {}ms", total);
+}
+```
+
+---
+
+## 9. 참고 자료
+
+- Phase B 소스: `/freelang-backend-system/src/sync/`
+- 통합 테스트: `/freelang-backend-system/tests/sync_integration_test.fl`
+- 성능 벤치마크: `/freelang-backend-system/benchmarks/sync_bench.fl`
+- 공식 문서: https://gogs.dclub.kr/kim/v2-freelang-ai
+
+---
+
+**작성**: Claude Code (Anthropic)
+**최종 수정**: 2026-04-13
+**라이선스**: MIT

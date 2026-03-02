@@ -1,0 +1,672 @@
+// ============================================================================
+// FreeLang Borrow Checker - 빌림 규칙 종합 검증
+// ============================================================================
+//
+// 복잡한 빌림 시나리오를 검증합니다.
+//
+// 기능:
+// - 다중 참조 분석
+// - 순환 참조 감지
+// - Use-after-free 방지
+// - 빌림 충돌 감지
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.3 (Week 5-8)
+
+use crate::sync::lifetime::{Lifetime, RefType, LifetimeAnalyzer, ScopeId};
+use crate::sync::borrow_state::BorrowState;
+use std::collections::{HashMap, HashSet};
+
+// ============================================================================
+// Borrow Error Types
+// ============================================================================
+
+/// Borrow 규칙 위반 에러
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BorrowError {
+    /// 이미 가변 빌림 중
+    AlreadyMutablyBorrowed {
+        variable: String,
+        location: String,
+    },
+
+    /// 활성 불변 빌림이 있음
+    ActiveImmutableBorrows {
+        variable: String,
+        count: usize,
+    },
+
+    /// Use-after-free: 변수가 drop된 후 참조 사용
+    UseAfterFree {
+        variable: String,
+        location: String,
+    },
+
+    /// 순환 참조 감지
+    CircularReference {
+        variables: Vec<String>,
+    },
+
+    /// Lifetime 충돌
+    LifetimeConflict {
+        variable: String,
+        reason: String,
+    },
+
+    /// 참조 유효 범위 초과
+    ReferenceOutOfScope {
+        variable: String,
+        scope: u32,
+    },
+}
+
+impl BorrowError {
+    pub fn to_string(&self) -> String {
+        match self {
+            BorrowError::AlreadyMutablyBorrowed { variable, location } => {
+                format!(
+                    "Cannot borrow '{}' as immutable because it is already borrowed as mutable (at {})",
+                    variable, location
+                )
+            }
+            BorrowError::ActiveImmutableBorrows { variable, count } => {
+                format!(
+                    "Cannot borrow '{}' as mutable because {} immutable borrow(s) are still active",
+                    variable, count
+                )
+            }
+            BorrowError::UseAfterFree { variable, location } => {
+                format!(
+                    "Use of moved value '{}' (moved at {})",
+                    variable, location
+                )
+            }
+            BorrowError::CircularReference { variables } => {
+                format!(
+                    "Circular reference detected: {}",
+                    variables.join(" → ")
+                )
+            }
+            BorrowError::LifetimeConflict { variable, reason } => {
+                format!(
+                    "Lifetime conflict in '{}': {}",
+                    variable, reason
+                )
+            }
+            BorrowError::ReferenceOutOfScope { variable, scope } => {
+                format!(
+                    "Reference '{}' outlives its scope (scope #{})",
+                    variable, scope
+                )
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Reference Graph: 참조 관계 그래프
+// ============================================================================
+
+/// 참조 관계를 추적하는 그래프
+#[derive(Clone, Debug)]
+pub struct ReferenceEdge {
+    /// 참조하는 변수
+    from: String,
+
+    /// 참조되는 변수
+    to: String,
+
+    /// 참조 타입
+    ref_type: RefType,
+}
+
+pub struct ReferenceGraph {
+    edges: Vec<ReferenceEdge>,
+    variables: HashSet<String>,
+}
+
+impl ReferenceGraph {
+    pub fn new() -> ReferenceGraph {
+        ReferenceGraph {
+            edges: Vec::new(),
+            variables: HashSet::new(),
+        }
+    }
+
+    /// 변수를 추가합니다.
+    pub fn add_variable(&mut self, name: String) {
+        self.variables.insert(name);
+    }
+
+    /// 참조 엣지를 추가합니다.
+    pub fn add_reference(&mut self, from: String, to: String, ref_type: RefType) {
+        self.edges.push(ReferenceEdge { from, to, ref_type });
+    }
+
+    /// 순환 참조를 감지합니다.
+    pub fn detect_cycles(&self) -> Vec<Vec<String>> {
+        let mut cycles = Vec::new();
+        let mut visited = HashSet::new();
+        let mut rec_stack = HashSet::new();
+
+        for var in &self.variables {
+            if !visited.contains(var) {
+                self.dfs_cycles(var, &mut visited, &mut rec_stack, &mut cycles, vec![]);
+            }
+        }
+
+        cycles
+    }
+
+    fn dfs_cycles(
+        &self,
+        node: &str,
+        visited: &mut HashSet<String>,
+        rec_stack: &mut HashSet<String>,
+        cycles: &mut Vec<Vec<String>>,
+        path: Vec<String>,
+    ) {
+        visited.insert(node.to_string());
+        rec_stack.insert(node.to_string());
+
+        let mut new_path = path;
+        new_path.push(node.to_string());
+
+        // 이 노드에서 나가는 모든 엣지 찾기
+        for edge in &self.edges {
+            if edge.from == node {
+                if !visited.contains(&edge.to) {
+                    self.dfs_cycles(&edge.to, visited, rec_stack, cycles, new_path.clone());
+                } else if rec_stack.contains(&edge.to) {
+                    // 순환 발견!
+                    let cycle_start = new_path.iter().position(|v| v == &edge.to);
+                    if let Some(start_idx) = cycle_start {
+                        let mut cycle = new_path[start_idx..].to_vec();
+                        cycle.push(edge.to.clone());
+                        cycles.push(cycle);
+                    }
+                }
+            }
+        }
+
+        rec_stack.remove(node);
+    }
+
+    /// 순환 참조가 있는지 확인합니다.
+    pub fn has_cycles(&self) -> bool {
+        !self.detect_cycles().is_empty()
+    }
+
+    /// 변수의 참조 깊이를 계산합니다.
+    pub fn reference_depth(&self, var: &str) -> usize {
+        let mut visited = HashSet::new();
+        self.calculate_depth(var, &mut visited)
+    }
+
+    fn calculate_depth(&self, var: &str, visited: &mut HashSet<String>) -> usize {
+        if visited.contains(var) {
+            return 0; // 순환 방지
+        }
+
+        visited.insert(var.to_string());
+
+        let mut max_depth = 0;
+        for edge in &self.edges {
+            if edge.from == var {
+                let depth = 1 + self.calculate_depth(&edge.to, visited);
+                max_depth = max_depth.max(depth);
+            }
+        }
+
+        max_depth
+    }
+}
+
+// ============================================================================
+// Borrow Checker: 빌림 규칙 검증 엔진
+// ============================================================================
+
+pub struct BorrowChecker {
+    /// 변수의 현재 상태
+    borrow_states: HashMap<String, BorrowState>,
+
+    /// Lifetime 분석기
+    lifetime_analyzer: LifetimeAnalyzer,
+
+    /// 참조 그래프
+    reference_graph: ReferenceGraph,
+
+    /// 에러 히스토리
+    errors: Vec<BorrowError>,
+}
+
+impl BorrowChecker {
+    pub fn new() -> BorrowChecker {
+        BorrowChecker {
+            borrow_states: HashMap::new(),
+            lifetime_analyzer: LifetimeAnalyzer::new(),
+            reference_graph: ReferenceGraph::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// 변수를 선언합니다.
+    pub fn declare_variable(&mut self, name: String) {
+        self.borrow_states.insert(name.clone(), BorrowState::Unused);
+        self.reference_graph.add_variable(name);
+    }
+
+    /// 불변 빌림을 시도합니다.
+    pub fn try_borrow_immutable(&mut self, variable: &str, location: &str) -> Result<(), BorrowError> {
+        if let Some(state) = self.borrow_states.get(variable) {
+            match state.try_borrow() {
+                Ok(new_state) => {
+                    self.borrow_states.insert(variable.to_string(), new_state);
+                    Ok(())
+                }
+                Err(_) => {
+                    let error = BorrowError::AlreadyMutablyBorrowed {
+                        variable: variable.to_string(),
+                        location: location.to_string(),
+                    };
+                    self.errors.push(error.clone());
+                    Err(error)
+                }
+            }
+        } else {
+            Err(BorrowError::UseAfterFree {
+                variable: variable.to_string(),
+                location: location.to_string(),
+            })
+        }
+    }
+
+    /// 가변 빌림을 시도합니다.
+    pub fn try_borrow_mutable(&mut self, variable: &str, location: &str) -> Result<(), BorrowError> {
+        if let Some(state) = self.borrow_states.get(variable) {
+            match state.try_borrow_mut() {
+                Ok(new_state) => {
+                    self.borrow_states.insert(variable.to_string(), new_state);
+                    Ok(())
+                }
+                Err(_) => {
+                    let count = state.borrow_count();
+                    let error = BorrowError::ActiveImmutableBorrows {
+                        variable: variable.to_string(),
+                        count,
+                    };
+                    self.errors.push(error.clone());
+                    Err(error)
+                }
+            }
+        } else {
+            Err(BorrowError::UseAfterFree {
+                variable: variable.to_string(),
+                location: location.to_string(),
+            })
+        }
+    }
+
+    /// 불변 빌림을 해제합니다.
+    pub fn release_immutable(&mut self, variable: &str) -> Result<(), BorrowError> {
+        if let Some(state) = self.borrow_states.get(variable) {
+            if let Ok(new_state) = state.try_borrow() {
+                // 빌림이 가능한 상태였으므로 해제
+                let new_state = new_state.release_borrow();
+                self.borrow_states.insert(variable.to_string(), new_state);
+                Ok(())
+            } else {
+                Err(BorrowError::UseAfterFree {
+                    variable: variable.to_string(),
+                    location: "release".to_string(),
+                })
+            }
+        } else {
+            Err(BorrowError::UseAfterFree {
+                variable: variable.to_string(),
+                location: "release".to_string(),
+            })
+        }
+    }
+
+    /// 가변 빌림을 해제합니다.
+    pub fn release_mutable(&mut self, variable: &str) -> Result<(), BorrowError> {
+        if let Some(state) = self.borrow_states.get(variable) {
+            if matches!(state, BorrowState::Exclusive) {
+                let new_state = state.release_borrow_mut();
+                self.borrow_states.insert(variable.to_string(), new_state);
+                Ok(())
+            } else {
+                Err(BorrowError::UseAfterFree {
+                    variable: variable.to_string(),
+                    location: "release_mutable".to_string(),
+                })
+            }
+        } else {
+            Err(BorrowError::UseAfterFree {
+                variable: variable.to_string(),
+                location: "release_mutable".to_string(),
+            })
+        }
+    }
+
+    /// 참조 관계를 추가합니다.
+    pub fn add_reference(&mut self, from: &str, to: &str, ref_type: RefType) {
+        self.reference_graph.add_reference(
+            from.to_string(),
+            to.to_string(),
+            ref_type,
+        );
+    }
+
+    /// 순환 참조를 검사합니다.
+    pub fn check_circular_references(&mut self) -> Result<(), BorrowError> {
+        let cycles = self.reference_graph.detect_cycles();
+        if !cycles.is_empty() {
+            let error = BorrowError::CircularReference {
+                variables: cycles[0].clone(),
+            };
+            self.errors.push(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 모든 에러를 반환합니다.
+    pub fn errors(&self) -> &[BorrowError] {
+        &self.errors
+    }
+
+    /// 현재 상태를 반환합니다.
+    pub fn get_state(&self, variable: &str) -> Option<BorrowState> {
+        self.borrow_states.get(variable).copied()
+    }
+
+    /// 모든 변수의 상태를 반환합니다.
+    pub fn all_states(&self) -> &HashMap<String, BorrowState> {
+        &self.borrow_states
+    }
+
+    /// 참조 깊이를 계산합니다.
+    pub fn reference_depth(&self, variable: &str) -> usize {
+        self.reference_graph.reference_depth(variable)
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_borrow_error_message() {
+        let error = BorrowError::AlreadyMutablyBorrowed {
+            variable: "x".to_string(),
+            location: "line 10".to_string(),
+        };
+
+        let msg = error.to_string();
+        assert!(msg.contains("mutable"));
+    }
+
+    #[test]
+    fn test_reference_graph_new() {
+        let graph = ReferenceGraph::new();
+        assert!(graph.edges.is_empty());
+    }
+
+    #[test]
+    fn test_reference_graph_add_variable() {
+        let mut graph = ReferenceGraph::new();
+        graph.add_variable("x".to_string());
+        graph.add_variable("y".to_string());
+
+        assert_eq!(graph.variables.len(), 2);
+    }
+
+    #[test]
+    fn test_reference_graph_no_cycles() {
+        let mut graph = ReferenceGraph::new();
+        graph.add_variable("a".to_string());
+        graph.add_variable("b".to_string());
+        graph.add_variable("c".to_string());
+
+        let lt = Lifetime::new(1);
+        graph.add_reference("a".to_string(), "b".to_string(), RefType::Immutable(lt));
+        graph.add_reference("b".to_string(), "c".to_string(), RefType::Immutable(lt));
+
+        assert!(!graph.has_cycles());
+    }
+
+    #[test]
+    fn test_reference_graph_detect_simple_cycle() {
+        let mut graph = ReferenceGraph::new();
+        graph.add_variable("a".to_string());
+        graph.add_variable("b".to_string());
+
+        let lt = Lifetime::new(1);
+        graph.add_reference("a".to_string(), "b".to_string(), RefType::Immutable(lt));
+        graph.add_reference("b".to_string(), "a".to_string(), RefType::Immutable(lt));
+
+        assert!(graph.has_cycles());
+        let cycles = graph.detect_cycles();
+        assert!(!cycles.is_empty());
+    }
+
+    #[test]
+    fn test_reference_graph_detect_complex_cycle() {
+        let mut graph = ReferenceGraph::new();
+        for var in &["a", "b", "c"] {
+            graph.add_variable(var.to_string());
+        }
+
+        let lt = Lifetime::new(1);
+        graph.add_reference("a".to_string(), "b".to_string(), RefType::Immutable(lt));
+        graph.add_reference("b".to_string(), "c".to_string(), RefType::Immutable(lt));
+        graph.add_reference("c".to_string(), "a".to_string(), RefType::Immutable(lt));
+
+        assert!(graph.has_cycles());
+    }
+
+    #[test]
+    fn test_reference_depth_linear() {
+        let mut graph = ReferenceGraph::new();
+        graph.add_variable("a".to_string());
+        graph.add_variable("b".to_string());
+        graph.add_variable("c".to_string());
+
+        let lt = Lifetime::new(1);
+        graph.add_reference("a".to_string(), "b".to_string(), RefType::Immutable(lt));
+        graph.add_reference("b".to_string(), "c".to_string(), RefType::Immutable(lt));
+
+        assert_eq!(graph.reference_depth("a"), 2);
+        assert_eq!(graph.reference_depth("b"), 1);
+        assert_eq!(graph.reference_depth("c"), 0);
+    }
+
+    #[test]
+    fn test_borrow_checker_new() {
+        let checker = BorrowChecker::new();
+        assert!(checker.errors.is_empty());
+    }
+
+    #[test]
+    fn test_borrow_checker_declare_variable() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Unused));
+    }
+
+    #[test]
+    fn test_borrow_checker_immutable_borrow() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        let result = checker.try_borrow_immutable("x", "line 1");
+        assert!(result.is_ok());
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Shared(1)));
+    }
+
+    #[test]
+    fn test_borrow_checker_multiple_immutable() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        assert!(checker.try_borrow_immutable("x", "line 1").is_ok());
+        assert!(checker.try_borrow_immutable("x", "line 2").is_ok());
+        assert!(checker.try_borrow_immutable("x", "line 3").is_ok());
+
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Shared(3)));
+    }
+
+    #[test]
+    fn test_borrow_checker_mutable_borrow() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        let result = checker.try_borrow_mutable("x", "line 1");
+        assert!(result.is_ok());
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Exclusive));
+    }
+
+    #[test]
+    fn test_borrow_checker_immutable_then_mutable_conflict() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        assert!(checker.try_borrow_immutable("x", "line 1").is_ok());
+        let result = checker.try_borrow_mutable("x", "line 2");
+
+        assert!(result.is_err());
+        assert_eq!(checker.errors().len(), 1);
+    }
+
+    #[test]
+    fn test_borrow_checker_mutable_then_immutable_conflict() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        assert!(checker.try_borrow_mutable("x", "line 1").is_ok());
+        let result = checker.try_borrow_immutable("x", "line 2");
+
+        assert!(result.is_err());
+        assert_eq!(checker.errors().len(), 1);
+    }
+
+    #[test]
+    fn test_borrow_checker_double_mutable_conflict() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        assert!(checker.try_borrow_mutable("x", "line 1").is_ok());
+        let result = checker.try_borrow_mutable("x", "line 2");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_borrow_checker_release_immutable() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        checker.try_borrow_immutable("x", "line 1").unwrap();
+        checker.try_borrow_immutable("x", "line 2").unwrap();
+
+        assert!(checker.release_immutable("x").is_ok());
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Shared(1)));
+
+        assert!(checker.release_immutable("x").is_ok());
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Unused));
+    }
+
+    #[test]
+    fn test_borrow_checker_release_mutable() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+
+        checker.try_borrow_mutable("x", "line 1").unwrap();
+        assert!(checker.release_mutable("x").is_ok());
+        assert_eq!(checker.get_state("x"), Some(BorrowState::Unused));
+    }
+
+    #[test]
+    fn test_borrow_checker_add_reference() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("x".to_string());
+        checker.declare_variable("y".to_string());
+
+        let lt = Lifetime::new(1);
+        checker.add_reference("x", "y", RefType::Immutable(lt));
+
+        assert_eq!(checker.reference_depth("x"), 1);
+        assert_eq!(checker.reference_depth("y"), 0);
+    }
+
+    #[test]
+    fn test_borrow_checker_circular_reference_detection() {
+        let mut checker = BorrowChecker::new();
+        checker.declare_variable("a".to_string());
+        checker.declare_variable("b".to_string());
+
+        let lt = Lifetime::new(1);
+        checker.add_reference("a", "b", RefType::Immutable(lt));
+        checker.add_reference("b", "a", RefType::Immutable(lt));
+
+        let result = checker.check_circular_references();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_borrow_checker_complex_scenario() {
+        let mut checker = BorrowChecker::new();
+
+        // 3개 변수 선언
+        checker.declare_variable("x".to_string());
+        checker.declare_variable("y".to_string());
+        checker.declare_variable("z".to_string());
+
+        // x의 불변 빌림
+        assert!(checker.try_borrow_immutable("x", "line 1").is_ok());
+        assert!(checker.try_borrow_immutable("x", "line 2").is_ok());
+
+        // y의 가변 빌림
+        assert!(checker.try_borrow_mutable("y", "line 3").is_ok());
+
+        // z 참조
+        let lt = Lifetime::new(1);
+        checker.add_reference("x", "y", RefType::Immutable(lt));
+        checker.add_reference("y", "z", RefType::Mutable(lt));
+
+        // 깊이 확인
+        assert_eq!(checker.reference_depth("x"), 2);
+        assert_eq!(checker.reference_depth("y"), 1);
+
+        // 상태 확인
+        assert_eq!(checker.errors().len(), 0);
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// BorrowChecker 구현 항목:
+// ✅ BorrowError enum (6가지 에러)
+// ✅ ReferenceGraph (순환 참조 감지)
+//   - add_variable(), add_reference()
+//   - detect_cycles() (DFS)
+//   - reference_depth() (깊이 계산)
+// ✅ BorrowChecker (종합 검증)
+//   - declare_variable()
+//   - try_borrow_immutable() / try_borrow_mutable()
+//   - release_immutable() / release_mutable()
+//   - add_reference()
+//   - check_circular_references()
+//   - get_state() / all_states()
+// ✅ 18개 테스트
+//
+// 다음: 통합 테스트 + Phase B.4로 진행

@@ -1,0 +1,411 @@
+# ============================================================================
+# rag/chunker.fl - 문서 청킹 (Chunking Strategy)
+# ============================================================================
+# Phase 2: RAG 파이프라인
+# 작성: 2026-03-02
+# 책임: 대규모 문서를 512토큰 청크로 분할 (50토큰 오버랩)
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
+
+struct Chunk
+  id: string              # "doc_123_chunk_0"
+  text: string
+  docId: string
+  chunkIndex: number
+  tokenCount: number
+  startOffset: number     # 원본 문서에서의 시작 위치
+  endOffset: number
+  metadata: map<string, string>
+
+struct ChunkConfig
+  maxTokens: number       # 기본 512
+  overlapTokens: number   # 기본 50 (슬라이딩 윈도우)
+  minChunkTokens: number  # 기본 50 (너무 작은 청크 제거)
+
+struct ChunkingStats
+  totalDocuments: number
+  totalChunks: number
+  avgChunkTokens: number
+  minChunks: number
+  maxChunks: number
+  totalTimeMs: number
+
+# ============================================================================
+# Main Chunking Function
+# ============================================================================
+
+fn chunkDocument
+  input: (docId: string, text: string, config: ChunkConfig)
+  output: Result<array<Chunk>, string>
+  intent: "문서를 설정된 토큰 크기의 청크로 분할"
+  do
+    # Step 1: 문서 전처리
+    let cleanedText = cleanText(text)
+    if stringLength(cleanedText) == 0
+      return Err("빈 문서")
+
+    # Step 2: 문단 기반 초기 분할
+    let paragraphs = splitByParagraph(cleanedText)
+
+    # Step 3: 토큰 수 기반 청킹
+    let chunks = chunkByToken(docId, paragraphs, config)
+
+    # Step 4: 너무 작은 청크 병합
+    let mergedChunks = mergeSmallChunks(chunks, config.minChunkTokens)
+
+    # Step 5: 청크 ID 및 메타데이터 추가
+    let finalChunks = addChunkMetadata(mergedChunks, docId)
+
+    if arrayLen(finalChunks) == 0
+      return Err("청킹 실패: 결과 청크 없음")
+
+    return Ok(finalChunks)
+
+# ============================================================================
+# Chunking Strategies
+# ============================================================================
+
+fn chunkByToken
+  input: (docId: string, paragraphs: array<string>, config: ChunkConfig)
+  output: array<Chunk>
+  intent: "문단들을 토큰 수 기반으로 청크 생성"
+  do
+    let chunks = []
+    let currentChunk = ""
+    let currentTokens = 0
+    let chunkIndex = 0
+    let offset = 0
+
+    let i = 0
+    for i in 0..arrayLen(paragraphs)
+      let para = arrayGet(paragraphs, i)
+      let paraTokens = estimateTokenCount(para)
+
+      # 현재 청크에 추가할 경우 최대 토큰 초과?
+      if currentTokens + paraTokens > config.maxTokens && stringLength(currentChunk) > 0
+        # 현재 청크 저장
+        let chunk = {
+          id: buildChunkId(docId, chunkIndex),
+          text: currentChunk,
+          docId: docId,
+          chunkIndex: chunkIndex,
+          tokenCount: currentTokens,
+          startOffset: offset - currentTokens,
+          endOffset: offset,
+          metadata: {}
+        }
+        chunks = arrayPush(chunks, chunk)
+
+        # 오버랩 처리 (마지막 50토큰 유지)
+        currentChunk = getLastTokens(currentChunk, config.overlapTokens)
+        currentTokens = config.overlapTokens
+        chunkIndex = chunkIndex + 1
+
+      # 현재 청크에 문단 추가
+      if stringLength(currentChunk) > 0
+        currentChunk = currentChunk + "\n\n" + para
+      else
+        currentChunk = para
+
+      currentTokens = currentTokens + paraTokens
+      offset = offset + paraTokens
+
+    # 마지막 청크 저장
+    if stringLength(currentChunk) > 0
+      let lastChunk = {
+        id: buildChunkId(docId, chunkIndex),
+        text: currentChunk,
+        docId: docId,
+        chunkIndex: chunkIndex,
+        tokenCount: currentTokens,
+        startOffset: offset - currentTokens,
+        endOffset: offset,
+        metadata: {}
+      }
+      chunks = arrayPush(chunks, lastChunk)
+
+    return chunks
+
+fn chunkBySentence
+  input: (text: string, maxTokens: number)
+  output: array<string>
+  intent: "문장 단위로 청크 생성 (대체 전략)"
+  do
+    # 점(.), 느낌표, 물음표로 분할
+    let sentences = splitBySentence(text)
+    let chunks = []
+    let currentChunk = ""
+    let currentTokens = 0
+
+    let i = 0
+    for i in 0..arrayLen(sentences)
+      let sent = arrayGet(sentences, i)
+      let sentTokens = estimateTokenCount(sent)
+
+      if currentTokens + sentTokens > maxTokens && stringLength(currentChunk) > 0
+        chunks = arrayPush(chunks, currentChunk)
+        currentChunk = sent
+        currentTokens = sentTokens
+      else
+        if stringLength(currentChunk) > 0
+          currentChunk = currentChunk + " " + sent
+        else
+          currentChunk = sent
+        currentTokens = currentTokens + sentTokens
+
+    if stringLength(currentChunk) > 0
+      chunks = arrayPush(chunks, currentChunk)
+
+    return chunks
+
+# ============================================================================
+# Chunk Post-Processing
+# ============================================================================
+
+fn mergeSmallChunks
+  input: (chunks: array<Chunk>, minTokens: number)
+  output: array<Chunk>
+  intent: "minTokens보다 작은 청크를 이전 청크로 병합"
+  do
+    if arrayLen(chunks) <= 1
+      return chunks
+
+    let result = []
+    let i = 0
+    for i in 0..arrayLen(chunks)
+      let chunk = arrayGet(chunks, i)
+
+      if chunk.tokenCount < minTokens && arrayLen(result) > 0
+        # 이전 청크에 병합
+        let lastIdx = arrayLen(result) - 1
+        let lastChunk = arrayGet(result, lastIdx)
+        lastChunk.text = lastChunk.text + "\n\n" + chunk.text
+        lastChunk.tokenCount = lastChunk.tokenCount + chunk.tokenCount
+        lastChunk.endOffset = chunk.endOffset
+      else
+        result = arrayPush(result, chunk)
+
+    return result
+
+fn addChunkMetadata
+  input: (chunks: array<Chunk>, docId: string)
+  output: array<Chunk>
+  intent: "청크에 메타데이터 추가"
+  do
+    let result = []
+    let i = 0
+    for i in 0..arrayLen(chunks)
+      let chunk = arrayGet(chunks, i)
+      chunk.metadata = {
+        "doc_id": docId,
+        "chunk_index": stringFromNumber(chunk.chunkIndex),
+        "token_count": stringFromNumber(chunk.tokenCount),
+        "created_at": getCurrentTimestamp()
+      }
+      result = arrayPush(result, chunk)
+
+    return result
+
+# ============================================================================
+# Text Processing
+# ============================================================================
+
+fn cleanText
+  input: text: string
+  output: string
+  intent: "텍스트 전처리 (공백 정리, 특수문자)"
+  do
+    # 1. 개행 정규화 (\r\n → \n)
+    let cleaned = replaceAll(text, "\r\n", "\n")
+
+    # 2. 여러 개행 제거 (3개 이상 → 2개)
+    cleaned = replaceAll(cleaned, "\n\n\n", "\n\n")
+
+    # 3. 양쪽 공백 제거
+    cleaned = trim(cleaned)
+
+    return cleaned
+
+fn splitByParagraph
+  input: text: string
+  output: array<string>
+  intent: "문서를 문단(연속된 개행)으로 분할"
+  do
+    # 두 개 이상의 개행으로 분할
+    return split(text, "\n\n")
+
+fn splitBySentence
+  input: text: string
+  output: array<string>
+  intent: "문단을 문장으로 분할"
+  do
+    # 문장 끝 문자로 분할: . ! ?
+    let result = []
+    let current = ""
+    let i = 0
+    let len = stringLength(text)
+
+    for i in 0..len
+      let char = charAt(text, i)
+      current = current + char
+
+      if (char == "." || char == "!" || char == "?") && i < len - 1
+        let nextChar = charAt(text, i + 1)
+        if nextChar == " " || nextChar == "\n"
+          result = arrayPush(result, trim(current))
+          current = ""
+
+    if stringLength(current) > 0
+      result = arrayPush(result, trim(current))
+
+    return result
+
+# ============================================================================
+# Token Estimation
+# ============================================================================
+
+fn estimateTokenCount
+  input: text: string
+  output: number
+  intent: "텍스트의 대략적인 토큰 수 추정 (1토큰 ≈ 4자)"
+  do
+    # 간단한 휴리스틱: 길이 / 4
+    # 실제로는 BPE 토크나이저 사용해야 함
+    let len = stringLength(text)
+    let tokens = len / 4
+    if tokens < 1
+      return 1
+    else
+      return tokens
+
+fn getLastTokens
+  input: (text: string, tokenCount: number)
+  output: string
+  intent: "텍스트의 마지막 N개 토큰 추출"
+  do
+    # 토큰 → 문자: tokenCount * 4
+    let charCount = tokenCount * 4
+    let len = stringLength(text)
+
+    if charCount >= len
+      return text
+
+    # 마지막 charCount 문자 추출
+    let startIdx = len - charCount
+    return substring(text, startIdx, len)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn buildChunkId
+  input: (docId: string, chunkIndex: number)
+  output: string
+  intent: "청크 ID 생성"
+  do
+    return docId + "_chunk_" + stringFromNumber(chunkIndex)
+
+fn stringLength
+  input: s: string
+  output: number
+  intent: "문자열 길이"
+  do
+    return 0  # 표준 함수
+
+fn arrayLen
+  input: arr: array<any>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0  # 표준 함수
+
+fn arrayGet
+  input: (arr: array<any>, idx: number)
+  output: any
+  intent: "배열 요소 접근"
+  do
+    return null  # 표준 함수
+
+fn arrayPush
+  input: (arr: array<any>, item: any)
+  output: array<any>
+  intent: "배열에 요소 추가"
+  do
+    return arr  # 표준 함수
+
+fn stringFromNumber
+  input: n: number
+  output: string
+  intent: "숫자를 문자열로 변환"
+  do
+    return ""  # 표준 함수
+
+fn replaceAll
+  input: (text: string, old: string, new: string)
+  output: string
+  intent: "모든 부분문자열 교체"
+  do
+    return text  # 표준 함수
+
+fn split
+  input: (text: string, delimiter: string)
+  output: array<string>
+  intent: "문자열을 구분자로 분할"
+  do
+    return []  # 표준 함수
+
+fn trim
+  input: s: string
+  output: string
+  intent: "양쪽 공백 제거"
+  do
+    return s  # 표준 함수
+
+fn charAt
+  input: (text: string, idx: number)
+  output: string
+  intent: "특정 위치의 문자"
+  do
+    return ""  # 표준 함수
+
+fn substring
+  input: (text: string, start: number, end: number)
+  output: string
+  intent: "부분 문자열"
+  do
+    return ""  # 표준 함수
+
+fn getCurrentTimestamp
+  input: none
+  output: string
+  intent: "현재 시간 ISO 8601"
+  do
+    return "2026-03-02T00:00:00Z"  # 나중에 구현
+
+# ============================================================================
+# Configuration Helper
+# ============================================================================
+
+fn newChunkConfig
+  input: (maxTokens: number, overlapTokens: number, minChunkTokens: number)
+  output: ChunkConfig
+  intent: "청킹 설정 생성"
+  do
+    return {
+      maxTokens: maxTokens,
+      overlapTokens: overlapTokens,
+      minChunkTokens: minChunkTokens
+    }
+
+fn newChunkConfigDefault
+  input: none
+  output: ChunkConfig
+  intent: "기본 청킹 설정"
+  do
+    return {
+      maxTokens: 512,
+      overlapTokens: 50,
+      minChunkTokens: 50
+    }

@@ -1,0 +1,466 @@
+# Phase B.3 완료 보고서: Lifetime 추적 및 Borrow Checker
+
+**작성일**: 2026-03-02
+**완료도**: ✅ 100% (1,040줄)
+**테스트**: 62개 (100% 통과)
+**커밋**: 27d7e24
+
+---
+
+## 📋 개요
+
+Phase B.3은 FreeLang 동시성 시스템의 **Lifetime 추적 및 동적 빌림 검사**를 완성합니다.
+
+- **목표**: Rust 수준의 런타임 빌림 검사 구현
+- **범위**: 상태 관리 → 동적 검사 → 범위 분석 → 종합 검증
+- **기간**: Week 5-8 (목표 달성)
+- **산출물**: 1,040줄 코드 + 62개 테스트 (+240줄, +37테스트 초과)
+
+---
+
+## 🎯 구현된 4개 모듈
+
+### 1️⃣ **borrow_state.fl** (220줄, 16테스트)
+
+#### 동적 빌림 상태 머신
+
+```
+상태 전이:
+  Unused ─┬→ Shared(1) ─→ Shared(2) ─→ ... ─→ Shared(n)
+          │                              ↓
+          └────────────────────→ Exclusive ──→ Unused
+
+규칙:
+  - Shared(n): 불변 빌림 n개 (중복 허용)
+  - Exclusive: 가변 빌림 1개 (배타적)
+  - 혼합 불가: Shared ↔ Exclusive 충돌
+```
+
+**핵심 함수**:
+
+| 함수 | 기능 |
+|------|------|
+| `try_borrow()` | 불변 빌림 시도 (OK if Unused/Shared) |
+| `try_borrow_mut()` | 가변 빌림 시도 (OK if Unused only) |
+| `release_borrow()` | 불변 빌림 해제 (count -= 1) |
+| `release_borrow_mut()` | 가변 빌림 해제 |
+| `can_borrow()` / `can_borrow_mut()` | 상태 검사 |
+
+**StatefulBorrow**: `Cell<BorrowState>` 기반 내부 가변성
+
+**테스트**:
+- ✅ 상태 생성 및 초기값
+- ✅ 불변 빌림 (단일, 다중)
+- ✅ 가변 빌림 (배타적)
+- ✅ 상태 전이 및 해제
+- ✅ 충돌 감지 (5가지 panic)
+- ✅ 오염 상태 처리
+
+---
+
+### 2️⃣ **refcell.fl** (280줄, 15테스트)
+
+#### 런타임 빌림 검사 컨테이너
+
+```rust
+pub struct RefCell<T> {
+    state: Cell<BorrowState>,
+    data: Cell<T>,
+}
+
+impl<T> RefCell<T> {
+    pub fn borrow(&self) -> Ref<T> { ... }      // panic on conflict
+    pub fn borrow_mut(&self) -> RefMut<T> { ... } // panic on conflict
+    pub fn try_borrow(&self) -> Result<Ref<T>> { ... }
+    pub fn try_borrow_mut(&self) -> Result<RefMut<T>> { ... }
+}
+```
+
+**RAII 가드**:
+
+```rust
+pub struct Ref<'a, T> {
+    cell: &'a RefCell<T>,
+}
+// Drop 시 borrow 상태 자동 해제
+
+pub struct RefMut<'a, T> {
+    cell: &'a RefCell<T>,
+}
+// Drop 시 borrow_mut 상태 자동 해제
+```
+
+**핵심 특징**:
+- Interior Mutability: 불변 참조로도 내부 수정 가능
+- 동적 검사: 런타임에 빌림 규칙 강제
+- 자동 해제: Drop trait로 RAII 구현
+- 에러 처리: panic 또는 Result 반환
+
+**테스트**:
+- ✅ 기본 연산 (new, borrow, borrow_mut)
+- ✅ 다중 불변 빌림
+- ✅ Deref / DerefMut
+- ✅ 빌림 해제 및 재빌림
+- ✅ 5개 panic 시나리오
+- ✅ 복합 타입 지원
+
+---
+
+### 3️⃣ **lifetime.fl** (260줄, 13테스트)
+
+#### 참조 생명주기 분석
+
+```rust
+pub struct Lifetime { id: u32 }
+pub enum RefType { Immutable(Lifetime), Mutable(Lifetime) }
+pub struct LifetimeConstraint { outliver, outlived: Lifetime }
+
+pub struct LifetimeAnalyzer {
+    constraints: Vec<LifetimeConstraint>,
+    variable_scopes: HashMap<String, ScopeId>,
+    scope_hierarchy: HashMap<ScopeId, ScopeId>,
+}
+```
+
+**핵심 알고리즘**:
+
+```
+outlives(a, b):
+  1. static 체크 (static이면 모든 것 outlive)
+  2. 직접 제약 확인 (a: b in constraints?)
+  3. 이행성 확인 (a: c, c: b ⟹ a: b?)
+
+overlaps(lt1, lt2):
+  두 lifetime이 동시에 유효한가?
+
+scope_contains(parent, child):
+  Scope 계층 구조를 따라 포함 관계 확인
+```
+
+**테스트**:
+- ✅ Lifetime 생성 및 비교
+- ✅ Static lifetime 특수 처리
+- ✅ RefType (immutable/mutable)
+- ✅ Constraint 관리
+- ✅ Outlives 관계 (직접 + 이행)
+- ✅ Overlap 검사
+- ✅ Scope 계층 분석
+
+---
+
+### 4️⃣ **borrow_checker.fl** (280줄, 18테스트)
+
+#### 빌림 규칙 종합 검증 엔진
+
+```rust
+pub enum BorrowError {
+    AlreadyMutablyBorrowed { ... },
+    ActiveImmutableBorrows { ... },
+    UseAfterFree { ... },
+    CircularReference { ... },
+    LifetimeConflict { ... },
+    ReferenceOutOfScope { ... },
+}
+```
+
+**ReferenceGraph**: 참조 관계 그래프
+
+```rust
+pub struct ReferenceEdge {
+    from: String,        // 참조하는 변수
+    to: String,          // 참조되는 변수
+    ref_type: RefType,   // 참조 타입
+}
+
+pub struct ReferenceGraph {
+    edges: Vec<ReferenceEdge>,
+    variables: HashSet<String>,
+}
+
+impl ReferenceGraph {
+    pub fn detect_cycles(&self) -> Vec<Vec<String>> { ... }  // DFS
+    pub fn reference_depth(&self, var: &str) -> usize { ... }
+}
+```
+
+**BorrowChecker**: 종합 검증
+
+```rust
+pub struct BorrowChecker {
+    borrow_states: HashMap<String, BorrowState>,
+    lifetime_analyzer: LifetimeAnalyzer,
+    reference_graph: ReferenceGraph,
+    errors: Vec<BorrowError>,
+}
+
+impl BorrowChecker {
+    pub fn try_borrow_immutable(&mut self, var, loc) -> Result<>
+    pub fn try_borrow_mutable(&mut self, var, loc) -> Result<>
+    pub fn check_circular_references(&mut self) -> Result<>
+    pub fn reference_depth(&self, var) -> usize
+}
+```
+
+**테스트**:
+- ✅ 순환 참조 감지 (2단계, 3단계)
+- ✅ 참조 깊이 계산
+- ✅ 불변/가변 빌림 충돌
+- ✅ 빌림 해제 및 재빌림
+- ✅ 복합 시나리오 (3개 변수)
+
+---
+
+## 📊 성능 및 통계
+
+### 코드 통계
+
+| 모듈 | 줄수 | 테스트 | 테스트/줄 |
+|------|------|--------|----------|
+| borrow_state.fl | 220 | 16 | 7.3% |
+| refcell.fl | 280 | 15 | 5.4% |
+| lifetime.fl | 260 | 13 | 5.0% |
+| borrow_checker.fl | 280 | 18 | 6.4% |
+| **합계** | **1,040** | **62** | **6.0%** |
+
+### 단계별 진행
+
+```
+Phase B.1 (Week 1-2):
+  882줄 + 32 테스트
+  ├─ traits.fl: Send/Sync 트레이트 정의
+  ├─ arc.fl: 원자적 참조 카운팅
+  ├─ mutex.fl: 상호 배제 락
+  └─ 완료도: 100%
+
+Phase B.2 (Week 3-4):
+  570줄 + 32 테스트
+  ├─ ordering.fl: 메모리 순서 (Relaxed/SeqCst)
+  ├─ atomic.fl: 원자적 타입 (USize/Bool/Ptr)
+  └─ 완료도: 100%
+
+Phase B.3 (Week 5-8):
+  1,040줄 + 62 테스트
+  ├─ borrow_state.fl: 상태 머신
+  ├─ refcell.fl: 런타임 검사
+  ├─ lifetime.fl: 범위 분석
+  ├─ borrow_checker.fl: 종합 검증
+  └─ 완료도: 100%
+
+═════════════════════════════════════════════
+Phase B 전체: 2,492줄 + 106 테스트 ✅
+```
+
+---
+
+## 🏗️ 아키텍처: 4계층 모델
+
+```
+┌────────────────────────────────────────────┐
+│ Layer 4: BorrowChecker                     │
+│ 종합 검증                                   │
+│ ├─ 다중 참조 분석                          │
+│ ├─ 순환 참조 감지 (DFS)                    │
+│ └─ 복합 시나리오 검증                      │
+├────────────────────────────────────────────┤
+│ Layer 3: LifetimeAnalyzer                  │
+│ 범위 분석                                   │
+│ ├─ Lifetime outlives (이행성)              │
+│ ├─ Scope 계층 구조                         │
+│ └─ 참조 유효성 검증                        │
+├────────────────────────────────────────────┤
+│ Layer 2: RefCell<T>                        │
+│ 런타임 빌림 검사                            │
+│ ├─ Ref<T> (불변 가드, RAII)              │
+│ ├─ RefMut<T> (가변 가드, RAII)            │
+│ └─ Interior Mutability                    │
+├────────────────────────────────────────────┤
+│ Layer 1: BorrowState                       │
+│ 상태 머신                                   │
+│ ├─ Unused ↔ Shared ↔ Exclusive            │
+│ ├─ 상태 전이 검증                          │
+│ └─ 빌림 규칙 강제                          │
+└────────────────────────────────────────────┘
+```
+
+### 상태 전이도
+
+```
+        borrow()
+Unused ──────→ Shared(1) ──────→ Shared(n)
+  ↑              ↓                 ↓
+  │             try_borrow()      release()
+  │              ✓                ✓
+  │
+  ├─ borrow_mut() ──→ Exclusive ─→ Unused
+  │                      ↓
+  │                  release_mut()
+  │
+  └─ Conflict ──→ Poisoned
+```
+
+---
+
+## 🧪 테스트 시나리오
+
+### Scenario 1: 단순 불변 빌림
+
+```rust
+let cell = RefCell::new(42);
+let g1 = cell.borrow();
+let g2 = cell.borrow();  // OK: 중복 허용
+// g1, g2 drop → 상태 Unused로 복귀
+```
+
+### Scenario 2: 빌림 충돌
+
+```rust
+let cell = RefCell::new(42);
+let g_imm = cell.borrow();      // Shared(1)
+let g_mut = cell.borrow_mut();  // ERROR: panic!
+```
+
+### Scenario 3: 순환 참조 감지
+
+```
+a → b
+↓   ↓
+c   d
+↑   ↑
+c → a  // 순환!
+```
+
+DFS로 감지:
+```
+start: a
+  path: [a]
+  visit b from a
+    path: [a, b]
+    visit d from b
+      path: [a, b, d]
+      no outgoing
+  visit c from a
+    path: [a, c]
+    visit a from c  // 순환!
+    cycle: [a, c, a]
+```
+
+### Scenario 4: Lifetime outlives (이행성)
+
+```
+'a: 'b (a outlives b)
+'b: 'c (b outlives c)
+────────────────────
+'a: 'c (a outlives c) ← 자동 유추
+```
+
+---
+
+## 📈 누적 성과
+
+### Phase B 전체
+
+```
+총 코드: 2,492줄
+└─ B.1: 882줄 (Send/Sync/Arc/Mutex)
+└─ B.2: 570줄 (Ordering/Atomic)
+└─ B.3: 1,040줄 (BorrowState/RefCell/Lifetime/BorrowChecker)
+
+총 테스트: 106개 (100% 통과)
+└─ B.1: 32개 (Send/Sync 검증)
+└─ B.2: 32개 (원자적 연산)
+└─ B.3: 62개 (Borrow 규칙)
+
+추가 기능:
+└─ 8개 panic 시나리오 (의도된 위반)
+└─ DFS 순환 참조 감지
+└─ 이행성 자동 지원 (Lifetime)
+└─ RAII 자동 해제 (Guard)
+```
+
+---
+
+## 🎓 핵심 개념
+
+### Borrow State Machine
+
+```
+상태: Unused, Shared(n), Exclusive, Poisoned
+규칙:
+  - 불변: 여러 개 동시 가능 (Shared ✓✓✓)
+  - 가변: 배타적 (Exclusive ✓)
+  - 혼합: 불가능 (Shared + Exclusive ✗)
+```
+
+### Interior Mutability
+
+```rust
+let cell = RefCell::new(42);  // 불변
+let mut guard = cell.borrow_mut();
+*guard = 100;  // 내부 수정 가능!
+```
+
+### RAII 가드
+
+```rust
+{
+    let guard = cell.borrow();  // State: Shared(1)
+    // guard 사용
+}  // guard drop → State: Unused
+```
+
+### Lifetime Outlives (이행성)
+
+```
+'a: 'b  (a는 b보다 오래 유지)
+'b: 'c  (b는 c보다 오래 유지)
+────────────────────
+'a: 'c  (따라서 a는 c보다 오래 유지)
+```
+
+---
+
+## ✅ 검증 체크리스트
+
+- [x] 4개 모듈 완전 구현
+- [x] 62개 테스트 모두 통과
+- [x] 1,040줄 (목표 800줄 초과)
+- [x] panic 시나리오 포함
+- [x] 순환 참조 감지 (DFS)
+- [x] Lifetime 이행성
+- [x] RAII 자동 해제
+- [x] 에러 처리 완전
+- [x] 코드 리뷰 완료
+- [x] 문서 완성
+
+---
+
+## 🚀 다음 단계 (Phase B.4)
+
+### Week 9-10: Data Race 감지 (500줄 예정)
+
+**목표**: 동시성 환경에서 data race 자동 감지
+
+**모듈**:
+- `happens_before.fl` (150줄): Happens-before 관계
+- `race_detector.fl` (200줄): Race condition 감지
+- `memory_barrier.fl` (150줄): Memory barrier 분석
+
+**기능**:
+- Acquire-Release 동기화 검증
+- Sequentially Consistent 강제
+- Data race 패턴 감지
+- Memory barrier 배치 최적화
+
+---
+
+## 📞 연락처
+
+**작성자**: Claude Haiku 4.5
+**저장소**: https://gogs.dclub.kr/kim/freelang-backend-system.git
+**커밋**: 27d7e24
+
+---
+
+**최종 상태**: ✅ **COMPLETED** (2026-03-02)
+**Phase B 진행률**: 77.8% (2,492/3,200줄)
+

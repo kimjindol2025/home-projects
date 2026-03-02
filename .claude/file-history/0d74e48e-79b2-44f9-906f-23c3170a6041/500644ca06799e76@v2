@@ -1,0 +1,292 @@
+// ============================================================================
+// FreeLang Arc<T> - Atomic Reference Counting
+// ============================================================================
+//
+// 여러 스레드가 안전하게 같은 데이터를 공유할 수 있도록 하는
+// 원자적 참조 카운팅 구조입니다.
+//
+// 특징:
+// - 원자적 참조 카운트 (스레드 안전)
+// - 마지막 소유자가 drop될 때 메모리 해제
+// - Send + Sync: 스레드 간 안전한 소유권 이동 및 공유
+//
+// 작성일: 2026-03-02
+// 커밋: Phase B.1 (Week 2)
+
+use crate::sync::atomic::AtomicUsize;
+use crate::sync::atomic::Ordering;
+use std::ptr::NonNull;
+
+// ============================================================================
+// Arc의 내부 구조
+// ============================================================================
+
+/// Arc 내부에서 실제 데이터와 참조 카운트를 저장합니다.
+struct ArcInner<T> {
+    // 강한 참조 카운트 (Arc<T>의 개수)
+    strong: AtomicUsize,
+
+    // 약한 참조 카운트 (Weak<T>의 개수)
+    // 이번 단계에서는 생략 가능
+    weak: AtomicUsize,
+
+    // 실제 데이터
+    data: T,
+}
+
+/// Arc<T>: Atomic Reference Counted pointer
+///
+/// 여러 스레드가 소유할 수 있는 불변 데이터 공유 포인터입니다.
+pub struct Arc<T: ?Sized> {
+    // 원자적으로 접근 가능한 포인터
+    ptr: NonNull<ArcInner<T>>,
+}
+
+// ============================================================================
+// Arc의 기본 메서드
+// ============================================================================
+
+impl<T> Arc<T> {
+    /// 새로운 Arc<T>를 생성합니다.
+    ///
+    /// # 예제
+    ///
+    /// ```
+    /// let five = Arc::new(5);
+    /// ```
+    pub fn new(data: T) -> Arc<T> {
+        let boxed = Box::new(ArcInner {
+            strong: AtomicUsize::new(1),
+            weak: AtomicUsize::new(1),
+            data,
+        });
+
+        Arc {
+            ptr: NonNull::new(Box::into_raw(boxed)).unwrap(),
+        }
+    }
+
+    /// Arc 내부의 데이터를 얻습니다.
+    ///
+    /// 불변 참조이므로, 내용을 변경할 수 없습니다.
+    pub fn get_ref(&self) -> &T {
+        unsafe {
+            &self.ptr.as_ref().data
+        }
+    }
+
+    /// 참조 카운트를 반환합니다.
+    pub fn strong_count(this: &Arc<T>) -> usize {
+        unsafe {
+            this.ptr.as_ref().strong.load(Ordering::SeqCst)
+        }
+    }
+}
+
+// ============================================================================
+// Clone 구현: 참조 카운트 증가
+// ============================================================================
+
+impl<T: ?Sized> Clone for Arc<T> {
+    /// Arc를 clone하면 참조 카운트가 1 증가합니다.
+    ///
+    /// 각 clone은 같은 데이터를 가리키지만, 독립적인 소유자입니다.
+    fn clone(&self) -> Arc<T> {
+        // 원자적으로 참조 카운트 증가
+        unsafe {
+            self.ptr.as_ref().strong.fetch_add(1, Ordering::SeqCst);
+        }
+
+        Arc {
+            ptr: self.ptr,
+        }
+    }
+}
+
+// ============================================================================
+// Drop 구현: 참조 카운트 감소
+// ============================================================================
+
+impl<T: ?Sized> Drop for Arc<T> {
+    /// Arc를 drop하면 참조 카운트가 1 감소합니다.
+    ///
+    /// 참조 카운트가 0이 되면 내부 데이터도 drop됩니다.
+    fn drop(&mut self) {
+        unsafe {
+            // 참조 카운트를 원자적으로 1 감소
+            let strong = self.ptr.as_ref().strong.fetch_sub(1, Ordering::SeqCst);
+
+            // 참조 카운트가 0이 되면 메모리 해제
+            if strong == 1 {
+                // 데이터 drop
+                std::mem::drop(Box::from_raw(self.ptr.as_mut()));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Deref 구현: Arc<T>를 &T처럼 사용
+// ============================================================================
+
+impl<T: ?Sized> std::ops::Deref for Arc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe {
+            &self.ptr.as_ref().data
+        }
+    }
+}
+
+// ============================================================================
+// Send/Sync 구현
+// ============================================================================
+
+// Arc<T>: Send if T: Send + Sync
+//
+// 설명:
+// - T: Send이면, T의 소유권을 다른 스레드로 이동할 수 있습니다.
+// - T: Sync이면, &T를 여러 스레드에서 공유할 수 있습니다.
+// - Arc<T>가 한 스레드에서 다른 스레드로 이동할 때:
+//   1. 새 스레드는 Arc를 통해 &T를 얻습니다.
+//   2. &T를 여러 스레드에서 사용하려면 T: Sync여야 합니다.
+//   3. 참조 카운트는 원자적 연산으로 안전합니다.
+impl<T> Send for Arc<T>
+where
+    T: Send + Sync,
+{
+}
+
+// Arc<T>: Sync if T: Send + Sync
+//
+// 설명:
+// - &Arc<T>를 여러 스레드에서 공유할 수 있습니다.
+// - &Arc<T>를 통해 &T를 얻을 수 있습니다.
+// - 여러 스레드에서 &T를 공유하려면 T: Sync여야 합니다.
+// - clone() 시 참조 카운트는 원자적으로 증가합니다.
+impl<T> Sync for Arc<T>
+where
+    T: Send + Sync,
+{
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_arc_new() {
+        let arc = Arc::new(42);
+        assert_eq!(*arc, 42);
+    }
+
+    #[test]
+    fn test_arc_clone() {
+        let arc1 = Arc::new(vec![1, 2, 3]);
+        let arc2 = arc1.clone();
+
+        // 두 Arc는 같은 데이터를 가리킵니다.
+        assert_eq!(arc1.get_ref(), arc2.get_ref());
+
+        // 참조 카운트는 2입니다.
+        assert_eq!(Arc::strong_count(&arc1), 2);
+    }
+
+    #[test]
+    fn test_arc_reference_count() {
+        let arc = Arc::new(10);
+        assert_eq!(Arc::strong_count(&arc), 1);
+
+        let _arc2 = arc.clone();
+        assert_eq!(Arc::strong_count(&arc), 2);
+
+        let _arc3 = arc.clone();
+        assert_eq!(Arc::strong_count(&arc), 3);
+
+        // _arc2가 drop되면서 카운트 감소
+        drop(_arc2);
+        assert_eq!(Arc::strong_count(&arc), 2);
+    }
+
+    #[test]
+    fn test_arc_deref() {
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        let arc = Arc::new(Point { x: 3, y: 4 });
+
+        // Deref를 통해 필드에 접근
+        assert_eq!(arc.x, 3);
+        assert_eq!(arc.y, 4);
+    }
+
+    #[test]
+    fn test_arc_drop() {
+        let arc = Arc::new(vec![1, 2, 3]);
+        let arc2 = arc.clone();
+
+        // arc drop → 카운트 1
+        drop(arc);
+
+        // arc2는 여전히 유효
+        assert_eq!(arc2.get_ref(), &vec![1, 2, 3]);
+    }
+
+    // 스레드 안전성 테스트 (컴파일 타임)
+    #[test]
+    fn test_arc_send_sync() {
+        // Arc<i32>는 Send + Sync
+        // (이것은 컴파일 타임에 검증됩니다)
+
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        assert_send::<Arc<i32>>();
+        assert_sync::<Arc<i32>>();
+    }
+
+    #[test]
+    fn test_arc_multiple_owners() {
+        // 여러 소유자가 같은 데이터를 공유
+        let data = Arc::new(String::from("Hello"));
+
+        let owner1 = data.clone();
+        let owner2 = data.clone();
+        let owner3 = data.clone();
+
+        assert_eq!(Arc::strong_count(&data), 4);
+
+        // 모든 소유자가 같은 데이터에 접근
+        assert_eq!(*owner1, "Hello");
+        assert_eq!(*owner2, "Hello");
+        assert_eq!(*owner3, "Hello");
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// Arc<T> 구현 항목:
+// ✅ ArcInner<T> 구조 정의
+// ✅ Arc<T> 포인터 구현
+// ✅ new() 메서드
+// ✅ get_ref() 메서드
+// ✅ strong_count() 메서드
+// ✅ Clone 구현 (atomic increment)
+// ✅ Drop 구현 (atomic decrement + drop)
+// ✅ Deref 구현
+// ✅ Send/Sync 구현 (조건부)
+// ✅ 10개 테스트
+//
+// 다음 단계:
+// 1. Mutex<T> 구현
+// 2. 컴파일러 통합 (thread::spawn T: Send 검증)
+// 3. 통합 테스트

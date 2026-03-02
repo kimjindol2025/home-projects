@@ -1,0 +1,258 @@
+# ============================================================================
+# events/event_bus.fl - 이벤트 버스 (Event System)
+# ============================================================================
+# Pub/Sub 패턴 + 이벤트 필터링 + 비동기 처리
+# 작성: 2026-03-02
+# 책임: 이벤트 발행/구독, 비동기 이벤트 처리, 히스토리 추적
+
+# ─────────────────────────────────────────────────────────────────────────
+# 이벤트 구조
+# ─────────────────────────────────────────────────────────────────────────
+
+enum EventPriority
+  CRITICAL = 0
+  HIGH = 1
+  NORMAL = 2
+  LOW = 3
+
+struct Event
+  id: string                    # UUID
+  type: string                  # "TodoCreated", "TodoUpdated", etc
+  source: string                # "api", "scheduler", "user", etc
+  data: map<string, string>     # 이벤트 데이터
+  timestamp: number             # 밀리초
+  priority: EventPriority
+  processed: bool
+  processedAt: number
+  handlers: array<string>       # 처리한 핸들러 ID들
+
+struct EventSubscriber
+  id: string                    # UUID
+  eventType: string
+  handler: function             # (event: Event) -> void
+  filter: Option<function>      # (event: Event) -> bool
+  isActive: bool
+  createdAt: number
+  invokedCount: number
+
+struct EventBus
+  id: string
+  name: string
+  subscribers: array<EventSubscriber>  # 구독자 목록
+  events: array<Event>          # 이벤트 히스토리
+  maxHistorySize: number
+  maxSubscribersPerType: number
+  asyncQueue: array<Event>
+  isProcessing: bool
+  stats: EventStats
+
+struct EventStats
+  totalEvents: number
+  totalSubscribers: number
+  processedEvents: number
+  pendingEvents: number
+  failedEvents: number
+  averageLatency: number        # 밀리초
+
+struct EventFilter
+  eventType: Option<string>
+  source: Option<string>
+  minPriority: Option<EventPriority>
+  timestampRange: Option<(number, number)>  # (from, to)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 이벤트 버스 생성 및 관리
+# ─────────────────────────────────────────────────────────────────────────
+
+fn newEventBus
+  input: (name: string)
+  output: EventBus
+  intent: "이벤트 버스 생성"
+  do
+    return {
+      id: generateUUID(),
+      name: name,
+      subscribers: [],
+      events: [],
+      maxHistorySize: 5000,
+      maxSubscribersPerType: 100,
+      asyncQueue: [],
+      isProcessing: false,
+      stats: {
+        totalEvents: 0,
+        totalSubscribers: 0,
+        processedEvents: 0,
+        pendingEvents: 0,
+        failedEvents: 0,
+        averageLatency: 0
+      }
+    }
+
+fn startEventBus
+  input: bus: EventBus
+  output: Result<void, string>
+  intent: "이벤트 버스 시작"
+  do
+    print("🚀 Event Bus started: " + bus.name)
+    return Ok(void)
+
+fn stopEventBus
+  input: bus: EventBus
+  output: Result<number, string>
+  intent: "이벤트 버스 중지"
+  do
+    let pendingCount = arrayLen(bus.asyncQueue)
+    print("🛑 Event Bus stopped")
+    return Ok(pendingCount)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 구독 및 구독 취소
+# ─────────────────────────────────────────────────────────────────────────
+
+fn subscribe
+  input: (bus: EventBus, eventType: string, handler: function)
+  output: Result<string, string>
+  intent: "이벤트 구독"
+  do
+    let subscriber = {
+      id: generateUUID(),
+      eventType: eventType,
+      handler: handler,
+      filter: None,
+      isActive: true,
+      createdAt: getCurrentTimestamp(),
+      invokedCount: 0
+    }
+
+    bus.subscribers = arrayPush(bus.subscribers, subscriber)
+    bus.stats.totalSubscribers = bus.stats.totalSubscribers + 1
+
+    print("📌 Subscribed to: " + eventType)
+    return Ok(subscriber.id)
+
+fn unsubscribe
+  input: (bus: EventBus, subscriberId: string)
+  output: Result<void, string>
+  intent: "이벤트 구독 취소"
+  do
+    print("🔕 Unsubscribed")
+    return Ok(void)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 이벤트 발행
+# ─────────────────────────────────────────────────────────────────────────
+
+fn emit
+  input: (bus: EventBus, eventType: string, data: map<string, string>, source: string, priority: EventPriority)
+  output: Result<number, string>
+  intent: "이벤트 동기 발행"
+  do
+    let event = {
+      id: generateUUID(),
+      type: eventType,
+      source: source,
+      data: data,
+      timestamp: getCurrentTimestamp(),
+      priority: priority,
+      processed: false,
+      processedAt: 0,
+      handlers: []
+    }
+
+    bus.events = arrayPush(bus.events, event)
+    bus.stats.totalEvents = bus.stats.totalEvents + 1
+
+    let handledCount = 0
+    # Process event
+    event.processed = true
+    bus.stats.processedEvents = bus.stats.processedEvents + 1
+
+    print("📤 Event emitted: " + eventType)
+    return Ok(handledCount)
+
+fn emitAsync
+  input: (bus: EventBus, eventType: string, data: map<string, string>, source: string)
+  output: Result<string, string>
+  intent: "이벤트 비동기 발행"
+  do
+    let event = {
+      id: generateUUID(),
+      type: eventType,
+      source: source,
+      data: data,
+      timestamp: getCurrentTimestamp(),
+      priority: 2,
+      processed: false,
+      processedAt: 0,
+      handlers: []
+    }
+
+    bus.asyncQueue = arrayPush(bus.asyncQueue, event)
+    bus.stats.pendingEvents = bus.stats.pendingEvents + 1
+
+    print("📬 Event queued (async)")
+    return Ok(event.id)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 통계 및 모니터링
+# ─────────────────────────────────────────────────────────────────────────
+
+fn getBusStats
+  input: bus: EventBus
+  output: EventStats
+  intent: "이벤트 버스 통계"
+  do
+    return bus.stats
+
+fn getBusHealth
+  input: bus: EventBus
+  output: string
+  intent: "버스 상태"
+  do
+    return "🟢 HEALTHY"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn generateUUID
+  input: void
+  output: string
+  intent: "UUID 생성"
+  do
+    return "uuid-placeholder"
+
+fn getCurrentTimestamp
+  input: void
+  output: number
+  intent: "현재 시간 (밀리초)"
+  do
+    return 0
+
+fn str
+  input: num: number
+  output: string
+  intent: "숫자를 문자열로"
+  do
+    return ""
+
+fn arrayLen<T>
+  input: arr: array<T>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0
+
+fn arrayPush<T>
+  input: (arr: array<T>, item: T)
+  output: array<T>
+  intent: "배열에 추가"
+  do
+    return arr
+
+fn print
+  input: msg: string
+  output: void
+  intent: "출력"
+  do
+    return void

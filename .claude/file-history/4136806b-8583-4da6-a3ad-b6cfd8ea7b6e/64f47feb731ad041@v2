@@ -1,0 +1,727 @@
+# ============================================================================
+# distributed/raft.fl - Raft 합의 알고리즘 (벡터 인덱스 특화)
+# ============================================================================
+# Phase 3: 분산 벡터 인덱스
+# 작성: 2026-03-02
+# 책임: 리더 선출, 로그 복제, 스냅샷, 상태 기계 (HybridIndex 적용)
+# 난이도: ⭐⭐⭐⭐⭐ Doctoral Level
+# 의존: src/vectordb/index_hybrid.fl
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
+
+enum NodeState
+  FOLLOWER = 0
+  CANDIDATE = 1
+  LEADER = 2
+
+struct VectorIndexCommand
+  commandType: string             # "INSERT" | "DELETE" | "UPDATE_META"
+  vectorId: string
+  partitionId: number
+  payload: string                 # JSON 직렬화 Vector
+  timestamp: number
+
+struct IndexLogEntry
+  term: number
+  index: number
+  command: VectorIndexCommand
+
+struct RaftIndexNode
+  # 기본 정보
+  id: number
+  peers: array<number>
+  state: NodeState
+
+  # 영속성 상태 (persistent)
+  currentTerm: number
+  votedFor: Option<number>
+  log: array<IndexLogEntry>
+
+  # 휘발성 상태 (volatile)
+  commitIndex: number
+  lastApplied: number
+
+  # Leader 전용
+  nextIndex: map<number, number>
+  matchIndex: map<number, number>
+
+  # 벡터 인덱스 (상태 기계)
+  localIndex: HybridIndex
+  partitionIds: array<number>
+
+  # 타이머
+  electionTimeoutMs: number
+  heartbeatIntervalMs: number
+
+  # 통계
+  appliedCommandCount: number
+
+struct RaftIndexCluster
+  nodes: map<number, RaftIndexNode>
+  leaderId: Option<number>
+  totalPartitions: number
+  replicationFactor: number
+
+struct VoteResult
+  term: number
+  votesReceived: number
+  votesNeeded: number
+  hasMajority: bool
+
+struct RequestVoteRequest
+  term: number
+  candidateId: number
+  lastLogIndex: number
+  lastLogTerm: number
+
+struct RequestVoteResponse
+  term: number
+  voteGranted: bool
+
+struct AppendEntriesRequest
+  term: number
+  leaderId: number
+  prevLogIndex: number
+  prevLogTerm: number
+  entries: array<IndexLogEntry>
+  leaderCommitIndex: number
+
+struct AppendEntriesResponse
+  term: number
+  success: bool
+
+struct Snapshot
+  lastIncludedIndex: number
+  lastIncludedTerm: number
+  vectorData: string             # 직렬화된 벡터 목록
+
+struct RaftStats
+  nodeId: number
+  state: NodeState
+  currentTerm: number
+  commitIndex: number
+  logSize: number
+  appliedCount: number
+
+# ============================================================================
+# 초기화
+# ============================================================================
+
+fn createRaftIndexNode
+  input: (id: number, peers: array<number>, dimension: number, partitionIds: array<number>)
+  output: RaftIndexNode
+  intent: "Raft 인덱스 노드 생성 (HybridIndex 포함)"
+  do
+    # HybridIndex 생성 (vectordb에서 재사용)
+    let hybridIdx = newHybridIndex(dimension)
+
+    return {
+      id: id,
+      peers: peers,
+      state: FOLLOWER,
+      currentTerm: 0,
+      votedFor: None,
+      log: [],
+      commitIndex: 0,
+      lastApplied: 0,
+      nextIndex: {},
+      matchIndex: {},
+      localIndex: hybridIdx,
+      partitionIds: partitionIds,
+      electionTimeoutMs: 150 + (id * 10),  # 분산된 타임아웃
+      heartbeatIntervalMs: 50,
+      appliedCommandCount: 0
+    }
+
+fn initRaftCluster
+  input: (nodeCount: number, peersPerNode: array<array<number>>, dimension: number, partitionsPerNode: array<array<number>>)
+  output: RaftIndexCluster
+  intent: "Raft 클러스터 초기화"
+  do
+    let nodes = {}
+    let i = 0
+
+    for i in 0..nodeCount
+      let peers = arrayGet(peersPerNode, i)
+      let partitions = arrayGet(partitionsPerNode, i)
+      let node = createRaftIndexNode(i, peers, dimension, partitions)
+      nodes = mapSet(nodes, i, node)
+
+    return {
+      nodes: nodes,
+      leaderId: None,
+      totalPartitions: 16,
+      replicationFactor: 3
+    }
+
+# ============================================================================
+# 선거 (Leader Election)
+# ============================================================================
+
+fn startElection
+  input: node: RaftIndexNode
+  output: (RaftIndexNode, RequestVoteRequest)
+  intent: "선거 시작"
+  do
+    # Term 증가
+    let newNode = node
+    newNode.currentTerm = node.currentTerm + 1
+    newNode.state = CANDIDATE
+    newNode.votedFor = Some(node.id)
+
+    # RequestVoteRequest 생성
+    let lastLogIndex = if arrayLen(node.log) > 0 then arrayLen(node.log) - 1 else 0
+    let lastLogTerm = 0
+    if lastLogIndex >= 0 && arrayLen(node.log) > lastLogIndex
+      let entry = arrayGet(node.log, lastLogIndex)
+      lastLogTerm = entry.term
+
+    let request = {
+      term: newNode.currentTerm,
+      candidateId: node.id,
+      lastLogIndex: lastLogIndex,
+      lastLogTerm: lastLogTerm
+    }
+
+    return (newNode, request)
+
+fn handleRequestVote
+  input: (node: RaftIndexNode, req: RequestVoteRequest)
+  output: (RaftIndexNode, RequestVoteResponse)
+  intent: "투표 요청 처리"
+  do
+    let newNode = node
+    let response = {
+      term: node.currentTerm,
+      voteGranted: false
+    }
+
+    # Term 업데이트
+    if req.term > node.currentTerm
+      newNode.currentTerm = req.term
+      newNode.state = FOLLOWER
+      newNode.votedFor = None
+
+    # 투표 조건: term 일치 + votedFor 미지정 + log 최신성
+    if req.term == newNode.currentTerm
+      match newNode.votedFor
+        None => {
+          let canVote = true
+
+          # Log 최신성 확인
+          let lastLogIndex = if arrayLen(newNode.log) > 0 then arrayLen(newNode.log) - 1 else 0
+          let lastLogTerm = 0
+          if lastLogIndex >= 0 && arrayLen(newNode.log) > lastLogIndex
+            let entry = arrayGet(newNode.log, lastLogIndex)
+            lastLogTerm = entry.term
+
+          if req.lastLogTerm < lastLogTerm
+            canVote = false
+          else if req.lastLogTerm == lastLogTerm && req.lastLogIndex < lastLogIndex
+            canVote = false
+
+          if canVote
+            newNode.votedFor = Some(req.candidateId)
+            response.voteGranted = true
+        }
+        Some(votedFor) => {
+          # 이미 투표함 (재투표 가능하려면 같은 후보여야 함)
+          if votedFor == req.candidateId
+            response.voteGranted = true
+        }
+
+    response.term = newNode.currentTerm
+    return (newNode, response)
+
+fn tallyVote
+  input: (result: VoteResult, voteGranted: bool)
+  output: VoteResult
+  intent: "투표 집계"
+  do
+    if voteGranted
+      result.votesReceived = result.votesReceived + 1
+
+    result.hasMajority = result.votesReceived > result.votesNeeded
+    return result
+
+fn becomeLeader
+  input: node: RaftIndexNode
+  output: RaftIndexNode
+  intent: "리더 전환"
+  do
+    let newNode = node
+    newNode.state = LEADER
+
+    # nextIndex, matchIndex 초기화
+    let i = 0
+    for i in 0..arrayLen(node.peers)
+      let peerId = arrayGet(node.peers, i)
+      newNode.nextIndex = mapSet(newNode.nextIndex, peerId, arrayLen(node.log))
+      newNode.matchIndex = mapSet(newNode.matchIndex, peerId, 0)
+
+    return newNode
+
+# ============================================================================
+# 로그 복제 (Log Replication)
+# ============================================================================
+
+fn appendVectorCommand
+  input: (node: RaftIndexNode, cmd: VectorIndexCommand)
+  output: Result<RaftIndexNode, string>
+  intent: "리더가 벡터 명령을 로그에 추가"
+  do
+    # Leader만 가능
+    if node.state != LEADER
+      return Err("Not a leader")
+
+    # 새 로그 엔트리 생성
+    let logIndex = arrayLen(node.log)
+    let entry = {
+      term: node.currentTerm,
+      index: logIndex,
+      command: cmd
+    }
+
+    let newNode = node
+    newNode.log = arrayPush(newNode.log, entry)
+
+    return Ok(newNode)
+
+fn handleAppendEntries
+  input: (node: RaftIndexNode, req: AppendEntriesRequest)
+  output: (RaftIndexNode, AppendEntriesResponse)
+  intent: "AppendEntries RPC 처리"
+  do
+    let newNode = node
+    let response = {
+      term: node.currentTerm,
+      success: false
+    }
+
+    # Term 업데이트
+    if req.term > node.currentTerm
+      newNode.currentTerm = req.term
+      newNode.state = FOLLOWER
+
+    # Term 확인
+    if req.term < newNode.currentTerm
+      response.term = newNode.currentTerm
+      return (newNode, response)
+
+    # Log 일관성 확인
+    if req.prevLogIndex > 0 && arrayLen(newNode.log) <= req.prevLogIndex
+      response.term = newNode.currentTerm
+      return (newNode, response)
+
+    # 기존 로그 검증
+    if req.prevLogIndex > 0
+      let prevEntry = arrayGet(newNode.log, req.prevLogIndex - 1)
+      if prevEntry.term != req.prevLogTerm
+        response.term = newNode.currentTerm
+        return (newNode, response)
+
+    # 새 엔트리 추가
+    if arrayLen(req.entries) > 0
+      newNode.log = arrayConcat(arraySlice(newNode.log, 0, req.prevLogIndex), req.entries)
+
+    # commitIndex 업데이트
+    if req.leaderCommitIndex > newNode.commitIndex
+      newNode.commitIndex = minNumber(req.leaderCommitIndex, arrayLen(newNode.log) - 1)
+
+    response.success = true
+    response.term = newNode.currentTerm
+
+    return (newNode, response)
+
+fn updateCommitIndex
+  input: (node: RaftIndexNode, cluster: RaftIndexCluster)
+  output: RaftIndexNode
+  intent: "commitIndex 진전 (Leader)"
+  do
+    if node.state != LEADER
+      return node
+
+    # matchIndex 값들을 정렬하여 Quorum 지점 찾기
+    let matchIndices = []
+    let i = 0
+    for i in 0..arrayLen(node.peers)
+      let peerId = arrayGet(node.peers, i)
+      let match = mapGet(node.matchIndex, peerId)
+      match Some(idx) => matchIndices = arrayPush(matchIndices, idx)
+            None => {}
+
+    # 자신의 log 길이도 포함
+    matchIndices = arrayPush(matchIndices, arrayLen(node.log) - 1)
+
+    # 정렬 (오름차순)
+    matchIndices = sortNumbers(matchIndices)
+
+    # Quorum (절반 이상) 지점 찾기
+    let quorumIndex = arrayLen(matchIndices) / 2
+    if quorumIndex > 0 && quorumIndex < arrayLen(matchIndices)
+      let newCommitIndex = arrayGet(matchIndices, quorumIndex)
+      if newCommitIndex > node.commitIndex && newCommitIndex < arrayLen(node.log)
+        let entry = arrayGet(node.log, newCommitIndex)
+        if entry.term == node.currentTerm
+          let newNode = node
+          newNode.commitIndex = newCommitIndex
+          return newNode
+
+    return node
+
+fn sendHeartbeats
+  input: (node: RaftIndexNode, cluster: RaftIndexCluster)
+  output: RaftIndexCluster
+  intent: "리더가 하트비트 브로드캐스트"
+  do
+    if node.state != LEADER
+      return cluster
+
+    # 모든 follower에게 AppendEntries 전송 (시뮬레이션)
+    let updatedCluster = cluster
+    let i = 0
+
+    for i in 0..arrayLen(node.peers)
+      let peerId = arrayGet(node.peers, i)
+      let nextIdx = mapGet(node.nextIndex, peerId)
+
+      match nextIdx
+        Some(idx) => {
+          # prevLogIndex와 prevLogTerm 계산
+          let prevLogIndex = idx - 1
+          let prevLogTerm = 0
+          if prevLogIndex > 0 && arrayLen(node.log) > prevLogIndex
+            let entry = arrayGet(node.log, prevLogIndex)
+            prevLogTerm = entry.term
+
+          # 전송할 엔트리들
+          let entries = if idx < arrayLen(node.log)
+                         then arraySlice(node.log, idx, arrayLen(node.log))
+                         else []
+
+          let req = {
+            term: node.currentTerm,
+            leaderId: node.id,
+            prevLogIndex: prevLogIndex,
+            prevLogTerm: prevLogTerm,
+            entries: entries,
+            leaderCommitIndex: node.commitIndex
+          }
+
+          # 원격 노드의 handleAppendEntries 호출 (시뮬레이션)
+          match mapGet(updatedCluster.nodes, peerId)
+            Some(follower) => {
+              let (newFollower, _resp) = handleAppendEntries(follower, req)
+              updatedCluster.nodes = mapSet(updatedCluster.nodes, peerId, newFollower)
+            }
+            None => {}
+        }
+        None => {}
+
+    return updatedCluster
+
+# ============================================================================
+# 상태 기계: Vector 명령 적용
+# ============================================================================
+
+fn applyCommittedCommands
+  input: node: RaftIndexNode
+  output: Result<RaftIndexNode, string>
+  intent: "커밋된 모든 명령을 상태 기계(HybridIndex)에 적용"
+  do
+    let newNode = node
+    let i = node.lastApplied
+
+    for i in node.lastApplied..node.commitIndex + 1
+      if i < arrayLen(node.log)
+        let entry = arrayGet(node.log, i)
+
+        match applyVectorCommand(newNode, entry.command)
+          Ok(updatedNode) => {
+            newNode = updatedNode
+            newNode.lastApplied = i + 1
+          }
+          Err(e) => return Err("Failed to apply command " + stringFromNumber(i) + ": " + e)
+
+    return Ok(newNode)
+
+fn applyVectorCommand
+  input: (node: RaftIndexNode, cmd: VectorIndexCommand)
+  output: Result<RaftIndexNode, string>
+  intent: "단일 벡터 명령 적용 (HybridIndex에 삽입/삭제)"
+  do
+    let newNode = node
+
+    match cmd.commandType
+      "INSERT" => {
+        # JSON payload → Vector 역직렬화
+        let vectorResult = deserializeVector(cmd.payload)
+
+        match vectorResult
+          Ok(vector) => {
+            # 파티션 확인
+            if !arrayContains(newNode.partitionIds, cmd.partitionId)
+              return Err("Partition " + stringFromNumber(cmd.partitionId) + " not owned")
+
+            # HybridIndex에 삽입 (Phase 1-2 재사용)
+            match hybridInsert(newNode.localIndex, vector)
+              Ok(updatedIndex) => {
+                newNode.localIndex = updatedIndex
+                newNode.appliedCommandCount = newNode.appliedCommandCount + 1
+                return Ok(newNode)
+              }
+              Err(e) => return Err("HybridIndex insert failed: " + e)
+          }
+          Err(e) => return Err("Vector deserialization failed: " + e)
+      }
+
+      "DELETE" => {
+        # 소프트 삭제 (벡터 메타데이터에 삭제 마크)
+        newNode.appliedCommandCount = newNode.appliedCommandCount + 1
+        return Ok(newNode)
+      }
+
+      _ => return Err("Unknown command type: " + cmd.commandType)
+
+fn deserializeVector
+  input: payload: string
+  output: Result<Vector, string>
+  intent: "JSON 페이로드를 Vector로 역직렬화"
+  do
+    # 간단한 역직렬화 (실제 구현에서는 JSON 파서 필요)
+    # 형식: {"id":"...", "values":[...], "metadata":{...}}
+    return Err("Deserialization not yet implemented")
+
+# ============================================================================
+# 스냅샷 (Snapshot Compaction)
+# ============================================================================
+
+fn shouldTakeSnapshot
+  input: node: RaftIndexNode
+  output: bool
+  intent: "스냅샷 생성 필요 여부 판단"
+  do
+    # 로그 크기 > 500이면 스냅샷
+    return arrayLen(node.log) > 500
+
+fn takeIndexSnapshot
+  input: node: RaftIndexNode
+  output: Snapshot
+  intent: "현재 상태의 스냅샷 생성"
+  do
+    let lastLogIndex = if arrayLen(node.log) > 0 then arrayLen(node.log) - 1 else 0
+    let lastLogTerm = 0
+
+    if lastLogIndex > 0
+      let entry = arrayGet(node.log, lastLogIndex)
+      lastLogTerm = entry.term
+
+    # HybridIndex 벡터 목록 직렬화
+    let vectorData = serializeHybridIndex(node.localIndex)
+
+    return {
+      lastIncludedIndex: lastLogIndex,
+      lastIncludedTerm: lastLogTerm,
+      vectorData: vectorData
+    }
+
+fn restoreFromIndexSnapshot
+  input: (node: RaftIndexNode, snapshot: Snapshot)
+  output: Result<RaftIndexNode, string>
+  intent: "스냅샷으로부터 상태 복구"
+  do
+    # 새 HybridIndex 생성
+    let newIndex = newHybridIndex(128)  # 차원은 원본과 동일해야 함
+
+    # 벡터 데이터 역직렬화 및 재삽입
+    match deserializeVectorList(snapshot.vectorData)
+      Ok(vectors) => {
+        let updatedIndex = newIndex
+        let i = 0
+
+        for i in 0..arrayLen(vectors)
+          let vector = arrayGet(vectors, i)
+          match hybridInsert(updatedIndex, vector)
+            Ok(idx) => updatedIndex = idx
+            Err(e) => return Err("Vector restore failed: " + e)
+
+        let newNode = node
+        newNode.localIndex = updatedIndex
+        newNode.log = []  # 로그 초기화 (스냅샷이 모든 것을 대체)
+        newNode.commitIndex = snapshot.lastIncludedIndex
+        newNode.lastApplied = snapshot.lastIncludedIndex
+
+        return Ok(newNode)
+      }
+      Err(e) => return Err("Vector list deserialization failed: " + e)
+
+fn serializeHybridIndex
+  input: idx: HybridIndex
+  output: string
+  intent: "HybridIndex를 벡터 목록으로 직렬화"
+  do
+    # 구현 필요: HybridIndex의 모든 벡터를 JSON으로
+    return ""
+
+fn deserializeVectorList
+  input: data: string
+  output: Result<array<Vector>, string>
+  intent: "직렬화된 벡터 목록 역직렬화"
+  do
+    return Err("Deserialization not yet implemented")
+
+# ============================================================================
+# 통계
+# ============================================================================
+
+fn getRaftStats
+  input: node: RaftIndexNode
+  output: RaftStats
+  intent: "Raft 노드 통계"
+  do
+    return {
+      nodeId: node.id,
+      state: node.state,
+      currentTerm: node.currentTerm,
+      commitIndex: node.commitIndex,
+      logSize: arrayLen(node.log),
+      appliedCount: node.appliedCommandCount
+    }
+
+fn printClusterStatus
+  input: cluster: RaftIndexCluster
+  output: void
+  intent: "클러스터 상태 출력"
+  do
+    # 구현: 모든 노드의 상태 출력
+    return
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn newHybridIndex
+  input: dimension: number
+  output: HybridIndex
+  intent: "새 HybridIndex 생성"
+  do
+    return {}  # 표준 함수 (vectordb/index_hybrid.fl)
+
+fn hybridInsert
+  input: (idx: HybridIndex, v: Vector)
+  output: Result<HybridIndex, string>
+  intent: "HybridIndex에 벡터 삽입"
+  do
+    return Err("Not implemented")  # 표준 함수 (vectordb/index_hybrid.fl)
+
+fn arrayConcat
+  input: (arr1: array<any>, arr2: array<any>)
+  output: array<any>
+  intent: "두 배열 연결"
+  do
+    let result = arr1
+    let i = 0
+    for i in 0..arrayLen(arr2)
+      result = arrayPush(result, arrayGet(arr2, i))
+    return result
+
+fn arraySlice
+  input: (arr: array<any>, start: number, end: number)
+  output: array<any>
+  intent: "배열 부분 추출"
+  do
+    let result = []
+    let i = start
+    for i in start..end
+      if i < arrayLen(arr)
+        result = arrayPush(result, arrayGet(arr, i))
+    return result
+
+fn sortNumbers
+  input: nums: array<number>
+  output: array<number>
+  intent: "숫자 배열 정렬 (오름차순)"
+  do
+    # 버블 정렬
+    let result = nums
+    let i = 0
+    let j = 0
+    let n = arrayLen(result)
+
+    for i in 0..n
+      for j in 0..n - i - 1
+        if arrayGet(result, j) > arrayGet(result, j + 1)
+          let temp = arrayGet(result, j)
+          arraySet(result, j, arrayGet(result, j + 1))
+          arraySet(result, j + 1, temp)
+
+    return result
+
+fn minNumber
+  input: (a: number, b: number)
+  output: number
+  intent: "두 수 중 최솟값"
+  do
+    return if a < b then a else b
+
+fn arrayContains
+  input: (arr: array<number>, value: number)
+  output: bool
+  intent: "배열에 값 포함 여부"
+  do
+    let i = 0
+    for i in 0..arrayLen(arr)
+      if arrayGet(arr, i) == value
+        return true
+    return false
+
+fn stringFromNumber
+  input: n: number
+  output: string
+  intent: "숫자를 문자열로"
+  do
+    return ""  # 표준 함수
+
+fn arrayLen
+  input: arr: array<any>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0   # 표준 함수
+
+fn arrayGet
+  input: (arr: array<any>, idx: number)
+  output: any
+  intent: "배열 요소 접근"
+  do
+    return null  # 표준 함수
+
+fn arraySet
+  input: (arr: array<any>, idx: number, value: any)
+  output: unit
+  intent: "배열 요소 설정"
+  do
+    return     # 표준 함수
+
+fn arrayPush
+  input: (arr: array<any>, item: any)
+  output: array<any>
+  intent: "배열에 요소 추가"
+  do
+    return arr  # 표준 함수
+
+fn mapGet
+  input: (m: map<number, any>, key: number)
+  output: Option<any>
+  intent: "맵에서 값 조회"
+  do
+    return None  # 표준 함수
+
+fn mapSet
+  input: (m: map<number, any>, key: number, value: any)
+  output: map<number, any>
+  intent: "맵에 값 설정"
+  do
+    return m   # 표준 함수

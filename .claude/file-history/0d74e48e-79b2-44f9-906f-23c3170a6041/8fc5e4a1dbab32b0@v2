@@ -1,0 +1,468 @@
+// ============================================================================
+// FreeLang Lifetime Analysis - 참조 생명주기 분석
+// ============================================================================
+//
+// 참조의 유효 범위(Lifetime)를 분석하고 추적합니다.
+//
+// 개념:
+// - Lifetime 범위: 참조가 유효한 코드 영역
+// - Scope: 중괄호로 구분된 블록
+// - Outlive: A가 B보다 오래 유지됨
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.3 (Week 5-8)
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Lifetime 표현
+// ============================================================================
+
+/// Lifetime: 참조의 유효 기간을 나타냅니다.
+///
+/// Rust에서 'a, 'b, 'static 같은 식별자입니다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Lifetime {
+    id: u32,
+}
+
+impl Lifetime {
+    /// 새로운 Lifetime을 생성합니다.
+    pub fn new(id: u32) -> Lifetime {
+        Lifetime { id }
+    }
+
+    /// 'static lifetime을 반환합니다.
+    pub fn static_lifetime() -> Lifetime {
+        Lifetime { id: u32::MAX }
+    }
+
+    /// 'static 인지 확인합니다.
+    pub fn is_static(&self) -> bool {
+        self.id == u32::MAX
+    }
+
+    pub fn to_string(&self) -> String {
+        if self.is_static() {
+            "'static".to_string()
+        } else {
+            format!("'{}", self.id)
+        }
+    }
+}
+
+// ============================================================================
+// Scope: 코드 블록
+// ============================================================================
+
+/// Scope: 중괄호로 둘러싸인 코드 영역
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScopeId {
+    id: u32,
+}
+
+impl ScopeId {
+    pub fn new(id: u32) -> ScopeId {
+        ScopeId { id }
+    }
+
+    pub fn global() -> ScopeId {
+        ScopeId { id: 0 }
+    }
+}
+
+// ============================================================================
+// Reference Type: 참조 타입
+// ============================================================================
+
+/// 참조 타입: &T (불변) 또는 &mut T (가변)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefType {
+    /// 불변 참조 &'a T
+    Immutable(Lifetime),
+
+    /// 가변 참조 &'a mut T
+    Mutable(Lifetime),
+}
+
+impl RefType {
+    /// 참조의 Lifetime을 얻습니다.
+    pub fn lifetime(&self) -> Lifetime {
+        match self {
+            RefType::Immutable(lt) => *lt,
+            RefType::Mutable(lt) => *lt,
+        }
+    }
+
+    /// 불변 참조인지 확인합니다.
+    pub fn is_immutable(&self) -> bool {
+        matches!(self, RefType::Immutable(_))
+    }
+
+    /// 가변 참조인지 확인합니다.
+    pub fn is_mutable(&self) -> bool {
+        matches!(self, RefType::Mutable(_))
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            RefType::Immutable(lt) => format!("&{}", lt.to_string()),
+            RefType::Mutable(lt) => format!("&{} mut", lt.to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Lifetime Constraint: Lifetime 간 제약
+// ============================================================================
+
+/// Lifetime 간 제약: 'a: 'b (a outlives b)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LifetimeConstraint {
+    /// Outliver: 더 오래 유지되는 lifetime
+    outliver: Lifetime,
+
+    /// Outlived: 더 짧게 유지되는 lifetime
+    outlived: Lifetime,
+}
+
+impl LifetimeConstraint {
+    /// 새로운 제약을 생성합니다: 'a: 'b
+    pub fn new(outliver: Lifetime, outlived: Lifetime) -> LifetimeConstraint {
+        LifetimeConstraint { outliver, outlived }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}: {}", self.outliver.to_string(), self.outlived.to_string())
+    }
+}
+
+// ============================================================================
+// Lifetime Analyzer
+// ============================================================================
+
+/// Lifetime 분석 엔진
+pub struct LifetimeAnalyzer {
+    // Lifetime 간 제약 관계
+    constraints: Vec<LifetimeConstraint>,
+
+    // 각 변수의 Scope
+    variable_scopes: HashMap<String, ScopeId>,
+
+    // 각 Scope의 부모 Scope
+    scope_hierarchy: HashMap<ScopeId, ScopeId>,
+
+    // 각 Scope의 생성 순서 (더 큰 ID = 더 깊은 scope)
+    scope_counter: u32,
+}
+
+impl LifetimeAnalyzer {
+    /// 새로운 분석기를 생성합니다.
+    pub fn new() -> LifetimeAnalyzer {
+        let mut analyzer = LifetimeAnalyzer {
+            constraints: Vec::new(),
+            variable_scopes: HashMap::new(),
+            scope_hierarchy: HashMap::new(),
+            scope_counter: 0,
+        };
+
+        // Global scope 초기화
+        analyzer.scope_hierarchy.insert(ScopeId::global(), ScopeId::global());
+        analyzer.scope_counter = 1;
+
+        analyzer
+    }
+
+    /// 새로운 Scope을 생성합니다.
+    pub fn enter_scope(&mut self, parent: ScopeId) -> ScopeId {
+        let scope_id = ScopeId::new(self.scope_counter);
+        self.scope_counter += 1;
+        self.scope_hierarchy.insert(scope_id, parent);
+        scope_id
+    }
+
+    /// 변수를 선언합니다.
+    pub fn declare_variable(&mut self, name: String, scope: ScopeId) {
+        self.variable_scopes.insert(name, scope);
+    }
+
+    /// Lifetime 제약을 추가합니다: 'a: 'b
+    pub fn add_constraint(&mut self, constraint: LifetimeConstraint) {
+        self.constraints.push(constraint);
+    }
+
+    /// 'a가 'b보다 오래 유지되는지 확인합니다.
+    pub fn outlives(&self, a: Lifetime, b: Lifetime) -> bool {
+        // 'static은 모든 lifetime을 outlive
+        if a.is_static() {
+            return true;
+        }
+        if b.is_static() && !a.is_static() {
+            return false;
+        }
+
+        // 제약 확인
+        for constraint in &self.constraints {
+            if constraint.outliver == a && constraint.outlived == b {
+                return true;
+            }
+        }
+
+        // 이행성 확인 (transitivity)
+        for constraint in &self.constraints {
+            if constraint.outliver == a {
+                if self.outlives(constraint.outlived, b) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// 두 Lifetime의 생명주기가 겹치는지 확인합니다.
+    pub fn overlaps(&self, lt1: Lifetime, lt2: Lifetime) -> bool {
+        // 'static은 모든 것과 겹침
+        if lt1.is_static() || lt2.is_static() {
+            return true;
+        }
+
+        // 같은 lifetime이면 겹침
+        if lt1 == lt2 {
+            return true;
+        }
+
+        // 제약이 없으면 겹칠 수 있음
+        !self.outlives(lt1, lt2) && !self.outlives(lt2, lt1)
+    }
+
+    /// 변수가 선언된 Scope을 반환합니다.
+    pub fn get_variable_scope(&self, name: &str) -> Option<ScopeId> {
+        self.variable_scopes.get(name).copied()
+    }
+
+    /// Scope이 다른 Scope을 포함하는지 확인합니다.
+    pub fn scope_contains(&self, parent: ScopeId, child: ScopeId) -> bool {
+        let mut current = child;
+        loop {
+            if current == parent {
+                return true;
+            }
+            if current == ScopeId::global() {
+                return false;
+            }
+            match self.scope_hierarchy.get(&current) {
+                Some(&p) => current = p,
+                None => return false,
+            }
+        }
+    }
+
+    /// 모든 제약을 반환합니다.
+    pub fn constraints(&self) -> &[LifetimeConstraint] {
+        &self.constraints
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lifetime_static() {
+        let lt = Lifetime::static_lifetime();
+        assert!(lt.is_static());
+    }
+
+    #[test]
+    fn test_lifetime_equality() {
+        let lt1 = Lifetime::new(1);
+        let lt2 = Lifetime::new(1);
+        let lt3 = Lifetime::new(2);
+
+        assert_eq!(lt1, lt2);
+        assert_ne!(lt1, lt3);
+    }
+
+    #[test]
+    fn test_ref_type_immutable() {
+        let lt = Lifetime::new(1);
+        let ref_type = RefType::Immutable(lt);
+
+        assert!(ref_type.is_immutable());
+        assert!(!ref_type.is_mutable());
+        assert_eq!(ref_type.lifetime(), lt);
+    }
+
+    #[test]
+    fn test_ref_type_mutable() {
+        let lt = Lifetime::new(2);
+        let ref_type = RefType::Mutable(lt);
+
+        assert!(!ref_type.is_immutable());
+        assert!(ref_type.is_mutable());
+        assert_eq!(ref_type.lifetime(), lt);
+    }
+
+    #[test]
+    fn test_lifetime_constraint_creation() {
+        let lt_a = Lifetime::new(1);
+        let lt_b = Lifetime::new(2);
+        let constraint = LifetimeConstraint::new(lt_a, lt_b);
+
+        assert_eq!(constraint.outliver, lt_a);
+        assert_eq!(constraint.outlived, lt_b);
+    }
+
+    #[test]
+    fn test_analyzer_new() {
+        let analyzer = LifetimeAnalyzer::new();
+        assert_eq!(analyzer.constraints.len(), 0);
+    }
+
+    #[test]
+    fn test_analyzer_enter_scope() {
+        let mut analyzer = LifetimeAnalyzer::new();
+
+        let scope1 = analyzer.enter_scope(ScopeId::global());
+        let scope2 = analyzer.enter_scope(scope1);
+
+        assert_ne!(scope1, scope2);
+    }
+
+    #[test]
+    fn test_analyzer_declare_variable() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let scope = ScopeId::global();
+
+        analyzer.declare_variable("x".to_string(), scope);
+        assert_eq!(analyzer.get_variable_scope("x"), Some(scope));
+        assert_eq!(analyzer.get_variable_scope("y"), None);
+    }
+
+    #[test]
+    fn test_analyzer_add_constraint() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let lt_a = Lifetime::new(1);
+        let lt_b = Lifetime::new(2);
+        let constraint = LifetimeConstraint::new(lt_a, lt_b);
+
+        analyzer.add_constraint(constraint);
+        assert_eq!(analyzer.constraints.len(), 1);
+    }
+
+    #[test]
+    fn test_analyzer_outlives_direct() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let lt_a = Lifetime::new(1);
+        let lt_b = Lifetime::new(2);
+
+        analyzer.add_constraint(LifetimeConstraint::new(lt_a, lt_b));
+        assert!(analyzer.outlives(lt_a, lt_b));
+        assert!(!analyzer.outlives(lt_b, lt_a));
+    }
+
+    #[test]
+    fn test_analyzer_outlives_static() {
+        let analyzer = LifetimeAnalyzer::new();
+        let lt_static = Lifetime::static_lifetime();
+        let lt_other = Lifetime::new(1);
+
+        assert!(analyzer.outlives(lt_static, lt_other));
+        assert!(!analyzer.outlives(lt_other, lt_static));
+    }
+
+    #[test]
+    fn test_analyzer_outlives_transitive() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let lt_a = Lifetime::new(1);
+        let lt_b = Lifetime::new(2);
+        let lt_c = Lifetime::new(3);
+
+        analyzer.add_constraint(LifetimeConstraint::new(lt_a, lt_b));
+        analyzer.add_constraint(LifetimeConstraint::new(lt_b, lt_c));
+
+        // 이행성: a: b, b: c => a: c
+        assert!(analyzer.outlives(lt_a, lt_b));
+        assert!(analyzer.outlives(lt_b, lt_c));
+        assert!(analyzer.outlives(lt_a, lt_c));
+    }
+
+    #[test]
+    fn test_analyzer_overlaps() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let lt_a = Lifetime::new(1);
+        let lt_b = Lifetime::new(2);
+
+        // 제약 없이 겹침
+        assert!(analyzer.overlaps(lt_a, lt_b));
+
+        // 제약 추가 후
+        analyzer.add_constraint(LifetimeConstraint::new(lt_a, lt_b));
+        assert!(!analyzer.overlaps(lt_a, lt_b));
+    }
+
+    #[test]
+    fn test_analyzer_scope_contains() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let global = ScopeId::global();
+        let scope1 = analyzer.enter_scope(global);
+        let scope2 = analyzer.enter_scope(scope1);
+
+        assert!(analyzer.scope_contains(global, scope1));
+        assert!(analyzer.scope_contains(global, scope2));
+        assert!(analyzer.scope_contains(scope1, scope2));
+        assert!(!analyzer.scope_contains(scope2, scope1));
+    }
+
+    #[test]
+    fn test_analyzer_complex_hierarchy() {
+        let mut analyzer = LifetimeAnalyzer::new();
+        let global = ScopeId::global();
+
+        // Global scope
+        //   └─ scope_a
+        //        └─ scope_b
+        //        └─ scope_c
+
+        let scope_a = analyzer.enter_scope(global);
+        let scope_b = analyzer.enter_scope(scope_a);
+        let scope_c = analyzer.enter_scope(scope_a);
+
+        analyzer.declare_variable("x".to_string(), scope_a);
+        analyzer.declare_variable("y".to_string(), scope_b);
+        analyzer.declare_variable("z".to_string(), scope_c);
+
+        assert_eq!(analyzer.get_variable_scope("x"), Some(scope_a));
+        assert_eq!(analyzer.get_variable_scope("y"), Some(scope_b));
+        assert_eq!(analyzer.get_variable_scope("z"), Some(scope_c));
+
+        assert!(analyzer.scope_contains(global, scope_b));
+        assert!(analyzer.scope_contains(scope_a, scope_b));
+        assert!(!analyzer.scope_contains(scope_b, scope_c));
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// Lifetime 분석 구현 항목:
+// ✅ Lifetime 구조 (id 기반)
+// ✅ ScopeId 구조
+// ✅ RefType enum (Immutable/Mutable)
+// ✅ LifetimeConstraint
+// ✅ LifetimeAnalyzer
+//   - enter_scope()
+//   - declare_variable()
+//   - add_constraint()
+//   - outlives() (이행성 포함)
+//   - overlaps()
+//   - scope_contains()
+// ✅ 13개 테스트
+//
+// 다음: borrow_checker.fl (Borrow 규칙 검증)

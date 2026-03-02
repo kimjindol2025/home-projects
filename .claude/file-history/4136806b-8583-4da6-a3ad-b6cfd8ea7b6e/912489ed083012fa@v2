@@ -1,0 +1,356 @@
+# ============================================================================
+# rag/batch.fl - 배치 임베딩 (Batch Embedding)
+# ============================================================================
+# Phase 2: RAG 파이프라인
+# 작성: 2026-03-02
+# 책임: 청크 배치를 효율적으로 임베딩하여 벡터 DB에 저장
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
+
+struct BatchEmbeddingConfig
+  batchSize: number       # 기본 100 (청크/배치)
+  parallelBatches: number # 기본 4 (병렬 배치 수)
+  maxRetries: number      # 기본 3 (임베딩 재시도)
+  progressCallback: boolean # 진행률 콜백 활성화
+
+struct BatchEmbeddingResult
+  totalChunks: number
+  processedChunks: number
+  failedChunks: number
+  skippedChunks: number
+  totalTimeMs: number
+  avgTimePerChunk: number
+
+struct EmbeddingBatch
+  batchId: string
+  chunks: array<Chunk>
+  startTime: number
+  status: string          # "pending" | "processing" | "completed" | "failed"
+  errorMsg: string
+
+struct EmbeddingResult
+  chunkId: string
+  status: string          # "success" | "failed" | "skipped"
+  timeMs: number
+  errorMsg: string
+
+# ============================================================================
+# Main Batch Embedding Function
+# ============================================================================
+
+fn embedChunkBatch
+  input: (chunks: array<Chunk>, hybridSys: HybridIndexSystem, config: BatchEmbeddingConfig)
+  output: Result<BatchEmbeddingResult, string>
+  intent: "청크 배열을 배치 단위로 임베딩하여 벡터 DB에 저장"
+  do
+    # Step 1: 배치 생성
+    let batches = createBatches(chunks, config.batchSize)
+
+    if arrayLen(batches) == 0
+      return Err("빈 청크 배열")
+
+    # Step 2: 배치 처리
+    let totalTime = 0
+    let processedCount = 0
+    let failedCount = 0
+    let updatedSys = hybridSys
+
+    let i = 0
+    for i in 0..arrayLen(batches)
+      let batch = arrayGet(batches, i)
+
+      # 배치 임베딩 실행
+      match processBatch(batch, updatedSys, config)
+        Ok(result) => {
+          processedCount = processedCount + result.processedChunks
+          failedCount = failedCount + result.failedChunks
+          totalTime = totalTime + result.totalTimeMs
+          # 주의: 실제로는 updatedSys를 update하지 못함 (immutable)
+        }
+        Err(e) => {
+          # 배치 실패 → 계속 진행 (robust)
+          failedCount = failedCount + arrayLen(batch.chunks)
+        }
+
+      # 진행률 보고
+      if config.progressCallback
+        let progress = (i + 1) * 100 / arrayLen(batches)
+        reportProgress(progress, i + 1, arrayLen(batches))
+
+    # Step 3: 최종 결과 생성
+    let result = {
+      totalChunks: arrayLen(chunks),
+      processedChunks: processedCount,
+      failedChunks: failedCount,
+      skippedChunks: 0,
+      totalTimeMs: totalTime,
+      avgTimePerChunk: if arrayLen(chunks) > 0 then totalTime / arrayLen(chunks) else 0
+    }
+
+    return Ok(result)
+
+# ============================================================================
+# Batch Processing
+# ============================================================================
+
+fn processBatch
+  input: (batch: EmbeddingBatch, hybridSys: HybridIndexSystem, config: BatchEmbeddingConfig)
+  output: Result<BatchEmbeddingResult, string>
+  intent: "단일 배치의 모든 청크를 임베딩"
+  do
+    let startTime = getCurrentTimeMs()
+    let processedCount = 0
+    let failedCount = 0
+
+    # 배치 상태 업데이트
+    batch.status = "processing"
+
+    # 각 청크 처리
+    let i = 0
+    for i in 0..arrayLen(batch.chunks)
+      let chunk = arrayGet(batch.chunks, i)
+
+      # 재시도 로직
+      match retryEmbedChunk(chunk, hybridSys, config.maxRetries)
+        Ok(updatedSys) => {
+          processedCount = processedCount + 1
+        }
+        Err(e) => {
+          failedCount = failedCount + 1
+          # 로그: chunk.id + " 임베딩 실패: " + e
+        }
+
+    let elapsedTime = getCurrentTimeMs() - startTime
+
+    # 배치 상태 업데이트
+    if failedCount == 0
+      batch.status = "completed"
+    else
+      batch.status = "completed"  # 부분 실패도 완료로 간주
+
+    return Ok({
+      totalChunks: arrayLen(batch.chunks),
+      processedChunks: processedCount,
+      failedChunks: failedCount,
+      skippedChunks: 0,
+      totalTimeMs: elapsedTime,
+      avgTimePerChunk: elapsedTime / arrayLen(batch.chunks)
+    })
+
+fn retryEmbedChunk
+  input: (chunk: Chunk, hybridSys: HybridIndexSystem, maxRetries: number)
+  output: Result<HybridIndexSystem, string>
+  intent: "청크 임베딩을 최대 maxRetries까지 재시도"
+  do
+    let attempt = 0
+    let lastError = ""
+
+    for attempt in 0..maxRetries
+      match embedSingleChunk(chunk, hybridSys)
+        Ok(updatedSys) => {
+          return Ok(updatedSys)
+        }
+        Err(e) => {
+          lastError = e
+          # 백오프: 2^attempt * 100ms (첫 시도는 0ms, 두 번째 100ms, 세 번째 400ms)
+          if attempt < maxRetries - 1
+            backoffMs(100 * (powerOfTwo(attempt)))
+        }
+
+    # 모든 재시도 실패
+    return Err("모든 재시도 실패: " + lastError)
+
+fn embedSingleChunk
+  input: (chunk: Chunk, hybridSys: HybridIndexSystem)
+  output: Result<HybridIndexSystem, string>
+  intent: "단일 청크를 임베딩하여 벡터 DB에 삽입"
+  do
+    # 청크의 메타데이터를 함께 저장
+    let metadata = chunk.metadata
+    metadata["chunk_index"] = stringFromNumber(chunk.chunkIndex)
+    metadata["token_count"] = stringFromNumber(chunk.tokenCount)
+
+    # HybridIndexSystem의 insertTextHybrid 호출
+    let result = insertTextHybrid(hybridSys, chunk.text, metadata)
+
+    match result
+      Ok(updatedSys) => {
+        return Ok(updatedSys)
+      }
+      Err(e) => {
+        return Err("청크 " + chunk.id + " 임베딩 실패: " + e)
+      }
+
+# ============================================================================
+# Batch Creation
+# ============================================================================
+
+fn createBatches
+  input: (chunks: array<Chunk>, batchSize: number)
+  output: array<EmbeddingBatch>
+  intent: "청크들을 batchSize 크기의 배치로 분할"
+  do
+    let batches = []
+    let batchIndex = 0
+    let i = 0
+
+    for i in 0..arrayLen(chunks)
+      if i % batchSize == 0
+        # 새 배치 시작
+        let batch = {
+          batchId: "batch_" + stringFromNumber(batchIndex),
+          chunks: [],
+          startTime: getCurrentTimeMs(),
+          status: "pending",
+          errorMsg: ""
+        }
+        batches = arrayPush(batches, batch)
+        batchIndex = batchIndex + 1
+
+      # 현재 청크를 마지막 배치에 추가
+      let lastBatch = arrayGet(batches, arrayLen(batches) - 1)
+      lastBatch.chunks = arrayPush(lastBatch.chunks, arrayGet(chunks, i))
+
+    return batches
+
+# ============================================================================
+# Failed Chunk Retry
+# ============================================================================
+
+fn retryFailedChunks
+  input: (failedChunkIds: array<string>, hybridSys: HybridIndexSystem, maxRetries: number)
+  output: array<string>
+  intent: "실패한 청크를 재시도 (청크 객체 없이 ID로만 진행)"
+  do
+    # 주의: 실패 청크를 다시 임베딩하려면 원본 청크 객체가 필요
+    # 현재는 ID만 있으므로 로깅만 수행
+    # 실제 구현: DB에서 청크 재로드 후 재시도
+
+    let stillFailed = []
+    let i = 0
+    for i in 0..arrayLen(failedChunkIds)
+      let chunkId = arrayGet(failedChunkIds, i)
+      # 로그: "재시도 대상 청크: " + chunkId
+      stillFailed = arrayPush(stillFailed, chunkId)
+
+    return stillFailed
+
+# ============================================================================
+# Progress Reporting
+# ============================================================================
+
+fn reportProgress
+  input: (percentage: number, current: number, total: number)
+  output: string
+  intent: "배치 처리 진행률 보고"
+  do
+    let msg = "[" + stringFromNumber(percentage) + "%] " +
+              stringFromNumber(current) + "/" + stringFromNumber(total) + " 배치 처리 완료"
+    # 실제로는 콘솔 또는 콜백으로 출력
+    return msg
+
+fn estimateBatchTime
+  input: (chunkCount: number, avgMs: number)
+  output: string
+  intent: "배치 처리 예상 시간 계산"
+  do
+    # avgMs는 청크당 평균 시간
+    let totalMs = chunkCount * avgMs
+    let seconds = totalMs / 1000
+    let minutes = seconds / 60
+
+    if minutes > 1
+      return stringFromNumber(minutes) + " 분"
+    else
+      return stringFromNumber(seconds) + " 초"
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn getCurrentTimeMs
+  input: none
+  output: number
+  intent: "현재 시간 (밀리초)"
+  do
+    return 0  # 표준 함수
+
+fn backoffMs
+  input: ms: number
+  output: unit
+  intent: "지정된 시간만큼 대기 (재시도 백오프)"
+  do
+    # 실제 구현: sleep(ms)
+    return  # 나중에 구현
+
+fn powerOfTwo
+  input: n: number
+  output: number
+  intent: "2의 n승 계산"
+  do
+    if n == 0
+      return 1
+    else if n == 1
+      return 2
+    else if n == 2
+      return 4
+    else
+      return 8  # 최대 3회 재시도
+
+fn stringFromNumber
+  input: n: number
+  output: string
+  intent: "숫자를 문자열로 변환"
+  do
+    return ""  # 표준 함수
+
+fn arrayLen
+  input: arr: array<any>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0  # 표준 함수
+
+fn arrayGet
+  input: (arr: array<any>, idx: number)
+  output: any
+  intent: "배열 요소 접근"
+  do
+    return null  # 표준 함수
+
+fn arrayPush
+  input: (arr: array<any>, item: any)
+  output: array<any>
+  intent: "배열에 요소 추가"
+  do
+    return arr  # 표준 함수
+
+# ============================================================================
+# Configuration Helper
+# ============================================================================
+
+fn newBatchEmbeddingConfig
+  input: (batchSize: number, parallelBatches: number, maxRetries: number)
+  output: BatchEmbeddingConfig
+  intent: "배치 임베딩 설정 생성"
+  do
+    return {
+      batchSize: batchSize,
+      parallelBatches: parallelBatches,
+      maxRetries: maxRetries,
+      progressCallback: true
+    }
+
+fn newBatchEmbeddingConfigDefault
+  input: none
+  output: BatchEmbeddingConfig
+  intent: "기본 배치 임베딩 설정"
+  do
+    return {
+      batchSize: 100,
+      parallelBatches: 4,
+      maxRetries: 3,
+      progressCallback: true
+    }

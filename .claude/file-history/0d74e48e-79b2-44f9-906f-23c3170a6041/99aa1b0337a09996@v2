@@ -1,0 +1,261 @@
+// ============================================================================
+// FreeLang Memory Ordering - Atomic Memory Semantics
+// ============================================================================
+//
+// CPU의 메모리 모델을 FreeLang에서 표현합니다.
+// 멀티스레드 환경에서 원자적 연산의 메모리 순서를 지정합니다.
+//
+// 작성일: 2026-03-02
+// 단계: Phase B.2 (Week 3-4)
+
+/// 메모리 순서를 정의하는 열거형
+///
+/// 원자적 연산 시 다른 메모리 연산과의 순서를 어떻게 보장할지 결정합니다.
+///
+/// 약한 메모리 모델 (ARM, PowerPC)에서는 명시적 메모리 순서가 중요합니다.
+/// 강한 메모리 모델 (x86-64)에서는 대부분의 순서가 같은 결과를 냅니다.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ordering {
+    /// 메모리 순서 보장 없음 (가장 빠름)
+    ///
+    /// 같은 원자 변수에 대한 연산만 순서가 보장됩니다.
+    /// 다른 변수와의 상대적 순서는 보장되지 않습니다.
+    ///
+    /// 사용 사례:
+    /// - 카운터 증가 (상대 순서 무관)
+    /// - 통계 수집 (대략적 값만 필요)
+    ///
+    /// # 예제
+    /// ```
+    /// counter.fetch_add(1, Ordering::Relaxed);
+    /// ```
+    Relaxed = 0,
+
+    /// Release 의미론
+    ///
+    /// 이 연산 이전의 모든 쓰기가 다른 스레드에서 보입니다.
+    /// (Acquire와 짝을 이루어야 함)
+    ///
+    /// 사용 사례:
+    /// - Lock 해제
+    /// - Mutex unlock 후 다른 스레드가 보여야 할 데이터 쓰기
+    ///
+    /// # 메모리 동작
+    /// ```
+    /// data = 42;           // 이전 쓰기
+    /// atomic_store(x, true, Release);  // Release 지점
+    /// // 이후 쓰기는 이 지점 이후로 이동 불가능
+    /// ```
+    Release = 1,
+
+    /// Acquire 의미론
+    ///
+    /// 이 연산 이후의 모든 읽기/쓰기가 이 연산 이후에 발생합니다.
+    /// (Release와 짝을 이루어야 함)
+    ///
+    /// 사용 사례:
+    /// - Lock 획득
+    /// - Mutex lock 후 데이터 읽기
+    ///
+    /// # 메모리 동작
+    /// ```
+    /// bool locked = atomic_load(x, Acquire);  // Acquire 지점
+    /// // 이 지점 이전의 연산은 위로 이동 불가능
+    /// if (locked) {
+    ///     data = atomic_load(y);  // 이 이후에 발생
+    /// }
+    /// ```
+    Acquire = 2,
+
+    /// Acquire-Release: Release와 Acquire의 조합
+    ///
+    /// 이 연산은 다른 스레드와의 동기화 포인트입니다.
+    /// 한쪽에서 Release, 다른 쪽에서 Acquire하면 동기화됩니다.
+    ///
+    /// 사용 사례:
+    /// - Compare-and-swap (lock-free 업데이트)
+    /// - 플래그 설정 및 읽기
+    AcqRel = 3,
+
+    /// Sequential Consistency: 가장 강한 보장
+    ///
+    /// 모든 스레드에서 같은 순서로 모든 연산을 봅니다.
+    /// 프로그램 순서 + Release-Acquire 관계를 모두 보장합니다.
+    ///
+    /// 특징:
+    /// - 가장 직관적
+    /// - 가장 느림 (약한 메모리 모델에서)
+    /// - Interleaving이 보장됨
+    ///
+    /// 사용 사례:
+    /// - 동기화가 확실해야 할 때
+    /// - 간단한 프로그램 (성능 미중요)
+    /// - 데이터 경합 감지기
+    ///
+    /// # 예제
+    /// ```
+    /// x.store(true, SeqCst);  // 모든 스레드가 이 순서를 봄
+    /// ```
+    SeqCst = 5,
+}
+
+// ============================================================================
+// Ordering 변환 및 유틸리티
+// ============================================================================
+
+impl Ordering {
+    /// Ordering을 LLVM 메모리 순서로 변환합니다.
+    ///
+    /// LLVM IR에서 사용되는 숫자 코드로 변환합니다.
+    /// (실제 구현에서는 LLVM 백엔드에서 사용됨)
+    pub fn to_llvm_code(&self) -> i32 {
+        match self {
+            Ordering::Relaxed => 0,  // LLVM: NotAtomic
+            Ordering::Release => 3,  // LLVM: Release
+            Ordering::Acquire => 2,  // LLVM: Acquire
+            Ordering::AcqRel => 4,   // LLVM: AcqRel
+            Ordering::SeqCst => 5,   // LLVM: SequentiallyConsistent
+        }
+    }
+
+    /// 이 Ordering이 읽기 전에 모든 이전 연산의 완료를 대기하는지 확인
+    pub fn is_acquire(&self) -> bool {
+        matches!(self, Ordering::Acquire | Ordering::AcqRel | Ordering::SeqCst)
+    }
+
+    /// 이 Ordering이 모든 이후 연산을 이 연산 이후로 밀어내는지 확인
+    pub fn is_release(&self) -> bool {
+        matches!(self, Ordering::Release | Ordering::AcqRel | Ordering::SeqCst)
+    }
+
+    /// 보수적으로 SeqCst로 업그레이드 (안전성을 위해)
+    pub fn upgrade_to_seq_cst(&self) -> Ordering {
+        Ordering::SeqCst
+    }
+
+    /// 현재 플랫폼의 권장 Ordering 반환
+    /// (x86-64는 강한 메모리 모델이므로 Acquire/Release로 충분)
+    pub fn platform_recommended() -> Ordering {
+        #[cfg(target_arch = "x86_64")]
+        return Ordering::Release;
+
+        #[cfg(not(target_arch = "x86_64"))]
+        return Ordering::SeqCst;
+    }
+}
+
+// ============================================================================
+// 메모리 순서 분석
+// ============================================================================
+
+/// 두 Ordering 간의 동기화 관계를 분석합니다.
+pub fn is_synchronized(release_order: Ordering, acquire_order: Ordering) -> bool {
+    // Release-Acquire 쌍이 동기화를 제공합니다.
+    release_order.is_release() && acquire_order.is_acquire()
+}
+
+/// 메모리 순서의 강도를 비교합니다.
+/// (더 높을수록 강함)
+pub fn ordering_strength(order: Ordering) -> usize {
+    match order {
+        Ordering::Relaxed => 1,
+        Ordering::Release => 2,
+        Ordering::Acquire => 3,
+        Ordering::AcqRel => 4,
+        Ordering::SeqCst => 5,
+    }
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ordering_to_llvm_code() {
+        assert_eq!(Ordering::Relaxed.to_llvm_code(), 0);
+        assert_eq!(Ordering::Release.to_llvm_code(), 3);
+        assert_eq!(Ordering::Acquire.to_llvm_code(), 2);
+        assert_eq!(Ordering::AcqRel.to_llvm_code(), 4);
+        assert_eq!(Ordering::SeqCst.to_llvm_code(), 5);
+    }
+
+    #[test]
+    fn test_is_acquire() {
+        assert!(!Ordering::Relaxed.is_acquire());
+        assert!(!Ordering::Release.is_acquire());
+        assert!(Ordering::Acquire.is_acquire());
+        assert!(Ordering::AcqRel.is_acquire());
+        assert!(Ordering::SeqCst.is_acquire());
+    }
+
+    #[test]
+    fn test_is_release() {
+        assert!(!Ordering::Relaxed.is_release());
+        assert!(Ordering::Release.is_release());
+        assert!(!Ordering::Acquire.is_release());
+        assert!(Ordering::AcqRel.is_release());
+        assert!(Ordering::SeqCst.is_release());
+    }
+
+    #[test]
+    fn test_is_synchronized() {
+        // Release-Acquire 쌍은 동기화
+        assert!(is_synchronized(Ordering::Release, Ordering::Acquire));
+        assert!(is_synchronized(Ordering::AcqRel, Ordering::Acquire));
+        assert!(is_synchronized(Ordering::SeqCst, Ordering::SeqCst));
+
+        // Release-Release는 동기화 아님
+        assert!(!is_synchronized(Ordering::Release, Ordering::Release));
+        // Acquire-Acquire는 동기화 아님
+        assert!(!is_synchronized(Ordering::Acquire, Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_ordering_strength() {
+        let relaxed = ordering_strength(Ordering::Relaxed);
+        let release = ordering_strength(Ordering::Release);
+        let acquire = ordering_strength(Ordering::Acquire);
+        let acqrel = ordering_strength(Ordering::AcqRel);
+        let seqcst = ordering_strength(Ordering::SeqCst);
+
+        assert!(relaxed < release);
+        assert!(release < acquire);
+        assert!(acquire < acqrel);
+        assert!(acqrel < seqcst);
+    }
+
+    #[test]
+    fn test_upgrade_to_seq_cst() {
+        assert_eq!(Ordering::Relaxed.upgrade_to_seq_cst(), Ordering::SeqCst);
+        assert_eq!(Ordering::Release.upgrade_to_seq_cst(), Ordering::SeqCst);
+        assert_eq!(Ordering::Acquire.upgrade_to_seq_cst(), Ordering::SeqCst);
+        assert_eq!(Ordering::AcqRel.upgrade_to_seq_cst(), Ordering::SeqCst);
+        assert_eq!(Ordering::SeqCst.upgrade_to_seq_cst(), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_platform_recommended() {
+        let recommended = Ordering::platform_recommended();
+        // x86-64: Release 이상이어야 함
+        // ARM: SeqCst 권장
+        assert!(recommended.is_release() || recommended == Ordering::SeqCst);
+    }
+}
+
+// ============================================================================
+// 정리
+// ============================================================================
+//
+// Ordering 구현:
+// ✅ 5가지 메모리 순서 정의 (Relaxed, Release, Acquire, AcqRel, SeqCst)
+// ✅ LLVM 코드 변환
+// ✅ Acquire/Release 검사
+// ✅ 동기화 관계 분석
+// ✅ 강도 비교
+// ✅ 7개 테스트
+//
+// 다음: AtomicUsize, AtomicBool 구현

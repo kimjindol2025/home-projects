@@ -1,0 +1,467 @@
+# ============================================================================
+# vectordb/collection.fl - 컬렉션 관리 및 문서 CRUD
+# ============================================================================
+# Phase VectorDB 구현
+# 작성: 2026-03-02
+# 책임: Collection 생성/삭제, Document CRUD, 메타데이터 필터링
+
+# ============================================================================
+# Type Definitions
+# ============================================================================
+
+struct VectorDocument
+  id: string
+  vector: Vector
+  rawText: Option<string>
+  metadata: map<string, string>
+  createdAt: string
+  updatedAt: string
+
+struct CollectionStats
+  totalDocs: number
+  dimension: number
+  indexType: number
+  avgSearchTime: number
+  totalSearches: number
+
+struct Collection
+  name: string
+  dimension: number
+  indexType: number
+  flatIndex: Option<FlatIndex>
+  lshIndex: Option<LSHIndex>
+  documents: map<string, VectorDocument>
+  stats: CollectionStats
+  createdAt: string
+
+struct VectorDB
+  collections: map<string, Collection>
+  totalCollections: number
+  config: VectorDBConfig
+
+struct VectorDBConfig
+  defaultDimension: number
+  defaultIndexType: number
+  maxCollections: number
+  maxDocsPerCollection: number
+
+# ============================================================================
+# VectorDB Initialization
+# ============================================================================
+
+fn newVectorDBConfig
+  input: void
+  output: VectorDBConfig
+  intent: "기본 VectorDB 설정 반환"
+  do
+    return {
+      defaultDimension: 128,
+      defaultIndexType: 0,
+      maxCollections: 100,
+      maxDocsPerCollection: 100000
+    }
+
+fn newVectorDB
+  input: config: VectorDBConfig
+  output: VectorDB
+  intent: "VectorDB 인스턴스 초기화"
+  do
+    return {
+      collections: {},
+      totalCollections: 0,
+      config: config
+    }
+
+# ============================================================================
+# Collection CRUD
+# ============================================================================
+
+fn createCollection
+  input: (db: VectorDB, name: string, dimension: number, indexType: number)
+  output: Result<VectorDB, string>
+  intent: "새 컬렉션 생성"
+  do
+    # 이름 중복 확인
+    match db.collections.get(name)
+      Some(_) => return Err("컬렉션 이미 존재: " + name)
+      None => pass
+
+    # maxCollections 한도 확인
+    if db.totalCollections >= db.config.maxCollections
+      return Err("컬렉션 수 초과")
+
+    # dimension 유효성
+    if dimension < 1 || dimension > 4096
+      return Err("차원 범위 초과: 1~4096")
+
+    # 인덱스 초기화
+    let flatIdx = newFlatIndex(dimension)
+    let lshConfig = {
+      indexType: indexType,
+      lshNumHashFunctions: 8,
+      lshSeed: 42
+    }
+    let lshIdx = newLSHIndex(dimension, lshConfig)
+
+    # Collection 생성
+    let stats = {
+      totalDocs: 0,
+      dimension: dimension,
+      indexType: indexType,
+      avgSearchTime: 0,
+      totalSearches: 0
+    }
+
+    let collection = {
+      name: name,
+      dimension: dimension,
+      indexType: indexType,
+      flatIndex: Some(flatIdx),
+      lshIndex: Some(lshIdx),
+      documents: {},
+      stats: stats,
+      createdAt: getCurrentTimestamp()
+    }
+
+    let updated = db
+    updated.collections.set(name, collection)
+    updated.totalCollections = db.totalCollections + 1
+
+    return Ok(updated)
+
+fn getCollection
+  input: (db: VectorDB, name: string)
+  output: Result<Collection, string>
+  intent: "이름으로 컬렉션 조회"
+  do
+    match db.collections.get(name)
+      Some(coll) => return Ok(coll)
+      None => return Err("컬렉션 찾기 실패: " + name)
+
+fn deleteCollection
+  input: (db: VectorDB, name: string)
+  output: Result<VectorDB, string>
+  intent: "컬렉션 및 모든 문서 삭제"
+  do
+    match db.collections.get(name)
+      Some(_) => {
+        let updated = db
+        updated.collections.set(name, {
+          name: "",
+          dimension: 0,
+          indexType: 0,
+          flatIndex: None,
+          lshIndex: None,
+          documents: {},
+          stats: {
+            totalDocs: 0,
+            dimension: 0,
+            indexType: 0,
+            avgSearchTime: 0,
+            totalSearches: 0
+          },
+          createdAt: ""
+        })
+        updated.totalCollections = db.totalCollections - 1
+        return Ok(updated)
+      }
+      None => return Err("컬렉션 찾기 실패")
+
+fn listCollections
+  input: db: VectorDB
+  output: array<string>
+  intent: "모든 컬렉션 이름 목록"
+  do
+    let names = []
+    # map 반복 필요
+    return names
+
+# ============================================================================
+# Document CRUD
+# ============================================================================
+
+fn newVectorDocument
+  input: (vector: Vector, rawText: Option<string>, metadata: map<string, string>)
+  output: VectorDocument
+  intent: "VectorDocument 생성"
+  do
+    return {
+      id: generateUUID(),
+      vector: vector,
+      rawText: rawText,
+      metadata: metadata,
+      createdAt: getCurrentTimestamp(),
+      updatedAt: getCurrentTimestamp()
+    }
+
+fn insertDocument
+  input: (db: VectorDB, collectionName: string, doc: VectorDocument)
+  output: Result<VectorDB, string>
+  intent: "컬렉션에 문서 삽입"
+  do
+    # 컬렉션 존재 확인
+    match db.collections.get(collectionName)
+      Some(coll) => {
+        # 차원 확인
+        if doc.vector.dimension != coll.dimension
+          return Err("벡터 차원 불일치")
+
+        # ID 중복 확인
+        match coll.documents.get(doc.id)
+          Some(_) => return Err("문서 ID 중복: " + doc.id)
+          None => pass
+
+        # maxDocsPerCollection 한도 확인
+        if coll.stats.totalDocs >= db.config.maxDocsPerCollection
+          return Err("컬렉션 문서 수 초과")
+
+        # 인덱스에 벡터 추가
+        let updatedColl = coll
+
+        # FlatIndex에 추가
+        match coll.flatIndex
+          Some(flatIdx) => {
+            match flatIndexInsert(flatIdx, doc.vector)
+              Ok(newIdx) => updatedColl.flatIndex = Some(newIdx)
+              Err(_) => pass
+          }
+          None => pass
+
+        # LSHIndex에 추가
+        match coll.lshIndex
+          Some(lshIdx) => {
+            match lshIndexInsert(lshIdx, doc.vector)
+              Ok(newIdx) => updatedColl.lshIndex = Some(newIdx)
+              Err(_) => pass
+          }
+          None => pass
+
+        # 문서 저장
+        updatedColl.documents.set(doc.id, doc)
+        updatedColl.stats.totalDocs = coll.stats.totalDocs + 1
+
+        let updated = db
+        updated.collections.set(collectionName, updatedColl)
+
+        return Ok(updated)
+      }
+      None => return Err("컬렉션 찾기 실패")
+
+fn deleteDocument
+  input: (db: VectorDB, collectionName: string, docId: string)
+  output: Result<VectorDB, string>
+  intent: "특정 문서 삭제"
+  do
+    match db.collections.get(collectionName)
+      Some(coll) => {
+        match coll.documents.get(docId)
+          Some(_) => {
+            let updatedColl = coll
+
+            # 인덱스에서 삭제
+            match coll.flatIndex
+              Some(flatIdx) => {
+                match flatIndexDelete(flatIdx, docId)
+                  Ok(newIdx) => updatedColl.flatIndex = Some(newIdx)
+                  Err(_) => pass
+              }
+              None => pass
+
+            match coll.lshIndex
+              Some(lshIdx) => {
+                match lshIndexDelete(lshIdx, docId)
+                  Ok(newIdx) => updatedColl.lshIndex = Some(newIdx)
+                  Err(_) => pass
+              }
+              None => pass
+
+            # 문서 삭제
+            updatedColl.documents.set(docId, {
+              id: "",
+              vector: { id: "", values: [], dimension: 0, metadata: {} },
+              rawText: None,
+              metadata: {},
+              createdAt: "",
+              updatedAt: ""
+            })
+            updatedColl.stats.totalDocs = coll.stats.totalDocs - 1
+
+            let updated = db
+            updated.collections.set(collectionName, updatedColl)
+
+            return Ok(updated)
+          }
+          None => return Err("문서 찾기 실패")
+      }
+      None => return Err("컬렉션 찾기 실패")
+
+fn getDocument
+  input: (db: VectorDB, collectionName: string, docId: string)
+  output: Result<VectorDocument, string>
+  intent: "ID로 문서 조회"
+  do
+    match db.collections.get(collectionName)
+      Some(coll) => {
+        match coll.documents.get(docId)
+          Some(doc) => return Ok(doc)
+          None => return Err("문서 찾기 실패")
+      }
+      None => return Err("컬렉션 찾기 실패")
+
+fn updateDocumentMetadata
+  input: (db: VectorDB, collectionName: string, docId: string, metadata: map<string, string>)
+  output: Result<VectorDB, string>
+  intent: "문서 메타데이터 업데이트"
+  do
+    match db.collections.get(collectionName)
+      Some(coll) => {
+        match coll.documents.get(docId)
+          Some(doc) => {
+            let updatedDoc = doc
+            updatedDoc.metadata = metadata
+            updatedDoc.updatedAt = getCurrentTimestamp()
+
+            let updatedColl = coll
+            updatedColl.documents.set(docId, updatedDoc)
+
+            let updated = db
+            updated.collections.set(collectionName, updatedColl)
+
+            return Ok(updated)
+          }
+          None => return Err("문서 찾기 실패")
+      }
+      None => return Err("컬렉션 찾기 실패")
+
+# ============================================================================
+# Filtering & Statistics
+# ============================================================================
+
+fn filterDocumentsByMetadata
+  input: (collection: Collection, filter: map<string, string>)
+  output: array<VectorDocument>
+  intent: "메타데이터 조건에 맞는 문서 필터링"
+  do
+    let results = []
+
+    # 모든 문서 반복 (간단한 구현)
+    # FreeLang: map 반복 필요
+    # 임시: 빈 배열 반환
+
+    return results
+
+fn getCollectionStats
+  input: collection: Collection
+  output: CollectionStats
+  intent: "컬렉션 통계 반환"
+  do
+    return collection.stats
+
+fn getDocumentCount
+  input: (db: VectorDB, collectionName: string)
+  output: Result<number, string>
+  intent: "컬렉션의 문서 수 반환"
+  do
+    match db.collections.get(collectionName)
+      Some(coll) => return Ok(coll.stats.totalDocs)
+      None => return Err("컬렉션 찾기 실패")
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn getCurrentTimestamp
+  input: void
+  output: string
+  intent: "현재 ISO 8601 타임스탬프 반환"
+  do
+    # FreeLang: 표준 라이브러리 필요
+    return "2026-03-02T12:00:00Z"
+
+fn generateUUID
+  input: void
+  output: string
+  intent: "UUID 생성"
+  do
+    # FreeLang: 표준 라이브러리 필요
+    return "uuid-" + str(getCurrentTimestamp())
+
+fn newFlatIndex
+  input: dimension: number
+  output: FlatIndex
+  intent: "FlatIndex 생성 (index.fl 참조)"
+  do
+    return {
+      vectors: [],
+      dimension: dimension,
+      count: 0,
+      vectorMap: {}
+    }
+
+fn flatIndexInsert
+  input: (idx: FlatIndex, v: Vector)
+  output: Result<FlatIndex, string>
+  intent: "FlatIndex 삽입 (index.fl 참조)"
+  do
+    if v.dimension != idx.dimension
+      return Err("차원 불일치")
+    let updated = idx
+    updated.vectors = arrayPush(idx.vectors, v)
+    updated.count = idx.count + 1
+    return Ok(updated)
+
+fn flatIndexDelete
+  input: (idx: FlatIndex, vectorId: string)
+  output: Result<FlatIndex, string>
+  intent: "FlatIndex 삭제 (index.fl 참조)"
+  do
+    let newVectors = []
+    for i in 0..arrayLen(idx.vectors)
+      let v = arrayGet(idx.vectors, i)
+      if v.id != vectorId
+        newVectors = arrayPush(newVectors, v)
+    let updated = idx
+    updated.vectors = newVectors
+    updated.count = idx.count - 1
+    return Ok(updated)
+
+fn newLSHIndex
+  input: (dimension: number, config: VectorDBConfig)
+  output: LSHIndex
+  intent: "LSHIndex 생성 (index.fl 참조)"
+  do
+    let hashFunctions = []
+    for i in 0..8
+      hashFunctions = arrayPush(hashFunctions, {
+        hyperplane: { id: "hp_" + str(i), values: [], dimension: dimension, metadata: {} },
+        bias: 0
+      })
+    return {
+      hashFunctions: hashFunctions,
+      buckets: {},
+      vectorStore: {},
+      numHashFunctions: 8,
+      dimension: dimension,
+      count: 0
+    }
+
+fn lshIndexInsert
+  input: (idx: LSHIndex, v: Vector)
+  output: Result<LSHIndex, string>
+  intent: "LSHIndex 삽입 (index.fl 참조)"
+  do
+    if v.dimension != idx.dimension
+      return Err("차원 불일치")
+    let updated = idx
+    updated.vectorStore.set(v.id, v)
+    updated.count = idx.count + 1
+    return Ok(updated)
+
+fn lshIndexDelete
+  input: (idx: LSHIndex, vectorId: string)
+  output: Result<LSHIndex, string>
+  intent: "LSHIndex 삭제 (index.fl 참조)"
+  do
+    let updated = idx
+    updated.count = idx.count - 1
+    return Ok(updated)

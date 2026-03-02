@@ -1,0 +1,986 @@
+// ============================================================================
+// vector_ops_tracer.go - FreeLang 벡터 DB 연산 성능 추적기
+// ============================================================================
+// 목표: 벡터 연산(dotProduct, cosineSimilarity, l2Distance)의
+//       실행 시간, 호출 빈도, 차원별 성능을 측정
+//
+// 참고: 실제 FreeLang VM 후킹 대신, Go 레벨 시뮬레이션 + /proc 기반 추적 사용
+// eBPF 프로그램 소스는 문자열로 내장 (BCC 환경에서 실제 컴파일 가능)
+//
+// 빌드: go build -o vector_ops_tracer vector_ops_tracer.go
+// 실행: ./vector_ops_tracer -duration 30s -dim 128,256,512
+// ============================================================================
+
+package main
+
+import (
+	"encoding/csv"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ============================================================================
+// eBPF 프로그램 소스 (문자열로 내장)
+// BCC(BPF Compiler Collection) 환경에서 실제 컴파일 가능
+// Android/arm64 환경에서는 Go 레벨 시뮬레이션으로 대체
+// ============================================================================
+
+const ebpfSource = `
+// eBPF 프로그램: FreeLang 벡터 연산 추적
+// 요구사항: Linux 5.8+, BCC, CAP_BPF 권한
+//
+// 구조체 정의
+struct vector_op_event {
+    u32 pid;
+    u64 timestamp_ns;
+    u64 duration_ns;
+    u32 dimension;
+    u32 op_type;    // 0=dot, 1=cosine, 2=l2, 3=manhattan
+    u8  is_error;
+    char comm[16];
+};
+
+// eBPF 맵: 연산별 누적 통계
+BPF_HASH(op_stats, u32, struct vector_op_event, 1024);
+
+// eBPF 맵: 진행 중인 호출 추적
+BPF_HASH(in_flight, u64, u64);
+
+// eBPF 링 버퍼: 이벤트 스트림
+BPF_RINGBUF_OUTPUT(events, 1 << 14);  // 16KB 링 버퍼
+
+// tracepoint: sys_enter_read 훅
+// FreeLang VM이 read() 시스템 콜을 통해 벡터 데이터를 읽는 시점 추적
+TRACEPOINT_PROBE(syscalls, sys_enter_read) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u32 pid = pid_tgid >> 32;
+
+    // FreeLang VM 프로세스 필터 (환경 변수 FL_PID로 설정)
+    // 여기서는 전체 프로세스 대상 (실제 환경에서는 필터 추가 필요)
+    u64 ts = bpf_ktime_get_ns();
+    in_flight.update(&pid_tgid, &ts);
+
+    return 0;
+}
+
+// tracepoint: sys_exit_read 훅
+TRACEPOINT_PROBE(syscalls, sys_exit_read) {
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u64 *start_ts = in_flight.lookup(&pid_tgid);
+    if (!start_ts) return 0;
+
+    u64 duration = bpf_ktime_get_ns() - *start_ts;
+    in_flight.delete(&pid_tgid);
+
+    // 이벤트 생성
+    struct vector_op_event *e = events.ringbuf_reserve(sizeof(*e));
+    if (!e) return 0;
+
+    e->pid = pid_tgid >> 32;
+    e->timestamp_ns = *start_ts;
+    e->duration_ns = duration;
+    e->dimension = 128;    // 실제: args->count / sizeof(float)
+    e->op_type = 0;        // 실제: mmap 패턴 분석으로 연산 타입 추론
+    e->is_error = (args->ret < 0) ? 1 : 0;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    events.ringbuf_submit(e, 0);
+    return 0;
+}
+
+// kprobe: FreeLang VM 내부 함수 후킹 (선택적, 심볼 테이블 필요)
+// int kprobe__fl_vector_dot_product(struct pt_regs *ctx) {
+//     // ...
+// }
+`
+
+// ============================================================================
+// 타입 정의
+// ============================================================================
+
+// OpType: 벡터 연산 종류
+type OpType int
+
+const (
+	OpDotProduct       OpType = iota // 내적
+	OpCosineSimilarity               // 코사인 유사도
+	OpL2Distance                     // L2 거리
+	OpManhattan                      // 맨해튼 거리
+)
+
+func (op OpType) String() string {
+	switch op {
+	case OpDotProduct:
+		return "dotProduct"
+	case OpCosineSimilarity:
+		return "cosineSimilarity"
+	case OpL2Distance:
+		return "l2Distance"
+	case OpManhattan:
+		return "manhattanDistance"
+	default:
+		return "unknown"
+	}
+}
+
+// VectorOpStat: 단일 벡터 연산의 성능 통계
+type VectorOpStat struct {
+	OpType     string    `json:"op_type"`
+	Dimension  uint32    `json:"dimension"`
+	TimeNs     uint64    `json:"time_ns"`
+	Count      uint64    `json:"count"`
+	ErrorCount uint64    `json:"error_count"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+// OpAggregate: 연산 타입별 집계 통계
+type OpAggregate struct {
+	OpType      string    `json:"op_type"`
+	TotalCalls  uint64    `json:"total_calls"`
+	ErrorCalls  uint64    `json:"error_calls"`
+	TotalTimeNs uint64    `json:"total_time_ns"`
+	MinTimeNs   uint64    `json:"min_time_ns"`
+	MaxTimeNs   uint64    `json:"max_time_ns"`
+	AvgTimeNs   float64   `json:"avg_time_ns"`
+	P50Ns       uint64    `json:"p50_ns"`
+	P95Ns       uint64    `json:"p95_ns"`
+	P99Ns       uint64    `json:"p99_ns"`
+	ErrorRate   float64   `json:"error_rate"`
+	StartTime   time.Time `json:"start_time"`
+	EndTime     time.Time `json:"end_time"`
+}
+
+// DimensionStats: 차원별 성능 통계
+type DimensionStats struct {
+	Dimension  uint32  `json:"dimension"`
+	AvgTimeNs  float64 `json:"avg_time_ns"`
+	TotalCalls uint64  `json:"total_calls"`
+	Throughput float64 `json:"throughput_ops_sec"`
+}
+
+// IndexingStats: FlatIndex vs LSHIndex 비교 결과
+type IndexingStats struct {
+	FlatInsertNs   float64 `json:"flat_insert_ns"`
+	LSHInsertNs    float64 `json:"lsh_insert_ns"`
+	FlatSearchNs   float64 `json:"flat_search_ns"`
+	LSHSearchNs    float64 `json:"lsh_search_ns"`
+	LSHAccuracy    float64 `json:"lsh_accuracy"`
+	FlatMemoryKB   int64   `json:"flat_memory_kb"`
+	LSHMemoryKB    int64   `json:"lsh_memory_kb"`
+	DocCount       int     `json:"doc_count"`
+	LSHSpeedupRatio float64 `json:"lsh_speedup_ratio"`
+}
+
+// TracerConfig: 추적기 설정
+type TracerConfig struct {
+	Duration    time.Duration
+	Dimensions  []int
+	OpTypes     []OpType
+	OutputCSV   string
+	OutputJSON  string
+	Verbose     bool
+}
+
+// ============================================================================
+// 벡터 연산 시뮬레이터
+// FreeLang VM의 vector.fl, index.fl 연산을 Go로 재현
+// ============================================================================
+
+// Vector: FreeLang Vector 구조체 대응
+type Vector struct {
+	ID        string
+	Values    []float64
+	Dimension int
+}
+
+// newRandomVector: 지정 차원의 랜덤 벡터 생성
+func newRandomVector(id string, dim int, rng *rand.Rand) Vector {
+	values := make([]float64, dim)
+	for i := range values {
+		values[i] = rng.Float64()*2 - 1 // [-1, 1]
+	}
+	return Vector{ID: id, Values: values, Dimension: dim}
+}
+
+// dotProduct: 내적 계산 (vector.fl dotProduct 대응)
+func dotProduct(a, b Vector) (float64, error, time.Duration) {
+	start := time.Now()
+	if a.Dimension != b.Dimension {
+		return 0, fmt.Errorf("차원 불일치: %d vs %d", a.Dimension, b.Dimension), time.Since(start)
+	}
+	result := 0.0
+	for i := 0; i < a.Dimension; i++ {
+		result += a.Values[i] * b.Values[i]
+	}
+	return result, nil, time.Since(start)
+}
+
+// vectorNorm: L2 노름 계산 (vector.fl vectorNorm 대응)
+func vectorNorm(v Vector) float64 {
+	sumSq := 0.0
+	for _, val := range v.Values {
+		sumSq += val * val
+	}
+	return math.Sqrt(sumSq)
+}
+
+// cosineSimilarity: 코사인 유사도 계산 (vector.fl cosineSimilarity 대응)
+func cosineSimilarity(a, b Vector) (float64, error, time.Duration) {
+	start := time.Now()
+	if a.Dimension != b.Dimension {
+		return 0, fmt.Errorf("차원 불일치"), time.Since(start)
+	}
+	dot, _, _ := dotProduct(a, b)
+	normA := vectorNorm(a)
+	normB := vectorNorm(b)
+	if normA == 0 || normB == 0 {
+		return 0, fmt.Errorf("영벡터로 코사인 유사도 불가"), time.Since(start)
+	}
+	return dot / (normA * normB), nil, time.Since(start)
+}
+
+// l2Distance: L2 거리 계산 (vector.fl l2Distance 대응)
+func l2Distance(a, b Vector) (float64, error, time.Duration) {
+	start := time.Now()
+	if a.Dimension != b.Dimension {
+		return 0, fmt.Errorf("차원 불일치"), time.Since(start)
+	}
+	sumSq := 0.0
+	for i := 0; i < a.Dimension; i++ {
+		diff := a.Values[i] - b.Values[i]
+		sumSq += diff * diff
+	}
+	return math.Sqrt(sumSq), nil, time.Since(start)
+}
+
+// manhattanDistance: 맨해튼 거리 (vector.fl manhattanDistance 대응)
+func manhattanDistance(a, b Vector) (float64, error, time.Duration) {
+	start := time.Now()
+	if a.Dimension != b.Dimension {
+		return 0, fmt.Errorf("차원 불일치"), time.Since(start)
+	}
+	total := 0.0
+	for i := 0; i < a.Dimension; i++ {
+		total += math.Abs(a.Values[i] - b.Values[i])
+	}
+	return total, nil, time.Since(start)
+}
+
+// ============================================================================
+// VectorOpTracer: 벡터 연산 추적기
+// ============================================================================
+
+type VectorOpTracer struct {
+	mu         sync.Mutex
+	stats      []VectorOpStat
+	config     TracerConfig
+	running    atomic.Bool
+	totalOps   atomic.Int64
+	errorOps   atomic.Int64
+}
+
+// NewVectorOpTracer: 추적기 초기화
+func NewVectorOpTracer(cfg TracerConfig) *VectorOpTracer {
+	return &VectorOpTracer{
+		stats:  make([]VectorOpStat, 0, 10000),
+		config: cfg,
+	}
+}
+
+// recordOp: 연산 결과 기록
+func (t *VectorOpTracer) recordOp(opType string, dim uint32, duration time.Duration, err error) {
+	stat := VectorOpStat{
+		OpType:    opType,
+		Dimension: dim,
+		TimeNs:    uint64(duration.Nanoseconds()),
+		Count:     1,
+		Timestamp: time.Now(),
+	}
+	if err != nil {
+		stat.ErrorCount = 1
+		t.errorOps.Add(1)
+	}
+	t.totalOps.Add(1)
+
+	t.mu.Lock()
+	t.stats = append(t.stats, stat)
+	t.mu.Unlock()
+}
+
+// runBenchmark: 지정 차원과 반복 횟수로 벤치마크 실행
+func (t *VectorOpTracer) runBenchmark(dim int, iterations int) {
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	for i := 0; i < iterations; i++ {
+		if !t.running.Load() {
+			break
+		}
+
+		a := newRandomVector(fmt.Sprintf("a%d", i), dim, rng)
+		b := newRandomVector(fmt.Sprintf("b%d", i), dim, rng)
+
+		// dotProduct 추적
+		_, errDot, durDot := dotProduct(a, b)
+		t.recordOp(OpDotProduct.String(), uint32(dim), durDot, errDot)
+
+		// cosineSimilarity 추적
+		_, errCos, durCos := cosineSimilarity(a, b)
+		t.recordOp(OpCosineSimilarity.String(), uint32(dim), durCos, errCos)
+
+		// l2Distance 추적
+		_, errL2, durL2 := l2Distance(a, b)
+		t.recordOp(OpL2Distance.String(), uint32(dim), durL2, errL2)
+
+		// manhattanDistance 추적
+		_, errMH, durMH := manhattanDistance(a, b)
+		t.recordOp(OpManhattan.String(), uint32(dim), durMH, errMH)
+
+		if t.config.Verbose && i%1000 == 0 {
+			fmt.Printf("  [dim=%d] %d/%d 완료 (총 ops: %d)\n",
+				dim, i, iterations, t.totalOps.Load())
+		}
+	}
+}
+
+// TraceVectorOps: 지정 시간 동안 벡터 연산 추적
+func (t *VectorOpTracer) TraceVectorOps(duration time.Duration) ([]VectorOpStat, error) {
+	t.running.Store(true)
+	defer t.running.Store(false)
+
+	fmt.Printf("[추적 시작] 기간: %v, 차원: %v\n", duration, t.config.Dimensions)
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	// 각 차원별 병렬 벤치마크 실행
+	iterationsPerDim := 5000
+	for _, dim := range t.config.Dimensions {
+		wg.Add(1)
+		d := dim
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(time.Millisecond)
+			defer ticker.Stop()
+			count := 0
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					t.runBenchmark(d, 10)
+					count++
+					if count >= iterationsPerDim/10 {
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// 타임아웃 처리
+	timer := time.NewTimer(duration)
+	go func() {
+		<-timer.C
+		close(done)
+		t.running.Store(false)
+	}()
+
+	wg.Wait()
+
+	t.mu.Lock()
+	result := make([]VectorOpStat, len(t.stats))
+	copy(result, t.stats)
+	t.mu.Unlock()
+
+	fmt.Printf("[추적 완료] 총 %d 연산, 오류 %d\n", t.totalOps.Load(), t.errorOps.Load())
+	return result, nil
+}
+
+// ============================================================================
+// 분석 함수들
+// ============================================================================
+
+// aggregateByOpType: 연산 타입별 집계
+func aggregateByOpType(stats []VectorOpStat) map[string]*OpAggregate {
+	aggMap := make(map[string]*OpAggregate)
+
+	for _, s := range stats {
+		agg, ok := aggMap[s.OpType]
+		if !ok {
+			agg = &OpAggregate{
+				OpType:    s.OpType,
+				MinTimeNs: math.MaxUint64,
+				StartTime: s.Timestamp,
+			}
+			aggMap[s.OpType] = agg
+		}
+
+		agg.TotalCalls += s.Count
+		agg.ErrorCalls += s.ErrorCount
+		agg.TotalTimeNs += s.TimeNs
+
+		if s.TimeNs < agg.MinTimeNs {
+			agg.MinTimeNs = s.TimeNs
+		}
+		if s.TimeNs > agg.MaxTimeNs {
+			agg.MaxTimeNs = s.TimeNs
+		}
+		if s.Timestamp.After(agg.EndTime) {
+			agg.EndTime = s.Timestamp
+		}
+	}
+
+	// 평균, 에러율, 퍼센타일 계산
+	for opType, agg := range aggMap {
+		if agg.TotalCalls > 0 {
+			agg.AvgTimeNs = float64(agg.TotalTimeNs) / float64(agg.TotalCalls)
+		}
+		if agg.TotalCalls > 0 {
+			agg.ErrorRate = float64(agg.ErrorCalls) / float64(agg.TotalCalls) * 100
+		}
+
+		// 퍼센타일: 해당 타입의 시간만 추출
+		var times []uint64
+		for _, s := range stats {
+			if s.OpType == opType {
+				times = append(times, s.TimeNs)
+			}
+		}
+		sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+		n := len(times)
+		if n > 0 {
+			agg.P50Ns = times[n*50/100]
+			agg.P95Ns = times[n*95/100]
+			if n*99/100 < n {
+				agg.P99Ns = times[n*99/100]
+			}
+		}
+		_ = opType
+	}
+
+	return aggMap
+}
+
+// DotProductPercentile: dotProduct 연산의 N 퍼센타일 시간(ns) 반환
+func DotProductPercentile(stats []VectorOpStat, percentile int) float64 {
+	var times []float64
+	for _, s := range stats {
+		if s.OpType == OpDotProduct.String() {
+			times = append(times, float64(s.TimeNs))
+		}
+	}
+	if len(times) == 0 {
+		return 0
+	}
+	sort.Float64s(times)
+	idx := len(times) * percentile / 100
+	if idx >= len(times) {
+		idx = len(times) - 1
+	}
+	return times[idx]
+}
+
+// analyzeDimensions: 차원별 성능 분석
+func analyzeDimensions(stats []VectorOpStat) []DimensionStats {
+	dimMap := make(map[uint32][]uint64)
+	for _, s := range stats {
+		dimMap[s.Dimension] = append(dimMap[s.Dimension], s.TimeNs)
+	}
+
+	var result []DimensionStats
+	for dim, times := range dimMap {
+		total := uint64(0)
+		for _, t := range times {
+			total += t
+		}
+		avg := float64(total) / float64(len(times))
+		throughput := 1e9 / avg // ops/sec
+
+		result = append(result, DimensionStats{
+			Dimension:  dim,
+			AvgTimeNs:  avg,
+			TotalCalls: uint64(len(times)),
+			Throughput: throughput,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Dimension < result[j].Dimension
+	})
+	return result
+}
+
+// ============================================================================
+// FlatIndex vs LSHIndex 비교 (index.fl 로직 재현)
+// ============================================================================
+
+// SimpleVector: 인덱싱 비교용 간단 벡터
+type SimpleVector struct {
+	ID     string
+	Values []float64
+}
+
+// FlatIndexSim: FlatIndex 시뮬레이터 (index.fl FlatIndex 대응)
+type FlatIndexSim struct {
+	vectors []SimpleVector
+	dim     int
+}
+
+func NewFlatIndexSim(dim int) *FlatIndexSim {
+	return &FlatIndexSim{dim: dim}
+}
+
+func (f *FlatIndexSim) Insert(v SimpleVector) {
+	f.vectors = append(f.vectors, v)
+}
+
+func (f *FlatIndexSim) Search(query SimpleVector, k int) []SimpleVector {
+	type scored struct {
+		v     SimpleVector
+		score float64
+	}
+	var results []scored
+	for _, v := range f.vectors {
+		// 코사인 유사도 계산
+		dot := 0.0
+		normQ, normV := 0.0, 0.0
+		for i := range query.Values {
+			dot += query.Values[i] * v.Values[i]
+			normQ += query.Values[i] * query.Values[i]
+			normV += v.Values[i] * v.Values[i]
+		}
+		normQ = math.Sqrt(normQ)
+		normV = math.Sqrt(normV)
+		sim := 0.0
+		if normQ > 0 && normV > 0 {
+			sim = dot / (normQ * normV)
+		}
+		results = append(results, scored{v: v, score: sim})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+	var topK []SimpleVector
+	for i := 0; i < k && i < len(results); i++ {
+		topK = append(topK, results[i].v)
+	}
+	return topK
+}
+
+// LSHIndexSim: LSHIndex 시뮬레이터 (index.fl LSHIndex 대응)
+type LSHIndexSim struct {
+	hashFunctions [][]float64 // 하이퍼플레인 벡터들
+	buckets       map[string][]SimpleVector
+	vectorStore   map[string]SimpleVector
+	dim           int
+	numHashFns    int
+}
+
+func NewLSHIndexSim(dim, numHashFns int, seed int64) *LSHIndexSim {
+	rng := rand.New(rand.NewSource(seed))
+	hashFns := make([][]float64, numHashFns)
+	for i := range hashFns {
+		hp := make([]float64, dim)
+		for j := range hp {
+			hp[j] = rng.NormFloat64()
+		}
+		hashFns[i] = hp
+	}
+	return &LSHIndexSim{
+		hashFunctions: hashFns,
+		buckets:       make(map[string][]SimpleVector),
+		vectorStore:   make(map[string]SimpleVector),
+		dim:           dim,
+		numHashFns:    numHashFns,
+	}
+}
+
+func (l *LSHIndexSim) computeKey(v SimpleVector) string {
+	var sb strings.Builder
+	for _, hp := range l.hashFunctions {
+		dot := 0.0
+		for i := range v.Values {
+			dot += v.Values[i] * hp[i]
+		}
+		if dot >= 0 {
+			sb.WriteByte('1')
+		} else {
+			sb.WriteByte('0')
+		}
+	}
+	return sb.String()
+}
+
+func (l *LSHIndexSim) Insert(v SimpleVector) {
+	key := l.computeKey(v)
+	l.buckets[key] = append(l.buckets[key], v)
+	l.vectorStore[v.ID] = v
+}
+
+func (l *LSHIndexSim) Search(query SimpleVector, k int) []SimpleVector {
+	key := l.computeKey(query)
+	candidates := l.buckets[key]
+
+	type scored struct {
+		v     SimpleVector
+		score float64
+	}
+	var results []scored
+	for _, v := range candidates {
+		dot := 0.0
+		normQ, normV := 0.0, 0.0
+		for i := range query.Values {
+			dot += query.Values[i] * v.Values[i]
+			normQ += query.Values[i] * query.Values[i]
+			normV += v.Values[i] * v.Values[i]
+		}
+		normQ = math.Sqrt(normQ)
+		normV = math.Sqrt(normV)
+		sim := 0.0
+		if normQ > 0 && normV > 0 {
+			sim = dot / (normQ * normV)
+		}
+		results = append(results, scored{v: v, score: sim})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].score > results[j].score
+	})
+	var topK []SimpleVector
+	for i := 0; i < k && i < len(results); i++ {
+		topK = append(topK, results[i].v)
+	}
+	return topK
+}
+
+// CompareIndexing: FlatIndex vs LSHIndex 성능 비교 (collection.fl 로직 대응)
+func CompareIndexing(docCount int, dim int) IndexingStats {
+	rng := rand.New(rand.NewSource(42))
+
+	flatIdx := NewFlatIndexSim(dim)
+	lshIdx := NewLSHIndexSim(dim, 8, 42)
+
+	// 삽입 시간 측정
+	var flatInsertTotal, lshInsertTotal time.Duration
+
+	docs := make([]SimpleVector, docCount)
+	for i := range docs {
+		vals := make([]float64, dim)
+		for j := range vals {
+			vals[j] = rng.Float64()*2 - 1
+		}
+		docs[i] = SimpleVector{ID: strconv.Itoa(i), Values: vals}
+	}
+
+	// FlatIndex 삽입
+	start := time.Now()
+	for _, d := range docs {
+		flatIdx.Insert(d)
+	}
+	flatInsertTotal = time.Since(start)
+
+	// LSHIndex 삽입
+	start = time.Now()
+	for _, d := range docs {
+		lshIdx.Insert(d)
+	}
+	lshInsertTotal = time.Since(start)
+
+	// 검색 시간 측정 (100회 평균)
+	searchRounds := 100
+	var flatSearchTotal, lshSearchTotal time.Duration
+
+	// LSH 정확도 측정
+	correctCount := 0
+
+	for i := 0; i < searchRounds; i++ {
+		vals := make([]float64, dim)
+		for j := range vals {
+			vals[j] = rng.Float64()*2 - 1
+		}
+		query := SimpleVector{ID: "query", Values: vals}
+
+		start = time.Now()
+		flatResults := flatIdx.Search(query, 10)
+		flatSearchTotal += time.Since(start)
+
+		start = time.Now()
+		lshResults := lshIdx.Search(query, 10)
+		lshSearchTotal += time.Since(start)
+
+		// 정확도: flat 결과 중 lsh 결과에 포함된 비율
+		flatIDs := make(map[string]bool)
+		for _, r := range flatResults {
+			flatIDs[r.ID] = true
+		}
+		for _, r := range lshResults {
+			if flatIDs[r.ID] {
+				correctCount++
+			}
+		}
+	}
+
+	accuracy := 0.0
+	if searchRounds*10 > 0 {
+		accuracy = float64(correctCount) / float64(searchRounds*10) * 100
+	}
+
+	speedup := 1.0
+	if lshSearchTotal > 0 {
+		speedup = float64(flatSearchTotal) / float64(lshSearchTotal)
+	}
+
+	// 메모리 추정 (벡터 float64 * 차원 * 문서 수)
+	flatMem := int64(docCount) * int64(dim) * 8 / 1024 // KB
+	lshMem := flatMem + int64(8)*int64(dim)*8/1024      // + 해시 함수 메모리
+
+	return IndexingStats{
+		FlatInsertNs:    float64(flatInsertTotal.Nanoseconds()) / float64(docCount),
+		LSHInsertNs:     float64(lshInsertTotal.Nanoseconds()) / float64(docCount),
+		FlatSearchNs:    float64(flatSearchTotal.Nanoseconds()) / float64(searchRounds),
+		LSHSearchNs:     float64(lshSearchTotal.Nanoseconds()) / float64(searchRounds),
+		LSHAccuracy:     accuracy,
+		FlatMemoryKB:    flatMem,
+		LSHMemoryKB:     lshMem,
+		DocCount:        docCount,
+		LSHSpeedupRatio: speedup,
+	}
+}
+
+// ============================================================================
+// 출력 및 리포트
+// ============================================================================
+
+// PrintOpAggregate: 연산별 집계 출력
+func PrintOpAggregate(aggMap map[string]*OpAggregate) {
+	fmt.Println("\n=== 벡터 연산별 성능 집계 ===")
+	fmt.Printf("%-20s %10s %10s %10s %10s %10s %8s\n",
+		"연산", "총호출", "에러율%", "평균ns", "P50ns", "P99ns", "처리량")
+	fmt.Println(strings.Repeat("-", 80))
+
+	opOrder := []string{
+		OpDotProduct.String(),
+		OpCosineSimilarity.String(),
+		OpL2Distance.String(),
+		OpManhattan.String(),
+	}
+
+	for _, opName := range opOrder {
+		agg, ok := aggMap[opName]
+		if !ok {
+			continue
+		}
+		throughput := 0.0
+		if agg.AvgTimeNs > 0 {
+			throughput = 1e9 / agg.AvgTimeNs
+		}
+		fmt.Printf("%-20s %10d %10.2f %10.0f %10d %10d %8.0f\n",
+			opName,
+			agg.TotalCalls,
+			agg.ErrorRate,
+			agg.AvgTimeNs,
+			agg.P50Ns,
+			agg.P99Ns,
+			throughput,
+		)
+	}
+}
+
+// PrintDimensionStats: 차원별 성능 출력
+func PrintDimensionStats(dimStats []DimensionStats) {
+	fmt.Println("\n=== 차원별 성능 분석 ===")
+	fmt.Printf("%-12s %12s %12s %15s\n", "차원", "평균시간(ns)", "총호출", "처리량(ops/s)")
+	fmt.Println(strings.Repeat("-", 55))
+	for _, ds := range dimStats {
+		fmt.Printf("%-12d %12.0f %12d %15.0f\n",
+			ds.Dimension, ds.AvgTimeNs, ds.TotalCalls, ds.Throughput)
+	}
+}
+
+// PrintIndexingComparison: 인덱스 비교 결과 출력
+func PrintIndexingComparison(stats IndexingStats) {
+	fmt.Println("\n=== FlatIndex vs LSHIndex 비교 ===")
+	fmt.Printf("문서 수: %d\n", stats.DocCount)
+	fmt.Printf("%-20s %15s %15s\n", "지표", "FlatIndex", "LSHIndex")
+	fmt.Println(strings.Repeat("-", 52))
+	fmt.Printf("%-20s %15.0f %15.0f\n", "삽입 시간(ns/doc)",
+		stats.FlatInsertNs, stats.LSHInsertNs)
+	fmt.Printf("%-20s %15.0f %15.0f\n", "검색 시간(ns)",
+		stats.FlatSearchNs, stats.LSHSearchNs)
+	fmt.Printf("%-20s %15s %14.1f%%\n", "LSH 정확도", "100%", stats.LSHAccuracy)
+	fmt.Printf("%-20s %15.0f %15.0f\n", "메모리 사용(KB)",
+		float64(stats.FlatMemoryKB), float64(stats.LSHMemoryKB))
+	fmt.Printf("%-20s %15s %14.2fx\n", "검색 속도비", "1.00x", stats.LSHSpeedupRatio)
+}
+
+// ExportCSV: CSV 파일로 통계 내보내기
+func ExportCSV(stats []VectorOpStat, filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("CSV 생성 실패: %w", err)
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	// 헤더
+	if err := w.Write([]string{
+		"timestamp", "op_type", "dimension", "time_ns", "count", "error_count",
+	}); err != nil {
+		return err
+	}
+
+	// 데이터
+	for _, s := range stats {
+		if err := w.Write([]string{
+			s.Timestamp.Format(time.RFC3339Nano),
+			s.OpType,
+			strconv.Itoa(int(s.Dimension)),
+			strconv.FormatUint(s.TimeNs, 10),
+			strconv.FormatUint(s.Count, 10),
+			strconv.FormatUint(s.ErrorCount, 10),
+		}); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("[CSV] %s 저장 완료 (%d 레코드)\n", filename, len(stats))
+	return nil
+}
+
+// ExportJSON: JSON 파일로 집계 통계 내보내기
+func ExportJSON(aggMap map[string]*OpAggregate, dimStats []DimensionStats,
+	indexStats IndexingStats, filename string) error {
+	report := map[string]interface{}{
+		"generated_at":       time.Now().Format(time.RFC3339),
+		"platform":           runtime.GOOS + "/" + runtime.GOARCH,
+		"op_aggregates":      aggMap,
+		"dimension_stats":    dimStats,
+		"indexing_comparison": indexStats,
+	}
+
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return fmt.Errorf("JSON 변환 실패: %w", err)
+	}
+
+	if err := os.WriteFile(filename, data, 0644); err != nil {
+		return fmt.Errorf("JSON 저장 실패: %w", err)
+	}
+
+	fmt.Printf("[JSON] %s 저장 완료\n", filename)
+	return nil
+}
+
+// ============================================================================
+// 메인 함수
+// ============================================================================
+
+func main() {
+	// 플래그 파싱
+	durationFlag := flag.Duration("duration", 10*time.Second, "추적 기간 (예: 10s, 1m)")
+	dimsFlag := flag.String("dims", "128,256,512", "추적할 차원 (쉼표 구분)")
+	csvOut := flag.String("csv", "vector_ops_profile.csv", "CSV 출력 파일")
+	jsonOut := flag.String("json", "performance_report.json", "JSON 출력 파일")
+	verbose := flag.Bool("v", false, "상세 출력")
+	compareIdx := flag.Bool("compare", true, "FlatIndex vs LSH 비교 실행")
+	docCount := flag.Int("docs", 1000, "인덱스 비교용 문서 수")
+	flag.Parse()
+
+	// 차원 파싱
+	dimStrs := strings.Split(*dimsFlag, ",")
+	dims := make([]int, 0, len(dimStrs))
+	for _, ds := range dimStrs {
+		d, err := strconv.Atoi(strings.TrimSpace(ds))
+		if err == nil && d > 0 {
+			dims = append(dims, d)
+		}
+	}
+	if len(dims) == 0 {
+		dims = []int{128, 256, 512}
+	}
+
+	fmt.Println("============================================================")
+	fmt.Println("  FreeLang 벡터 DB 성능 추적기 (eBPF 시뮬레이션)")
+	fmt.Println("============================================================")
+	fmt.Printf("  플랫폼: %s/%s\n", runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("  추적 기간: %v\n", *durationFlag)
+	fmt.Printf("  대상 차원: %v\n", dims)
+	fmt.Println()
+	fmt.Println("  [참고] eBPF 소스가 내장되어 있습니다.")
+	fmt.Println("  실제 BCC 환경: bcc.Compile(ebpfSource)로 커널 레벨 추적 가능")
+	fmt.Println("  현재: Go 레벨 시뮬레이션으로 동일 메트릭 수집")
+	fmt.Println()
+
+	cfg := TracerConfig{
+		Duration:   *durationFlag,
+		Dimensions: dims,
+		OutputCSV:  *csvOut,
+		OutputJSON: *jsonOut,
+		Verbose:    *verbose,
+	}
+
+	tracer := NewVectorOpTracer(cfg)
+
+	// 1. 벡터 연산 추적
+	stats, err := tracer.TraceVectorOps(*durationFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "추적 실패: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 2. 집계 분석
+	aggMap := aggregateByOpType(stats)
+	dimStats := analyzeDimensions(stats)
+
+	// 3. 출력
+	PrintOpAggregate(aggMap)
+	PrintDimensionStats(dimStats)
+
+	// 4. dotProduct 퍼센타일 출력
+	p50 := DotProductPercentile(stats, 50)
+	p99 := DotProductPercentile(stats, 99)
+	fmt.Printf("\n[dotProduct 퍼센타일] P50: %.0fns, P99: %.0fns\n", p50, p99)
+
+	// 5. FlatIndex vs LSH 비교 (선택적)
+	var indexStats IndexingStats
+	if *compareIdx {
+		fmt.Printf("\n[인덱스 비교 시작] 문서 수: %d\n", *docCount)
+		for _, dim := range dims {
+			fmt.Printf("  차원 %d 비교 중...\n", dim)
+			is := CompareIndexing(*docCount, dim)
+			if dim == dims[0] {
+				indexStats = is
+			}
+			fmt.Printf("  차원 %d: Flat검색=%.0fns, LSH검색=%.0fns, 정확도=%.1f%%, 속도향상=%.2fx\n",
+				dim, is.FlatSearchNs, is.LSHSearchNs, is.LSHAccuracy, is.LSHSpeedupRatio)
+		}
+		PrintIndexingComparison(indexStats)
+	}
+
+	// 6. CSV 내보내기
+	if err := ExportCSV(stats, *csvOut); err != nil {
+		fmt.Fprintf(os.Stderr, "CSV 저장 실패: %v\n", err)
+	}
+
+	// 7. JSON 내보내기
+	if err := ExportJSON(aggMap, dimStats, indexStats, *jsonOut); err != nil {
+		fmt.Fprintf(os.Stderr, "JSON 저장 실패: %v\n", err)
+	}
+
+	fmt.Println("\n============================================================")
+	fmt.Println("  추적 완료!")
+	fmt.Printf("  - CSV: %s\n", *csvOut)
+	fmt.Printf("  - JSON: %s\n", *jsonOut)
+	fmt.Println("============================================================")
+}

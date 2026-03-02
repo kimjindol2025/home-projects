@@ -1,0 +1,429 @@
+/**
+ * ============================================================================
+ * grpc-web/client.ts - gRPC-web TypeScript 클라이언트
+ * ============================================================================
+ * 브라우저용 gRPC 클라이언트 라이브러리
+ * 작성: 2026-03-02
+ * 책임: gRPC 호출, 스트리밍, 타입 안전성
+ */
+
+/**
+ * gRPC-web 클라이언트 설정
+ */
+export interface GrpcWebClientConfig {
+  host: string;
+  port: number;
+  useSSL?: boolean;
+  timeout?: number;
+  retries?: number;
+}
+
+/**
+ * gRPC 메타데이터
+ */
+export interface Metadata {
+  [key: string]: string;
+}
+
+/**
+ * gRPC 호출 옵션
+ */
+export interface CallOptions {
+  metadata?: Metadata;
+  deadline?: number;  // 밀리초
+  onStatusChange?: (status: GrpcStatus) => void;
+}
+
+/**
+ * gRPC 상태 코드
+ */
+export enum GrpcStatus {
+  OK = 0,
+  CANCELLED = 1,
+  UNKNOWN = 2,
+  INVALID_ARGUMENT = 3,
+  DEADLINE_EXCEEDED = 4,
+  NOT_FOUND = 5,
+  ALREADY_EXISTS = 6,
+  PERMISSION_DENIED = 7,
+  RESOURCE_EXHAUSTED = 8,
+  FAILED_PRECONDITION = 9,
+  ABORTED = 10,
+  OUT_OF_RANGE = 11,
+  UNIMPLEMENTED = 12,
+  INTERNAL = 13,
+  UNAVAILABLE = 14,
+  DATA_LOSS = 15,
+  UNAUTHENTICATED = 16,
+}
+
+/**
+ * gRPC 응답
+ */
+export interface GrpcResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  status: GrpcStatus;
+  metadata?: Metadata;
+}
+
+/**
+ * 스트리밍 응답
+ */
+export interface StreamResponse<T> {
+  items: T[];
+  error?: string;
+  status: GrpcStatus;
+}
+
+/**
+ * gRPC-web 클라이언트
+ */
+export class GrpcWebClient {
+  private host: string;
+  private port: number;
+  private useSSL: boolean;
+  private timeout: number;
+  private retries: number;
+  private baseUrl: string;
+  private callCount: number = 0;
+  private errorCount: number = 0;
+
+  constructor(config: GrpcWebClientConfig) {
+    this.host = config.host;
+    this.port = config.port;
+    this.useSSL = config.useSSL ?? true;
+    this.timeout = config.timeout ?? 30000;
+    this.retries = config.retries ?? 3;
+
+    // 베이스 URL 구성
+    const protocol = this.useSSL ? 'https' : 'http';
+    this.baseUrl = `${protocol}://${this.host}:${this.port}`;
+
+    console.log(`[gRPC-web] Client initialized: ${this.baseUrl}`);
+  }
+
+  /**
+   * Unary RPC 호출 (단일 요청/응답)
+   */
+  async callUnary<Req, Res>(
+    service: string,
+    method: string,
+    request: Req,
+    options?: CallOptions
+  ): Promise<GrpcResponse<Res>> {
+    const url = `${this.baseUrl}/${service}/${method}`;
+    this.callCount++;
+
+    try {
+      const response = await this.fetchWithRetry<Res>(
+        url,
+        {
+          method: 'POST',
+          headers: this.buildHeaders(options?.metadata),
+          body: JSON.stringify(request),
+        },
+        this.retries,
+        options?.deadline
+      );
+
+      return {
+        success: true,
+        data: response,
+        status: GrpcStatus.OK,
+        metadata: options?.metadata,
+      };
+    } catch (error) {
+      this.errorCount++;
+      return {
+        success: false,
+        error: this.formatError(error),
+        status: GrpcStatus.UNKNOWN,
+      };
+    }
+  }
+
+  /**
+   * Server Streaming RPC (서버 → 클라이언트)
+   */
+  async callServerStreaming<Req, Res>(
+    service: string,
+    method: string,
+    request: Req,
+    onMessage: (message: Res) => void,
+    options?: CallOptions
+  ): Promise<StreamResponse<Res>> {
+    const url = `${this.baseUrl}/${service}/${method}/stream`;
+    this.callCount++;
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: this.buildHeaders(options?.metadata),
+        body: JSON.stringify(request),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      const items: Res[] = [];
+      const reader = response.body?.getReader();
+
+      if (reader) {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const text = new TextDecoder().decode(value);
+            const message = JSON.parse(text) as Res;
+            items.push(message);
+            onMessage(message);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+
+      return {
+        items,
+        status: GrpcStatus.OK,
+      };
+    } catch (error) {
+      this.errorCount++;
+      return {
+        items: [],
+        error: this.formatError(error),
+        status: GrpcStatus.UNKNOWN,
+      };
+    }
+  }
+
+  /**
+   * Client Streaming RPC (클라이언트 → 서버)
+   */
+  async callClientStreaming<Req, Res>(
+    service: string,
+    method: string,
+    requests: Req[],
+    options?: CallOptions
+  ): Promise<GrpcResponse<Res>> {
+    const url = `${this.baseUrl}/${service}/${method}/stream`;
+    this.callCount++;
+
+    try {
+      const response = await this.fetchWithRetry<Res>(
+        url,
+        {
+          method: 'POST',
+          headers: this.buildHeaders(options?.metadata),
+          body: JSON.stringify({ items: requests }),
+        },
+        this.retries,
+        options?.deadline
+      );
+
+      return {
+        success: true,
+        data: response,
+        status: GrpcStatus.OK,
+      };
+    } catch (error) {
+      this.errorCount++;
+      return {
+        success: false,
+        error: this.formatError(error),
+        status: GrpcStatus.UNKNOWN,
+      };
+    }
+  }
+
+  /**
+   * Bidirectional Streaming RPC (양방향)
+   */
+  async callBidiStreaming<Req, Res>(
+    service: string,
+    method: string,
+    requests: Req[],
+    onMessage: (message: Res) => void,
+    options?: CallOptions
+  ): Promise<StreamResponse<Res>> {
+    const url = `${this.baseUrl}/${service}/${method}/bidi`;
+    this.callCount++;
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: this.buildHeaders(options?.metadata),
+        body: JSON.stringify({ items: requests }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      const items: Res[] = [];
+      const reader = response.body?.getReader();
+
+      if (reader) {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const text = new TextDecoder().decode(value);
+            const message = JSON.parse(text) as Res;
+            items.push(message);
+            onMessage(message);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      }
+
+      return {
+        items,
+        status: GrpcStatus.OK,
+      };
+    } catch (error) {
+      this.errorCount++;
+      return {
+        items: [],
+        error: this.formatError(error),
+        status: GrpcStatus.UNKNOWN,
+      };
+    }
+  }
+
+  /**
+   * 재시도 로직과 함께 fetch 수행
+   */
+  private async fetchWithRetry<T>(
+    url: string,
+    options: RequestInit,
+    maxRetries: number,
+    deadline?: number
+  ): Promise<T> {
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const timeoutId = deadline
+          ? setTimeout(() => {
+              throw new Error('Request timeout');
+            }, deadline)
+          : null;
+
+        const response = await fetch(url, options);
+
+        if (timeoutId) clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          throw new Error(`Server returned ${response.status}`);
+        }
+
+        const data = await response.json();
+        return data as T;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (attempt < maxRetries) {
+          // 지수 백오프: 100ms * 2^attempt
+          const backoff = 100 * Math.pow(2, attempt);
+          console.log(`[gRPC-web] Retry ${attempt + 1}/${maxRetries} in ${backoff}ms`);
+          await new Promise(resolve => setTimeout(resolve, backoff));
+        }
+      }
+    }
+
+    throw lastError || new Error('Unknown error');
+  }
+
+  /**
+   * 요청 헤더 구성
+   */
+  private buildHeaders(metadata?: Metadata): HeadersInit {
+    const headers: HeadersInit = {
+      'Content-Type': 'application/json',
+      'X-Grpc-Web': '1',
+    };
+
+    if (metadata) {
+      Object.assign(headers, metadata);
+    }
+
+    return headers;
+  }
+
+  /**
+   * 에러 메시지 포맷팅
+   */
+  private formatError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+    return String(error);
+  }
+
+  /**
+   * 클라이언트 통계
+   */
+  getStats() {
+    return {
+      calls: this.callCount,
+      errors: this.errorCount,
+      successRate: this.callCount > 0
+        ? ((this.callCount - this.errorCount) / this.callCount * 100).toFixed(1) + '%'
+        : 'N/A',
+    };
+  }
+
+  /**
+   * 타임아웃 설정
+   */
+  setTimeout(ms: number): void {
+    this.timeout = ms;
+  }
+
+  /**
+   * 클라이언트 URI 반환
+   */
+  getUri(): string {
+    return this.baseUrl;
+  }
+}
+
+/**
+ * gRPC 서비스 기본 클래스
+ */
+export abstract class GrpcService {
+  constructor(protected client: GrpcWebClient) {}
+}
+
+/**
+ * 타입 가드: Response 검증
+ */
+export function isGrpcResponse<T>(
+  response: any
+): response is GrpcResponse<T> {
+  return (
+    typeof response === 'object' &&
+    'success' in response &&
+    'status' in response
+  );
+}
+
+/**
+ * 타입 가드: Stream Response 검증
+ */
+export function isStreamResponse<T>(
+  response: any
+): response is StreamResponse<T> {
+  return (
+    typeof response === 'object' &&
+    Array.isArray(response.items) &&
+    'status' in response
+  );
+}
