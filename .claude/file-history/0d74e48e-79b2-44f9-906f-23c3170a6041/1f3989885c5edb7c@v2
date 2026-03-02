@@ -1,0 +1,694 @@
+// ============================================================================
+// FreeLang Phase G Week 2: CPU Scheduler & Context Switching
+// ============================================================================
+//
+// OS 멀티태스킹의 핵심: 프로세스 스케줄링과 컨텍스트 전환
+//
+// 구현 일시: 2026-03-02
+// 단계: Phase G Week 2
+
+// ============================================================================
+// Part 1: CPU 레지스터 상태
+// ============================================================================
+
+/// x86-64 일반 목적 레지스터
+pub struct GeneralPurposeRegisters {
+    /// RAX: 누적기
+    pub rax: u64,
+    /// RBX: 기본
+    pub rbx: u64,
+    /// RCX: 카운터
+    pub rcx: u64,
+    /// RDX: 데이터
+    pub rdx: u64,
+    /// RSI: 소스 인덱스
+    pub rsi: u64,
+    /// RDI: 목적지 인덱스
+    pub rdi: u64,
+    /// RBP: 베이스 포인터
+    pub rbp: u64,
+    /// RSP: 스택 포인터
+    pub rsp: u64,
+}
+
+impl GeneralPurposeRegisters {
+    pub fn new() -> Self {
+        GeneralPurposeRegisters {
+            rax: 0,
+            rbx: 0,
+            rcx: 0,
+            rdx: 0,
+            rsi: 0,
+            rdi: 0,
+            rbp: 0,
+            rsp: 0,
+        }
+    }
+
+    pub fn initialize_for_process(stack_addr: u64) -> Self {
+        let mut regs = GeneralPurposeRegisters::new();
+        regs.rsp = stack_addr;  // 스택 포인터 초기화
+        regs.rbp = stack_addr;  // 베이스 포인터 초기화
+        regs
+    }
+
+    pub fn get_all_registers(&self) -> [u64; 8] {
+        [
+            self.rax, self.rbx, self.rcx, self.rdx,
+            self.rsi, self.rdi, self.rbp, self.rsp,
+        ]
+    }
+
+    pub fn set_all_registers(&mut self, values: [u64; 8]) {
+        self.rax = values[0];
+        self.rbx = values[1];
+        self.rcx = values[2];
+        self.rdx = values[3];
+        self.rsi = values[4];
+        self.rdi = values[5];
+        self.rbp = values[6];
+        self.rsp = values[7];
+    }
+
+    pub fn print_registers(&self) {
+        println!("RAX: 0x{:016x} | RBX: 0x{:016x}", self.rax, self.rbx);
+        println!("RCX: 0x{:016x} | RDX: 0x{:016x}", self.rcx, self.rdx);
+        println!("RSI: 0x{:016x} | RDI: 0x{:016x}", self.rsi, self.rdi);
+        println!("RBP: 0x{:016x} | RSP: 0x{:016x}", self.rbp, self.rsp);
+    }
+}
+
+/// CPU 플래그 (RFLAGS)
+pub struct CPUFlags {
+    /// Carry Flag
+    pub carry: bool,
+    /// Zero Flag
+    pub zero: bool,
+    /// Sign Flag
+    pub sign: bool,
+    /// Overflow Flag
+    pub overflow: bool,
+    /// Interrupt Enable Flag
+    pub interrupt_enable: bool,
+}
+
+impl CPUFlags {
+    pub fn new() -> Self {
+        CPUFlags {
+            carry: false,
+            zero: false,
+            sign: false,
+            overflow: false,
+            interrupt_enable: true,
+        }
+    }
+
+    pub fn to_u64(&self) -> u64 {
+        let mut flags: u64 = 0;
+        if self.carry { flags |= 1 << 0; }
+        if self.zero { flags |= 1 << 6; }
+        if self.sign { flags |= 1 << 7; }
+        if self.overflow { flags |= 1 << 11; }
+        if self.interrupt_enable { flags |= 1 << 9; }
+        flags
+    }
+
+    pub fn from_u64(flags: u64) -> Self {
+        CPUFlags {
+            carry: (flags & (1 << 0)) != 0,
+            zero: (flags & (1 << 6)) != 0,
+            sign: (flags & (1 << 7)) != 0,
+            overflow: (flags & (1 << 11)) != 0,
+            interrupt_enable: (flags & (1 << 9)) != 0,
+        }
+    }
+}
+
+// ============================================================================
+// Part 2: 컨텍스트 (Context) 구조
+// ============================================================================
+
+/// 프로세스의 완전한 CPU 상태 (컨텍스트)
+pub struct ProcessContext {
+    /// 일반 목적 레지스터
+    pub registers: GeneralPurposeRegisters,
+
+    /// 프로그램 카운터 (RIP)
+    pub instruction_pointer: u64,
+
+    /// CPU 플래그
+    pub flags: CPUFlags,
+
+    /// 컨텍스트 ID (고유 식별자)
+    pub context_id: u32,
+
+    /// 컨텍스트 생성 시간
+    pub created_at: u64,
+
+    /// 컨텍스트 전환 횟수
+    pub switch_count: u32,
+}
+
+impl ProcessContext {
+    pub fn new(context_id: u32, instruction_pointer: u64, stack_addr: u64) -> Self {
+        ProcessContext {
+            registers: GeneralPurposeRegisters::initialize_for_process(stack_addr),
+            instruction_pointer,
+            flags: CPUFlags::new(),
+            context_id,
+            created_at: 0,
+            switch_count: 0,
+        }
+    }
+
+    pub fn save_state(&mut self, rax: u64, rbx: u64, rcx: u64, rdx: u64,
+                      rsi: u64, rdi: u64, rbp: u64, rsp: u64) {
+        self.registers.rax = rax;
+        self.registers.rbx = rbx;
+        self.registers.rcx = rcx;
+        self.registers.rdx = rdx;
+        self.registers.rsi = rsi;
+        self.registers.rdi = rdi;
+        self.registers.rbp = rbp;
+        self.registers.rsp = rsp;
+    }
+
+    pub fn restore_state(&self) -> [u64; 8] {
+        self.registers.get_all_registers()
+    }
+
+    pub fn record_switch(&mut self) {
+        self.switch_count += 1;
+    }
+
+    pub fn print_context(&self) {
+        println!("\n📋 Process Context #{}:", self.context_id);
+        println!("  RIP (Instruction Pointer): 0x{:016x}", self.instruction_pointer);
+        println!("  Flags: {:?}", self.flags.to_u64());
+        println!("  Context Switches: {}", self.switch_count);
+        println!("  Registers:");
+        self.registers.print_registers();
+    }
+}
+
+// ============================================================================
+// Part 3: 라운드-로빈 스케줄러
+// ============================================================================
+
+/// 스케줄러 큐의 노드
+pub struct ReadyQueueNode {
+    /// 프로세스 ID
+    pub pid: u32,
+
+    /// 프로세스 컨텍스트
+    pub context: ProcessContext,
+
+    /// 타임 슬라이스 (밀리초)
+    pub time_slice_ms: u32,
+
+    /// 사용된 시간 (밀리초)
+    pub used_time_ms: u32,
+}
+
+impl ReadyQueueNode {
+    pub fn new(pid: u32, context: ProcessContext, time_slice_ms: u32) -> Self {
+        ReadyQueueNode {
+            pid,
+            context,
+            time_slice_ms,
+            used_time_ms: 0,
+        }
+    }
+
+    pub fn has_time_remaining(&self) -> bool {
+        self.used_time_ms < self.time_slice_ms
+    }
+
+    pub fn consume_time(&mut self, duration_ms: u32) {
+        self.used_time_ms += duration_ms;
+    }
+
+    pub fn reset_time(&mut self) {
+        self.used_time_ms = 0;
+    }
+
+    pub fn time_remaining(&self) -> u32 {
+        if self.used_time_ms < self.time_slice_ms {
+            self.time_slice_ms - self.used_time_ms
+        } else {
+            0
+        }
+    }
+}
+
+/// 라운드-로빈 스케줄러
+pub struct RoundRobinScheduler {
+    /// Ready 큐 (FIFO)
+    pub ready_queue: Vec<ReadyQueueNode>,
+
+    /// 현재 실행 중인 프로세스 인덱스
+    pub current_index: Option<usize>,
+
+    /// 기본 타임 슬라이스 (4ms)
+    pub default_time_slice_ms: u32,
+
+    /// 스케줄러 틱 카운트
+    pub tick_count: u32,
+
+    /// 컨텍스트 전환 횟수
+    pub context_switch_count: u32,
+}
+
+impl RoundRobinScheduler {
+    pub fn new() -> Self {
+        RoundRobinScheduler {
+            ready_queue: Vec::new(),
+            current_index: None,
+            default_time_slice_ms: 4,  // 4ms 타임 슬라이스
+            tick_count: 0,
+            context_switch_count: 0,
+        }
+    }
+
+    pub fn add_process(&mut self, pid: u32, context: ProcessContext) {
+        let node = ReadyQueueNode::new(pid, context, self.default_time_slice_ms);
+        self.ready_queue.push(node);
+
+        // 첫 프로세스면 현재 실행 중인 것으로 설정
+        if self.current_index.is_none() {
+            self.current_index = Some(0);
+        }
+    }
+
+    pub fn schedule_next(&mut self) -> Option<(u32, ProcessContext)> {
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+
+        // 현재 프로세스의 타임 슬라이스가 끝났으면 다음 프로세스로 전환
+        if let Some(current) = self.current_index {
+            let queue_len = self.ready_queue.len();
+
+            // 현재 프로세스의 시간 초기화
+            self.ready_queue[current].reset_time();
+
+            // 다음 프로세스로 이동
+            let next_index = (current + 1) % queue_len;
+            self.current_index = Some(next_index);
+            self.context_switch_count += 1;
+
+            let node = &self.ready_queue[next_index];
+            let context = node.context.clone();
+            return Some((node.pid, context));
+        }
+
+        None
+    }
+
+    pub fn get_current_process(&self) -> Option<(u32, &ProcessContext)> {
+        if let Some(index) = self.current_index {
+            if index < self.ready_queue.len() {
+                let node = &self.ready_queue[index];
+                return Some((node.pid, &node.context));
+            }
+        }
+        None
+    }
+
+    pub fn consume_time(&mut self, duration_ms: u32) {
+        if let Some(index) = self.current_index {
+            self.ready_queue[index].consume_time(duration_ms);
+        }
+        self.tick_count += 1;
+    }
+
+    pub fn queue_length(&self) -> usize {
+        self.ready_queue.len()
+    }
+
+    pub fn print_queue_status(&self) {
+        println!("\n📊 Ready Queue Status:");
+        println!("  Total Processes: {}", self.ready_queue.len());
+        println!("  Context Switches: {}", self.context_switch_count);
+        println!("  Total Ticks: {}", self.tick_count);
+        println!("\n  Queue Contents:");
+
+        for (idx, node) in self.ready_queue.iter().enumerate() {
+            let status = if self.current_index == Some(idx) {
+                "▶️ RUNNING"
+            } else {
+                "⏸️  WAITING"
+            };
+
+            println!("    [{}] PID {} - {} (Time: {}/{}ms)",
+                     idx, node.pid, status,
+                     node.used_time_ms, node.time_slice_ms);
+        }
+    }
+}
+
+// ============================================================================
+// Part 4: 컨텍스트 스위처 (Context Switcher)
+// ============================================================================
+
+/// 컨텍스트 전환 정보
+pub struct ContextSwitchInfo {
+    /// 이전 프로세스 ID
+    pub prev_pid: u32,
+
+    /// 다음 프로세스 ID
+    pub next_pid: u32,
+
+    /// 전환 시간 (ms)
+    pub switch_time_ms: u32,
+
+    /// 이전 프로세스의 컨텍스트
+    pub prev_context: ProcessContext,
+
+    /// 다음 프로세스의 컨텍스트
+    pub next_context: ProcessContext,
+}
+
+pub struct ContextSwitcher {
+    /// 마지막 컨텍스트 전환 정보
+    pub last_switch: Option<ContextSwitchInfo>,
+
+    /// 총 컨텍스트 전환 횟수
+    pub total_switches: u64,
+
+    /// 컨텍스트 전환 누적 시간 (ns)
+    pub total_switch_time_ns: u64,
+}
+
+impl ContextSwitcher {
+    pub fn new() -> Self {
+        ContextSwitcher {
+            last_switch: None,
+            total_switches: 0,
+            total_switch_time_ns: 0,
+        }
+    }
+
+    pub fn switch_context(&mut self, prev_pid: u32, prev_context: ProcessContext,
+                          next_pid: u32, mut next_context: ProcessContext,
+                          switch_time_ms: u32) {
+        // 이전 프로세스 컨텍스트 저장
+        // (실제로는 메모리에 저장하지만, 여기서는 시뮬레이션)
+
+        // 다음 프로세스 컨텍스트 복원
+        next_context.record_switch();
+
+        let switch_info = ContextSwitchInfo {
+            prev_pid,
+            next_pid,
+            switch_time_ms,
+            prev_context,
+            next_context,
+        };
+
+        self.last_switch = Some(switch_info);
+        self.total_switches += 1;
+        self.total_switch_time_ns += switch_time_ms as u64 * 1_000_000;  // ms → ns
+    }
+
+    pub fn get_last_switch(&self) -> Option<&ContextSwitchInfo> {
+        self.last_switch.as_ref()
+    }
+
+    pub fn average_switch_time_us(&self) -> f64 {
+        if self.total_switches == 0 {
+            return 0.0;
+        }
+        (self.total_switch_time_ns as f64) / (self.total_switches as f64) / 1000.0
+    }
+
+    pub fn print_statistics(&self) {
+        println!("\n⚡ Context Switch Statistics:");
+        println!("  Total Switches: {}", self.total_switches);
+        println!("  Total Time: {} ns", self.total_switch_time_ns);
+        println!("  Average Switch Time: {:.2} µs", self.average_switch_time_us());
+
+        if let Some(last_switch) = &self.last_switch {
+            println!("\n  Last Context Switch:");
+            println!("    {} → {}", last_switch.prev_pid, last_switch.next_pid);
+            println!("    Switch Time: {}ms", last_switch.switch_time_ms);
+        }
+    }
+}
+
+// ============================================================================
+// Part 5: 클론 구현 (테스트용)
+// ============================================================================
+
+impl Clone for GeneralPurposeRegisters {
+    fn clone(&self) -> Self {
+        GeneralPurposeRegisters {
+            rax: self.rax,
+            rbx: self.rbx,
+            rcx: self.rcx,
+            rdx: self.rdx,
+            rsi: self.rsi,
+            rdi: self.rdi,
+            rbp: self.rbp,
+            rsp: self.rsp,
+        }
+    }
+}
+
+impl Clone for CPUFlags {
+    fn clone(&self) -> Self {
+        CPUFlags {
+            carry: self.carry,
+            zero: self.zero,
+            sign: self.sign,
+            overflow: self.overflow,
+            interrupt_enable: self.interrupt_enable,
+        }
+    }
+}
+
+impl Clone for ProcessContext {
+    fn clone(&self) -> Self {
+        ProcessContext {
+            registers: self.registers.clone(),
+            instruction_pointer: self.instruction_pointer,
+            flags: self.flags.clone(),
+            context_id: self.context_id,
+            created_at: self.created_at,
+            switch_count: self.switch_count,
+        }
+    }
+}
+
+// ============================================================================
+// Part 6: 메인 스케줄러 테스트
+// ============================================================================
+
+pub fn main() {
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║  FreeLang OS Kernel - Phase G Week 2 Context Switching     ║");
+    println!("╚════════════════════════════════════════════════════════════╝\n");
+
+    // 스케줄러 생성
+    let mut scheduler = RoundRobinScheduler::new();
+    let mut switcher = ContextSwitcher::new();
+
+    println!("✅ Scheduler initialized");
+    println!("   Default Time Slice: {}ms\n", scheduler.default_time_slice_ms);
+
+    // 프로세스 생성 및 추가
+    println!("🔄 Creating processes...");
+
+    let mut ctx1 = ProcessContext::new(1, 0x100000, 0x7FFFF000);
+    ctx1.registers.rax = 42;
+    scheduler.add_process(1, ctx1);
+    println!("   ✅ Process 1 added");
+
+    let mut ctx2 = ProcessContext::new(2, 0x110000, 0x7FFFE000);
+    ctx2.registers.rax = 100;
+    scheduler.add_process(2, ctx2);
+    println!("   ✅ Process 2 added");
+
+    let mut ctx3 = ProcessContext::new(3, 0x120000, 0x7FFFCD000);
+    ctx3.registers.rax = 200;
+    scheduler.add_process(3, ctx3);
+    println!("   ✅ Process 3 added");
+
+    // 스케줄링 시뮬레이션
+    println!("\n⏱️  Scheduling simulation (5 time slices)...\n");
+
+    for round in 0..5 {
+        println!("Round {}:", round + 1);
+
+        if let Some((pid, context)) = scheduler.get_current_process() {
+            println!("  ▶️  Running Process {}", pid);
+            println!("     RIP: 0x{:x}, RAX: {}", context.instruction_pointer, context.registers.rax);
+        }
+
+        // 타임 슬라이스 사용
+        scheduler.consume_time(4);
+
+        // 다음 프로세스로 전환
+        if let Some((next_pid, next_context)) = scheduler.schedule_next() {
+            if let Some((prev_pid, _)) = scheduler.get_current_process() {
+                println!("  ⏸️  Switching {} → {}", prev_pid, next_pid);
+                switcher.switch_context(prev_pid, next_context.clone(), next_pid, next_context, 1);
+            }
+        }
+
+        println!();
+    }
+
+    // 상태 출력
+    scheduler.print_queue_status();
+    switcher.print_statistics();
+
+    println!("\n✨ Scheduling simulation complete!\n");
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_general_purpose_registers() {
+        let regs = GeneralPurposeRegisters::new();
+        assert_eq!(regs.rax, 0);
+        assert_eq!(regs.rsp, 0);
+    }
+
+    #[test]
+    fn test_registers_initialize_for_process() {
+        let regs = GeneralPurposeRegisters::initialize_for_process(0x7FFF0000);
+        assert_eq!(regs.rsp, 0x7FFF0000);
+        assert_eq!(regs.rbp, 0x7FFF0000);
+    }
+
+    #[test]
+    fn test_cpu_flags() {
+        let flags = CPUFlags::new();
+        assert_eq!(flags.carry, false);
+        assert_eq!(flags.interrupt_enable, true);
+
+        let flags_u64 = flags.to_u64();
+        let flags_restored = CPUFlags::from_u64(flags_u64);
+        assert_eq!(flags_restored.interrupt_enable, true);
+    }
+
+    #[test]
+    fn test_process_context_creation() {
+        let ctx = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        assert_eq!(ctx.context_id, 1);
+        assert_eq!(ctx.instruction_pointer, 0x100000);
+        assert_eq!(ctx.registers.rsp, 0x7FFF0000);
+    }
+
+    #[test]
+    fn test_process_context_save_restore() {
+        let mut ctx = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        ctx.save_state(42, 100, 200, 300, 400, 500, 600, 700);
+
+        let state = ctx.restore_state();
+        assert_eq!(state[0], 42);   // rax
+        assert_eq!(state[1], 100);  // rbx
+        assert_eq!(state[7], 700);  // rsp
+    }
+
+    #[test]
+    fn test_ready_queue_node() {
+        let ctx = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        let mut node = ReadyQueueNode::new(1, ctx, 4);
+
+        assert!(node.has_time_remaining());
+        assert_eq!(node.time_remaining(), 4);
+
+        node.consume_time(2);
+        assert_eq!(node.time_remaining(), 2);
+
+        node.reset_time();
+        assert_eq!(node.used_time_ms, 0);
+    }
+
+    #[test]
+    fn test_round_robin_scheduler_creation() {
+        let scheduler = RoundRobinScheduler::new();
+        assert_eq!(scheduler.queue_length(), 0);
+        assert_eq!(scheduler.default_time_slice_ms, 4);
+    }
+
+    #[test]
+    fn test_round_robin_scheduler_add_process() {
+        let mut scheduler = RoundRobinScheduler::new();
+        let ctx = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+
+        scheduler.add_process(1, ctx);
+        assert_eq!(scheduler.queue_length(), 1);
+        assert_eq!(scheduler.current_index, Some(0));
+    }
+
+    #[test]
+    fn test_round_robin_scheduler_next() {
+        let mut scheduler = RoundRobinScheduler::new();
+
+        let ctx1 = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        let ctx2 = ProcessContext::new(2, 0x110000, 0x7FFEE000);
+
+        scheduler.add_process(1, ctx1);
+        scheduler.add_process(2, ctx2);
+
+        if let Some((pid, _)) = scheduler.schedule_next() {
+            assert_eq!(pid, 2);
+        }
+    }
+
+    #[test]
+    fn test_context_switcher() {
+        let mut switcher = ContextSwitcher::new();
+
+        let ctx1 = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        let ctx2 = ProcessContext::new(2, 0x110000, 0x7FFEE000);
+
+        switcher.switch_context(1, ctx1, 2, ctx2, 1);
+
+        assert_eq!(switcher.total_switches, 1);
+        assert!(switcher.last_switch.is_some());
+    }
+
+    #[test]
+    fn test_context_switcher_average_time() {
+        let mut switcher = ContextSwitcher::new();
+
+        let ctx1 = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        let ctx2 = ProcessContext::new(2, 0x110000, 0x7FFEE000);
+
+        switcher.switch_context(1, ctx1.clone(), 2, ctx2.clone(), 2);
+        switcher.switch_context(2, ctx2.clone(), 1, ctx1, 2);
+
+        assert_eq!(switcher.total_switches, 2);
+        let avg = switcher.average_switch_time_us();
+        assert!(avg > 0.0);
+    }
+
+    #[test]
+    fn test_scheduling_simulation() {
+        let mut scheduler = RoundRobinScheduler::new();
+
+        let ctx1 = ProcessContext::new(1, 0x100000, 0x7FFF0000);
+        let ctx2 = ProcessContext::new(2, 0x110000, 0x7FFEE000);
+
+        scheduler.add_process(1, ctx1);
+        scheduler.add_process(2, ctx2);
+
+        for _ in 0..4 {
+            scheduler.consume_time(4);
+            scheduler.schedule_next();
+        }
+
+        assert!(scheduler.tick_count > 0);
+        assert!(scheduler.context_switch_count > 0);
+    }
+}

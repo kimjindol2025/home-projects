@@ -1,0 +1,641 @@
+// ============================================================================
+// FreeLang Phase G Week 3: Interrupt Handler & IDT
+// ============================================================================
+//
+// OS의 심장: 인터럽트 처리 및 예외 처리
+//
+// 구현 일시: 2026-03-02
+// 단계: Phase G Week 3
+
+// ============================================================================
+// Part 1: 인터럽트 타입 정의
+// ============================================================================
+
+/// 인터럽트 타입 (x86-64 표준)
+#[derive(Clone, Copy, Debug)]
+pub enum InterruptType {
+    /// 0: Divide Error (정수 0으로 나누기)
+    DivideError,
+
+    /// 1: Debug Exception
+    Debug,
+
+    /// 2: Non-Maskable Interrupt
+    NMI,
+
+    /// 3: Breakpoint
+    Breakpoint,
+
+    /// 4: Overflow
+    Overflow,
+
+    /// 5: Bound Range Exceeded
+    BoundRangeExceeded,
+
+    /// 6: Invalid Opcode
+    InvalidOpcode,
+
+    /// 7: Device Not Available
+    DeviceNotAvailable,
+
+    /// 8: Double Fault
+    DoubleFault,
+
+    /// 10: Invalid TSS (Task State Segment)
+    InvalidTSS,
+
+    /// 11: Segment Not Present
+    SegmentNotPresent,
+
+    /// 12: Stack Segment Fault
+    StackSegmentFault,
+
+    /// 13: General Protection Fault
+    GeneralProtectionFault,
+
+    /// 14: Page Fault
+    PageFault,
+
+    /// 16: Floating-Point Exception
+    FloatingPointException,
+
+    /// 17: Alignment Check
+    AlignmentCheck,
+
+    /// 18: Machine Check
+    MachineCheck,
+
+    /// 19: SIMD Floating-Point Exception
+    SIMDException,
+
+    /// Hardware Interrupt (IRQ)
+    HardwareInterrupt { irq: u8 },
+
+    /// Software Interrupt / System Call
+    SystemCall,
+}
+
+impl InterruptType {
+    pub fn to_vector(&self) -> u8 {
+        match self {
+            InterruptType::DivideError => 0,
+            InterruptType::Debug => 1,
+            InterruptType::NMI => 2,
+            InterruptType::Breakpoint => 3,
+            InterruptType::Overflow => 4,
+            InterruptType::BoundRangeExceeded => 5,
+            InterruptType::InvalidOpcode => 6,
+            InterruptType::DeviceNotAvailable => 7,
+            InterruptType::DoubleFault => 8,
+            InterruptType::InvalidTSS => 10,
+            InterruptType::SegmentNotPresent => 11,
+            InterruptType::StackSegmentFault => 12,
+            InterruptType::GeneralProtectionFault => 13,
+            InterruptType::PageFault => 14,
+            InterruptType::FloatingPointException => 16,
+            InterruptType::AlignmentCheck => 17,
+            InterruptType::MachineCheck => 18,
+            InterruptType::SIMDException => 19,
+            InterruptType::HardwareInterrupt { irq } => 32 + irq,
+            InterruptType::SystemCall => 128,
+        }
+    }
+
+    pub fn is_exception(&self) -> bool {
+        match self {
+            InterruptType::HardwareInterrupt { .. } => false,
+            InterruptType::SystemCall => false,
+            _ => true,
+        }
+    }
+
+    pub fn is_fault(&self) -> bool {
+        matches!(self,
+            InterruptType::DivideError |
+            InterruptType::InvalidOpcode |
+            InterruptType::PageFault |
+            InterruptType::GeneralProtectionFault
+        )
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            InterruptType::DivideError => "Divide by zero",
+            InterruptType::Debug => "Debug breakpoint",
+            InterruptType::NMI => "Non-maskable interrupt",
+            InterruptType::Breakpoint => "Breakpoint",
+            InterruptType::Overflow => "Integer overflow",
+            InterruptType::BoundRangeExceeded => "Bound range exceeded",
+            InterruptType::InvalidOpcode => "Invalid opcode",
+            InterruptType::DeviceNotAvailable => "Device not available",
+            InterruptType::DoubleFault => "Double fault",
+            InterruptType::InvalidTSS => "Invalid TSS",
+            InterruptType::SegmentNotPresent => "Segment not present",
+            InterruptType::StackSegmentFault => "Stack segment fault",
+            InterruptType::GeneralProtectionFault => "General protection fault",
+            InterruptType::PageFault => "Page fault",
+            InterruptType::FloatingPointException => "Floating-point exception",
+            InterruptType::AlignmentCheck => "Alignment check",
+            InterruptType::MachineCheck => "Machine check",
+            InterruptType::SIMDException => "SIMD exception",
+            InterruptType::HardwareInterrupt { .. } => "Hardware interrupt",
+            InterruptType::SystemCall => "System call",
+        }
+    }
+}
+
+// ============================================================================
+// Part 2: 인터럽트 프레임 (Interrupt Frame)
+// ============================================================================
+
+/// CPU가 인터럽트 발생 시 저장하는 정보
+pub struct InterruptFrame {
+    /// 인터럽트 벡터 번호
+    pub vector: u8,
+
+    /// 에러 코드 (없으면 0)
+    pub error_code: u64,
+
+    /// RIP (Instruction Pointer) - 인터럽트 발생 시점의 명령어
+    pub rip: u64,
+
+    /// CS (Code Segment)
+    pub cs: u64,
+
+    /// RFLAGS (프로세서 플래그)
+    pub rflags: u64,
+
+    /// RSP (Stack Pointer)
+    pub rsp: u64,
+
+    /// SS (Stack Segment)
+    pub ss: u64,
+
+    /// 추가 정보: 발생 시간 (시뮬레이션 틱)
+    pub timestamp: u32,
+
+    /// 추가 정보: 발생 카운트
+    pub occurrence_count: u32,
+}
+
+impl InterruptFrame {
+    pub fn new(vector: u8, error_code: u64, rip: u64) -> Self {
+        InterruptFrame {
+            vector,
+            error_code,
+            rip,
+            cs: 0x08,      // 커널 코드 세그먼트
+            rflags: 0x202, // IF 플래그 설정
+            rsp: 0x7FFF0000,
+            ss: 0x10,      // 커널 스택 세그먼트
+            timestamp: 0,
+            occurrence_count: 0,
+        }
+    }
+
+    pub fn print_frame(&self) {
+        println!("\n📋 Interrupt Frame:");
+        println!("  Vector: {} (0x{:02x})", self.vector, self.vector);
+        println!("  Error Code: 0x{:016x}", self.error_code);
+        println!("  RIP: 0x{:016x}", self.rip);
+        println!("  CS: 0x{:04x} | SS: 0x{:04x}", self.cs, self.ss);
+        println!("  RSP: 0x{:016x}", self.rsp);
+        println!("  RFLAGS: 0x{:08x}", self.rflags);
+        println!("  Timestamp: {} | Count: {}", self.timestamp, self.occurrence_count);
+    }
+}
+
+// ============================================================================
+// Part 3: 인터럽트 디스크립터 테이블 (IDT) 항목
+// ============================================================================
+
+/// IDT 항목 (게이트 디스크립터)
+pub struct IDTEntry {
+    /// 오프셋 (핸들러 주소)
+    pub offset: u64,
+
+    /// 세그먼트 선택자 (코드 세그먼트)
+    pub segment_selector: u16,
+
+    /// 플래그 (타입, DPL, 존재 여부)
+    pub flags: u8,
+
+    /// 이 항목의 벡터 번호
+    pub vector: u8,
+
+    /// 설정된 여부
+    pub present: bool,
+
+    /// 특권 레벨 (DPL, 0-3)
+    pub privilege_level: u8,
+
+    /// 게이트 타입 (Interrupt Gate, Trap Gate)
+    pub gate_type: GateType,
+
+    /// 핸들러 함수 포인터 (시뮬레이션용)
+    pub handler_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum GateType {
+    InterruptGate,  // 인터럽트 발생 시 IF 플래그 자동 클리어
+    TrapGate,       // IF 플래그 유지
+}
+
+impl IDTEntry {
+    pub fn new(vector: u8, offset: u64, handler_id: u32) -> Self {
+        IDTEntry {
+            offset,
+            segment_selector: 0x08,  // 커널 코드 세그먼트
+            flags: 0x8E,             // Present, DPL=0, Type=Interrupt Gate
+            vector,
+            present: true,
+            privilege_level: 0,
+            gate_type: GateType::InterruptGate,
+            handler_id,
+        }
+    }
+
+    pub fn set_user_accessible(&mut self) {
+        self.privilege_level = 3;  // 사용자 모드 접근 가능
+    }
+
+    pub fn print_entry(&self) {
+        println!("  [Vector {}] Offset: 0x{:016x}, Handler: {}, Present: {}",
+                 self.vector, self.offset, self.handler_id, self.present);
+    }
+}
+
+// ============================================================================
+// Part 4: IDT (인터럽트 디스크립터 테이블)
+// ============================================================================
+
+/// Interrupt Descriptor Table (최대 256개 항목)
+pub struct IDT {
+    /// 256개의 IDT 항목
+    pub entries: Vec<IDTEntry>,
+
+    /// 로드된 여부
+    pub loaded: bool,
+
+    /// 처리된 인터럽트 수
+    pub total_interrupts: u64,
+
+    /// 핸들러 매핑
+    pub handlers: Vec<Option<u32>>,
+}
+
+impl IDT {
+    pub fn new() -> Self {
+        let mut idt = IDT {
+            entries: Vec::new(),
+            loaded: false,
+            total_interrupts: 0,
+            handlers: vec![None; 256],
+        };
+
+        // 기본 예외 핸들러 설정
+        for i in 0..20 {
+            let entry = IDTEntry::new(i as u8, 0x100000 + (i * 0x100) as u64, i as u32);
+            idt.entries.push(entry);
+        }
+
+        // 하드웨어 인터럽트 (IRQ 0-15)
+        for i in 0..16 {
+            let entry = IDTEntry::new(32 + i as u8, 0x200000 + (i * 0x100) as u64, 100 + i as u32);
+            idt.entries.push(entry);
+        }
+
+        // 시스템 호출 (0x80)
+        let mut syscall_entry = IDTEntry::new(128, 0x300000, 200);
+        syscall_entry.set_user_accessible();
+        idt.entries.push(syscall_entry);
+
+        idt
+    }
+
+    pub fn load(&mut self) -> Result<(), String> {
+        if self.entries.is_empty() {
+            return Err("IDT is empty".to_string());
+        }
+
+        self.loaded = true;
+        println!("✅ IDT loaded with {} entries", self.entries.len());
+        Ok(())
+    }
+
+    pub fn register_handler(&mut self, vector: u8, handler_id: u32) -> Result<(), String> {
+        if vector as usize >= 256 {
+            return Err(format!("Invalid vector number: {}", vector));
+        }
+
+        self.handlers[vector as usize] = Some(handler_id);
+
+        // 기존 항목 업데이트 또는 새 항목 생성
+        for entry in &mut self.entries {
+            if entry.vector == vector {
+                entry.handler_id = handler_id;
+                return Ok(());
+            }
+        }
+
+        // 새 항목 생성
+        let entry = IDTEntry::new(vector, 0x100000, handler_id);
+        self.entries.push(entry);
+        Ok(())
+    }
+
+    pub fn get_handler(&self, vector: u8) -> Option<u32> {
+        if vector as usize < self.handlers.len() {
+            self.handlers[vector as usize]
+        } else {
+            None
+        }
+    }
+
+    pub fn print_idt(&self) {
+        println!("\n╔════════════════════════════════════════════════════════════╗");
+        println!("║         Interrupt Descriptor Table (IDT) Status            ║");
+        println!("╚════════════════════════════════════════════════════════════╝");
+
+        println!("\nStatus: {} | Entries: {}",
+                 if self.loaded { "LOADED" } else { "NOT LOADED" },
+                 self.entries.len());
+
+        println!("\nException Handlers (0-19):");
+        for i in 0..20.min(self.entries.len()) {
+            self.entries[i].print_entry();
+        }
+
+        println!("\nHardware Interrupts (32-47):");
+        for i in 32..48.min(self.entries.len()) {
+            if i < self.entries.len() {
+                self.entries[i].print_entry();
+            }
+        }
+
+        println!("\nSystem Call Handler (128):");
+        for entry in &self.entries {
+            if entry.vector == 128 {
+                entry.print_entry();
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Part 5: 인터럽트 핸들러
+// ============================================================================
+
+pub struct InterruptHandler {
+    /// 처리한 인터럽트 수
+    pub handled_count: u64,
+
+    /// 처리 불가능한 인터럽트 수
+    pub unhandled_count: u64,
+
+    /// 마지막 인터럽트 프레임
+    pub last_frame: Option<InterruptFrame>,
+
+    /// 인터럽트 통계
+    pub statistics: Vec<(u8, u64)>,  // (vector, count)
+}
+
+impl InterruptHandler {
+    pub fn new() -> Self {
+        InterruptHandler {
+            handled_count: 0,
+            unhandled_count: 0,
+            last_frame: None,
+            statistics: vec![],
+        }
+    }
+
+    pub fn handle_interrupt(&mut self, int_type: InterruptType, mut frame: InterruptFrame) -> Result<(), String> {
+        frame.timestamp = self.handled_count as u32;
+        frame.occurrence_count = self.handled_count as u32;
+
+        let vector = int_type.to_vector();
+
+        // 통계 업데이트
+        let mut found = false;
+        for (v, count) in &mut self.statistics {
+            if *v == vector {
+                *count += 1;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            self.statistics.push((vector, 1));
+        }
+
+        self.last_frame = Some(frame);
+
+        match int_type {
+            InterruptType::DivideError => {
+                println!("💥 EXCEPTION: Divide by zero at 0x{:x}",
+                         self.last_frame.as_ref().unwrap().rip);
+                Err("Divide by zero".to_string())
+            },
+            InterruptType::PageFault => {
+                println!("📄 EXCEPTION: Page fault at 0x{:x}",
+                         self.last_frame.as_ref().unwrap().rip);
+                Err("Page fault".to_string())
+            },
+            InterruptType::GeneralProtectionFault => {
+                println!("⚠️  EXCEPTION: General protection fault");
+                Err("GPF".to_string())
+            },
+            InterruptType::HardwareInterrupt { irq } => {
+                println!("⚡ Hardware interrupt: IRQ {}", irq);
+                self.handled_count += 1;
+                Ok(())
+            },
+            InterruptType::SystemCall => {
+                println!("🔗 System call from 0x{:x}",
+                         self.last_frame.as_ref().unwrap().rip);
+                self.handled_count += 1;
+                Ok(())
+            },
+            _ => {
+                println!("⚡ Interrupt: {}", int_type.description());
+                self.handled_count += 1;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn print_statistics(&self) {
+        println!("\n📊 Interrupt Handler Statistics:");
+        println!("  Handled: {}", self.handled_count);
+        println!("  Unhandled: {}", self.unhandled_count);
+
+        if !self.statistics.is_empty() {
+            println!("\n  Per-Interrupt Counts:");
+            for (vector, count) in &self.statistics {
+                println!("    Vector {}: {} occurrences", vector, count);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Part 6: 메인 함수
+// ============================================================================
+
+pub fn main() {
+    println!("╔════════════════════════════════════════════════════════════╗");
+    println!("║    FreeLang OS Kernel - Phase G Week 3 Interrupts         ║");
+    println!("╚════════════════════════════════════════════════════════════╝\n");
+
+    // IDT 생성 및 로드
+    println!("🔧 Setting up IDT...");
+    let mut idt = IDT::new();
+    idt.load().unwrap();
+
+    // 인터럽트 핸들러 생성
+    let mut handler = InterruptHandler::new();
+
+    // 몇 가지 인터럽트 처리
+    println!("\n⚡ Handling interrupts...\n");
+
+    // 1. 하드웨어 인터럽트 (타이머)
+    let frame = InterruptFrame::new(32, 0, 0x100000);
+    handler.handle_interrupt(InterruptType::HardwareInterrupt { irq: 0 }, frame).ok();
+
+    // 2. 하드웨어 인터럽트 (키보드)
+    let frame = InterruptFrame::new(33, 0, 0x100100);
+    handler.handle_interrupt(InterruptType::HardwareInterrupt { irq: 1 }, frame).ok();
+
+    // 3. 시스템 호출
+    let frame = InterruptFrame::new(128, 0, 0x100200);
+    handler.handle_interrupt(InterruptType::SystemCall, frame).ok();
+
+    // 4. 페이지 폴트
+    let mut frame = InterruptFrame::new(14, 0x500000, 0x100300);
+    frame.error_code = 0x04;  // 존재하지 않는 페이지
+    let result = handler.handle_interrupt(InterruptType::PageFault, frame);
+    println!("   Result: {:?}", result);
+
+    // 5. 0으로 나누기
+    let frame = InterruptFrame::new(0, 0, 0x100400);
+    let result = handler.handle_interrupt(InterruptType::DivideError, frame);
+    println!("   Result: {:?}", result);
+
+    // IDT 상태 출력
+    idt.print_idt();
+
+    // 통계 출력
+    handler.print_statistics();
+
+    if let Some(frame) = &handler.last_frame {
+        frame.print_frame();
+    }
+
+    println!("\n✨ Interrupt handling simulation complete!\n");
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_interrupt_type_vector() {
+        assert_eq!(InterruptType::DivideError.to_vector(), 0);
+        assert_eq!(InterruptType::PageFault.to_vector(), 14);
+        assert_eq!(InterruptType::SystemCall.to_vector(), 128);
+    }
+
+    #[test]
+    fn test_interrupt_type_exception() {
+        assert!(InterruptType::DivideError.is_exception());
+        assert!(!InterruptType::HardwareInterrupt { irq: 0 }.is_exception());
+    }
+
+    #[test]
+    fn test_interrupt_type_fault() {
+        assert!(InterruptType::DivideError.is_fault());
+        assert!(InterruptType::PageFault.is_fault());
+        assert!(!InterruptType::Breakpoint.is_fault());
+    }
+
+    #[test]
+    fn test_interrupt_frame_creation() {
+        let frame = InterruptFrame::new(14, 0x500000, 0x100000);
+        assert_eq!(frame.vector, 14);
+        assert_eq!(frame.error_code, 0x500000);
+        assert_eq!(frame.rip, 0x100000);
+    }
+
+    #[test]
+    fn test_idt_entry_creation() {
+        let entry = IDTEntry::new(0, 0x100000, 0);
+        assert_eq!(entry.vector, 0);
+        assert_eq!(entry.offset, 0x100000);
+        assert!(entry.present);
+    }
+
+    #[test]
+    fn test_idt_creation() {
+        let idt = IDT::new();
+        assert!(!idt.entries.is_empty());
+        assert!(!idt.loaded);
+    }
+
+    #[test]
+    fn test_idt_load() {
+        let mut idt = IDT::new();
+        assert!(idt.load().is_ok());
+        assert!(idt.loaded);
+    }
+
+    #[test]
+    fn test_idt_register_handler() {
+        let mut idt = IDT::new();
+        idt.load().unwrap();
+        assert!(idt.register_handler(32, 100).is_ok());
+    }
+
+    #[test]
+    fn test_interrupt_handler_creation() {
+        let handler = InterruptHandler::new();
+        assert_eq!(handler.handled_count, 0);
+    }
+
+    #[test]
+    fn test_interrupt_handler_handle() {
+        let mut handler = InterruptHandler::new();
+        let frame = InterruptFrame::new(32, 0, 0x100000);
+        let result = handler.handle_interrupt(
+            InterruptType::HardwareInterrupt { irq: 0 },
+            frame
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_interrupt_handler_statistics() {
+        let mut handler = InterruptHandler::new();
+        for i in 0..3 {
+            let frame = InterruptFrame::new(32, 0, 0x100000);
+            handler.handle_interrupt(
+                InterruptType::HardwareInterrupt { irq: i as u8 },
+                frame
+            ).ok();
+        }
+        assert_eq!(handler.handled_count, 3);
+    }
+
+    #[test]
+    fn test_interrupt_handler_exception() {
+        let mut handler = InterruptHandler::new();
+        let frame = InterruptFrame::new(0, 0, 0x100000);
+        let result = handler.handle_interrupt(InterruptType::DivideError, frame);
+        assert!(result.is_err());
+    }
+}

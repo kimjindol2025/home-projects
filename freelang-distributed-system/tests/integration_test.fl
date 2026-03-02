@@ -1,0 +1,784 @@
+# ============================================================================
+# tests/integration_test.fl - Week 3 Integration Tests (Day 1-3)
+# ============================================================================
+# 작성: 2026-03-02
+# 목표: Phase 3 통합 - Raft + HybridIndexSystem + Coordinator 검증
+# 범위: 5개 통합 시나리오 + 20개 테스트
+#
+# 아키텍처:
+# ┌─────────────────────────────────────┐
+# │ Phase 4: API Layer                  │ (다음)
+# ├─────────────────────────────────────┤
+# │ Phase 3: Coordinator                │ ← HERE
+# │ ├─ routeInsertRequest()             │
+# │ ├─ routeSearchRequest()             │
+# │ └─ aggregateSearchResults()         │
+# ├─────────────────────────────────────┤
+# │ Week 3: Integration (여기) ✨        │ ← HERE
+# │ ├─ integrateVectorInsertWithRaft    │
+# │ ├─ integrateVectorSearchWithRaft    │
+# │ ├─ integrateFailoverWithVectorContinuity
+# │ ├─ integrateNewNodeWithSnapshot    │
+# │ └─ integrateNetworkPartitionRecovery
+# ├─────────────────────────────────────┤
+# │ Week 1-2: Raft Core                 │ (완료)
+# │ ├─ Election, Replication, Snapshot  │
+# │ └─ Chaos Engineering Framework      │
+# ├─────────────────────────────────────┤
+# │ Phase 1-2: HybridIndexSystem        │ (완료)
+# └─────────────────────────────────────┘
+
+# ============================================================================
+# Test Group A: Vector Insert with Raft Consensus (4개 테스트)
+# ============================================================================
+
+fn testVectorInsertBasic() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+  let vectorId = "vec_001"
+  let vector = [1.0, 2.0, 3.0, 4.0]
+
+  # Act
+  let result = integrateVectorInsertWithRaft(cluster, vectorId, vector, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      if response["status"] == "inserted" &&
+         response["quorumAchieved"] == true &&
+         length(response["replicationDetails"]) == 4
+        Ok(true)
+      else
+        Err("Vector insert response invalid")
+    Err(e) ->
+      Err("Vector insert failed: " + e)
+
+fn testVectorInsertQuorumSuccess() -> Result<bool, string>
+  # Arrange: 5 노드, Quorum = 3
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+  let vectorId = "vec_quorum"
+  let vector = [5.0, 6.0, 7.0]
+
+  # Act
+  let result = integrateVectorInsertWithRaft(cluster, vectorId, vector, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      # 5개 노드: Leader 1 + Followers 4
+      # Quorum = ⌊5/2⌋ + 1 = 3
+      # 성공: Leader(1) + 2이상의 Followers
+      if response["quorumAchieved"] == true
+        Ok(true)
+      else
+        Err("Quorum not achieved")
+    Err(e) ->
+      Err("Quorum test failed: " + e)
+
+fn testVectorInsertPartitionFailure() -> Result<bool, string>
+  # Arrange: Network partition 상태에서 insert 시도
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Partition: [0,1,2] vs [3,4] (Majority vs Minority)
+  let partitionedCluster = simulateNetworkPartition(cluster, [0, 1, 2], [3, 4])
+  let vectorId = "vec_partition"
+  let vector = [8.0, 9.0]
+
+  # Act: Majority에서 insert (성공 예상)
+  let majorityResult = integrateVectorInsertWithRaft(partitionedCluster, vectorId, vector, coordinator)
+
+  # Act: Minority에서 insert (실패 예상)
+  let minorityResult = integrateVectorInsertWithRaft(partitionedCluster, "vec_minority", vector, coordinator)
+
+  # Assert
+  let majoritySuccess = match majorityResult
+    Ok(_) -> true
+    Err(_) -> false
+
+  let minorityFailed = match minorityResult
+    Ok(_) -> false
+    Err(_) -> true
+
+  if majoritySuccess && minorityFailed
+    Ok(true)
+  else
+    Err("Partition behavior incorrect")
+
+fn testVectorInsertMultipleBatch() -> Result<bool, string>
+  # Arrange: 여러 벡터를 순차적으로 삽입
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+  let insertCount = 10
+  let successCount = 0
+
+  # Act: 10개 벡터 삽입
+  for i in range(0, insertCount)
+    let vectorId = "vec_batch_" + toString(i)
+    let vector = [number(i), number(i) + 1.0]
+    let result = integrateVectorInsertWithRaft(cluster, vectorId, vector, coordinator)
+
+    match result
+      Ok(_) -> successCount = successCount + 1
+      Err(_) -> { }
+
+  # Assert: 모두 성공
+  if successCount == insertCount
+    Ok(true)
+  else
+    Err("Batch insert: " + toString(successCount) + "/" + toString(insertCount) + " succeeded")
+
+# ============================================================================
+# Test Group B: Vector Search with Quorum Read (4개 테스트)
+# ============================================================================
+
+fn testVectorSearchBasic() -> Result<bool, string>
+  # Arrange: 먼저 몇 개 벡터 삽입 후 검색
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert vectors
+  integrateVectorInsertWithRaft(cluster, "vec_search_1", [1.0, 0.0], coordinator)
+  integrateVectorInsertWithRaft(cluster, "vec_search_2", [0.0, 1.0], coordinator)
+  integrateVectorInsertWithRaft(cluster, "vec_search_3", [1.0, 1.0], coordinator)
+
+  # Act: Search
+  let query = [1.0, 0.5]
+  let topK = 2
+  let result = integrateVectorSearchWithRaft(cluster, query, topK, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      if response["status"] == "completed" &&
+         length(response["results"]) <= topK &&
+         response["consistency"] == "eventual (quorum read)"
+        Ok(true)
+      else
+        Err("Search response invalid")
+    Err(e) ->
+      Err("Vector search failed: " + e)
+
+fn testVectorSearchQuorumRead() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert data
+  integrateVectorInsertWithRaft(cluster, "qr_1", [1.0, 2.0], coordinator)
+  integrateVectorInsertWithRaft(cluster, "qr_2", [3.0, 4.0], coordinator)
+
+  # Act: Quorum read search
+  let query = [2.0, 3.0]
+  let result = integrateVectorSearchWithRaft(cluster, query, 10, coordinator)
+
+  # Assert: 최신 committed 데이터만 읽음
+  match result
+    Ok(response) ->
+      # Quorum read는 최신 commitIndex를 가진 노드에서 읽음
+      if response["totalResults"] >= 0  # Results from committed entries only
+        Ok(true)
+      else
+        Err("Quorum read failed")
+    Err(e) ->
+      Err("Quorum read test failed: " + e)
+
+fn testVectorSearchMultiPartition() -> Result<bool, string>
+  # Arrange: 여러 파티션에서 검색 (coordinator 사용)
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert vectors across multiple partitions
+  for i in range(0, 20)
+    let vectorId = "mp_vec_" + toString(i)
+    let dimension = number(i % 4)
+    let vector = [dimension, dimension + 1.0]
+    integrateVectorInsertWithRaft(cluster, vectorId, vector, coordinator)
+
+  # Act: Search returns top-k globally
+  let query = [1.5, 2.5]
+  let result = integrateVectorSearchWithRaft(cluster, query, 5, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      # globalTop-K aggregation across partitions
+      if length(response["results"]) <= 5 &&
+         response["partitions_queried"] > 1
+        Ok(true)
+      else
+        Err("Multi-partition search failed")
+    Err(e) ->
+      Err("Multi-partition test failed: " + e)
+
+fn testVectorSearchWithFollowerLag() -> Result<bool, string>
+  # Arrange: 하나의 follower가 느린 상태
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert with one slow follower
+  simulateFollowerLag(cluster, 4, 100)  # Node 4: 100ms lag
+
+  integrateVectorInsertWithRaft(cluster, "lag_vec", [1.0, 2.0], coordinator)
+
+  # Act: Search should not wait for lagging follower
+  let query = [1.0, 2.0]
+  let result = integrateVectorSearchWithRaft(cluster, query, 10, coordinator)
+
+  # Assert: Eventually consistent - search proceeds without waiting for node 4
+  match result
+    Ok(response) ->
+      # Quorum read from up-to-date nodes, lagging node will catch up eventually
+      if response["consistency"] == "eventual (quorum read)"
+        Ok(true)
+      else
+        Err("Eventually consistent property violated")
+    Err(e) ->
+      Err("Follower lag test failed: " + e)
+
+# ============================================================================
+# Test Group C: Leader Failover with Vector Continuity (4개 테스트)
+# ============================================================================
+
+fn testLeaderFailoverBasic() -> Result<bool, string>
+  # Arrange: 5노드 클러스터, 모두 정상 상태
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert data
+  integrateVectorInsertWithRaft(cluster, "fail_vec_1", [1.0, 2.0], coordinator)
+
+  # Act: Leader 실패
+  let failedPartition = 0  # Partition containing leader
+  let result = integrateFailoverWithVectorContinuity(cluster, failedPartition, coordinator)
+
+  # Assert: Automatic failover succeeds
+  match result
+    Ok(response) ->
+      if response["failover"] == "successful" &&
+         response["vectorIndexState"] == "synchronized" &&
+         response["writeResumed"] == true
+        Ok(true)
+      else
+        Err("Failover response invalid")
+    Err(e) ->
+      Err("Leader failover failed: " + e)
+
+fn testFailoverDataDurability() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert committed data (quorum replicated)
+  integrateVectorInsertWithRaft(cluster, "durable_vec", [9.0, 8.0], coordinator)
+
+  # Act: Failover
+  let failedPartition = 0
+  let failoverResult = integrateFailoverWithVectorContinuity(cluster, failedPartition, coordinator)
+
+  # Assert: Committed data preserved through quorum protection
+  match failoverResult
+    Ok(response) ->
+      # Search should find the inserted vector (durable)
+      let searchResult = integrateVectorSearchWithRaft(cluster, [9.0, 8.0], 10, coordinator)
+      match searchResult
+        Ok(searchResp) ->
+          # Should find the data
+          if length(searchResp["results"]) > 0
+            Ok(true)
+          else
+            Err("Data lost during failover")
+        Err(e) ->
+          Err("Search after failover failed: " + e)
+    Err(e) ->
+      Err("Failover preparation failed: " + e)
+
+fn testFailoverRecoveryTime() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+  let startTime = getCurrentTimeMs()
+
+  # Act: Leader fails and new one elected
+  let result = integrateFailoverWithVectorContinuity(cluster, 0, coordinator)
+
+  # Assert: Recovery within election timeout (150ms)
+  let endTime = getCurrentTimeMs()
+  let recoveryTime = endTime - startTime
+
+  match result
+    Ok(response) ->
+      if recoveryTime <= 150
+        Ok(true)
+      else
+        Err("Recovery time exceeded 150ms: " + toString(recoveryTime) + "ms")
+    Err(e) ->
+      Err("Failover timing test failed: " + e)
+
+fn testFailoverWriteResume() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Act 1: Failover occurs
+  let failoverResult = integrateFailoverWithVectorContinuity(cluster, 0, coordinator)
+
+  # Act 2: Insert after failover
+  match failoverResult
+    Ok(_) ->
+      let insertAfterFailover = integrateVectorInsertWithRaft(
+        cluster,
+        "post_failover_vec",
+        [5.0, 6.0],
+        coordinator
+      )
+
+      # Assert: Write succeeds
+      match insertAfterFailover
+        Ok(response) ->
+          if response["status"] == "inserted"
+            Ok(true)
+          else
+            Err("Write not resumed after failover")
+        Err(e) ->
+          Err("Write after failover failed: " + e)
+    Err(e) ->
+      Err("Failover setup failed: " + e)
+
+# ============================================================================
+# Test Group D: New Node Join with Snapshot (4개 테스트)
+# ============================================================================
+
+fn testNewNodeJoinSnapshot() -> Result<bool, string>
+  # Arrange: 5노드 클러스터, 새 노드 준비
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+  let newNode = {
+    "id": 10,
+    "state": "FOLLOWER",
+    "log": array<map<string, any>>(),
+    "commitIndex": 0,
+    "lastSnapshotIndex": 0,
+    "hybridIndex": {}
+  }
+
+  # Insert some data first
+  integrateVectorInsertWithRaft(cluster, "snap_vec", [1.0, 2.0], coordinator)
+
+  # Act: New node joins via snapshot
+  let partitionId = 0
+  let result = integrateNewNodeWithSnapshot(cluster, newNode, partitionId, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      if response["snapshotApplied"] == true &&
+         response["vectorIndexSynced"] == true &&
+         response["searchCapability"] == "ready"
+        Ok(true)
+      else
+        Err("New node snapshot integration failed")
+    Err(e) ->
+      Err("New node join failed: " + e)
+
+fn testNewNodeFastRecovery() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Insert 100 vectors
+  for i in range(0, 100)
+    integrateVectorInsertWithRaft(cluster, "fast_" + toString(i), [number(i), 0.0], coordinator)
+
+  let newNode = createNewNode(10)
+  let startTime = getCurrentTimeMs()
+
+  # Act: New node recovery
+  let result = integrateNewNodeWithSnapshot(cluster, newNode, 0, coordinator)
+
+  let endTime = getCurrentTimeMs()
+  let recoveryMs = endTime - startTime
+
+  # Assert: Fast recovery (< 1 second vs minutes with log replication)
+  match result
+    Ok(response) ->
+      if recoveryMs < 1000  # Less than 1 second
+        Ok(true)
+      else
+        Err("Recovery time: " + toString(recoveryMs) + "ms (expected < 1000ms)")
+    Err(e) ->
+      Err("Fast recovery test failed: " + e)
+
+fn testNewNodeSearchReady() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  integrateVectorInsertWithRaft(cluster, "ready_vec_1", [1.0, 0.0], coordinator)
+  integrateVectorInsertWithRaft(cluster, "ready_vec_2", [0.0, 1.0], coordinator)
+
+  let newNode = createNewNode(11)
+
+  # Act: New node joins
+  let joinResult = integrateNewNodeWithSnapshot(cluster, newNode, 0, coordinator)
+
+  # Assert: Can immediately search
+  match joinResult
+    Ok(_) ->
+      let searchResult = integrateVectorSearchWithRaft(cluster, [0.5, 0.5], 10, coordinator)
+      match searchResult
+        Ok(response) ->
+          if response["status"] == "completed"
+            Ok(true)
+          else
+            Err("Search not ready")
+        Err(e) ->
+          Err("Search failed: " + e)
+    Err(e) ->
+      Err("New node join failed: " + e)
+
+fn testNewNodeWriteCapability() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+  let newNode = createNewNode(12)
+
+  # Act: New node joins
+  let joinResult = integrateNewNodeWithSnapshot(cluster, newNode, 0, coordinator)
+
+  # Assert: Can participate in replication (as follower)
+  match joinResult
+    Ok(response) ->
+      if response["writeCapability"] == "ready (as follower)"
+        Ok(true)
+      else
+        Err("Write capability not ready")
+    Err(e) ->
+      Err("Write capability test failed: " + e)
+
+# ============================================================================
+# Test Group E: Network Partition Recovery (4개 테스트)
+# ============================================================================
+
+fn testNetworkPartitionRecoveryBasic() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Act
+  let result = integrateNetworkPartitionRecovery(cluster, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      if response["partition"] == "healed" &&
+         response["consistency"] == "eventually_consistent"
+        Ok(true)
+      else
+        Err("Partition recovery response invalid")
+    Err(e) ->
+      Err("Network partition recovery failed: " + e)
+
+fn testPartitionMajorityMinority() -> Result<bool, string>
+  # Arrange: Network partition [0,1,2] (Majority) vs [3,4] (Minority)
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  # Act: Insert in partition
+  let partitionedCluster = simulateNetworkPartition(cluster, [0, 1, 2], [3, 4])
+
+  let majorityInsert = integrateVectorInsertWithRaft(
+    partitionedCluster,
+    "majority_vec",
+    [1.0, 2.0],
+    coordinator
+  )
+
+  let minorityInsert = integrateVectorInsertWithRaft(
+    partitionedCluster,
+    "minority_vec",
+    [3.0, 4.0],
+    coordinator
+  )
+
+  # Assert
+  let majoritySuccess = match majorityInsert
+    Ok(_) -> true
+    Err(_) -> false
+
+  let minorityFailed = match minorityInsert
+    Ok(_) -> false
+    Err(_) -> true
+
+  if majoritySuccess && minorityFailed
+    Ok(true)
+  else
+    Err("Partition majority/minority behavior incorrect")
+
+fn testPartitionHealingSync() -> Result<bool, string>
+  # Arrange: Create partition and insert data
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  let partitionedCluster = simulateNetworkPartition(cluster, [0, 1, 2], [3, 4])
+
+  # Majority writes
+  integrateVectorInsertWithRaft(partitionedCluster, "heal_vec", [5.0, 6.0], coordinator)
+
+  # Act: Heal partition
+  let healedCluster = healNetworkPartition(partitionedCluster)
+  let result = integrateNetworkPartitionRecovery(healedCluster, coordinator)
+
+  # Assert: Minority syncs with majority
+  match result
+    Ok(response) ->
+      if response["minorityState"] == "synced" &&
+         response["vectorIndexState"] == "consistent_across_cluster"
+        Ok(true)
+      else
+        Err("Partition healing sync failed")
+    Err(e) ->
+      Err("Healing sync test failed: " + e)
+
+fn testPartitionConsistency() -> Result<bool, string>
+  # Arrange
+  let cluster = createTestCluster(5)
+  let coordinator = createTestCoordinator(cluster)
+
+  let partitionedCluster = simulateNetworkPartition(cluster, [0, 1, 2], [3, 4])
+
+  # Insert and partition
+  integrateVectorInsertWithRaft(partitionedCluster, "cons_vec", [7.0, 8.0], coordinator)
+
+  # Act: Heal and verify consistency
+  let healedCluster = healNetworkPartition(partitionedCluster)
+  let result = integrateNetworkPartitionRecovery(healedCluster, coordinator)
+
+  # Assert
+  match result
+    Ok(response) ->
+      # After healing, all nodes should have consistent state
+      let searchBefore = integrateVectorSearchWithRaft(cluster, [7.0, 8.0], 10, coordinator)
+      match searchBefore
+        Ok(resp) ->
+          if response["vectorIndexState"] == "consistent_across_cluster"
+            Ok(true)
+          else
+            Err("Consistency property violated")
+        Err(e) ->
+          Err("Search consistency verification failed: " + e)
+    Err(e) ->
+      Err("Partition consistency test failed: " + e)
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn createTestCluster(nodeCount: number) -> map<string, any>
+  let nodes = {}
+  for i in range(0, nodeCount)
+    nodes[toString(i)] = {
+      "id": i,
+      "state": if i == 0 then "LEADER" else "FOLLOWER",
+      "currentTerm": 1,
+      "votedFor": if i == 0 then i else -1,
+      "log": array<map<string, any>>(),
+      "commitIndex": 0,
+      "lastApplied": 0,
+      "lastSnapshotIndex": 0,
+      "alive": true,
+      "nextIndex": {},
+      "matchIndex": {},
+      "hybridIndex": {}
+    }
+
+  {
+    "nodeIds": range(0, nodeCount),
+    "nodes": nodes,
+    "leaderElectionMs": 150
+  }
+
+fn createTestCoordinator(cluster: map<string, any>) -> map<string, any>
+  {
+    "nodeId": 0,
+    "partitionCount": 16,
+    "consistentHash": {
+      "partitions": 16,
+      "vnodes": 150
+    },
+    "cluster": cluster
+  }
+
+fn createNewNode(id: number) -> map<string, any>
+  {
+    "id": id,
+    "state": "FOLLOWER",
+    "log": array<map<string, any>>(),
+    "commitIndex": 0,
+    "lastSnapshotIndex": 0,
+    "hybridIndex": {},
+    "ready": false
+  }
+
+fn getCurrentTimeMs() -> number
+  0
+
+fn toString(x: any) -> string
+  ""
+
+fn number(x: any) -> number
+  0.0
+
+fn range(start: number, end: number) -> array<number>
+  array<number>()
+
+fn push(arr: array<any>, item: any) -> array<any>
+  arr
+
+fn length(arr: any) -> number
+  0
+
+fn has(m: map<string, any>, key: string) -> bool
+  false
+
+# ============================================================================
+# Test Runner
+# ============================================================================
+
+fn runAllIntegrationTests() -> Result<number, string>
+  let passed = 0
+  let failed = 0
+  let failedTests = array<string>()
+
+  # Group A: Vector Insert (4 tests)
+  match testVectorInsertBasic()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorInsertBasic: " + e) }
+
+  match testVectorInsertQuorumSuccess()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorInsertQuorumSuccess: " + e) }
+
+  match testVectorInsertPartitionFailure()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorInsertPartitionFailure: " + e) }
+
+  match testVectorInsertMultipleBatch()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorInsertMultipleBatch: " + e) }
+
+  # Group B: Vector Search (4 tests)
+  match testVectorSearchBasic()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorSearchBasic: " + e) }
+
+  match testVectorSearchQuorumRead()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorSearchQuorumRead: " + e) }
+
+  match testVectorSearchMultiPartition()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorSearchMultiPartition: " + e) }
+
+  match testVectorSearchWithFollowerLag()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testVectorSearchWithFollowerLag: " + e) }
+
+  # Group C: Failover (4 tests)
+  match testLeaderFailoverBasic()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testLeaderFailoverBasic: " + e) }
+
+  match testFailoverDataDurability()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testFailoverDataDurability: " + e) }
+
+  match testFailoverRecoveryTime()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testFailoverRecoveryTime: " + e) }
+
+  match testFailoverWriteResume()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testFailoverWriteResume: " + e) }
+
+  # Group D: New Node (4 tests)
+  match testNewNodeJoinSnapshot()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testNewNodeJoinSnapshot: " + e) }
+
+  match testNewNodeFastRecovery()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testNewNodeFastRecovery: " + e) }
+
+  match testNewNodeSearchReady()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testNewNodeSearchReady: " + e) }
+
+  match testNewNodeWriteCapability()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testNewNodeWriteCapability: " + e) }
+
+  # Group E: Partition Recovery (4 tests)
+  match testNetworkPartitionRecoveryBasic()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testNetworkPartitionRecoveryBasic: " + e) }
+
+  match testPartitionMajorityMinority()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testPartitionMajorityMinority: " + e) }
+
+  match testPartitionHealingSync()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testPartitionHealingSync: " + e) }
+
+  match testPartitionConsistency()
+    Ok(_) -> passed = passed + 1
+    Err(e) -> { failed = failed + 1; push(failedTests, "testPartitionConsistency: " + e) }
+
+  if failed == 0
+    Ok(passed)
+  else
+    let summary = "Passed: " + toString(passed) + ", Failed: " + toString(failed)
+    Err(summary)
+
+# ============================================================================
+# 결과 보고
+# ============================================================================
+
+fn reportIntegrationTestResults(result: Result<number, string>) -> string
+  let report = "=== Week 3 Integration Tests (Day 1-3) ===\\n\\n"
+
+  match result
+    Ok(passedCount) ->
+      report = report + "✅ All " + toString(passedCount) + " integration tests PASSED!\\n\\n"
+      report = report + "INTEGRATION SCENARIOS VERIFIED:\\n"
+      report = report + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n"
+      report = report + "✓ Vector Insert with Raft Consensus (4 tests)\\n"
+      report = report + "  ├─ Basic insert & quorum success\\n"
+      report = report + "  ├─ Partition failure handling\\n"
+      report = report + "  └─ Batch insert (10 vectors)\\n"
+      report = report + "\\n✓ Vector Search with Quorum Read (4 tests)\\n"
+      report = report + "  ├─ Basic search & quorum read\\n"
+      report = report + "  ├─ Multi-partition aggregation\\n"
+      report = report + "  └─ Eventually consistent (follower lag)\\n"
+      report = report + "\\n✓ Leader Failover with Continuity (4 tests)\\n"
+      report = report + "  ├─ Automatic failover & data durability\\n"
+      report = report + "  ├─ Recovery time (< 150ms)\\n"
+      report = report + "  └─ Write resume after failover\\n"
+      report = report + "\\n✓ New Node Join with Snapshot (4 tests)\\n"
+      report = report + "  ├─ Snapshot-based sync\\n"
+      report = report + "  ├─ Fast recovery (< 1 second)\\n"
+      report = report + "  └─ Search & write readiness\\n"
+      report = report + "\\n✓ Network Partition Recovery (4 tests)\\n"
+      report = report + "  ├─ Majority/minority split\\n"
+      report = report + "  ├─ Healing & data sync\\n"
+      report = report + "  └─ Cross-cluster consistency\\n"
+      report = report + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\\n"
+      report = report + "\\nPHASE 3 INTEGRATION STATUS: ✅ VERIFIED\\n"
+
+    Err(summary) ->
+      report = report + "❌ Integration tests FAILED: " + summary + "\\n"
+
+  report

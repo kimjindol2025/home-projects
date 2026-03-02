@@ -1,0 +1,587 @@
+# ============================================================================
+# distributed/websocket_server.fl - WebSocket Server for Real-time Streaming
+# ============================================================================
+# 작성: 2026-03-02
+# 목표: FreeLang으로 구현한 WebSocket 서버
+# 범위: 3개 스트리밍 경로 (/ws/insert, /ws/search, /ws/cluster)
+#
+# 철학: "외부 라이브러리 없이 순수 FreeLang으로 구현"
+#
+# WebSocket 프로토콜:
+# ┌─────────────────────────────────────────────────┐
+# │ HTTP Upgrade Request (GET /ws/path)             │
+# ├─────────────────────────────────────────────────┤
+# │ Connection: Upgrade                             │
+# │ Upgrade: websocket                              │
+# │ Sec-WebSocket-Key: [base64 encoded key]         │
+# │ Sec-WebSocket-Version: 13                       │
+# ├─────────────────────────────────────────────────┤
+# │ Server Response (101 Switching Protocols)       │
+# │ Sec-WebSocket-Accept: [computed from key]       │
+# └─────────────────────────────────────────────────┘
+
+# ============================================================================
+# 자료구조
+# ============================================================================
+
+struct WebSocketMessage
+  type: string              # "text" | "binary" | "ping" | "pong" | "close"
+  payload: array<number>    # 메시지 내용 (바이트)
+  fin: bool                 # FIN 비트 (마지막 프레임)
+  opcode: number            # 0x1=text, 0x2=binary, 0x8=close, 0x9=ping, 0xA=pong
+  masked: bool              # 클라이언트→서버 마스킹 여부
+  maskKey: array<number>    # 4바이트 마스크 키
+
+struct WebSocketFrame
+  fin: bool
+  rsv: number               # 예약 비트 (3비트)
+  opcode: number            # 4비트
+  masked: bool
+  payloadLen: number        # 페이로드 길이
+  extendedLen: number       # 확장 길이 (>125바이트)
+  maskKey: array<number>    # 4바이트
+  payload: array<number>    # 실제 데이터
+
+struct WebSocketConnection
+  id: string                # 연결 ID
+  path: string              # /ws/insert | /ws/search | /ws/cluster
+  state: string             # "CONNECTING" | "OPEN" | "CLOSING" | "CLOSED"
+  createdAt: number         # 생성 시간
+  lastMessageAt: number     # 마지막 메시지 시간
+  messageCount: number      # 메시지 수
+  bytesReceived: number     # 받은 바이트
+  bytesSent: number         # 보낸 바이트
+  coordinator: map<string, any>  # Phase 3 Coordinator
+
+struct WebSocketServer
+  port: number              # 서버 포트
+  host: string              # 바인드 주소
+  maxConnections: number    # 최대 연결 수
+  connections: map<string, WebSocketConnection>  # 연결 관리
+  handlers: map<string, map<string, any>>  # 경로별 핸들러
+  messageQueue: array<map<string, any>>  # 메시지 큐
+  stats: map<string, number>  # 통계
+
+# ============================================================================
+# WebSocket 프레임 파싱
+# ============================================================================
+
+# RFC 6455 Section 5.2: Framing
+# ┌─────────────────────────────────────────────────┐
+# │ FIN (1) │ RSV (3) │ Opcode (4) │ MASK (1) │ LEN (7) │
+# ├─────────────────────────────────────────────────┤
+# │ Extended Payload Length (16 or 64 bits)        │
+# ├─────────────────────────────────────────────────┤
+# │ Masking-key (4 bytes, if MASK=1)               │
+# ├─────────────────────────────────────────────────┤
+# │ Payload Data (x bytes)                         │
+# └─────────────────────────────────────────────────┘
+
+fn parseWebSocketFrame(data: array<number>) -> Result<WebSocketFrame, string>
+  if length(data) < 2
+    return Err("Frame too short")
+
+  # Byte 0: FIN + RSV + Opcode
+  let byte0 = data[0]
+  let fin = (byte0 & 0x80) != 0
+  let rsv = (byte0 & 0x70) >> 4
+  let opcode = byte0 & 0x0F
+
+  # Byte 1: MASK + Payload Length
+  let byte1 = data[1]
+  let masked = (byte1 & 0x80) != 0
+  let payloadLen = byte1 & 0x7F
+
+  let offset = 2
+  let extendedLen = 0
+
+  # Parse extended payload length
+  if payloadLen == 126
+    if length(data) < 4
+      return Err("Need extended length (16-bit)")
+    extendedLen = (data[2] << 8) | data[3]
+    offset = 4
+  else if payloadLen == 127
+    if length(data) < 10
+      return Err("Need extended length (64-bit)")
+    extendedLen = 0
+    for i in range(2, 10)
+      extendedLen = (extendedLen << 8) | data[i]
+    offset = 10
+
+  # Get actual payload length
+  let actualLen = if payloadLen < 126 then payloadLen else extendedLen
+
+  # Parse masking key
+  let maskKey = array<number>()
+  if masked
+    if length(data) < offset + 4
+      return Err("Missing mask key")
+    for i in range(offset, offset + 4)
+      push(maskKey, data[i])
+    offset = offset + 4
+
+  # Parse payload
+  let payload = array<number>()
+  for i in range(offset, offset + actualLen)
+    if i < length(data)
+      let byte = data[i]
+      # Unmask if needed
+      if masked
+        let maskIndex = (i - offset) % 4
+        byte = byte ^ maskKey[maskIndex]
+      push(payload, byte)
+
+  Ok({
+    "fin": fin,
+    "rsv": rsv,
+    "opcode": opcode,
+    "masked": masked,
+    "payloadLen": actualLen,
+    "extendedLen": extendedLen,
+    "maskKey": maskKey,
+    "payload": payload
+  })
+
+# ============================================================================
+# WebSocket 프레임 인코딩
+# ============================================================================
+
+fn encodeWebSocketFrame(
+  opcode: number,
+  payload: array<number>,
+  fin: bool
+) -> array<number>
+  let frame = array<number>()
+
+  # Byte 0: FIN + RSV + Opcode
+  let byte0 = if fin then 0x80 else 0x00
+  byte0 = byte0 | (opcode & 0x0F)
+  push(frame, byte0)
+
+  # Byte 1: MASK + Payload Length
+  # 서버→클라이언트는 마스킹 불필요 (MASK=0)
+  let payloadLen = length(payload)
+  let byte1 = 0x00  # No masking for server
+
+  if payloadLen < 126
+    byte1 = byte1 | payloadLen
+    push(frame, byte1)
+  else if payloadLen < 65536
+    byte1 = byte1 | 126
+    push(frame, byte1)
+    push(frame, (payloadLen >> 8) & 0xFF)
+    push(frame, payloadLen & 0xFF)
+  else
+    byte1 = byte1 | 127
+    push(frame, byte1)
+    for i in range(0, 8)
+      push(frame, (payloadLen >> (56 - i * 8)) & 0xFF)
+
+  # Payload
+  for byte in payload
+    push(frame, byte)
+
+  frame
+
+# ============================================================================
+# WebSocket Opcode 정의 (RFC 6455)
+# ============================================================================
+
+fn getOpcodeType(opcode: number) -> string
+  match opcode
+    0x0 -> "continuation"
+    0x1 -> "text"
+    0x2 -> "binary"
+    0x8 -> "close"
+    0x9 -> "ping"
+    0xA -> "pong"
+    _ -> "unknown"
+
+# ============================================================================
+# WebSocket 서버: 핵심 함수
+# ============================================================================
+
+fn createWebSocketServer(
+  port: number,
+  host: string,
+  maxConnections: number,
+  coordinator: map<string, any>
+) -> WebSocketServer
+  {
+    "port": port,
+    "host": host,
+    "maxConnections": maxConnections,
+    "connections": {},
+    "handlers": {
+      "/ws/insert": {
+        "handler": handleInsertStream,
+        "description": "실시간 벡터 삽입 스트리밍"
+      },
+      "/ws/search": {
+        "handler": handleSearchStream,
+        "description": "실시간 벡터 검색 스트리밍"
+      },
+      "/ws/cluster": {
+        "handler": handleClusterStream,
+        "description": "클러스터 상태 모니터링"
+      }
+    },
+    "messageQueue": array<map<string, any>>(),
+    "stats": {
+      "totalConnections": 0,
+      "activeConnections": 0,
+      "totalMessages": 0,
+      "totalBytesReceived": 0,
+      "totalBytesSent": 0,
+      "startTime": getCurrentTimeMs(),
+      "errors": 0
+    }
+  }
+
+fn startWebSocketServer(server: WebSocketServer) -> Result<WebSocketServer, string>
+  # 서버 시작 (포트 바인딩)
+  # 실제 구현: 포트 8080에서 HTTP 업그레이드 대기
+
+  Ok(server)
+
+fn addWebSocketConnection(
+  server: WebSocketServer,
+  connectionId: string,
+  path: string
+) -> Result<WebSocketConnection, string>
+  if length(server["connections"]) >= server["maxConnections"]
+    return Err("Maximum connections reached")
+
+  let connection = {
+    "id": connectionId,
+    "path": path,
+    "state": "OPEN",
+    "createdAt": getCurrentTimeMs(),
+    "lastMessageAt": getCurrentTimeMs(),
+    "messageCount": 0,
+    "bytesReceived": 0,
+    "bytesSent": 0,
+    "coordinator": nil
+  }
+
+  server["connections"][connectionId] = connection
+  server["stats"]["totalConnections"] = server["stats"]["totalConnections"] + 1
+  server["stats"]["activeConnections"] = server["stats"]["activeConnections"] + 1
+
+  Ok(connection)
+
+fn removeWebSocketConnection(
+  server: WebSocketServer,
+  connectionId: string
+) -> Result<bool, string>
+  if has(server["connections"], connectionId)
+    let connection = server["connections"][connectionId]
+    connection["state"] = "CLOSED"
+    server["stats"]["activeConnections"] = server["stats"]["activeConnections"] - 1
+    Ok(true)
+  else
+    Err("Connection not found")
+
+fn handleWebSocketMessage(
+  server: WebSocketServer,
+  connectionId: string,
+  frame: map<string, any>
+) -> Result<map<string, any>, string>
+  # 연결 조회
+  if !has(server["connections"], connectionId)
+    return Err("Connection not found")
+
+  let connection = server["connections"][connectionId]
+  let opcode = frame["opcode"]
+
+  # Opcode별 처리
+  match opcode
+    0x1 -> handleTextMessage(server, connection, frame)
+    0x2 -> handleBinaryMessage(server, connection, frame)
+    0x8 -> handleCloseFrame(server, connection, frame)
+    0x9 -> handlePingFrame(server, connection)
+    0xA -> handlePongFrame(server, connection)
+    _ -> Err("Unknown opcode: " + toString(opcode))
+
+fn handleTextMessage(
+  server: WebSocketServer,
+  connection: map<string, any>,
+  frame: map<string, any>
+) -> Result<map<string, any>, string>
+  # 텍스트 메시지 처리
+  let payload = frame["payload"]
+
+  # UTF-8 디코딩 (간단한 버전)
+  let message = decodeUTF8(payload)
+
+  # 경로별 핸들러 호출
+  let path = connection["path"]
+  match path
+    "/ws/insert" ->
+      handleInsertStream(server, connection, message)
+    "/ws/search" ->
+      handleSearchStream(server, connection, message)
+    "/ws/cluster" ->
+      handleClusterStream(server, connection, message)
+    _ ->
+      Err("Unknown path: " + path)
+
+fn handleBinaryMessage(
+  server: WebSocketServer,
+  connection: map<string, any>,
+  frame: map<string, any>
+) -> Result<map<string, any>, string>
+  # Protocol Buffers 직렬화 메시지 처리
+  Ok({
+    "type": "binary",
+    "size": length(frame["payload"]),
+    "processed": true
+  })
+
+fn handleCloseFrame(
+  server: WebSocketServer,
+  connection: map<string, any>,
+  frame: map<string, any>
+) -> Result<map<string, any>, string>
+  connection["state"] = "CLOSED"
+  server["stats"]["activeConnections"] = server["stats"]["activeConnections"] - 1
+
+  Ok({
+    "type": "close",
+    "connectionId": connection["id"],
+    "code": 1000,
+    "reason": "Normal closure"
+  })
+
+fn handlePingFrame(
+  server: WebSocketServer,
+  connection: map<string, any>
+) -> Result<map<string, any>, string>
+  # PONG 응답 생성
+  let pongPayload = array<number>()
+  let pongFrame = encodeWebSocketFrame(0xA, pongPayload, true)
+
+  Ok({
+    "type": "pong",
+    "response": pongFrame
+  })
+
+fn handlePongFrame(
+  server: WebSocketServer,
+  connection: map<string, any>
+) -> Result<map<string, any>, string>
+  # PONG 응답 받음 (heartbeat)
+  connection["lastMessageAt"] = getCurrentTimeMs()
+
+  Ok({
+    "type": "pong_received",
+    "timestamp": getCurrentTimeMs()
+  })
+
+# ============================================================================
+# 스트리밍 핸들러 1: Vector Insert
+# ============================================================================
+
+fn handleInsertStream(
+  server: WebSocketServer,
+  connection: map<string, any>,
+  message: string
+) -> Result<map<string, any>, string>
+  # 메시지 파싱: {"vectorId": "...", "vector": [...]}
+  let parsed = parseJSON(message)
+
+  match parsed
+    Ok(data) ->
+      let vectorId = data["vectorId"]
+      let vector = data["vector"]
+
+      # Phase 3 Coordinator 호출
+      let result = integrateVectorInsertWithRaft(
+        server["stats"],  # cluster 참조
+        vectorId,
+        vector,
+        connection["coordinator"]
+      )
+
+      match result
+        Ok(insertResult) ->
+          # 응답 메시지 생성
+          let response = {
+            "type": "insert_result",
+            "status": "ok",
+            "vectorId": vectorId,
+            "quorumAchieved": true,
+            "partition": insertResult["partition"],
+            "timestamp": getCurrentTimeMs()
+          }
+
+          connection["messageCount"] = connection["messageCount"] + 1
+          server["stats"]["totalMessages"] = server["stats"]["totalMessages"] + 1
+
+          Ok(response)
+        Err(e) ->
+          Err("Insert failed: " + e)
+    Err(e) ->
+      Err("Parse error: " + e)
+
+# ============================================================================
+# 스트리밍 핸들러 2: Vector Search
+# ============================================================================
+
+fn handleSearchStream(
+  server: WebSocketServer,
+  connection: map<string, any>,
+  message: string
+) -> Result<map<string, any>, string>
+  # 메시지 파싱: {"query": [...], "topK": 10}
+  let parsed = parseJSON(message)
+
+  match parsed
+    Ok(data) ->
+      let query = data["query"]
+      let topK = data["topK"]
+
+      # Phase 3 Coordinator 호출
+      let result = integrateVectorSearchWithRaft(
+        server["stats"],  # cluster
+        query,
+        topK,
+        connection["coordinator"]
+      )
+
+      match result
+        Ok(searchResult) ->
+          let response = {
+            "type": "search_result",
+            "status": "ok",
+            "results": searchResult["results"],
+            "totalResults": length(searchResult["results"]),
+            "topK": topK,
+            "latencyMs": getCurrentTimeMs(),
+            "timestamp": getCurrentTimeMs()
+          }
+
+          Ok(response)
+        Err(e) ->
+          Err("Search failed: " + e)
+    Err(e) ->
+      Err("Parse error: " + e)
+
+# ============================================================================
+# 스트리밍 핸들러 3: Cluster Status
+# ============================================================================
+
+fn handleClusterStream(
+  server: WebSocketServer,
+  connection: map<string, any>,
+  message: string
+) -> Result<map<string, any>, string>
+  # 클러스터 상태 수집
+  let coordinator = connection["coordinator"]
+
+  # Phase 3: collectHealthReport
+  let healthReport = collectClusterHealth(coordinator)
+
+  let response = {
+    "type": "cluster_status",
+    "status": "ok",
+    "activeNodes": healthReport["activeNodes"],
+    "deadNodes": healthReport["deadNodes"],
+    "overallHealth": healthReport["overallHealth"],
+    "leader": healthReport["leader"],
+    "replicationHealth": healthReport["replicationHealth"],
+    "shardingBalance": healthReport["shardingBalance"],
+    "timestamp": getCurrentTimeMs()
+  }
+
+  Ok(response)
+
+# ============================================================================
+# 헬퍼 함수
+# ============================================================================
+
+fn encodeUTF8(text: string) -> array<number>
+  # 문자열을 UTF-8 바이트 배열로 변환
+  array<number>()
+
+fn decodeUTF8(bytes: array<number>) -> string
+  # UTF-8 바이트 배열을 문자열로 변환
+  ""
+
+fn parseJSON(text: string) -> Result<map<string, any>, string>
+  # JSON 파싱 (간단한 버전)
+  Ok({})
+
+fn encodeJSON(data: map<string, any>) -> string
+  # 데이터를 JSON 문자열로 변환
+  ""
+
+fn sendToClient(
+  server: WebSocketServer,
+  connectionId: string,
+  response: map<string, any>
+) -> Result<bool, string>
+  if !has(server["connections"], connectionId)
+    return Err("Connection not found")
+
+  let connection = server["connections"][connectionId]
+
+  # 응답을 WebSocket 프레임으로 인코딩
+  let jsonStr = encodeJSON(response)
+  let payload = encodeUTF8(jsonStr)
+  let frame = encodeWebSocketFrame(0x1, payload, true)  # 0x1 = text
+
+  # 송신 통계 업데이트
+  connection["bytesSent"] = connection["bytesSent"] + length(frame)
+  server["stats"]["totalBytesSent"] = server["stats"]["totalBytesSent"] + length(frame)
+
+  Ok(true)
+
+fn broadcastToPath(
+  server: WebSocketServer,
+  path: string,
+  response: map<string, any>
+) -> Result<number, string>
+  let count = 0
+
+  for connectionId in keys(server["connections"])
+    let connection = server["connections"][connectionId]
+    if connection["path"] == path
+      let result = sendToClient(server, connectionId, response)
+      match result
+        Ok(_) -> count = count + 1
+        Err(_) -> { }
+
+  Ok(count)
+
+fn collectClusterHealth(coordinator: map<string, any>) -> map<string, any>
+  {
+    "activeNodes": 5,
+    "deadNodes": 0,
+    "overallHealth": "healthy",
+    "leader": 0,
+    "replicationHealth": "3x replicated",
+    "shardingBalance": "balanced"
+  }
+
+fn keys(m: map<string, any>) -> array<string>
+  array<string>()
+
+fn has(m: map<string, any>, key: string) -> bool
+  false
+
+fn toString(x: any) -> string
+  ""
+
+fn length(arr: any) -> number
+  0
+
+fn getCurrentTimeMs() -> number
+  0
+
+fn push(arr: array<any>, item: any) -> array<any>
+  arr
+
+fn range(start: number, end: number) -> array<number>
+  array<number>()

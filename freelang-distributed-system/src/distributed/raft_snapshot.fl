@@ -1,0 +1,365 @@
+# ============================================================================
+# distributed/raft_snapshot.fl - Snapshot & Log Compaction (Week 2 Day 4-5)
+# ============================================================================
+# 작성: 2026-03-02
+# 목표: 메모리 효율성 + 고속 복구
+# RFC 5740: InstallSnapshot RPC 구현
+#
+# 핵심 아이디어:
+# "로그 전체를 복제하기보다, 스냅샷 + 최신 로그만 전송"
+# 메모리 ↓ (GB → MB)
+# 복구 속도 ↑ (분 → 초)
+
+# ============================================================================
+# 자료구조: Snapshot
+# ============================================================================
+
+struct Snapshot
+  lastIncludedIndex: number        # 스냅샷에 포함된 마지막 로그 인덱스
+  lastIncludedTerm: number         # 그 엔트리의 Term
+  lastIncludedData: map<string, any>  # 상태 머신의 상태 스냅샷
+  timestamp: number                # 스냅샷 생성 시각
+
+struct InstallSnapshotArgs
+  term: number                     # Leader의 현재 Term
+  leaderId: number                 # Leader 노드 ID
+  lastIncludedIndex: number        # 스냅샷의 마지막 인덱스
+  lastIncludedTerm: number         # 스냅샷의 마지막 Term
+  offset: number                   # 바이트 오프셋 (큰 파일)
+  data: array<number>              # 스냅샷 데이터 (청크)
+  done: bool                        # 마지막 청크인가?
+
+struct InstallSnapshotReply
+  term: number                     # Follower의 현재 Term
+  success: bool                    # 스냅샷 설치 성공
+
+# ============================================================================
+# 핵심 함수 1: Snapshot 생성
+# ============================================================================
+# Raft Figure 12: 리더와 팔로워에서 스냅샷 생성 가능
+# 보통: commitIndex - snapshotThreshold 에서 생성
+
+fn createSnapshot(
+  node: map<string, any>,
+  snapshotThreshold: number
+) -> Result<Snapshot, string>
+  # 조건: commitIndex - lastSnapshotIndex > snapshotThreshold
+  # (메모리 절약을 위해 스냅샷 생성)
+
+  let lastSnapshotIndex = get(node, "lastSnapshotIndex", 0)
+  let shouldSnapshot = node["commitIndex"] - lastSnapshotIndex > snapshotThreshold
+
+  if !shouldSnapshot
+    return Err("Not yet time to create snapshot")
+
+  # Step 1: commitIndex까지의 상태 저장
+  let snapshotIndex = node["commitIndex"]
+  let snapshotTerm = 0
+
+  if snapshotIndex >= 0 && snapshotIndex < length(node["log"])
+    snapshotTerm = node["log"][snapshotIndex]["term"]
+
+  # Step 2: 상태 머신의 현재 상태 캡처
+  let stateSnapshot = {
+    "vectorIndex": getVectorIndexState(node),  # Phase 3 통합
+    "timestamp": getCurrentTimeMs()
+  }
+
+  # Step 3: 스냅샷 객체 생성
+  let snapshot = {
+    "lastIncludedIndex": snapshotIndex,
+    "lastIncludedTerm": snapshotTerm,
+    "lastIncludedData": stateSnapshot,
+    "timestamp": getCurrentTimeMs()
+  }
+
+  # Step 4: 메타데이터 업데이트 (로그는 아직 유지)
+  node["lastSnapshotIndex"] = snapshotIndex
+  node["lastSnapshotTerm"] = snapshotTerm
+
+  Ok(snapshot)
+
+# ============================================================================
+# 핵심 함수 2: Log Compaction
+# ============================================================================
+# 스냅샷 생성 후, 포함된 로그 엔트리 제거
+
+fn compactLog(
+  node: map<string, any>,
+  snapshot: Snapshot
+) -> Result<map<string, any>, string>
+  # 스냅샷이 index X까지 포함하면
+  # 로그는 index X+1부터만 유지
+
+  let compactUpToIndex = snapshot["lastIncludedIndex"]
+
+  if compactUpToIndex < 0
+    return Err("Invalid snapshot index")
+
+  # 로그를 (compactUpToIndex, 끝) 부분만 유지
+  let newLog = array<map<string, any>>()
+  for i in range(compactUpToIndex + 1, length(node["log"]))
+    push(newLog, node["log"][i])
+
+  # 예시: 로그 [e0, e1, e2, e3, e4, e5]에서
+  #       compactUpToIndex=2 (e0,e1,e2 스냅샷)
+  #       → 새 로그 = [e3, e4, e5]
+
+  node["log"] = newLog
+
+  # 주의: commitIndex와 lastApplied도 조정
+  if node["commitIndex"] <= compactUpToIndex
+    node["commitIndex"] = compactUpToIndex
+  if node["lastApplied"] <= compactUpToIndex
+    node["lastApplied"] = compactUpToIndex
+
+  # nextIndex도 조정 (Leader의 경우)
+  if node["state"] == "LEADER"
+    for followerId in getFollowerIds(node)
+      if !has(node["nextIndex"], followerId)
+        node["nextIndex"][followerId] = compactUpToIndex + 1
+      else if node["nextIndex"][followerId] <= compactUpToIndex
+        node["nextIndex"][followerId] = compactUpToIndex + 1
+
+  Ok(node)
+
+# ============================================================================
+# 핵심 함수 3: InstallSnapshot RPC (Follower)
+# ============================================================================
+# Raft Figure 12: InstallSnapshot receiver
+
+fn handleInstallSnapshot(
+  node: map<string, any>,
+  args: InstallSnapshotArgs
+) -> InstallSnapshotReply
+  # Rule 1: 요청자의 Term < 자신의 Term → 거부
+  if args.term < node["currentTerm"]
+    return InstallSnapshotReply {
+      "term": node["currentTerm"],
+      "success": false
+    }
+
+  # Rule 2: 요청자의 Term >= 자신의 Term → Term 업데이트
+  if args.term > node["currentTerm"]
+    node["currentTerm"] = args.term
+    node["votedFor"] = -1
+
+  node["state"] = "FOLLOWER"
+  node["leaderId"] = args.leaderId
+  node["lastHeartbeat"] = getCurrentTimeMs()
+
+  # Rule 3: 이미 이 스냅샷을 받았으면 스킵
+  let lastSnapshotIndex = get(node, "lastSnapshotIndex", 0)
+  if args.lastIncludedIndex < lastSnapshotIndex
+    # 이미 더 최신 스냅샷을 가짐
+    return InstallSnapshotReply {
+      "term": node["currentTerm"],
+      "success": true
+    }
+
+  # Rule 4: 스냅샷 청크 수신 (크기가 크면 여러 청크로 전송)
+  if !has(node, "snapshotBuffer")
+    node["snapshotBuffer"] = array<number>()
+
+  # 청크 데이터 누적
+  for byte in args.data
+    push(node["snapshotBuffer"], byte)
+
+  # Rule 5: 마지막 청크가 아니면 대기
+  if !args.done
+    return InstallSnapshotReply {
+      "term": node["currentTerm"],
+      "success": true  # 진행 중이지만 성공 신호
+    }
+
+  # Rule 6: 마지막 청크 수신 → 스냅샷 설치
+  # Step 1: 스냅샷 내용으로 상태 머신 복구
+  let snapshot = deserializeSnapshot(node["snapshotBuffer"])
+
+  # Step 2: commitIndex 이상인 로그만 유지
+  if args.lastIncludedIndex >= length(node["log"]) - 1
+    # 스냅샷이 모든 로그를 포함 → 로그 전부 제거
+    node["log"] = array<map<string, any>>()
+  else
+    # 스냅샷 이후의 로그만 유지
+    let newLog = array<map<string, any>>()
+    for i in range(args.lastIncludedIndex + 1, length(node["log"]))
+      push(newLog, node["log"][i])
+    node["log"] = newLog
+
+  # Step 3: 메타데이터 업데이트
+  node["lastSnapshotIndex"] = args.lastIncludedIndex
+  node["lastSnapshotTerm"] = args.lastIncludedTerm
+  node["commitIndex"] = maxOfTwoNumbers(node["commitIndex"], args.lastIncludedIndex)
+
+  # Step 4: 스냅샷의 상태 머신 상태 적용
+  applySnapshot(node, snapshot)
+
+  # Step 5: 버퍼 초기화
+  node["snapshotBuffer"] = array<number>()
+
+  InstallSnapshotReply {
+    "term": node["currentTerm"],
+    "success": true
+  }
+
+# ============================================================================
+# 핵심 함수 4: Leader의 Snapshot 전송
+# ============================================================================
+
+fn sendInstallSnapshot(
+  leader: map<string, any>,
+  followerId: number,
+  snapshot: Snapshot,
+  cluster: map<string, any>
+) -> Result<bool, string>
+  if leader["state"] != "LEADER"
+    return Err("Only LEADER can send snapshots")
+
+  # Follower에게 스냅샷 전송
+  # 청크 단위로 나누어 전송 (네트워크 효율)
+
+  let chunkSize = 64 * 1024  # 64KB chunks
+
+  let snapshotData = serializeSnapshot(snapshot)
+  let dataLength = length(snapshotData)
+
+  # 여러 청크로 분할
+  for offset in range(0, dataLength, chunkSize)
+    let chunkEnd = minOfTwoNumbers(offset + chunkSize, dataLength)
+    let chunk = array<number>()
+
+    for i in range(offset, chunkEnd)
+      push(chunk, snapshotData[i])
+
+    let args = InstallSnapshotArgs {
+      "term": leader["currentTerm"],
+      "leaderId": leader["id"],
+      "lastIncludedIndex": snapshot["lastIncludedIndex"],
+      "lastIncludedTerm": snapshot["lastIncludedTerm"],
+      "offset": offset,
+      "data": chunk,
+      "done": chunkEnd == dataLength  # 마지막 청크?
+    }
+
+    # Follower에게 RPC 전송
+    let follower = cluster["nodes"][followerId]
+    let reply = handleInstallSnapshot(follower, args)
+
+    if !reply["success"]
+      return Err("Follower rejected snapshot")
+
+  # nextIndex/matchIndex 업데이트
+  leader["nextIndex"][followerId] = snapshot["lastIncludedIndex"] + 1 + length(leader["log"])
+  leader["matchIndex"][followerId] = snapshot["lastIncludedIndex"]
+
+  Ok(true)
+
+# ============================================================================
+# 핵심 함수 5: Snapshot 기반 고속 복구
+# ============================================================================
+# 새로 클러스터에 참여하는 노드를 빠르게 따라잡게 함
+
+fn fastRecoveryWithSnapshot(
+  newNode: map<string, any>,
+  leader: map<string, any>,
+  cluster: map<string, any>
+) -> Result<map<string, any>, string>
+  # Scenario: 새 노드가 클러스터에 참여
+  #           Leader는 최신 스냅샷 + 이후 로그만 전송
+
+  # Step 1: Leader의 최신 스냅샷 요청
+  if !has(leader, "currentSnapshot")
+    return Err("Leader has no snapshot")
+
+  let snapshot = leader["currentSnapshot"]
+
+  # Step 2: Snapshot 전송 (InstallSnapshot RPC)
+  let snapshotResult = sendInstallSnapshot(leader, newNode["id"], snapshot, cluster)
+
+  match snapshotResult
+    Ok(_) ->
+      # Step 3: Snapshot 이후의 로그 복제
+      let args = {
+        "term": leader["currentTerm"],
+        "leaderId": leader["id"],
+        "prevLogIndex": snapshot["lastIncludedIndex"],
+        "prevLogTerm": snapshot["lastIncludedTerm"],
+        "entries": array<map<string, any>>(),
+        "leaderCommit": leader["commitIndex"]
+      }
+
+      # Leader의 로그 중 스냅샷 이후 부분만 추출
+      for i in range(snapshot["lastIncludedIndex"] + 1, length(leader["log"]))
+        push(args["entries"], leader["log"][i])
+
+      # AppendEntries로 남은 로그 복제
+      let reply = handleAppendEntries(newNode, args)
+
+      if reply["success"]
+        Ok(newNode)
+      else
+        Err("Failed to replicate post-snapshot logs")
+
+    Err(e) ->
+      Err("Snapshot transmission failed: " + e)
+
+# ============================================================================
+# 헬퍼 함수
+# ============================================================================
+
+fn serializeSnapshot(snapshot: Snapshot) -> array<number>
+  # 스냅샷을 바이트 배열로 직렬화
+  # 실제 구현: JSON/Protobuf 직렬화
+  array<number>()
+
+fn deserializeSnapshot(data: array<number>) -> Snapshot
+  # 바이트 배열을 Snapshot으로 역직렬화
+  {
+    "lastIncludedIndex": 0,
+    "lastIncludedTerm": 0,
+    "lastIncludedData": {},
+    "timestamp": 0
+  }
+
+fn applySnapshot(
+  node: map<string, any>,
+  snapshot: Snapshot
+) -> map<string, any>
+  # 스냅샷의 상태를 상태 머신에 적용
+  # Phase 3 coordinator와 통합
+  node
+
+fn getVectorIndexState(node: map<string, any>) -> map<string, any>
+  # 현재 벡터 인덱스 상태 캡처
+  {}
+
+fn getFollowerIds(node: map<string, any>) -> array<number>
+  array<number>()
+
+fn get(m: map<string, any>, key: string, default: any) -> any
+  default
+
+fn has(m: map<string, any>, key: string) -> bool
+  false
+
+fn length(arr: any) -> number
+  0
+
+fn range(start: number, end: number, step: number) -> array<number>
+  array<number>()
+
+fn range(start: number, end: number) -> array<number>
+  array<number>()
+
+fn push(arr: array<any>, item: any) -> array<any>
+  arr
+
+fn maxOfTwoNumbers(a: number, b: number) -> number
+  if a > b then a else b
+
+fn minOfTwoNumbers(a: number, b: number) -> number
+  if a < b then a else b
+
+fn getCurrentTimeMs() -> number
+  0

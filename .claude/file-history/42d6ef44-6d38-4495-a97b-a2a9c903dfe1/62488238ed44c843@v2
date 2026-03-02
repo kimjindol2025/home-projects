@@ -1,0 +1,346 @@
+// ============================================================================
+// Rate Limiting System - Phase 5 Week 1
+// Token Bucket + Sliding Window algorithms (100% FreeLang)
+// ============================================================================
+
+// Rate limit configuration
+struct RateLimitConfig
+  maxRequests: number      // Requests per window
+  windowSize: number       // Time window in seconds
+  algorithm: string        // "token_bucket" or "sliding_window"
+  burst: number           // Burst allowance (token bucket)
+  perClientLimit: bool    // Per-client vs global
+  cleanupInterval: number // Cleanup old entries (seconds)
+
+// Token bucket state
+struct TokenBucket
+  clientId: string
+  tokens: number           // Current tokens
+  lastRefill: number       // Last refill timestamp
+  capacity: number         // Max tokens
+  refillRate: number       // Tokens per second
+  requestCount: number
+  blockedUntil: number
+
+// Sliding window state
+struct SlidingWindow
+  clientId: string
+  requests: array<number>  // Request timestamps
+  windowStart: number
+  windowEnd: number
+  requestCount: number
+  blockUntil: number
+
+// Rate limiter context
+struct RateLimiterContext
+  config: RateLimitConfig
+  tokenBuckets: map<string, TokenBucket>
+  slidingWindows: map<string, SlidingWindow>
+  globalBucket: TokenBucket
+  lastCleanup: number
+
+// Create rate limit configuration
+fn newRateLimitConfig(
+  algorithm: string,
+  maxRequests: number,
+  windowSize: number
+) -> RateLimitConfig
+  {
+    "maxRequests": maxRequests,
+    "windowSize": windowSize,
+    "algorithm": algorithm,
+    "burst": maxRequests / 5,  // 20% burst allowance
+    "perClientLimit": true,
+    "cleanupInterval": 300     // 5 minutes
+  }
+
+// Create rate limiter context
+fn newRateLimiterContext(config: RateLimitConfig) -> RateLimiterContext
+  {
+    "config": config,
+    "tokenBuckets": {},
+    "slidingWindows": {},
+    "globalBucket": {
+      "clientId": "global",
+      "tokens": config["maxRequests"],
+      "lastRefill": getCurrentTime(),
+      "capacity": config["maxRequests"],
+      "refillRate": config["maxRequests"] / config["windowSize"],
+      "requestCount": 0,
+      "blockedUntil": 0
+    },
+    "lastCleanup": getCurrentTime()
+  }
+
+// Token bucket: Refill tokens
+fn refillTokens(bucket: TokenBucket, now: number) -> TokenBucket
+  let timePassed = now - bucket["lastRefill"]
+  let tokensToAdd = timePassed * bucket["refillRate"]
+  bucket["tokens"] = bucket["tokens"] + tokensToAdd
+  if bucket["tokens"] > bucket["capacity"]
+    bucket["tokens"] = bucket["capacity"]
+  bucket["lastRefill"] = now
+  bucket
+
+// Token bucket: Check and consume
+fn checkTokenBucket(
+  context: RateLimiterContext,
+  clientId: string,
+  tokensNeeded: number
+) -> Result<bool, string>
+  let now = getCurrentTime()
+  let config = context["config"]
+
+  // Get or create bucket
+  let bucket = context["tokenBuckets"][clientId]
+  if bucket == nil
+    bucket = {
+      "clientId": clientId,
+      "tokens": config["maxRequests"],
+      "lastRefill": now,
+      "capacity": config["maxRequests"],
+      "refillRate": config["maxRequests"] / config["windowSize"],
+      "requestCount": 0,
+      "blockedUntil": 0
+    }
+
+  // Check if blocked
+  if bucket["blockedUntil"] > now
+    let waitTime = bucket["blockedUntil"] - now
+    return Err("Rate limit exceeded. Retry after " + toString(waitTime) + "s")
+
+  // Refill tokens
+  bucket = refillTokens(bucket, now)
+
+  // Check if enough tokens
+  if bucket["tokens"] >= tokensNeeded
+    bucket["tokens"] = bucket["tokens"] - tokensNeeded
+    bucket["requestCount"] = bucket["requestCount"] + 1
+    context["tokenBuckets"][clientId] = bucket
+    return Ok(true)
+
+  // Not enough tokens - block
+  let blockTime = tokensNeeded / bucket["refillRate"]
+  bucket["blockedUntil"] = now + blockTime
+  context["tokenBuckets"][clientId] = bucket
+  Err("Rate limit exceeded")
+
+// Sliding window: Add request
+fn addRequestToWindow(
+  window: SlidingWindow,
+  now: number,
+  config: RateLimitConfig
+) -> SlidingWindow
+  // Clean up old requests
+  let windowStart = now - config["windowSize"]
+  let newRequests = []
+  for timestamp in window["requests"]
+    if timestamp > windowStart
+      newRequests.append(timestamp)
+  window["requests"] = newRequests
+  window["windowStart"] = windowStart
+  window["windowEnd"] = now
+  window
+
+// Sliding window: Check and record
+fn checkSlidingWindow(
+  context: RateLimiterContext,
+  clientId: string
+) -> Result<bool, string>
+  let now = getCurrentTime()
+  let config = context["config"]
+
+  // Get or create window
+  let window = context["slidingWindows"][clientId]
+  if window == nil
+    window = {
+      "clientId": clientId,
+      "requests": [],
+      "windowStart": now,
+      "windowEnd": now,
+      "requestCount": 0,
+      "blockUntil": 0
+    }
+
+  // Check if blocked
+  if window["blockUntil"] > now
+    let waitTime = window["blockUntil"] - now
+    return Err("Rate limit exceeded. Retry after " + toString(waitTime) + "s")
+
+  // Clean up and update window
+  window = addRequestToWindow(window, now, config)
+
+  // Check if limit exceeded
+  if window["requests"].length() >= config["maxRequests"]
+    window["blockUntil"] = now + 60  // Block for 1 minute
+    context["slidingWindows"][clientId] = window
+    return Err("Rate limit exceeded")
+
+  // Add current request
+  window["requests"].append(now)
+  window["requestCount"] = window["requestCount"] + 1
+  context["slidingWindows"][clientId] = window
+
+  Ok(true)
+
+// Check rate limit (main function)
+fn checkRateLimit(
+  context: RateLimiterContext,
+  clientId: string
+) -> Result<bool, string>
+  let config = context["config"]
+
+  match config["algorithm"]
+    "token_bucket" ->
+      checkTokenBucket(context, clientId, 1)
+    "sliding_window" ->
+      checkSlidingWindow(context, clientId)
+    _ ->
+      checkTokenBucket(context, clientId, 1)
+
+// Get rate limit status
+fn getRateLimitStatus(
+  context: RateLimiterContext,
+  clientId: string
+) -> map<string, any>
+  let bucket = context["tokenBuckets"][clientId]
+  let window = context["slidingWindows"][clientId]
+
+  if bucket != nil
+    return {
+      "algorithm": "token_bucket",
+      "clientId": clientId,
+      "tokensAvailable": bucket["tokens"],
+      "capacity": bucket["capacity"],
+      "requestCount": bucket["requestCount"],
+      "blocked": bucket["blockedUntil"] > getCurrentTime()
+    }
+
+  if window != nil
+    return {
+      "algorithm": "sliding_window",
+      "clientId": clientId,
+      "requestCount": window["requestCount"],
+      "windowRequests": window["requests"].length(),
+      "windowSize": context["config"]["windowSize"],
+      "blocked": window["blockUntil"] > getCurrentTime()
+    }
+
+  {
+    "algorithm": context["config"]["algorithm"],
+    "clientId": clientId,
+    "status": "no_requests"
+  }
+
+// Cleanup old entries
+fn cleanupRateLimiters(context: RateLimiterContext) -> RateLimiterContext
+  let now = getCurrentTime()
+  let config = context["config"]
+
+  if (now - context["lastCleanup"]) < config["cleanupInterval"]
+    return context
+
+  // Remove old token buckets (not accessed for 1 hour)
+  let newBuckets = {}
+  for clientId in context["tokenBuckets"].keys()
+    let bucket = context["tokenBuckets"][clientId]
+    if (now - bucket["lastRefill"]) < 3600
+      newBuckets[clientId] = bucket
+  context["tokenBuckets"] = newBuckets
+
+  // Remove old sliding windows (not accessed for 1 hour)
+  let newWindows = {}
+  for clientId in context["slidingWindows"].keys()
+    let window = context["slidingWindows"][clientId]
+    if (now - window["windowEnd"]) < 3600
+      newWindows[clientId] = window
+  context["slidingWindows"] = newWindows
+
+  context["lastCleanup"] = now
+  context
+
+// DDoS protection: Detect suspicious patterns
+fn detectDdosPattern(
+  context: RateLimiterContext,
+  clientId: string
+) -> bool
+  let bucket = context["tokenBuckets"][clientId]
+  if bucket == nil
+    return false
+
+  // If blocked more than 10 times in last 5 minutes, likely DDoS
+  if bucket["blockedUntil"] > 0 && bucket["requestCount"] > 1000
+    return true
+
+  false
+
+// Whitelist/Blacklist management
+struct IpFilterList
+  whitelist: array<string>
+  blacklist: array<string>
+  isWhitelistMode: bool  // true = whitelist, false = blacklist
+
+fn newIpFilterList() -> IpFilterList
+  {
+    "whitelist": [],
+    "blacklist": [],
+    "isWhitelistMode": false
+  }
+
+fn addToWhitelist(list: IpFilterList, ip: string) -> IpFilterList
+  list["whitelist"].append(ip)
+  list
+
+fn addToBlacklist(list: IpFilterList, ip: string) -> IpFilterList
+  list["blacklist"].append(ip)
+  list
+
+fn isIpAllowed(list: IpFilterList, ip: string) -> bool
+  if list["isWhitelistMode"]
+    // Whitelist mode: only allow whitelisted IPs
+    for whiteIp in list["whitelist"]
+      if whiteIp == ip
+        return true
+    return false
+  else
+    // Blacklist mode: block blacklisted IPs
+    for blackIp in list["blacklist"]
+      if blackIp == ip
+        return false
+    return true
+
+// Adaptive rate limiting
+fn adjustRateLimit(
+  context: RateLimiterContext,
+  clientId: string,
+  newLimit: number
+) -> RateLimiterContext
+  let bucket = context["tokenBuckets"][clientId]
+  if bucket != nil
+    bucket["capacity"] = newLimit
+    bucket["refillRate"] = newLimit / context["config"]["windowSize"]
+    context["tokenBuckets"][clientId] = bucket
+  context
+
+// Get rate limiter statistics
+fn getRateLimiterStats(context: RateLimiterContext) -> string
+  let totalBuckets = context["tokenBuckets"].length()
+  let totalWindows = context["slidingWindows"].length()
+  let blockedCount = 0
+
+  for clientId in context["tokenBuckets"].keys()
+    let bucket = context["tokenBuckets"][clientId]
+    if bucket["blockedUntil"] > getCurrentTime()
+      blockedCount = blockedCount + 1
+
+  "Rate Limiter Statistics:\n" +
+  "  Algorithm: " + context["config"]["algorithm"] + "\n" +
+  "  Total Clients (Buckets): " + toString(totalBuckets) + "\n" +
+  "  Total Clients (Windows): " + toString(totalWindows) + "\n" +
+  "  Currently Blocked: " + toString(blockedCount) + "\n" +
+  "  Max Requests: " + toString(context["config"]["maxRequests"]) + "\n" +
+  "  Window Size: " + toString(context["config"]["windowSize"]) + "s"
+
+// Helper: Get current time (simplified)
+fn getCurrentTime() -> number
+  1740998400

@@ -1,0 +1,541 @@
+# ============================================================================
+# distributed/raft_benchmark.fl - Performance Benchmarking (Week 3 Day 4-5)
+# ============================================================================
+# 작성: 2026-03-02
+# 목표: Phase 3 성능 측정 + 최적화 포인트 식별
+# 범위: 5개 벤치마크 시나리오 (Insert, Search, Failover, NewNode, Partition)
+#
+# 철학: "측정 없는 최적화는 악의 근원이다"
+# "Premature optimization is the root of all evil" - Donald Knuth
+
+# ============================================================================
+# Benchmark 1: Vector Insert Performance
+# ============================================================================
+
+struct InsertBenchmark
+  iterationCount: number          # 벡터 삽입 개수
+  vectorDimension: number         # 벡터 차원
+  nodeCount: number               # 클러스터 크기
+  quorumSize: number              # Quorum 크기
+  totalTimeMs: number             # 전체 시간 (ms)
+  totalOperations: number         # 성공한 연산 수
+  failedOperations: number        # 실패한 연산 수
+  throughput: number              # 스루풋 (vectors/sec)
+  avgLatencyMs: number            # 평균 지연 (ms)
+  p50LatencyMs: number            # P50 지연
+  p99LatencyMs: number            # P99 지연
+  memoryPerVectorKb: number       # 벡터당 메모리 (KB)
+
+fn benchmarkVectorInsert(
+  cluster: map<string, any>,
+  coordinator: map<string, any>,
+  vectorCount: number,
+  vectorDim: number
+) -> InsertBenchmark
+  let benchmark = {
+    "iterationCount": vectorCount,
+    "vectorDimension": vectorDim,
+    "nodeCount": length(cluster["nodeIds"]),
+    "quorumSize": (length(cluster["nodeIds"]) / 2) + 1,
+    "totalTimeMs": 0,
+    "totalOperations": 0,
+    "failedOperations": 0,
+    "throughput": 0.0,
+    "avgLatencyMs": 0.0,
+    "p50LatencyMs": 0.0,
+    "p99LatencyMs": 0.0,
+    "memoryPerVectorKb": 0.0
+  }
+
+  let startTime = getCurrentTimeMs()
+  let latencies = array<number>()
+
+  # Insert vectorCount 벡터
+  for i in range(0, vectorCount)
+    let vectorId = "bench_vec_" + toString(i)
+    let vector = array<number>()
+    for d in range(0, vectorDim)
+      push(vector, randomFloat())
+
+    let opStartTime = getCurrentTimeMs()
+
+    # Insert with Raft
+    let result = integrateVectorInsertWithRaft(cluster, vectorId, vector, coordinator)
+
+    let opEndTime = getCurrentTimeMs()
+    let opLatency = opEndTime - opStartTime
+
+    match result
+      Ok(_) ->
+        benchmark["totalOperations"] = benchmark["totalOperations"] + 1
+        push(latencies, opLatency)
+      Err(_) ->
+        benchmark["failedOperations"] = benchmark["failedOperations"] + 1
+
+  let endTime = getCurrentTimeMs()
+  benchmark["totalTimeMs"] = endTime - startTime
+
+  # Calculate metrics
+  if benchmark["totalOperations"] > 0
+    benchmark["throughput"] = number(benchmark["totalOperations"]) / (benchmark["totalTimeMs"] / 1000.0)
+    benchmark["avgLatencyMs"] = benchmarkAverageLatency(latencies)
+    benchmark["p50LatencyMs"] = benchmarkPercentile(latencies, 50)
+    benchmark["p99LatencyMs"] = benchmarkPercentile(latencies, 99)
+
+  # Memory estimate
+  benchmark["memoryPerVectorKb"] = benchmarkMemoryPerVector(vectorDim)
+
+  benchmark
+
+# ============================================================================
+# Benchmark 2: Vector Search Performance
+# ============================================================================
+
+struct SearchBenchmark
+  queryCount: number              # 검색 쿼리 수
+  vectorDimension: number         # 벡터 차원
+  topK: number                    # 반환할 결과 개수
+  nodeCount: number               # 클러스터 크기
+  totalTimeMs: number             # 전체 시간 (ms)
+  successfulSearches: number      # 성공한 검색 수
+  failedSearches: number          # 실패한 검색 수
+  throughput: number              # 스루풋 (queries/sec)
+  avgLatencyMs: number            # 평균 지연 (ms)
+  p50LatencyMs: number            # P50 지연
+  p99LatencyMs: number            # P99 지연
+  avgRecall: number               # 재현율 (0-1)
+  networkBandwidthMb: number      # 네트워크 대역폭 (MB)
+
+fn benchmarkVectorSearch(
+  cluster: map<string, any>,
+  coordinator: map<string, any>,
+  queryCount: number,
+  vectorDim: number,
+  topK: number
+) -> SearchBenchmark
+  let benchmark = {
+    "queryCount": queryCount,
+    "vectorDimension": vectorDim,
+    "topK": topK,
+    "nodeCount": length(cluster["nodeIds"]),
+    "totalTimeMs": 0,
+    "successfulSearches": 0,
+    "failedSearches": 0,
+    "throughput": 0.0,
+    "avgLatencyMs": 0.0,
+    "p50LatencyMs": 0.0,
+    "p99LatencyMs": 0.0,
+    "avgRecall": 0.0,
+    "networkBandwidthMb": 0.0
+  }
+
+  let startTime = getCurrentTimeMs()
+  let latencies = array<number>()
+  let recalls = array<number>()
+
+  # Execute queryCount searches
+  for i in range(0, queryCount)
+    let query = array<number>()
+    for d in range(0, vectorDim)
+      push(query, randomFloat())
+
+    let opStartTime = getCurrentTimeMs()
+
+    # Search with Quorum read
+    let result = integrateVectorSearchWithRaft(cluster, query, topK, coordinator)
+
+    let opEndTime = getCurrentTimeMs()
+    let opLatency = opEndTime - opStartTime
+
+    match result
+      Ok(response) ->
+        benchmark["successfulSearches"] = benchmark["successfulSearches"] + 1
+        push(latencies, opLatency)
+
+        # Recall 추정 (반환된 결과 수 / topK)
+        let resultCount = length(response["results"])
+        let recall = number(resultCount) / number(topK)
+        push(recalls, recall)
+      Err(_) ->
+        benchmark["failedSearches"] = benchmark["failedSearches"] + 1
+
+  let endTime = getCurrentTimeMs()
+  benchmark["totalTimeMs"] = endTime - startTime
+
+  # Calculate metrics
+  if benchmark["successfulSearches"] > 0
+    benchmark["throughput"] = number(benchmark["successfulSearches"]) / (benchmark["totalTimeMs"] / 1000.0)
+    benchmark["avgLatencyMs"] = benchmarkAverageLatency(latencies)
+    benchmark["p50LatencyMs"] = benchmarkPercentile(latencies, 50)
+    benchmark["p99LatencyMs"] = benchmarkPercentile(latencies, 99)
+    benchmark["avgRecall"] = benchmarkAverageRecall(recalls)
+
+  # Network bandwidth estimate
+  benchmark["networkBandwidthMb"] = benchmarkNetworkBandwidth(vectorDim, topK, length(cluster["nodeIds"]))
+
+  benchmark
+
+# ============================================================================
+# Benchmark 3: Failover Performance
+# ============================================================================
+
+struct FailoverBenchmark
+  failoverCount: number           # Failover 실행 횟수
+  avgLeaderElectionTimeMs: number # 평균 리더 선출 시간
+  p99ElectionTimeMs: number       # P99 선출 시간
+  dataLossCount: number           # 손실된 벡터 수
+  serviceDowntimeMs: number       # 서비스 중단 시간
+  failoverSuccessRate: number     # 성공률 (0-1)
+  writeResumeTimeMs: number       # 쓰기 재개 시간
+
+fn benchmarkFailover(
+  cluster: map<string, any>,
+  coordinator: map<string, any>,
+  failoverCount: number
+) -> FailoverBenchmark
+  let benchmark = {
+    "failoverCount": failoverCount,
+    "avgLeaderElectionTimeMs": 0.0,
+    "p99ElectionTimeMs": 0.0,
+    "dataLossCount": 0,
+    "serviceDowntimeMs": 0,
+    "failoverSuccessRate": 0.0,
+    "writeResumeTimeMs": 0.0
+  }
+
+  let electionTimes = array<number>()
+  let successCount = 0
+
+  for i in range(0, failoverCount)
+    let partitionId = i % length(cluster["nodeIds"])
+
+    let startTime = getCurrentTimeMs()
+
+    # Trigger failover
+    let result = integrateFailoverWithVectorContinuity(cluster, partitionId, coordinator)
+
+    let endTime = getCurrentTimeMs()
+    let electionTime = endTime - startTime
+
+    match result
+      Ok(response) ->
+        successCount = successCount + 1
+        push(electionTimes, electionTime)
+
+        # Track recovery metrics
+        benchmark["serviceDowntimeMs"] = benchmark["serviceDowntimeMs"] + electionTime
+        benchmark["writeResumeTimeMs"] = maxOfTwoNumbers(
+          benchmark["writeResumeTimeMs"],
+          electionTime
+        )
+      Err(_) ->
+        { }  # Count as failure
+
+  # Calculate metrics
+  if length(electionTimes) > 0
+    benchmark["avgLeaderElectionTimeMs"] = benchmarkAverageLatency(electionTimes)
+    benchmark["p99ElectionTimeMs"] = benchmarkPercentile(electionTimes, 99)
+
+  benchmark["failoverSuccessRate"] = number(successCount) / number(failoverCount)
+
+  benchmark
+
+# ============================================================================
+# Benchmark 4: New Node Recovery Performance
+# ============================================================================
+
+struct NewNodeBenchmark
+  nodeJoinCount: number           # 새 노드 추가 횟수
+  avgRecoveryTimeMs: number       # 평균 복구 시간
+  maxRecoveryTimeMs: number       # 최악의 복구 시간
+  totalMemoryUsedMb: number       # 전체 메모리 사용량
+  memoryPerNodeMb: number         # 노드당 메모리
+  snapshotSizeMb: number          # 스냅샷 크기
+  replicationBandwidthMb: number  # 복제 대역폭
+  successfulJoins: number         # 성공한 join
+  searchReadyCount: number        # 검색 준비된 노드 수
+  writeReadyCount: number         # 쓰기 준비된 노드 수
+
+fn benchmarkNewNodeRecovery(
+  cluster: map<string, any>,
+  coordinator: map<string, any>,
+  nodeJoinCount: number,
+  vectorCountPerNode: number
+) -> NewNodeBenchmark
+  let benchmark = {
+    "nodeJoinCount": nodeJoinCount,
+    "avgRecoveryTimeMs": 0.0,
+    "maxRecoveryTimeMs": 0.0,
+    "totalMemoryUsedMb": 0.0,
+    "memoryPerNodeMb": 0.0,
+    "snapshotSizeMb": 0.0,
+    "replicationBandwidthMb": 0.0,
+    "successfulJoins": 0,
+    "searchReadyCount": 0,
+    "writeReadyCount": 0
+  }
+
+  let recoveryTimes = array<number>()
+  let nodeStartId = 100
+
+  for i in range(0, nodeJoinCount)
+    let newNode = createNewNode(nodeStartId + i)
+    let partitionId = i % 16  # 16 partitions
+
+    let startTime = getCurrentTimeMs()
+
+    # New node joins cluster
+    let result = integrateNewNodeWithSnapshot(cluster, newNode, partitionId, coordinator)
+
+    let endTime = getCurrentTimeMs()
+    let recoveryTime = endTime - startTime
+
+    match result
+      Ok(response) ->
+        benchmark["successfulJoins"] = benchmark["successfulJoins"] + 1
+        push(recoveryTimes, recoveryTime)
+
+        if response["searchCapability"] == "ready"
+          benchmark["searchReadyCount"] = benchmark["searchReadyCount"] + 1
+
+        if response["writeCapability"] == "ready (as follower)"
+          benchmark["writeReadyCount"] = benchmark["writeReadyCount"] + 1
+
+        # Memory tracking
+        benchmark["snapshotSizeMb"] = benchmarkSnapshotSize(vectorCountPerNode)
+      Err(_) ->
+        { }
+
+  # Calculate metrics
+  if length(recoveryTimes) > 0
+    benchmark["avgRecoveryTimeMs"] = benchmarkAverageLatency(recoveryTimes)
+    benchmark["maxRecoveryTimeMs"] = benchmarkMaxLatency(recoveryTimes)
+
+  benchmark["memoryPerNodeMb"] = benchmark["snapshotSizeMb"]
+  benchmark["totalMemoryUsedMb"] = benchmark["memoryPerNodeMb"] * number(nodeJoinCount)
+  benchmark["replicationBandwidthMb"] = benchmarkReplicationBandwidth(vectorCountPerNode)
+
+  benchmark
+
+# ============================================================================
+# Benchmark 5: Network Partition Tolerance
+# ============================================================================
+
+struct PartitionBenchmark
+  partitionCount: number          # 파티션 발생 횟수
+  majorityAvailabilityPercent: number  # Majority 가용성 %
+  minorityIsolationMs: number     # Minority 격리 시간
+  avgPartitionTimeMs: number      # 평균 파티션 시간
+  maxPartitionTimeMs: number      # 최대 파티션 시간
+  healingTimeMs: number           # 파티션 복구 시간
+  dataConsistencyScore: number    # 일관성 점수 (0-1)
+  minorityDataLossCount: number   # Minority 데이터 손실 수
+
+fn benchmarkNetworkPartition(
+  cluster: map<string, any>,
+  coordinator: map<string, any>,
+  partitionCount: number
+) -> PartitionBenchmark
+  let benchmark = {
+    "partitionCount": partitionCount,
+    "majorityAvailabilityPercent": 0.0,
+    "minorityIsolationMs": 0.0,
+    "avgPartitionTimeMs": 0.0,
+    "maxPartitionTimeMs": 0.0,
+    "healingTimeMs": 0.0,
+    "dataConsistencyScore": 1.0,
+    "minorityDataLossCount": 0
+  }
+
+  let partitionTimes = array<number>()
+  let healingStartTime = 0
+
+  for i in range(0, partitionCount)
+    # Simulate partition
+    let partition1 = [0, 1, 2]  # Majority
+    let partition2 = [3, 4]      # Minority
+
+    let startTime = getCurrentTimeMs()
+
+    let partitionedCluster = simulateNetworkPartition(cluster, partition1, partition2)
+
+    # Try operations in both partitions
+    let majorityWrite = integrateVectorInsertWithRaft(
+      partitionedCluster,
+      "part_maj_" + toString(i),
+      [1.0, 2.0],
+      coordinator
+    )
+
+    let minorityWrite = integrateVectorInsertWithRaft(
+      partitionedCluster,
+      "part_min_" + toString(i),
+      [3.0, 4.0],
+      coordinator
+    )
+
+    let partitionTime = getCurrentTimeMs() - startTime
+    push(partitionTimes, partitionTime)
+
+    # Check availability
+    match majorityWrite
+      Ok(_) ->
+        benchmark["majorityAvailabilityPercent"] = benchmark["majorityAvailabilityPercent"] + 100.0
+      Err(_) ->
+        { }
+
+    match minorityWrite
+      Ok(_) ->
+        benchmark["minorityDataLossCount"] = benchmark["minorityDataLossCount"] + 1
+      Err(_) ->
+        benchmark["minorityIsolationMs"] = partitionTime
+
+    # Heal partition
+    healingStartTime = getCurrentTimeMs()
+    let healedCluster = healNetworkPartition(partitionedCluster)
+    let healResult = integrateNetworkPartitionRecovery(healedCluster, coordinator)
+
+    match healResult
+      Ok(_) ->
+        let healTime = getCurrentTimeMs() - healingStartTime
+        benchmark["healingTimeMs"] = maxOfTwoNumbers(benchmark["healingTimeMs"], healTime)
+      Err(_) ->
+        { }
+
+  # Calculate metrics
+  if length(partitionTimes) > 0
+    benchmark["avgPartitionTimeMs"] = benchmarkAverageLatency(partitionTimes)
+    benchmark["maxPartitionTimeMs"] = benchmarkMaxLatency(partitionTimes)
+
+  benchmark["majorityAvailabilityPercent"] = benchmark["majorityAvailabilityPercent"] / number(partitionCount)
+
+  # Data consistency: 0 losses = 1.0, losses reduce score
+  benchmark["dataConsistencyScore"] = 1.0 - (number(benchmark["minorityDataLossCount"]) / number(partitionCount))
+
+  benchmark
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+fn benchmarkAverageLatency(latencies: array<number>) -> number
+  if length(latencies) == 0
+    return 0.0
+
+  let sum = 0.0
+  for latency in latencies
+    sum = sum + latency
+
+  sum / number(length(latencies))
+
+fn benchmarkPercentile(values: array<number>, percentile: number) -> number
+  if length(values) == 0
+    return 0.0
+
+  # Simple percentile calculation (sorted)
+  let index = (percentile * number(length(values))) / 100.0
+  if index < 0
+    return values[0]
+  if index >= number(length(values))
+    return values[length(values) - 1]
+
+  values[number(index)]
+
+fn benchmarkMaxLatency(latencies: array<number>) -> number
+  if length(latencies) == 0
+    return 0.0
+
+  let max = latencies[0]
+  for latency in latencies
+    if latency > max
+      max = latency
+
+  max
+
+fn benchmarkAverageRecall(recalls: array<number>) -> number
+  if length(recalls) == 0
+    return 0.0
+
+  let sum = 0.0
+  for recall in recalls
+    sum = sum + recall
+
+  sum / number(length(recalls))
+
+fn benchmarkMemoryPerVector(dimension: number) -> number
+  # 8 bytes per float64 * dimension + overhead
+  let baseMemory = number(dimension) * 8.0 / 1024.0  # KB
+  baseMemory + 0.5  # overhead
+
+fn benchmarkNetworkBandwidth(dimension: number, topK: number, nodeCount: number) -> number
+  # Estimate network bandwidth: vectorSize * topK * (nodeCount - 1) / 1024 / 1024
+  let vectorSize = number(dimension) * 8.0
+  let results = vectorSize * number(topK)
+  let totalData = results * number(nodeCount - 1)
+  totalData / 1024.0 / 1024.0
+
+fn benchmarkSnapshotSize(vectorCount: number) -> number
+  # Rough estimate: 1KB per vector (including index overhead)
+  number(vectorCount) / 1024.0
+
+fn benchmarkReplicationBandwidth(vectorCount: number) -> number
+  # Replication to 2 replicas (3x total)
+  number(vectorCount) * 0.001 * 2.0  # Rough estimate in MB
+
+fn getCurrentTimeMs() -> number
+  0
+
+fn toString(x: any) -> string
+  ""
+
+fn randomFloat() -> number
+  0.5
+
+fn length(arr: any) -> number
+  0
+
+fn maxOfTwoNumbers(a: number, b: number) -> number
+  if a > b then a else b
+
+fn minOfTwoNumbers(a: number, b: number) -> number
+  if a < b then a else b
+
+fn range(start: number, end: number) -> array<number>
+  array<number>()
+
+fn push(arr: array<any>, item: any) -> array<any>
+  arr
+
+# ============================================================================
+# Benchmark Orchestrator
+# ============================================================================
+
+fn runAllBenchmarks(
+  cluster: map<string, any>,
+  coordinator: map<string, any>
+) -> Result<map<string, any>, string>
+  let results = {
+    "insertBenchmark": nil,
+    "searchBenchmark": nil,
+    "failoverBenchmark": nil,
+    "newNodeBenchmark": nil,
+    "partitionBenchmark": nil,
+    "timestamp": getCurrentTimeMs()
+  }
+
+  # Benchmark 1: Insert
+  results["insertBenchmark"] = benchmarkVectorInsert(cluster, coordinator, 1000, 128)
+
+  # Benchmark 2: Search
+  results["searchBenchmark"] = benchmarkVectorSearch(cluster, coordinator, 500, 128, 10)
+
+  # Benchmark 3: Failover
+  results["failoverBenchmark"] = benchmarkFailover(cluster, coordinator, 5)
+
+  # Benchmark 4: New Node
+  results["newNodeBenchmark"] = benchmarkNewNodeRecovery(cluster, coordinator, 3, 1000)
+
+  # Benchmark 5: Partition
+  results["partitionBenchmark"] = benchmarkNetworkPartition(cluster, coordinator, 5)
+
+  Ok(results)
