@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+Model Manager: PPO 모델의 저장, 로드, 메타데이터 관리
+
+강화학습으로 훈련한 정책/가치 네트워크를 디스크에 저장하고,
+필요할 때 빠르게 로드하여 추론에 사용.
+"""
+
+import torch
+import torch.nn as nn
+import json
+import os
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Any, Optional, Tuple
+import hashlib
+
+
+class ModelCheckpoint:
+    """모델 체크포인트 관리"""
+
+    def __init__(self, model_dir: str = "models"):
+        self.model_dir = Path(model_dir)
+        self.model_dir.mkdir(exist_ok=True)
+
+        self.metadata_dir = self.model_dir / "metadata"
+        self.metadata_dir.mkdir(exist_ok=True)
+
+    def save_checkpoint(
+        self,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
+        best_reward: float,
+        hyperparameters: Dict[str, Any],
+        model_id: str = "mlir-adaptive-ppo"
+    ) -> str:
+        """
+        모델 체크포인트 저장
+
+        Args:
+            policy_net: 정책 네트워크
+            value_net: 가치 네트워크
+            optimizer: 옵티마이저
+            epoch: 현재 에포크
+            best_reward: 최고 보상
+            hyperparameters: 하이퍼파라미터 딕셔너리
+            model_id: 모델 식별자
+
+        Returns:
+            저장된 체크포인트 파일 경로
+        """
+        checkpoint = {
+            "policy_state_dict": policy_net.state_dict(),
+            "value_state_dict": value_net.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_reward": best_reward,
+            "hyperparameters": hyperparameters,
+            "timestamp": datetime.now().isoformat(),
+            "model_id": model_id,
+            "pytorch_version": torch.__version__,
+        }
+
+        checkpoint_path = (
+            self.model_dir / f"{model_id}_epoch_{epoch}.pt"
+        )
+
+        torch.save(checkpoint, checkpoint_path)
+
+        # 메타데이터도 별도 저장
+        metadata = self._create_metadata(
+            checkpoint_path,
+            epoch,
+            best_reward,
+            hyperparameters,
+        )
+
+        metadata_path = (
+            self.metadata_dir / f"{model_id}_epoch_{epoch}.json"
+        )
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"✓ Checkpoint saved: {checkpoint_path}")
+        print(f"  - Epoch: {epoch}")
+        print(f"  - Best Reward: {best_reward:.4f}")
+        print(f"  - Metadata: {metadata_path}")
+
+        return str(checkpoint_path)
+
+    def save_best_model(
+        self,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        epoch: int,
+        best_reward: float,
+        hyperparameters: Dict[str, Any],
+        model_id: str = "mlir-adaptive-ppo"
+    ) -> str:
+        """
+        최고 성능 모델 저장 (이전 최고 모델 덮어쓰기)
+        """
+        checkpoint = {
+            "policy_state_dict": policy_net.state_dict(),
+            "value_state_dict": value_net.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_reward": best_reward,
+            "hyperparameters": hyperparameters,
+            "timestamp": datetime.now().isoformat(),
+            "model_id": model_id,
+            "pytorch_version": torch.__version__,
+        }
+
+        checkpoint_path = (
+            self.model_dir / f"{model_id}_best.pt"
+        )
+
+        torch.save(checkpoint, checkpoint_path)
+
+        metadata = self._create_metadata(
+            checkpoint_path,
+            epoch,
+            best_reward,
+            hyperparameters,
+            is_best=True,
+        )
+
+        metadata_path = (
+            self.metadata_dir / f"{model_id}_best.json"
+        )
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"🏆 Best model saved: {checkpoint_path}")
+        print(f"   Reward: {best_reward:.4f} (Epoch {epoch})")
+
+        return str(checkpoint_path)
+
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        device: str = "cpu"
+    ) -> Dict[str, Any]:
+        """
+        체크포인트 로드
+
+        Args:
+            checkpoint_path: 체크포인트 파일 경로
+            policy_net: 정책 네트워크 (상태 로드할 객체)
+            value_net: 가치 네트워크 (상태 로드할 객체)
+            optimizer: 옵티마이저 (선택사항)
+            device: 로드할 디바이스 ('cpu' 또는 'cuda')
+
+        Returns:
+            메타데이터 (epoch, best_reward, 등)
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        policy_net.load_state_dict(checkpoint["policy_state_dict"])
+        value_net.load_state_dict(checkpoint["value_state_dict"])
+
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        metadata = {
+            "epoch": checkpoint["epoch"],
+            "best_reward": checkpoint["best_reward"],
+            "hyperparameters": checkpoint["hyperparameters"],
+            "timestamp": checkpoint["timestamp"],
+        }
+
+        print(f"✓ Checkpoint loaded: {checkpoint_path}")
+        print(f"  - Epoch: {checkpoint['epoch']}")
+        print(f"  - Best Reward: {checkpoint['best_reward']:.4f}")
+
+        return metadata
+
+    def load_best_model(
+        self,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        device: str = "cpu",
+        model_id: str = "mlir-adaptive-ppo"
+    ) -> Dict[str, Any]:
+        """
+        최고 성능 모델 로드
+        """
+        best_path = self.model_dir / f"{model_id}_best.pt"
+        if not best_path.exists():
+            raise FileNotFoundError(f"Best model not found: {best_path}")
+
+        return self.load_checkpoint(
+            str(best_path),
+            policy_net,
+            value_net,
+            device=device
+        )
+
+    def list_checkpoints(self, model_id: str = "mlir-adaptive-ppo") -> list:
+        """
+        저장된 모든 체크포인트 나열 (최신순)
+        """
+        checkpoints = list(self.model_dir.glob(f"{model_id}_epoch_*.pt"))
+        checkpoints.sort(
+            key=lambda x: int(x.stem.split("_")[-1]),
+            reverse=True
+        )
+        return [str(cp) for cp in checkpoints]
+
+    def _create_metadata(
+        self,
+        checkpoint_path: str,
+        epoch: int,
+        best_reward: float,
+        hyperparameters: Dict[str, Any],
+        is_best: bool = False
+    ) -> Dict[str, Any]:
+        """메타데이터 생성"""
+        file_size = os.path.getsize(checkpoint_path) / (1024 * 1024)  # MB
+
+        return {
+            "checkpoint_path": checkpoint_path,
+            "epoch": epoch,
+            "best_reward": best_reward,
+            "hyperparameters": hyperparameters,
+            "timestamp": datetime.now().isoformat(),
+            "file_size_mb": round(file_size, 2),
+            "is_best": is_best,
+            "pytorch_version": torch.__version__,
+        }
+
+
+class InferenceModel:
+    """추론용 모델 (평가 모드, 그래디언트 X)"""
+
+    def __init__(
+        self,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        checkpoint_path: str,
+        device: str = "cpu",
+    ):
+        """
+        추론 모델 초기화
+
+        Args:
+            policy_net: 정책 네트워크
+            value_net: 가치 네트워크
+            checkpoint_path: 저장된 체크포인트 경로
+            device: 실행 디바이스
+        """
+        self.device = device
+        self.policy_net = policy_net.to(device)
+        self.value_net = value_net.to(device)
+
+        # 체크포인트 로드
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        self.policy_net.load_state_dict(checkpoint["policy_state_dict"])
+        self.value_net.load_state_dict(checkpoint["value_state_dict"])
+
+        # 평가 모드 (드롭아웃, 배치 정규화 비활성화)
+        self.policy_net.eval()
+        self.value_net.eval()
+
+        self.hyperparameters = checkpoint["hyperparameters"]
+        self.metadata = {
+            "epoch": checkpoint["epoch"],
+            "best_reward": checkpoint["best_reward"],
+            "checkpoint_path": checkpoint_path,
+        }
+
+    def infer(
+        self,
+        state: torch.Tensor,
+        use_deterministic: bool = True
+    ) -> Tuple[int, float, float]:
+        """
+        상태를 받아 최적 행동 및 가치 추론
+
+        Args:
+            state: 상태 벡터 (shape: [state_dim])
+            use_deterministic: True면 argmax, False면 샘플링
+
+        Returns:
+            (action, action_prob, value)
+                - action: 선택된 행동 (정수)
+                - action_prob: 행동의 확률
+                - value: 상태의 가치 추정
+        """
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).to(self.device)
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+
+            # 정책 네트워크
+            logits, action_probs = self.policy_net(state_tensor)
+
+            if use_deterministic:
+                action = torch.argmax(action_probs, dim=-1).item()
+            else:
+                action = torch.multinomial(
+                    action_probs.squeeze(),
+                    num_samples=1
+                ).item()
+
+            action_prob = action_probs[0, action].item()
+
+            # 가치 네트워크
+            value = self.value_net(state_tensor).squeeze().item()
+
+        return action, action_prob, value
+
+    def infer_batch(
+        self,
+        states: torch.Tensor,
+        use_deterministic: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        배치 추론 (효율성을 위해 여러 상태 동시 처리)
+
+        Args:
+            states: 상태 배치 (shape: [batch_size, state_dim])
+            use_deterministic: 결정론적 또는 샘플링
+
+        Returns:
+            (actions, action_probs, values)
+        """
+        with torch.no_grad():
+            states_tensor = torch.FloatTensor(states).to(self.device)
+
+            logits, action_probs = self.policy_net(states_tensor)
+
+            if use_deterministic:
+                actions = torch.argmax(action_probs, dim=-1)
+            else:
+                actions = torch.multinomial(action_probs, num_samples=1).squeeze()
+
+            # 각 샘플의 선택된 행동 확률
+            action_probs_selected = torch.gather(
+                action_probs,
+                dim=1,
+                index=actions.unsqueeze(1)
+            ).squeeze()
+
+            values = self.value_net(states_tensor).squeeze()
+
+        return actions, action_probs_selected, values
+
+    def get_metadata(self) -> Dict[str, Any]:
+        """모델 메타데이터 반환"""
+        return self.metadata
+
+    def get_hyperparameters(self) -> Dict[str, Any]:
+        """하이퍼파라미터 반환"""
+        return self.hyperparameters
+
+
+class ModelConfig:
+    """모델 설정 저장/로드"""
+
+    @staticmethod
+    def save_config(
+        config: Dict[str, Any],
+        config_path: str = "models/config.json"
+    ):
+        """설정을 JSON 파일로 저장"""
+        config_path = Path(config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2)
+
+        print(f"✓ Config saved: {config_path}")
+
+    @staticmethod
+    def load_config(config_path: str = "models/config.json") -> Dict[str, Any]:
+        """설정을 JSON 파일에서 로드"""
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        print(f"✓ Config loaded: {config_path}")
+        return config
+
+    @staticmethod
+    def create_default_config() -> Dict[str, Any]:
+        """기본 설정 생성"""
+        return {
+            "model_id": "mlir-adaptive-ppo-v1.0",
+            "training_date": datetime.now().isoformat(),
+            "hardware_target": "NVIDIA H100",
+            "architecture": {
+                "state_dims": 100,
+                "action_space": 1000,
+                "backbone": [100, 256, 128],
+                "policy_head": [128, 1000],
+                "value_head": [128, 1]
+            },
+            "hyperparameters": {
+                "learning_rate": 3e-4,
+                "entropy_coefficient": 0.01,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_epsilon": 0.2,
+                "batch_size": 64,
+                "num_epochs": 3,
+                "max_grad_norm": 0.5,
+            },
+            "training_stats": {
+                "epochs_trained": 0,
+                "best_reward": 0.0,
+                "total_steps": 0,
+            }
+        }
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Model Manager Demo")
+    print("=" * 60)
+
+    # 1. 설정 생성
+    config = ModelConfig.create_default_config()
+    ModelConfig.save_config(config)
+
+    # 2. 더미 네트워크 생성 (데모용)
+    class DummyPolicyNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(100, 256)
+            self.fc2 = nn.Linear(256, 128)
+            self.policy_head = nn.Linear(128, 1000)
+
+        def forward(self, x):
+            x = torch.relu(self.fc1(x))
+            x = torch.relu(self.fc2(x))
+            logits = self.policy_head(x)
+            probs = torch.softmax(logits, dim=-1)
+            return logits, probs
+
+    class DummyValueNet(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc1 = nn.Linear(100, 256)
+            self.fc2 = nn.Linear(256, 128)
+            self.value_head = nn.Linear(128, 1)
+
+        def forward(self, x):
+            x = torch.relu(self.fc1(x))
+            x = torch.relu(self.fc2(x))
+            return self.value_head(x)
+
+    policy_net = DummyPolicyNet()
+    value_net = DummyValueNet()
+    optimizer = torch.optim.Adam(
+        list(policy_net.parameters()) + list(value_net.parameters()),
+        lr=3e-4
+    )
+
+    # 3. 체크포인트 저장 테스트
+    manager = ModelCheckpoint()
+    checkpoint_path = manager.save_checkpoint(
+        policy_net,
+        value_net,
+        optimizer,
+        epoch=500,
+        best_reward=0.87,
+        hyperparameters=config["hyperparameters"],
+    )
+
+    # 4. 최고 모델 저장 테스트
+    manager.save_best_model(
+        policy_net,
+        value_net,
+        optimizer,
+        epoch=500,
+        best_reward=0.87,
+        hyperparameters=config["hyperparameters"],
+    )
+
+    # 5. 모델 로드 테스트
+    print("\n" + "=" * 60)
+    print("Loading model...")
+    print("=" * 60)
+
+    policy_net_loaded = DummyPolicyNet()
+    value_net_loaded = DummyValueNet()
+
+    metadata = manager.load_checkpoint(
+        checkpoint_path,
+        policy_net_loaded,
+        value_net_loaded,
+    )
+
+    # 6. 추론 테스트
+    print("\n" + "=" * 60)
+    print("Inference test...")
+    print("=" * 60)
+
+    inference = InferenceModel(
+        policy_net_loaded,
+        value_net_loaded,
+        checkpoint_path,
+    )
+
+    # 테스트 상태
+    test_state = torch.randn(100).numpy()
+    action, prob, value = inference.infer(test_state)
+
+    print(f"✓ Inference successful")
+    print(f"  - State shape: {test_state.shape}")
+    print(f"  - Action: {action}")
+    print(f"  - Action Probability: {prob:.6f}")
+    print(f"  - Value Estimate: {value:.6f}")
+
+    # 배치 추론 테스트
+    batch_states = torch.randn(5, 100).numpy()
+    actions, probs, values = inference.infer_batch(batch_states)
+
+    print(f"\n✓ Batch inference successful")
+    print(f"  - Batch size: {len(actions)}")
+    print(f"  - Actions: {actions.tolist()}")
+    print(f"  - Values: {values.numpy()}")
+
+    # 7. 저장된 체크포인트 나열
+    print("\n" + "=" * 60)
+    print("Saved checkpoints:")
+    print("=" * 60)
+    checkpoints = manager.list_checkpoints()
+    for cp in checkpoints:
+        print(f"  • {cp}")

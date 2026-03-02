@@ -1,0 +1,520 @@
+"""
+v7.2 결제 서비스 (Payment Service)
+
+2계층 설계로 gRPC와 독립적인 비즈니스 로직 구현
+"""
+
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Generator, Optional
+from dataclasses import dataclass, asdict
+import uuid
+import random
+
+# ============================================================================
+# 비즈니스 로직 레이어
+# ============================================================================
+
+
+class PaymentStatus(Enum):
+    """결제 상태"""
+    PENDING = "PENDING"
+    AUTHORIZED = "AUTHORIZED"
+    CAPTURED = "CAPTURED"
+    FAILED = "FAILED"
+    REFUNDED = "REFUNDED"
+
+
+class PaymentMethod(Enum):
+    """결제 수단"""
+    CREDIT_CARD = "CREDIT_CARD"
+    DEBIT_CARD = "DEBIT_CARD"
+    DIGITAL_WALLET = "DIGITAL_WALLET"
+    BANK_TRANSFER = "BANK_TRANSFER"
+
+
+@dataclass
+class PaymentRecord:
+    """결제 기록"""
+    payment_id: str
+    order_id: str
+    amount: float
+    currency: str
+    method: PaymentMethod
+    status: PaymentStatus
+    created_at: str = None
+    updated_at: str = None
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.utcnow().isoformat()
+        if self.updated_at is None:
+            self.updated_at = datetime.utcnow().isoformat()
+
+    def to_dict(self) -> Dict:
+        """딕셔너리 변환"""
+        data = asdict(self)
+        data["method"] = self.method.value
+        data["status"] = self.status.value
+        return data
+
+
+class PaymentBusinessLogic:
+    """
+    결제 비즈니스 로직
+
+    1. process_payment (Unary): 단일 결제 처리
+    2. validate_payment_stream (Server Streaming): 결제 검증 스트림
+    3. process_refunds (Client Streaming): 환불 배치 처리
+    4. monitor_payments_bidirectional (Bidirectional): 실시간 결제 모니터링
+    """
+
+    # 모의 결제 게이트웨이 설정
+    PROCESSING_FEE_RATE = 0.029  # 2.9%
+    SUCCESS_RATE = 0.95  # 95% 성공률
+    VALID_CARDS = {"4532", "5425", "3782"}  # BIN 프리픽스
+
+    def __init__(self):
+        """결제 저장소 초기화"""
+        self.payments: Dict[str, PaymentRecord] = {}
+        self.metrics = {
+            "total_processed": 0,
+            "total_authorized": 0,
+            "total_failed": 0,
+            "total_refunded": 0,
+            "total_amount": 0.0,
+        }
+
+    # ========================================================================
+    # 1. Unary RPC: process_payment
+    # ========================================================================
+
+    def process_payment(
+        self,
+        order_id: str,
+        amount: float,
+        currency: str,
+        method: str,
+        card_number: Optional[str] = None,
+    ) -> Dict:
+        """
+        결제 처리 (Unary RPC)
+
+        Args:
+            order_id: 주문 ID
+            amount: 금액
+            currency: 통화
+            method: 결제 수단
+            card_number: 카드 번호 (선택사항)
+
+        Returns:
+            결제 처리 결과
+        """
+        payment_id = f"PAY-{uuid.uuid4().hex[:8].upper()}"
+
+        try:
+            payment_method = PaymentMethod[method.upper()]
+        except KeyError:
+            return {
+                "success": False,
+                "error": f"지원하지 않는 결제 수단: {method}",
+            }
+
+        # 결제 검증
+        if method == "CREDIT_CARD":
+            if not card_number or not self._validate_card(card_number):
+                return {
+                    "success": False,
+                    "error": "카드 번호가 유효하지 않습니다",
+                }
+
+        # 결제 처리 시뮬레이션
+        success = random.random() < self.SUCCESS_RATE
+
+        if success:
+            fee = amount * self.PROCESSING_FEE_RATE
+            total_charge = amount + fee
+
+            payment = PaymentRecord(
+                payment_id=payment_id,
+                order_id=order_id,
+                amount=total_charge,
+                currency=currency,
+                method=payment_method,
+                status=PaymentStatus.CAPTURED,
+            )
+
+            self.payments[payment_id] = payment
+            self.metrics["total_processed"] += 1
+            self.metrics["total_authorized"] += 1
+            self.metrics["total_amount"] += total_charge
+
+            return {
+                "success": True,
+                "payment": payment.to_dict(),
+                "message": f"결제 {payment_id} 완료",
+                "fee": fee,
+                "total_charge": total_charge,
+            }
+        else:
+            self.metrics["total_processed"] += 1
+            self.metrics["total_failed"] += 1
+
+            return {
+                "success": False,
+                "error": "결제 게이트웨이에서 거부되었습니다",
+                "reason": random.choice(
+                    ["신용카드 한도 초과", "유효하지 않은 CVV", "거래 거부"]
+                ),
+            }
+
+    # ========================================================================
+    # 2. Server Streaming RPC: validate_payment_stream
+    # ========================================================================
+
+    def validate_payment_stream(
+        self,
+        payment_id: str,
+    ) -> Generator[Dict, None, None]:
+        """
+        결제 검증 스트림 (Server Streaming RPC)
+
+        여러 검증 단계를 순차적으로 스트림합니다.
+
+        Args:
+            payment_id: 결제 ID
+
+        Yields:
+            각 검증 단계의 결과
+        """
+        if payment_id not in self.payments:
+            yield {
+                "success": False,
+                "error": f"결제 {payment_id}을(를) 찾을 수 없습니다",
+            }
+            return
+
+        payment = self.payments[payment_id]
+
+        # 검증 단계들
+        validations = [
+            ("결제액 검증", payment.amount > 0),
+            ("통화 검증", payment.currency in ["USD", "EUR", "KRW"]),
+            ("결제 수단 검증", payment.method in PaymentMethod),
+            ("사기 탐지", random.random() < 0.99),  # 1% 사기 의심율
+            ("결제 게이트웨이 최종 확인", random.random() < 0.98),
+        ]
+
+        all_passed = True
+        for step_name, result in validations:
+            status = "✓ 통과" if result else "✗ 실패"
+            yield {
+                "success": result,
+                "step": step_name,
+                "status": status,
+                "payment_id": payment_id,
+            }
+
+            if not result:
+                all_passed = False
+                break
+
+        if all_passed:
+            payment.status = PaymentStatus.CAPTURED
+            yield {
+                "success": True,
+                "step": "최종 결과",
+                "status": "✓ 모든 검증 완료",
+                "payment": payment.to_dict(),
+            }
+
+    # ========================================================================
+    # 3. Client Streaming RPC: process_refunds
+    # ========================================================================
+
+    def process_refunds(
+        self,
+        refund_requests: List[Dict],
+    ) -> Dict:
+        """
+        환불 배치 처리 (Client Streaming RPC)
+
+        여러 환불 요청을 처리하고 최종 결과를 반환합니다.
+
+        Args:
+            refund_requests: 환불 요청 리스트
+
+        Returns:
+            배치 환불 결과
+        """
+        successful = []
+        failed = []
+
+        for req in refund_requests:
+            payment_id = req.get("payment_id")
+
+            if payment_id not in self.payments:
+                failed.append(
+                    {
+                        **req,
+                        "error": f"결제 {payment_id}을(를) 찾을 수 없습니다",
+                    }
+                )
+                continue
+
+            payment = self.payments[payment_id]
+
+            # 환불 가능 여부 확인
+            if payment.status not in [PaymentStatus.CAPTURED, PaymentStatus.AUTHORIZED]:
+                failed.append(
+                    {
+                        **req,
+                        "error": f"환불 불가 상태: {payment.status.value}",
+                    }
+                )
+                continue
+
+            # 환불 처리
+            refund_amount = req.get("amount", payment.amount)
+            if refund_amount > payment.amount:
+                failed.append(
+                    {
+                        **req,
+                        "error": f"환불액({refund_amount})이 원 금액({payment.amount})을 초과합니다",
+                    }
+                )
+                continue
+
+            # 환불 성공
+            payment.status = PaymentStatus.REFUNDED
+            payment.updated_at = datetime.utcnow().isoformat()
+            self.metrics["total_refunded"] += 1
+            self.metrics["total_amount"] -= refund_amount
+
+            successful.append(
+                {
+                    "payment_id": payment_id,
+                    "refund_amount": refund_amount,
+                    "status": "성공",
+                    "timestamp": payment.updated_at,
+                }
+            )
+
+        return {
+            "success": len(failed) == 0,
+            "total_received": len(refund_requests),
+            "total_successful": len(successful),
+            "total_failed": len(failed),
+            "successful_refunds": successful,
+            "failed_refunds": failed if failed else None,
+            "message": f"환불 처리 완료: {len(successful)}/{len(refund_requests)}",
+        }
+
+    # ========================================================================
+    # 4. Bidirectional Streaming RPC: monitor_payments_bidirectional
+    # ========================================================================
+
+    def monitor_payments_bidirectional(
+        self,
+        monitor_requests: List[Dict],
+    ) -> Generator[Dict, None, None]:
+        """
+        실시간 결제 모니터링 (Bidirectional Streaming RPC)
+
+        클라이언트의 모니터링 요청에 대해 실시간 상태를 전송합니다.
+
+        Args:
+            monitor_requests: 모니터링 요청 리스트
+
+        Yields:
+            각 결제의 실시간 상태
+        """
+        for i, request in enumerate(monitor_requests, 1):
+            payment_id = request.get("payment_id")
+
+            if payment_id not in self.payments:
+                yield {
+                    "success": False,
+                    "sequence": i,
+                    "error": f"결제 {payment_id}을(를) 찾을 수 없습니다",
+                }
+                continue
+
+            payment = self.payments[payment_id]
+
+            # 상태 업데이트 시뮬레이션
+            statuses = [
+                PaymentStatus.PENDING,
+                PaymentStatus.AUTHORIZED,
+                PaymentStatus.CAPTURED,
+            ]
+
+            for status in statuses:
+                payment.status = status
+                yield {
+                    "success": True,
+                    "sequence": i,
+                    "payment_id": payment_id,
+                    "status": status.value,
+                    "amount": payment.amount,
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+
+    # ========================================================================
+    # 유틸리티
+    # ========================================================================
+
+    def _validate_card(self, card_number: str) -> bool:
+        """신용카드 번호 검증 (Luhn 알고리즘)"""
+        if not card_number or len(card_number) < 13:
+            return False
+
+        # 간단한 BIN 검증
+        bin_prefix = card_number[:4]
+        if not any(bin_prefix.startswith(prefix) for prefix in self.VALID_CARDS):
+            return False
+
+        # Luhn 알고리즘
+        total = 0
+        for i, digit in enumerate(reversed(card_number)):
+            n = int(digit)
+            if i % 2 == 1:
+                n *= 2
+                if n > 9:
+                    n -= 9
+            total += n
+        return total % 10 == 0
+
+    def get_payment(self, payment_id: str) -> Optional[Dict]:
+        """결제 조회"""
+        if payment_id in self.payments:
+            return self.payments[payment_id].to_dict()
+        return None
+
+    def get_payments_by_order(self, order_id: str) -> List[Dict]:
+        """주문별 결제 내역 조회"""
+        return [
+            payment.to_dict()
+            for payment in self.payments.values()
+            if payment.order_id == order_id
+        ]
+
+    def get_metrics(self) -> Dict:
+        """메트릭 조회"""
+        return {
+            **self.metrics,
+            "avg_transaction": (
+                self.metrics["total_amount"] / self.metrics["total_processed"]
+                if self.metrics["total_processed"] > 0
+                else 0.0
+            ),
+        }
+
+
+# ============================================================================
+# gRPC 서비스 레이어 (선택적)
+# ============================================================================
+
+try:
+    import grpc
+    from ..generated import payment_pb2, payment_pb2_grpc
+
+    GRPC_AVAILABLE = True
+
+    class PaymentServicer(payment_pb2_grpc.PaymentServiceServicer):
+        """gRPC PaymentService 구현"""
+
+        def __init__(
+            self, business_logic: Optional[PaymentBusinessLogic] = None
+        ):
+            self.logic = business_logic or PaymentBusinessLogic()
+
+        def ProcessPayment(self, request, context):
+            """Unary RPC"""
+            try:
+                result = self.logic.process_payment(
+                    order_id=request.order_id,
+                    amount=request.amount,
+                    currency=request.currency,
+                    method=request.method,
+                    card_number=request.card_number if request.card_number else None,
+                )
+
+                if result["success"]:
+                    return payment_pb2.ProcessPaymentResponse(
+                        success=True,
+                        payment_id=result["payment"]["payment_id"],
+                        total_charge=result["total_charge"],
+                        message=result["message"],
+                    )
+                else:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, result["error"])
+
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def ValidatePaymentStream(self, request, context):
+            """Server Streaming RPC"""
+            try:
+                for validation in self.logic.validate_payment_stream(
+                    payment_id=request.payment_id
+                ):
+                    yield payment_pb2.ValidatePaymentResponse(
+                        success=validation["success"],
+                        step=validation.get("step", ""),
+                        status=validation.get("status", ""),
+                        message=validation.get("error", ""),
+                    )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def ProcessRefunds(self, request_iterator, context):
+            """Client Streaming RPC"""
+            try:
+                refund_requests = [
+                    {
+                        "payment_id": req.payment_id,
+                        "amount": req.amount,
+                    }
+                    for req in request_iterator
+                ]
+
+                result = self.logic.process_refunds(refund_requests)
+
+                return payment_pb2.ProcessRefundsResponse(
+                    success=result["success"],
+                    total_received=result["total_received"],
+                    total_successful=result["total_successful"],
+                    total_failed=result["total_failed"],
+                    message=result["message"],
+                )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def MonitorPaymentsBidirectional(self, request_iterator, context):
+            """Bidirectional Streaming RPC"""
+            try:
+                requests = list(request_iterator)
+                for response in self.logic.monitor_payments_bidirectional(
+                    [{"payment_id": req.payment_id} for req in requests]
+                ):
+                    yield payment_pb2.MonitorPaymentsResponse(
+                        success=response["success"],
+                        payment_id=response.get("payment_id", ""),
+                        status=response.get("status", ""),
+                        amount=response.get("amount", 0.0),
+                        message=response.get("error", ""),
+                    )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+except ImportError:
+    GRPC_AVAILABLE = False
+
+    class PaymentServicer:
+        """그루핑을 위한 더미 클래스"""
+
+        def __init__(
+            self, business_logic: Optional[PaymentBusinessLogic] = None
+        ):
+            self.logic = business_logic or PaymentBusinessLogic()

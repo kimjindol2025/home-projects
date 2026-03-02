@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""
+태스크 그래프 (Task Graph)
+
+MLIR IR을 DAG(Directed Acyclic Graph)로 변환하여
+연산 간 의존성을 명시적으로 표현
+"""
+
+from dataclasses import dataclass, field
+from typing import List, Dict, Set, Optional, Tuple
+from enum import Enum
+import json
+
+
+class TaskType(Enum):
+    """작업 종류"""
+    COMPUTE = "compute"
+    COMMUNICATE = "communicate"
+    SYNCHRONIZE = "synchronize"
+    MEMORY = "memory"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class TaskNode:
+    """그래프의 개별 노드 (작업)"""
+    task_id: str
+    task_type: TaskType
+
+    # 작업 명세
+    operation_name: str
+    work_size_flops: Optional[float] = None
+    data_size_bytes: Optional[float] = None
+
+    # 스케줄링 정보
+    target_device: Optional[str] = None  # 목표 장치 그룹
+
+    # 비용
+    estimated_time_ms: float = 0.0
+
+    # 입출력
+    input_tensors: List[str] = field(default_factory=list)
+    output_tensors: List[str] = field(default_factory=list)
+
+    def __hash__(self):
+        return hash(self.task_id)
+
+
+@dataclass
+class TaskDependency:
+    """작업 간 의존성"""
+    source_task_id: str
+    target_task_id: str
+
+    # 의존성 종류
+    dependency_type: str  # "data", "control", "barrier"
+
+    # 데이터 전송 정보
+    data_name: Optional[str] = None
+    data_size_bytes: float = 0.0
+
+
+class TaskGraph:
+    """연산 그래프를 태스크 DAG로 표현"""
+
+    def __init__(self):
+        self.tasks: Dict[str, TaskNode] = {}
+        self.dependencies: List[TaskDependency] = []
+        self.task_counter = 0
+
+    def add_task(self,
+                 task_type: TaskType,
+                 operation_name: str,
+                 work_size_flops: Optional[float] = None,
+                 data_size_bytes: Optional[float] = None,
+                 target_device: Optional[str] = None) -> str:
+        """작업 추가"""
+
+        task_id = f"task_{self.task_counter}"
+        self.task_counter += 1
+
+        task = TaskNode(
+            task_id=task_id,
+            task_type=task_type,
+            operation_name=operation_name,
+            work_size_flops=work_size_flops,
+            data_size_bytes=data_size_bytes,
+            target_device=target_device
+        )
+
+        self.tasks[task_id] = task
+        return task_id
+
+    def add_dependency(self,
+                      source_task_id: str,
+                      target_task_id: str,
+                      dependency_type: str = "data",
+                      data_name: Optional[str] = None,
+                      data_size_bytes: float = 0.0) -> None:
+        """의존성 추가"""
+
+        dep = TaskDependency(
+            source_task_id=source_task_id,
+            target_task_id=target_task_id,
+            dependency_type=dependency_type,
+            data_name=data_name,
+            data_size_bytes=data_size_bytes
+        )
+
+        self.dependencies.append(dep)
+
+    def get_predecessors(self, task_id: str) -> List[str]:
+        """선행 작업 조회"""
+        return [dep.source_task_id for dep in self.dependencies
+                if dep.target_task_id == task_id]
+
+    def get_successors(self, task_id: str) -> List[str]:
+        """후행 작업 조회"""
+        return [dep.target_task_id for dep in self.dependencies
+                if dep.source_task_id == task_id]
+
+    def topological_sort(self) -> List[str]:
+        """위상 정렬 - 작업 실행 순서 결정"""
+
+        # Kahn's algorithm
+        in_degree = {tid: 0 for tid in self.tasks.keys()}
+
+        for dep in self.dependencies:
+            in_degree[dep.target_task_id] += 1
+
+        # 진입 차수가 0인 노드부터 시작
+        queue = [tid for tid in self.tasks.keys() if in_degree[tid] == 0]
+        sorted_tasks = []
+
+        while queue:
+            current = queue.pop(0)
+            sorted_tasks.append(current)
+
+            # 현재 노드의 후행 노드 처리
+            for successor in self.get_successors(current):
+                in_degree[successor] -= 1
+                if in_degree[successor] == 0:
+                    queue.append(successor)
+
+        if len(sorted_tasks) != len(self.tasks):
+            raise ValueError("Cycle detected in task graph!")
+
+        return sorted_tasks
+
+    def find_critical_path(self) -> Tuple[float, List[str]]:
+        """임계 경로 찾기 (최장 경로)"""
+
+        # 위상 정렬
+        sorted_tasks = self.topological_sort()
+
+        # 최장 경로 계산
+        longest_path = {tid: 0.0 for tid in self.tasks.keys()}
+        parent = {tid: None for tid in self.tasks.keys()}
+
+        for task_id in sorted_tasks:
+            for successor in self.get_successors(task_id):
+                new_length = longest_path[task_id] + self.tasks[successor].estimated_time_ms
+
+                if new_length > longest_path[successor]:
+                    longest_path[successor] = new_length
+                    parent[successor] = task_id
+
+        # 최대 경로 길이 찾기
+        max_length = max(longest_path.values())
+        end_task = [tid for tid, length in longest_path.items()
+                   if length == max_length][0]
+
+        # 경로 복원
+        path = []
+        current = end_task
+        while current is not None:
+            path.append(current)
+            current = parent[current]
+        path.reverse()
+
+        return max_length, path
+
+    def identify_parallelizable_tasks(self) -> List[List[str]]:
+        """병렬화 가능한 작업 찾기"""
+
+        # 같은 레벨의 작업들은 병렬 실행 가능
+        levels = {}
+        in_degree = {tid: 0 for tid in self.tasks.keys()}
+
+        for dep in self.dependencies:
+            in_degree[dep.target_task_id] += 1
+
+        # BFS로 레벨 할당
+        level = 0
+        queue = [tid for tid in self.tasks.keys() if in_degree[tid] == 0]
+        levels[0] = queue
+
+        processed = set(queue)
+
+        while True:
+            next_queue = []
+            for task_id in queue:
+                for successor in self.get_successors(task_id):
+                    if successor not in processed:
+                        next_queue.append(successor)
+                        processed.add(successor)
+
+            if not next_queue:
+                break
+
+            level += 1
+            levels[level] = next_queue
+            queue = next_queue
+
+        # 결과 반환
+        return [levels[l] for l in sorted(levels.keys())]
+
+    def estimate_makespan(self, task_times: Dict[str, float]) -> float:
+        """전체 실행 시간 추정 (Makespan)"""
+
+        # 각 작업의 시간 업데이트
+        for task_id, time_ms in task_times.items():
+            if task_id in self.tasks:
+                self.tasks[task_id].estimated_time_ms = time_ms
+
+        critical_path_length, _ = self.find_critical_path()
+        return critical_path_length
+
+    def bottleneck_analysis(self) -> Dict:
+        """병목 분석"""
+
+        sorted_tasks = self.topological_sort()
+        task_depth = {tid: 0.0 for tid in self.tasks.keys()}
+
+        # Forward pass: 각 작업의 깊이 계산
+        for task_id in sorted_tasks:
+            current_depth = self.tasks[task_id].estimated_time_ms
+
+            for pred in self.get_predecessors(task_id):
+                current_depth = max(current_depth,
+                                   task_depth[pred] + self.tasks[task_id].estimated_time_ms)
+
+            task_depth[task_id] = current_depth
+
+        # 병목 작업 식별
+        max_depth = max(task_depth.values())
+        bottleneck_tasks = [tid for tid, depth in task_depth.items()
+                           if depth >= max_depth * 0.95]  # 상위 5%
+
+        return {
+            "total_makespan_ms": max_depth,
+            "num_bottleneck_tasks": len(bottleneck_tasks),
+            "bottleneck_tasks": bottleneck_tasks,
+            "parallelizable_groups": self.identify_parallelizable_tasks()
+        }
+
+    def export_to_json(self) -> str:
+        """그래프를 JSON으로 내보내기"""
+
+        data = {
+            "num_tasks": len(self.tasks),
+            "num_dependencies": len(self.dependencies),
+            "tasks": [
+                {
+                    "task_id": tid,
+                    "type": task.task_type.value,
+                    "operation": task.operation_name,
+                    "work_size_flops": task.work_size_flops,
+                    "estimated_time_ms": task.estimated_time_ms,
+                    "predecessors": self.get_predecessors(tid),
+                    "successors": self.get_successors(tid)
+                }
+                for tid, task in self.tasks.items()
+            ],
+            "critical_path": {
+                "length_ms": self.find_critical_path()[0],
+                "path": self.find_critical_path()[1]
+            }
+        }
+
+        return json.dumps(data, indent=2)
+
+    def visualize_dag(self) -> str:
+        """DAG 시각화 (텍스트)"""
+
+        sorted_tasks = self.topological_sort()
+        visualization = "\n=== Task Graph DAG ===\n"
+
+        levels = {}
+        visited = set()
+
+        for level, tasks in enumerate(self.identify_parallelizable_tasks()):
+            visualization += f"\nLevel {level}:\n"
+            for task_id in tasks:
+                task = self.tasks[task_id]
+                visualization += f"  [{task_id}] {task.operation_name} "
+                visualization += f"({task.estimated_time_ms:.1f}ms)\n"
+
+        return visualization
+

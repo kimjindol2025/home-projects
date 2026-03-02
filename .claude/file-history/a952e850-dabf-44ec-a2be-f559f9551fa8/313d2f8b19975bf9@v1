@@ -1,0 +1,198 @@
+/**
+ * FreeLang v5 Blockchain — Block
+ *
+ * 구조:
+ *   BlockHeader: index / previousHash / merkleRoot / timestamp / difficulty / nonce
+ *   Block:       header + hash + transactions + coinbase + miner
+ *
+ * Proof-of-Work:
+ *   difficulty = N → 해시 앞 N자리가 "0"이어야 함
+ *   mineBlock(template, difficulty) → MineResult
+ *
+ * 유효성:
+ *   validateBlock(block, prevBlock) → errors[]
+ *   calcBlockHash(header)           → hex
+ */
+
+import { sha256d } from "./crypto-utils";
+import { MerkleTree } from "./merkle-tree";
+import { Block, BlockHeader, Transaction, CoinbaseTx, MineResult } from "./types";
+
+// ============================================================
+// 해시 계산
+// ============================================================
+
+export function calcBlockHash(header: BlockHeader): string {
+  const data = JSON.stringify({
+    index:        header.index,
+    previousHash: header.previousHash,
+    merkleRoot:   header.merkleRoot,
+    timestamp:    header.timestamp,
+    difficulty:   header.difficulty,
+    nonce:        header.nonce,
+  });
+  return sha256d(data);
+}
+
+// ============================================================
+// Merkle Root 계산
+// ============================================================
+
+export function calcMerkleRoot(
+  transactions: Transaction[],
+  coinbase:     CoinbaseTx | null
+): string {
+  const ids: string[] = [];
+  if (coinbase) ids.push(coinbase.id);
+  ids.push(...transactions.map((tx) => tx.id));
+  return MerkleTree.buildRoot(ids);
+}
+
+// ============================================================
+// 제네시스 블록
+// ============================================================
+
+export function createGenesisBlock(miner = "genesis"): Block {
+  const header: BlockHeader = {
+    index:        0,
+    previousHash: "0".repeat(64),
+    merkleRoot:   "0".repeat(64),
+    timestamp:    0,
+    difficulty:   1,
+    nonce:        0,
+  };
+
+  const hash = calcBlockHash(header);
+
+  return {
+    header,
+    hash,
+    transactions: [],
+    coinbase:     null,
+    miner,
+  };
+}
+
+// ============================================================
+// Proof-of-Work 채굴
+// ============================================================
+
+export function mineBlock(
+  index:        number,
+  previousHash: string,
+  transactions: Transaction[],
+  coinbase:     CoinbaseTx | null,
+  miner:        string,
+  difficulty:   number,
+  maxAttempts   = 10_000_000
+): MineResult {
+  const target     = "0".repeat(difficulty);
+  const merkleRoot = calcMerkleRoot(transactions, coinbase);
+  const timestamp  = Date.now();
+  const startTime  = Date.now();
+
+  let nonce    = 0;
+  let hash     = "";
+  let attempts = 0;
+
+  const baseHeader: Omit<BlockHeader, "nonce"> = {
+    index,
+    previousHash,
+    merkleRoot,
+    timestamp,
+    difficulty,
+  };
+
+  while (attempts < maxAttempts) {
+    const header: BlockHeader = { ...baseHeader, nonce };
+    hash = calcBlockHash(header);
+    attempts++;
+
+    if (hash.startsWith(target)) {
+      const timeMs   = Date.now() - startTime || 1;
+      const hashRate = Math.round((attempts / timeMs) * 1000);
+
+      const block: Block = {
+        header: { ...baseHeader, nonce },
+        hash,
+        transactions,
+        coinbase,
+        miner,
+      };
+
+      return { block, nonce, attempts, timeMs, hashRate };
+    }
+
+    nonce++;
+  }
+
+  // maxAttempts 초과 → 마지막 해시로 반환 (테스트용 폴백)
+  const header: BlockHeader = { ...baseHeader, nonce };
+  hash = calcBlockHash(header);
+  const timeMs   = Date.now() - startTime || 1;
+  const hashRate = Math.round((attempts / timeMs) * 1000);
+
+  const block: Block = {
+    header: { ...baseHeader, nonce },
+    hash,
+    transactions,
+    coinbase,
+    miner,
+  };
+
+  return { block, nonce, attempts, timeMs, hashRate };
+}
+
+// ============================================================
+// 블록 유효성 검증
+// ============================================================
+
+export interface BlockValidationResult {
+  valid:  boolean;
+  errors: string[];
+}
+
+export function validateBlock(
+  block:     Block,
+  prevBlock: Block | null,
+  difficulty: number
+): BlockValidationResult {
+  const errors: string[] = [];
+
+  // 1. 해시 재계산
+  const expectedHash = calcBlockHash(block.header);
+  if (expectedHash !== block.hash) {
+    errors.push(`해시 불일치: ${block.hash.slice(0, 8)}... ≠ ${expectedHash.slice(0, 8)}...`);
+  }
+
+  // 2. PoW 검증
+  const target = "0".repeat(difficulty);
+  if (!block.hash.startsWith(target)) {
+    errors.push(`PoW 미충족: difficulty=${difficulty}`);
+  }
+
+  // 3. 이전 블록 연결
+  if (prevBlock) {
+    if (block.header.previousHash !== prevBlock.hash) {
+      errors.push("previousHash 불일치");
+    }
+    if (block.header.index !== prevBlock.header.index + 1) {
+      errors.push(`index 불연속: ${block.header.index} vs ${prevBlock.header.index + 1}`);
+    }
+  } else if (block.header.index !== 0) {
+    errors.push("제네시스 블록만 prevBlock 없이 가능");
+  }
+
+  // 4. Merkle Root 검증
+  const expectedRoot = calcMerkleRoot(block.transactions, block.coinbase);
+  if (expectedRoot !== block.header.merkleRoot) {
+    errors.push("Merkle Root 불일치");
+  }
+
+  // 5. 타임스탬프 기본 검증 (미래 2분 이내)
+  if (block.header.timestamp > Date.now() + 120_000) {
+    errors.push("블록 타임스탬프가 너무 미래임");
+  }
+
+  return { valid: errors.length === 0, errors };
+}

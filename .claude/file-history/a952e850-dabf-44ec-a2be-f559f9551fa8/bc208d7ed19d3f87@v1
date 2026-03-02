@@ -1,0 +1,528 @@
+/**
+ * FreeLang v5 Blockchain — 통합 테스트
+ *
+ * T01~T06: CryptoUtils
+ * T07~T12: MerkleTree
+ * T13~T18: Transaction
+ * T19~T26: Block / PoW
+ * T27~T36: Blockchain
+ * T37~T42: Wallet
+ * T43~T48: Mempool
+ */
+
+import {
+  sha256, sha256d, hash160, ripemd160,
+  genKeyPair, deriveAddress, createSignature, verifySignature,
+  combineHash,
+} from "../src/crypto-utils";
+
+import { MerkleTree } from "../src/merkle-tree";
+
+import {
+  TransactionBuilder, createCoinbaseTx, validateTx, serializeTx,
+} from "../src/transaction";
+
+import {
+  calcBlockHash, createGenesisBlock, mineBlock, validateBlock, calcMerkleRoot,
+} from "../src/block";
+
+import { Blockchain } from "../src/blockchain";
+import { Wallet, MultiSigWallet } from "../src/wallet";
+import { Mempool } from "../src/mempool";
+import { Transaction } from "../src/types";
+
+// ============================================================
+// 헬퍼
+// ============================================================
+
+function makeWallet() {
+  return Wallet.create();
+}
+
+function makeFundedChain(wallet: Wallet, amount = 100): Blockchain {
+  const chain   = new Blockchain();
+  const genesis = chain.getBlock(0)!;
+
+  // 코인베이스로 wallet에 자금 지급
+  const coinbase = createCoinbaseTx(wallet.address, amount, 1);
+  const result   = mineBlock(1, genesis.hash, [], coinbase, wallet.address, 1, 100_000);
+  chain.addBlockForce(result.block);
+  return chain;
+}
+
+// ============================================================
+// T01~T06: CryptoUtils
+// ============================================================
+
+describe("CryptoUtils", () => {
+  test("T01: sha256 — 결정론적 64자 hex", () => {
+    const h1 = sha256("hello");
+    const h2 = sha256("hello");
+    expect(h1).toBe(h2);
+    expect(h1).toHaveLength(64);
+    expect(/^[0-9a-f]{64}$/.test(h1)).toBe(true);
+  });
+
+  test("T02: sha256d — 이중 해시, sha256 결과와 다름", () => {
+    const single = sha256("test");
+    const double = sha256d("test");
+    expect(double).toHaveLength(64);
+    expect(double).not.toBe(single);
+  });
+
+  test("T03: hash160 — 40자 hex (160비트)", () => {
+    const h = hash160("pubkey");
+    expect(h).toHaveLength(40);
+    expect(/^[0-9a-f]+$/.test(h)).toBe(true);
+  });
+
+  test("T04: ripemd160 — 40자 hex", () => {
+    const h = ripemd160("data");
+    expect(h).toHaveLength(40);
+  });
+
+  test("T05: genKeyPair — privateKey 64자, publicKey 64자", () => {
+    const { privateKey, publicKey } = genKeyPair();
+    expect(privateKey).toHaveLength(64);
+    expect(publicKey).toHaveLength(64);
+    // 두 번 생성 시 다른 키
+    const { privateKey: pk2 } = genKeyPair();
+    expect(pk2).not.toBe(privateKey);
+  });
+
+  test("T06: createSignature + verifySignature — 서명 검증", () => {
+    const { privateKey, publicKey } = genKeyPair();
+    const message   = "transfer:100:alice:bob";
+    const signature = createSignature(privateKey, publicKey, message);
+    expect(signature).toHaveLength(64);
+    expect(verifySignature(publicKey, message, signature)).toBe(true);
+    // 변조된 메시지는 검증 실패
+    expect(verifySignature(publicKey, message + "x", signature)).toBe(false);
+  });
+});
+
+// ============================================================
+// T07~T12: MerkleTree
+// ============================================================
+
+describe("MerkleTree", () => {
+  test("T07: buildRoot — 빈 목록은 0x64자", () => {
+    const root = MerkleTree.buildRoot([]);
+    expect(root).toHaveLength(64);
+    expect(root).toBe("0".repeat(64));
+  });
+
+  test("T08: buildRoot — 단일 항목", () => {
+    const root = MerkleTree.buildRoot(["tx1"]);
+    expect(root).toHaveLength(64);
+  });
+
+  test("T09: buildRoot — 같은 입력은 같은 루트", () => {
+    const txs  = ["tx1", "tx2", "tx3", "tx4"];
+    const r1   = MerkleTree.buildRoot(txs);
+    const r2   = MerkleTree.buildRoot(txs);
+    expect(r1).toBe(r2);
+  });
+
+  test("T10: buildRoot — 순서가 다르면 루트 다름", () => {
+    const r1 = MerkleTree.buildRoot(["tx1", "tx2"]);
+    const r2 = MerkleTree.buildRoot(["tx2", "tx1"]);
+    expect(r1).not.toBe(r2);
+  });
+
+  test("T11: getProof + verifyProof — Proof 검증 성공", () => {
+    const txs   = ["alpha", "beta", "gamma", "delta"];
+    const proof  = MerkleTree.getProof(txs, 2)!;
+    expect(proof).not.toBeNull();
+    expect(MerkleTree.verifyProof(proof)).toBe(true);
+  });
+
+  test("T12: buildTree — 레벨 수 검증 (4개 = 3레벨)", () => {
+    const txs   = ["a", "b", "c", "d"];
+    const tree  = MerkleTree.buildTree(txs);
+    // 리프(1), 중간(2), 루트(3) = 3레벨
+    expect(tree.length).toBe(3);
+    expect(tree[tree.length - 1]).toHaveLength(1); // 루트는 1개
+  });
+});
+
+// ============================================================
+// T13~T18: Transaction
+// ============================================================
+
+describe("Transaction", () => {
+  let wallet: Wallet;
+  let receiver: Wallet;
+
+  beforeEach(() => {
+    wallet   = makeWallet();
+    receiver = makeWallet();
+  });
+
+  test("T13: TransactionBuilder — 서명된 트랜잭션 생성", () => {
+    const tx = new TransactionBuilder()
+      .setFrom(wallet.address)
+      .setTo(receiver.address)
+      .setAmount(10)
+      .setFee(1)
+      .setNonce(0)
+      .sign((wallet as any).keyPair.privateKey, wallet.publicKey);
+
+    expect(tx.id).toHaveLength(64);
+    expect(tx.from).toBe(wallet.address);
+    expect(tx.to).toBe(receiver.address);
+    expect(tx.amount).toBe(10);
+    expect(tx.fee).toBe(1);
+    expect(tx.signature).toHaveLength(64);
+  });
+
+  test("T14: TransactionBuilder — amount=0 예외", () => {
+    expect(() =>
+      new TransactionBuilder()
+        .setFrom(wallet.address)
+        .setTo(receiver.address)
+        .setAmount(0)
+        .setFee(1)
+        .sign((wallet as any).keyPair.privateKey, wallet.publicKey)
+    ).toThrow("amount > 0");
+  });
+
+  test("T15: createCoinbaseTx — 코인베이스 생성", () => {
+    const cb = createCoinbaseTx(wallet.address, 50, 1);
+    expect(cb.to).toBe(wallet.address);
+    expect(cb.amount).toBe(50);
+    expect(cb.height).toBe(1);
+    expect(cb.id).toHaveLength(64);
+  });
+
+  test("T16: validateTx — 유효한 트랜잭션 검증 성공", () => {
+    const tx     = wallet.send(receiver.address, 5, 1, 0);
+    const result = validateTx(tx, wallet.publicKey);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
+  });
+
+  test("T17: validateTx — 자기 자신에게 전송 실패", () => {
+    const tx = wallet.send(wallet.address, 5, 1, 0);
+    // from === to 이므로 에러
+    const result = validateTx(tx, wallet.publicKey);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("self-transfer"))).toBe(true);
+  });
+
+  test("T18: serializeTx — 결정론적 직렬화", () => {
+    const tx  = wallet.send(receiver.address, 10, 1, 0);
+    const s1  = serializeTx(tx);
+    const s2  = serializeTx(tx);
+    expect(s1).toBe(s2);
+    expect(typeof s1).toBe("string");
+  });
+});
+
+// ============================================================
+// T19~T26: Block / PoW
+// ============================================================
+
+describe("Block / PoW", () => {
+  test("T19: createGenesisBlock — index=0, previousHash=0x64", () => {
+    const genesis = createGenesisBlock();
+    expect(genesis.header.index).toBe(0);
+    expect(genesis.header.previousHash).toBe("0".repeat(64));
+    expect(genesis.hash).toHaveLength(64);
+  });
+
+  test("T20: calcBlockHash — 결정론적", () => {
+    const genesis = createGenesisBlock();
+    const h1      = calcBlockHash(genesis.header);
+    const h2      = calcBlockHash(genesis.header);
+    expect(h1).toBe(h2);
+    expect(h1).toBe(genesis.hash);
+  });
+
+  test("T21: mineBlock — difficulty=1, 해시 앞 1자리 '0'", () => {
+    const genesis = createGenesisBlock();
+    const result  = mineBlock(1, genesis.hash, [], null, "miner", 1, 1_000_000);
+    expect(result.block.hash.startsWith("0")).toBe(true);
+    expect(result.attempts).toBeGreaterThan(0);
+    expect(result.nonce).toBeGreaterThanOrEqual(0);
+  });
+
+  test("T22: mineBlock — 채굴 결과 타임 및 hashRate 존재", () => {
+    const genesis = createGenesisBlock();
+    const result  = mineBlock(1, genesis.hash, [], null, "miner1", 1, 500_000);
+    expect(result.timeMs).toBeGreaterThanOrEqual(0);
+    expect(result.hashRate).toBeGreaterThanOrEqual(0);
+  });
+
+  test("T23: validateBlock — 유효한 블록 검증 통과", () => {
+    const genesis = createGenesisBlock();
+    const result  = mineBlock(1, genesis.hash, [], null, "miner", 1, 1_000_000);
+    const valid   = validateBlock(result.block, genesis, 1);
+    expect(valid.valid).toBe(true);
+    expect(valid.errors).toHaveLength(0);
+  });
+
+  test("T24: validateBlock — 해시 변조 감지", () => {
+    const genesis    = createGenesisBlock();
+    const { block }  = mineBlock(1, genesis.hash, [], null, "miner", 1, 1_000_000);
+    const tampered   = { ...block, hash: "a".repeat(64) };
+    const valid      = validateBlock(tampered, genesis, 1);
+    expect(valid.valid).toBe(false);
+    expect(valid.errors.length).toBeGreaterThan(0);
+  });
+
+  test("T25: mineBlock — 코인베이스 포함 Merkle Root 검증", () => {
+    const genesis  = createGenesisBlock();
+    const coinbase = createCoinbaseTx("miner", 50, 1);
+    const result   = mineBlock(1, genesis.hash, [], coinbase, "miner", 1, 1_000_000);
+    const valid    = validateBlock(result.block, genesis, 1);
+    expect(valid.valid).toBe(true);
+  });
+
+  test("T26: validateBlock — previousHash 불일치 감지", () => {
+    const genesis = createGenesisBlock();
+    const result  = mineBlock(1, "x".repeat(64), [], null, "miner", 1, 1_000_000);
+    const valid   = validateBlock(result.block, genesis, 1);
+    // previousHash가 genesis.hash와 다르므로 실패
+    expect(valid.valid).toBe(false);
+  });
+});
+
+// ============================================================
+// T27~T36: Blockchain
+// ============================================================
+
+describe("Blockchain", () => {
+  test("T27: 생성 직후 height=0 (제네시스만)", () => {
+    const chain = new Blockchain();
+    expect(chain.getHeight()).toBe(0);
+    expect(chain.getBlock(0)).toBeDefined();
+  });
+
+  test("T28: addBlock — 유효한 블록 추가 성공", () => {
+    const chain   = new Blockchain();
+    const genesis = chain.getLatestBlock();
+    const result  = mineBlock(1, genesis.hash, [], null, "miner", 1, 1_000_000);
+    const { ok }  = chain.addBlock(result.block);
+    expect(ok).toBe(true);
+    expect(chain.getHeight()).toBe(1);
+  });
+
+  test("T29: addBlock — 잘못된 블록 추가 실패", () => {
+    const chain  = new Blockchain();
+    const genesis = chain.getBlock(0)!;
+    // previousHash를 0으로 지정해 잘못된 블록 생성
+    const bad = mineBlock(1, "0".repeat(64), [], null, "miner", 1, 100_000);
+    // 실제 previousHash는 genesis.hash이므로 검증 실패 가능
+    // (해시가 맞을 수도 있으므로 prevBlock hash 불일치로 확인)
+    if (bad.block.header.previousHash !== genesis.hash) {
+      const { ok } = chain.addBlock(bad.block);
+      expect(ok).toBe(false);
+    } else {
+      // 우연히 맞을 경우 skip
+      expect(true).toBe(true);
+    }
+  });
+
+  test("T30: getBalance — 코인베이스로 잔고 부여", () => {
+    const wallet = makeWallet();
+    const chain  = makeFundedChain(wallet, 100);
+    expect(chain.getBalance(wallet.address)).toBe(100);
+  });
+
+  test("T31: getBalance — 전송 후 잔고 변화", () => {
+    const alice = makeWallet();
+    const bob   = makeWallet();
+    const chain = makeFundedChain(alice, 100);
+
+    const tx      = alice.send(bob.address, 30, 1, 0);
+    const genesis2 = chain.getLatestBlock();
+    const cb       = createCoinbaseTx("miner", 50, 2);
+    const result   = mineBlock(2, genesis2.hash, [tx], cb, "miner", 1, 1_000_000);
+    chain.addBlockForce(result.block);
+
+    // alice: 100 - 30 - 1(fee) + 거스름돈 = 69
+    expect(chain.getBalance(alice.address)).toBe(69);
+    expect(chain.getBalance(bob.address)).toBe(30);
+  });
+
+  test("T32: getTxHistory — 트랜잭션 내역 조회", () => {
+    const alice = makeWallet();
+    const bob   = makeWallet();
+    const chain = makeFundedChain(alice, 100);
+
+    const tx     = alice.send(bob.address, 20, 1, 0);
+    const prev   = chain.getLatestBlock();
+    const result = mineBlock(2, prev.hash, [tx], null, "miner", 1, 1_000_000);
+    chain.addBlockForce(result.block);
+
+    const history = chain.getTxHistory(alice.address);
+    expect(history.length).toBeGreaterThan(0);
+    expect(history.some((t) => t.id === tx.id)).toBe(true);
+  });
+
+  test("T33: isValid — 정상 체인 유효", () => {
+    const chain = new Blockchain();
+    expect(chain.isValid()).toBe(true);
+  });
+
+  test("T34: getStats — 통계 반환", () => {
+    const wallet = makeWallet();
+    const chain  = makeFundedChain(wallet, 50);
+    const stats  = chain.getStats();
+    expect(stats.height).toBe(1);
+    expect(stats.totalCoins).toBe(50);
+  });
+
+  test("T35: getUtxos — UTXO 목록 반환", () => {
+    const wallet = makeWallet();
+    const chain  = makeFundedChain(wallet, 100);
+    const utxos  = chain.getUtxos(wallet.address);
+    expect(utxos.length).toBeGreaterThan(0);
+    expect(utxos[0].address).toBe(wallet.address);
+  });
+
+  test("T36: fork — 특정 높이에서 포크", () => {
+    const chain = new Blockchain();
+    const g     = chain.getLatestBlock();
+    const r1    = mineBlock(1, g.hash, [], null, "miner", 1, 1_000_000);
+    chain.addBlockForce(r1.block);
+    const r2 = mineBlock(2, r1.block.hash, [], null, "miner", 1, 1_000_000);
+    chain.addBlockForce(r2.block);
+
+    const forked = chain.fork(1);
+    expect(forked.getHeight()).toBe(1);
+  });
+});
+
+// ============================================================
+// T37~T42: Wallet
+// ============================================================
+
+describe("Wallet", () => {
+  test("T37: Wallet.create — 유효한 주소/공개키 생성", () => {
+    const wallet = Wallet.create();
+    expect(wallet.address).toHaveLength(40);
+    expect(wallet.publicKey).toHaveLength(64);
+  });
+
+  test("T38: Wallet.fromPrivateKey — 복원 가능", () => {
+    const original = Wallet.create();
+    const pk       = (original as any).keyPair.privateKey as string;
+    const restored = Wallet.fromPrivateKey(pk);
+    expect(restored.address).toBe(original.address);
+    expect(restored.publicKey).toBe(original.publicKey);
+  });
+
+  test("T39: Wallet.fromPrivateKey — 잘못된 키 예외", () => {
+    expect(() => Wallet.fromPrivateKey("bad-key")).toThrow();
+  });
+
+  test("T40: wallet.send — 트랜잭션 생성 및 서명", () => {
+    const alice  = Wallet.create();
+    const bob    = Wallet.create();
+    const tx     = alice.send(bob.address, 50, 2, 0);
+    expect(tx.from).toBe(alice.address);
+    expect(tx.to).toBe(bob.address);
+    expect(tx.amount).toBe(50);
+    expect(tx.fee).toBe(2);
+  });
+
+  test("T41: wallet.getBalance — 체인 잔고 조회", () => {
+    const wallet = makeWallet();
+    const chain  = makeFundedChain(wallet, 75);
+    expect(wallet.getBalance(chain)).toBe(75);
+  });
+
+  test("T42: MultiSigWallet — 2-of-3 서명 트랜잭션 생성", () => {
+    const signers = [Wallet.create(), Wallet.create(), Wallet.create()];
+    const msig    = new MultiSigWallet(signers, 2);
+    expect(msig.threshold).toBe(2);
+    expect(msig.signerCount).toBe(3);
+    expect(msig.address).toHaveLength(40);
+  });
+});
+
+// ============================================================
+// T43~T48: Mempool
+// ============================================================
+
+describe("Mempool", () => {
+  let alice: Wallet;
+  let bob:   Wallet;
+
+  beforeEach(() => {
+    alice = makeWallet();
+    bob   = makeWallet();
+  });
+
+  test("T43: add — 정상 트랜잭션 추가", () => {
+    const pool = new Mempool();
+    const tx   = alice.send(bob.address, 10, 1, 0);
+    const { ok } = pool.add(tx);
+    expect(ok).toBe(true);
+    expect(pool.size()).toBe(1);
+  });
+
+  test("T44: add — 중복 트랜잭션 거부", () => {
+    const pool = new Mempool();
+    const tx   = alice.send(bob.address, 10, 1, 0);
+    pool.add(tx);
+    const { ok, reason } = pool.add(tx);
+    expect(ok).toBe(false);
+    expect(reason).toBe("duplicate");
+  });
+
+  test("T45: add — minFee 미달 거부", () => {
+    const pool = new Mempool({ minFee: 5 });
+    const tx   = alice.send(bob.address, 10, 2, 0); // fee=2 < minFee=5
+    const { ok, reason } = pool.add(tx);
+    expect(ok).toBe(false);
+    expect(reason).toContain("minFee");
+  });
+
+  test("T46: selectForBlock — 수수료 내림차순 정렬", () => {
+    const pool = new Mempool();
+    const tx1  = alice.send(bob.address, 10, 5, 0);
+    const tx2  = alice.send(bob.address, 10, 2, 1);
+    const tx3  = alice.send(bob.address, 10, 8, 2);
+    pool.add(tx1); pool.add(tx2); pool.add(tx3);
+
+    const selected = pool.selectForBlock(3);
+    expect(selected[0].fee).toBeGreaterThanOrEqual(selected[1].fee);
+    expect(selected[1].fee).toBeGreaterThanOrEqual(selected[2].fee);
+  });
+
+  test("T47: expire — 오래된 트랜잭션 제거", () => {
+    const pool = new Mempool();
+    // 타임스탬프를 과거로 조작한 트랜잭션 직접 삽입
+    const tx: Transaction = {
+      id:        "a".repeat(64),
+      from:      alice.address,
+      to:        bob.address,
+      amount:    10,
+      fee:       1,
+      timestamp: Date.now() - 7_200_000, // 2시간 전
+      signature: "s".repeat(64),
+      nonce:     0,
+    };
+    pool["pool"].set(tx.id, tx);
+    expect(pool.size()).toBe(1);
+    const removed = pool.expire(3_600_000); // 1시간 이상 → 만료
+    expect(removed).toBe(1);
+    expect(pool.size()).toBe(0);
+  });
+
+  test("T48: getStats — 통계 계산", () => {
+    const pool = new Mempool();
+    pool.add(alice.send(bob.address, 10, 3, 0));
+    pool.add(alice.send(bob.address, 10, 7, 1));
+    pool.add(alice.send(bob.address, 10, 1, 2));
+
+    const stats = pool.getStats();
+    expect(stats.count).toBe(3);
+    expect(stats.maxFee).toBe(7);
+    expect(stats.minFee).toBe(1);
+    expect(stats.totalFees).toBe(11);
+  });
+});

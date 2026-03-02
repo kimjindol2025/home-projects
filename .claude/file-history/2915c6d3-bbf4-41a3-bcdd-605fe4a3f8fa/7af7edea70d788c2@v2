@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+계층적 통신 (Hierarchical Communication)
+
+물리적 네트워크 계층을 인식하여 AllReduce 및 집합 통신을 계층적으로 스케줄
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Set, Optional, Tuple
+import json
+import math
+
+
+@dataclass
+class HardwareLayer:
+    """하드웨어 계층"""
+    layer_name: str  # "intra_server", "inter_server" 등
+    bandwidth_gbps: float
+    latency_us: float
+    num_nodes: int  # 이 계층의 노드 수
+
+
+@dataclass
+class HierarchicalCommunicationSchedule:
+    """계층적 통신 스케줄"""
+    operation: str  # "all_reduce" 등
+    stages: List[Dict]  # 각 단계의 세부 정보
+    total_time_ms: float
+
+
+class HierarchyDetector:
+    """하드웨어 계층 자동 감지"""
+
+    def detect_hierarchy_from_topology(self,
+                                      device_count: int,
+                                      bandwidth_info: Dict[str, float]) -> List[HardwareLayer]:
+        """토폴로지에서 계층 감지"""
+
+        layers = []
+
+        # Intra-Server (매우 빠름): NVLink
+        intra_bandwidth = bandwidth_info.get("intra_server_gbps", 2700.0)  # NVLink
+        intra_latency = bandwidth_info.get("intra_latency_us", 0.5)
+
+        if device_count > 1:
+            devices_per_server = 4  # 일반적: 4x GPU per server
+            num_servers = device_count // devices_per_server + (1 if device_count % devices_per_server else 0)
+
+            if num_servers > 0:
+                layers.append(HardwareLayer(
+                    layer_name="intra_server",
+                    bandwidth_gbps=intra_bandwidth,
+                    latency_us=intra_latency,
+                    num_nodes=devices_per_server
+                ))
+
+        # Inter-Server (느림): Ethernet/Infiniband
+        if device_count > 4:
+            inter_bandwidth = bandwidth_info.get("inter_server_gbps", 100.0)  # Ethernet
+            inter_latency = bandwidth_info.get("inter_latency_us", 100.0)
+
+            num_servers = device_count // 4 + (1 if device_count % 4 else 0)
+
+            layers.append(HardwareLayer(
+                layer_name="inter_server",
+                bandwidth_gbps=inter_bandwidth,
+                latency_us=inter_latency,
+                num_nodes=num_servers
+            ))
+
+        return layers
+
+    def report_hierarchy(self, layers: List[HardwareLayer]) -> str:
+        """계층 구조 리포트"""
+
+        report = "\nNetwork Hierarchy Detected:\n"
+        report += "─" * 50 + "\n"
+
+        for layer in layers:
+            report += f"{layer.layer_name.upper()}:\n"
+            report += f"  Bandwidth: {layer.bandwidth_gbps:.1f} GB/s\n"
+            report += f"  Latency: {layer.latency_us:.2f} µs\n"
+            report += f"  Nodes: {layer.num_nodes}\n"
+
+        return report
+
+
+class HierarchicalAllReduceGenerator:
+    """계층적 AllReduce 생성"""
+
+    def generate_hierarchical_all_reduce(self,
+                                        data_size_bytes: float,
+                                        hierarchy: List[HardwareLayer]) -> HierarchicalCommunicationSchedule:
+        """계층적 AllReduce 스케줄 생성"""
+
+        stages = []
+
+        # Step 1: Intra-Server AllReduce
+        intra_layer = None
+        for layer in hierarchy:
+            if layer.layer_name == "intra_server":
+                intra_layer = layer
+                break
+
+        if intra_layer:
+            # 각 서버 내에서 AllReduce
+            intra_stages = math.log2(intra_layer.num_nodes)
+            intra_time = (intra_stages * data_size_bytes / (intra_layer.bandwidth_gbps * 1e9)) * 1000
+
+            stages.append({
+                "name": "intra_server_reduce",
+                "layer": "intra_server",
+                "num_stages": intra_stages,
+                "time_ms": intra_time,
+                "description": f"Reduce within each server (NVLink)"
+            })
+
+        # Step 2: Inter-Server AllReduce (데이터 집약 후)
+        inter_layer = None
+        for layer in hierarchy:
+            if layer.layer_name == "inter_server":
+                inter_layer = layer
+                break
+
+        if inter_layer:
+            # 서버 간 AllReduce (데이터는 훨씬 작음)
+            # 각 서버의 대표 결과만 전송
+            reduced_data_size = data_size_bytes / intra_layer.num_nodes if intra_layer else data_size_bytes
+
+            inter_stages = math.log2(inter_layer.num_nodes) * 2  # Reduce + Broadcast
+            inter_time = (inter_stages * reduced_data_size / (inter_layer.bandwidth_gbps * 1e9)) * 1000
+
+            stages.append({
+                "name": "inter_server_allreduce",
+                "layer": "inter_server",
+                "num_stages": inter_stages,
+                "time_ms": inter_time,
+                "data_size_bytes": reduced_data_size,
+                "description": f"AllReduce among servers (Ethernet)"
+            })
+
+        # Step 3: Intra-Server Broadcast
+        if intra_layer:
+            intra_broadcast_time = (intra_stages * data_size_bytes / (intra_layer.bandwidth_gbps * 1e9)) * 1000
+
+            stages.append({
+                "name": "intra_server_broadcast",
+                "layer": "intra_server",
+                "num_stages": intra_stages,
+                "time_ms": intra_broadcast_time,
+                "description": f"Broadcast result within each server"
+            })
+
+        total_time = sum(stage.get("time_ms", 0) for stage in stages)
+
+        return HierarchicalCommunicationSchedule(
+            operation="hierarchical_all_reduce",
+            stages=stages,
+            total_time_ms=total_time
+        )
+
+    def generate_hierarchical_all_gather(self,
+                                        data_size_bytes: float,
+                                        hierarchy: List[HardwareLayer]) -> HierarchicalCommunicationSchedule:
+        """계층적 AllGather 생성"""
+
+        stages = []
+
+        # Intra-Server AllGather
+        intra_layer = None
+        for layer in hierarchy:
+            if layer.layer_name == "intra_server":
+                intra_layer = layer
+                break
+
+        if intra_layer:
+            intra_time = (data_size_bytes / (intra_layer.bandwidth_gbps * 1e9)) * 1000
+
+            stages.append({
+                "name": "intra_server_gather",
+                "time_ms": intra_time,
+                "description": "AllGather within each server"
+            })
+
+        # Inter-Server AllGather
+        inter_layer = None
+        for layer in hierarchy:
+            if layer.layer_name == "inter_server":
+                inter_layer = layer
+                break
+
+        if inter_layer:
+            # 각 서버의 대표 데이터만 전송
+            reduced_data_size = data_size_bytes / (intra_layer.num_nodes if intra_layer else 1)
+            inter_time = (reduced_data_size / (inter_layer.bandwidth_gbps * 1e9)) * 1000
+
+            stages.append({
+                "name": "inter_server_gather",
+                "time_ms": inter_time,
+                "description": "AllGather among servers"
+            })
+
+        total_time = sum(stage.get("time_ms", 0) for stage in stages)
+
+        return HierarchicalCommunicationSchedule(
+            operation="hierarchical_all_gather",
+            stages=stages,
+            total_time_ms=total_time
+        )
+
+    def compare_flat_vs_hierarchical(self,
+                                    data_size_bytes: float,
+                                    num_devices: int,
+                                    bandwidth_gbps: float = 100.0) -> Dict:
+        """Flat Ring AllReduce vs 계층적 AllReduce 비교"""
+
+        # Flat Ring: 2*(N-1) steps
+        flat_steps = 2 * (num_devices - 1)
+        flat_time = (flat_steps * data_size_bytes / (bandwidth_gbps * 1e9)) * 1000
+
+        # 계층적 (추정)
+        hierarchy = [
+            HardwareLayer("intra_server", 2700.0, 0.5, 4),
+            HardwareLayer("inter_server", bandwidth_gbps, 100.0, num_devices // 4)
+        ]
+
+        hierarchical_schedule = self.generate_hierarchical_all_reduce(data_size_bytes, hierarchy)
+        hierarchical_time = hierarchical_schedule.total_time_ms
+
+        speedup = flat_time / hierarchical_time if hierarchical_time > 0 else 1.0
+
+        return {
+            "flat_ring": {
+                "steps": flat_steps,
+                "time_ms": flat_time
+            },
+            "hierarchical": {
+                "stages": hierarchical_schedule.stages,
+                "time_ms": hierarchical_time
+            },
+            "speedup": speedup
+        }
+
+
+class HierarchicalCommunicationDAG:
+    """계층적 통신 DAG 생성"""
+
+    def generate_communication_dag(self,
+                                  all_reduce_schedule: HierarchicalCommunicationSchedule) -> Dict:
+        """통신 DAG 생성"""
+
+        dag = {
+            "nodes": [],
+            "edges": []
+        }
+
+        # 각 스테이지를 DAG 노드로
+        for i, stage in enumerate(all_reduce_schedule.stages):
+            dag["nodes"].append({
+                "id": f"stage_{i}",
+                "name": stage.get("name", f"stage_{i}"),
+                "time_ms": stage.get("time_ms", 0),
+                "layer": stage.get("layer", "unknown")
+            })
+
+            # 순차 의존성
+            if i > 0:
+                dag["edges"].append({
+                    "from": f"stage_{i-1}",
+                    "to": f"stage_{i}",
+                    "dependency": "sequential"
+                })
+
+        return dag
+
+    def optimize_communication_schedule(self,
+                                       dag: Dict) -> Dict:
+        """통신 스케줄 최적화"""
+
+        optimized = dag.copy()
+
+        # 병렬화 가능한 스테이지 찾기
+        for i, node in enumerate(optimized["nodes"]):
+            # 같은 계층의 이전 스테이지와 병렬 가능
+            if i > 0:
+                prev_node = optimized["nodes"][i-1]
+                if node.get("layer") == prev_node.get("layer"):
+                    # 같은 계층이면 시간 단축 가능
+                    node["potential_parallelism"] = True
+
+        return optimized
+
+    def report_hierarchical_schedule(self,
+                                    schedule: HierarchicalCommunicationSchedule) -> str:
+        """계층적 스케줄 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║        HIERARCHICAL COMMUNICATION SCHEDULE                        ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        report += f"Operation: {schedule.operation}\n"
+        report += f"Total Time: {schedule.total_time_ms:.2f} ms\n\n"
+
+        report += "Stages:\n"
+        for i, stage in enumerate(schedule.stages, 1):
+            report += f"\n{i}. {stage.get('name', f'Stage {i}')}\n"
+            report += f"   Layer: {stage.get('layer', 'N/A')}\n"
+            report += f"   Time: {stage.get('time_ms', 0):.2f} ms\n"
+            report += f"   Description: {stage.get('description', '')}\n"
+
+        report += "\n" + "─" * 68 + "\n"
+
+        return report
+
+    def export_to_json(self, schedule: HierarchicalCommunicationSchedule) -> str:
+        """스케줄을 JSON으로 내보내기"""
+
+        data = {
+            "operation": schedule.operation,
+            "total_time_ms": schedule.total_time_ms,
+            "stages": schedule.stages
+        }
+
+        return json.dumps(data, indent=2)
+

@@ -1,0 +1,428 @@
+# 📐 **Phase 1.1: 하드웨어 비용 모델 설계**
+
+**작성일**: 2026-02-27
+**상태**: 설계 완료
+**목표**: MLIR Dialect에 하드웨어 인식 기능 추가
+
+---
+
+## **1. 개요**
+
+### **문제 정의**
+
+자가 적응형 컴파일러가 "최적의" 최적화 선택을 하려면:
+- 어떤 최적화를 적용했을 때 "얼마나 빨라질지" 예측 필요
+- 하드웨어 제약 조건을 수식으로 표현 필요
+- 모든 연산이 자신의 "비용"을 계산 가능해야 함
+
+**해결책**: 수학적 비용 모델 + MLIR 인터페이스
+
+---
+
+## **2. 하드웨어 매개변수 정의**
+
+### **2.1 핵심 파라미터**
+
+```
+HardwareSpec {
+  // 계산 성능
+  Peak_FLOPS = C_compute
+    ├─ 단위: FP32 operations/sec
+    ├─ 예: NVIDIA H100 = 3.96 TFLOPS
+    └─ 의미: 초당 처리 가능한 부동소수점 연산 수
+
+  // 메모리 대역폭
+  Memory_Bandwidth = BW_mem
+    ├─ 단위: GB/sec
+    ├─ 예: NVIDIA H100 DRAM = 3.94 TB/sec
+    └─ 의미: 메모리에서 초당 읽을 수 있는 데이터 양
+
+  // On-chip 메모리
+  SRAM_Size = S_SRAM
+    ├─ 단위: bytes
+    ├─ 예: 일반 GPU = 96KB-192KB per SM
+    └─ 의미: 캐시나 고속 메모리 용량
+
+  // 메모리 지연시간
+  Memory_Latency = L_latency
+    ├─ 단위: cycles
+    ├─ 예: DRAM 접근 = 200-400 cycles
+    └─ 의미: 메모리 요청부터 데이터 도착까지 소요 시간
+}
+```
+
+### **2.2 하드웨어 프로필 예제**
+
+**Example 1: NVIDIA H100**
+```
+Peak_FLOPS = 3.96 × 10^12  (3.96 TFLOPS)
+BW_mem = 3.94 × 10^12      (3.94 TB/sec)
+S_SRAM = 192 × 1024        (192 KB per SM)
+L_latency = 300            (cycles)
+```
+
+**Example 2: Apple Neural Engine**
+```
+Peak_FLOPS = 1.6 × 10^12   (1.6 TFLOPS)
+BW_mem = 0.2 × 10^12       (200 GB/sec)
+S_SRAM = 16 × 1024         (16 KB)
+L_latency = 150            (cycles)
+```
+
+**Example 3: Custom TPU**
+```
+Peak_FLOPS = 2.5 × 10^12
+BW_mem = 2.0 × 10^12
+S_SRAM = 256 × 1024
+L_latency = 250
+```
+
+---
+
+## **3. 비용 함수 모델링**
+
+### **3.1 기본 개념**
+
+컴파일러의 목표:
+```
+minimize: Total_Latency(T, loop_order)
+subject to: Memory_Constraint(T) ≤ S_SRAM
+```
+
+여기서:
+- **T** = 타일 크기 (최적화 변수)
+- **loop_order** = 루프 순서 (최적화 변수)
+- **Memory_Constraint** = SRAM 초과 여부 (하드 제약)
+
+### **3.2 전체 지연시간 수식**
+
+```
+┌─────────────────────────────────────────────────────┐
+│ Total_Latency = Compute_Latency + Memory_Latency    │
+└─────────────────────────────────────────────────────┘
+
+1. Compute Latency (연산 시간)
+   ─────────────────────────────
+   Compute_Latency = (Total_Operations) / Peak_FLOPS
+
+   예: MatMul(1024×1024×1024)
+     = (2 × 1024³) / (3.96 × 10^12)
+     ≈ 0.533 ms
+
+2. Memory Latency (메모리 시간)
+   ────────────────────────────
+   Memory_Latency = (Data_Transfers) / BW_mem +
+                    (Cache_Misses) × L_latency
+
+   예: 행렬곱셈
+     = (3 × 1024² × 4bytes) / (3.94 × 10^12) +
+       (cache_misses) × 300 cycles
+     ≈ 1.2 ms
+
+Total_Latency ≈ 0.533 + 1.2 = 1.733 ms
+```
+
+### **3.3 캐시 효율성 분석**
+
+```
+┌─────────────────────────────────────────┐
+│ Cache Hit Rate = f(Tile_Size, SRAM)     │
+└─────────────────────────────────────────┘
+
+작은 타일 (T=32):
+  ✓ SRAM 사용: 12KB  (효율적)
+  ✓ 캐시 히트: 95%+
+  ✗ 연산량 대비 메모리 접근 비율 높음
+  → Medium throughput
+
+중간 타일 (T=64):
+  ✓ SRAM 사용: 48KB  (balanced)
+  ✓ 캐시 히트: 92%
+  ✓ 연산 효율: 좋음
+  → High throughput (추천)
+
+큰 타일 (T=128):
+  ✗ SRAM 사용: 192KB (초과! ⚠️)
+  ✗ DRAM 스왑 발생
+  ✗ 캐시 히트: 50% 이하
+  → Very low throughput
+```
+
+---
+
+## **4. MLIR 인터페이스 설계**
+
+### **4.1 HardwareAwareInterface**
+
+```cpp
+/// HardwareAwareInterface - 모든 연산이 구현할 인터페이스
+///
+/// 목적: 컴파일러가 특정 최적화의 비용을 정량적으로 계산하도록 함
+///
+/// 예:
+///   auto matmul = createMatMulOp(...);
+///   auto costAnalyzer = createCostAnalyzer(h100_spec);
+///   int64_t memory = matmul.getMemoryFootprint(tileSizes);
+///   double time = matmul.estimateComputeTime(h100_spec);
+
+class HardwareAwareInterface : public OpInterface<"HardwareAwareInterface"> {
+public:
+  /// 주어진 타일 크기에서 필요한 메모리량 계산
+  ///
+  /// @param tileSizes: 각 차원의 타일 크기
+  /// @return: 필요한 메모리량 (bytes)
+  int64_t getMemoryFootprint(ArrayRef<int64_t> tileSizes);
+
+  /// 주어진 하드웨어에서 예상 연산 시간
+  ///
+  /// @param spec: 하드웨어 스펙
+  /// @return: 예상 실행 시간 (milliseconds)
+  double estimateComputeTime(const HardwareSpec& spec);
+
+  /// 메모리 대역폭 제약 확인
+  ///
+  /// @param spec: 하드웨어 스펙
+  /// @return: 메모리 접근이 병목인가?
+  bool isMemoryBound(const HardwareSpec& spec);
+
+  /// 캐시 효율성 예측
+  ///
+  /// @param tileSizes: 타일 크기
+  /// @return: 캐시 히트율 (0.0 ~ 1.0)
+  double estimateCacheHitRate(ArrayRef<int64_t> tileSizes);
+
+  /// Roofline 모델을 통한 성능 분석
+  ///
+  /// @param spec: 하드웨어 스펙
+  /// @return: 달성 가능 FLOPS
+  double getRooflinePerformance(const HardwareSpec& spec);
+};
+```
+
+### **4.2 HardwareSpec 데이터 구조**
+
+```cpp
+struct HardwareSpec {
+  // 계산 성능 (FLOPS)
+  double peakFLOPS;
+
+  // 메모리 대역폭 (GB/sec)
+  double memoryBandwidth;
+
+  // On-chip 메모리 크기 (bytes)
+  int64_t sramSize;
+
+  // 메모리 지연시간 (cycles)
+  double memoryLatency;
+
+  // 기타 파라미터
+  int64_t cacheLineSize;      // Typical: 64 bytes
+  int64_t l1CacheSize;        // L1$ 크기
+  int64_t l2CacheSize;        // L2$ 크기
+  double clockFrequencyGHz;    // CPU/GPU 클록속도
+
+  // 생성자
+  HardwareSpec(
+    double peak = 0,
+    double bw = 0,
+    int64_t sram = 0,
+    double lat = 0
+  ) : peakFLOPS(peak),
+      memoryBandwidth(bw),
+      sramSize(sram),
+      memoryLatency(lat) {}
+
+  // 유틸리티: 알려진 하드웨어 프로필 로드
+  static HardwareSpec getNvidiaH100();
+  static HardwareSpec getIntelXeon();
+  static HardwareSpec getAppleNeuralEngine();
+};
+```
+
+---
+
+## **5. 실전 시나리오 분석**
+
+### **시나리오: SRAM 128KB, MatMul 1024×1024**
+
+```
+하드웨어:
+  Peak_FLOPS = 1 TFLOPS (정규화)
+  BW_mem = 100 GB/sec
+  S_SRAM = 128 KB
+  L_latency = 200 cycles
+
+연산:
+  MatMul(1024 × 1024 × 1024)
+  = 2 × 1024³ = 2,147,483,648 operations
+```
+
+### **Case A: T=32 (작은 타일)**
+
+```
+메모리 분석:
+  Tile 메모리 = 32² × 3 × 4 bytes = 12 KB ✓ (OK)
+
+캐시 효율:
+  SRAM 사용율 = 12 / 128 = 9.4% (매우 효율적)
+  캐시 히트율 = 95%
+
+타일 개수:
+  타일 수 = (1024/32)³ = 32³ = 32,768 개
+
+연산 시간:
+  Operations per tile = 2 × 32³ = 65,536
+  Total ops = 2 × 1024³ (같음)
+
+  Compute_Time = 2,147,483,648 / (1 × 10^12) = 0.00215 sec = 2.15 ms
+
+메모리 시간:
+  Cache misses = 32,768 × (1-0.95) = 1,638 misses
+  Memory_Time = (12KB × 32768) / (100GB/s) + 1638 × 200
+              ≈ 0.3 ms + 0.328 ms = 0.628 ms
+
+총 시간:
+  Total = 2.15 + 0.628 = 2.778 ms ⚠️ (느림)
+
+원인: 타일이 너무 작아서 캐시 오버헤드가 큼
+```
+
+### **Case B: T=128 (큰 타일 - SRAM 초과)**
+
+```
+메모리 분석:
+  Tile 메모리 = 128² × 3 × 4 bytes = 192 KB ✗ (초과!)
+
+DRAM 스왑:
+  SRAM 부족 = 192 - 128 = 64 KB
+  DRAM에서 스왑 필요: 64KB × 32 = 2 MB (매우 큼)
+
+캐시 효율:
+  캐시 히트율 = 30% (메모리 부하 증가)
+
+연산 시간:
+  Compute_Time = 2.15 ms (동일)
+
+메모리 시간:
+  DRAM 접근 = (192 × 1024 × 8) / (100GB/s)
+            ≈ 15.7 ms (매우 느림!)
+
+  Memory_Time ≈ 15.7 ms
+
+총 시간:
+  Total = 2.15 + 15.7 = 17.85 ms ❌ (매우 느림)
+
+원인: SRAM 오버플로우 → DRAM 스왑 → 극도로 느려짐
+```
+
+### **Case C: T=64 (최적 타일)**
+
+```
+메모리 분석:
+  Tile 메모리 = 64² × 3 × 4 bytes = 48 KB ✓ (OK)
+
+캐시 효율:
+  SRAM 사용율 = 48 / 128 = 37.5% (효율적)
+  캐시 히트율 = 92%
+
+타일 개수:
+  타일 수 = (1024/64)³ = 16³ = 4,096 개
+
+연산 시간:
+  Compute_Time = 2.15 ms
+
+메모리 시간:
+  Cache misses = 4,096 × (1-0.92) = 328 misses
+  Memory_Time = (48KB × 4096) / (100GB/s) + 328 × 200
+              ≈ 0.2 ms + 0.066 ms = 0.266 ms
+
+총 시간:
+  Total = 2.15 + 0.266 = 2.416 ms ✅ (최적!)
+
+결론: T=64가 최선의 선택
+```
+
+---
+
+## **6. 정답 분석**
+
+### **질문: 자가 적응형 컴파일러는 무엇을 학습해야 할까?**
+
+```
+A) SRAM을 초과하더라도 최대한 큰 타일을 선택한다
+   → ❌ 틀림. Case B에서 성능이 17.85ms로 악화
+
+B) SRAM 한도 내에서 최대한 큰 타일(예: T=64)을 찾아
+   DRAM 접근을 최소화한다
+   → ✅ 맞음! Case C에서 2.416ms로 최적
+```
+
+### **왜 B가 정답인가?**
+
+```
+핵심 원리:
+┌───────────────────────────────────────────┐
+│ "메모리 계층 구조는 하드 제약(Hard      │
+│  Constraint)이다"                        │
+│                                           │
+│ SRAM 제약을 위반하면:                    │
+│  - DRAM 스왑 발생                        │
+│  - 메모리 대역폭 1000배 이상 악화         │
+│  - 전체 성능이 catastrophic 하강         │
+└───────────────────────────────────────────┘
+
+따라서:
+1. SRAM 제약은 절대 위반할 수 없음
+2. 그 제약 내에서 최대 효율 추구
+3. 메모리 계층을 "존중"하는 설계
+```
+
+---
+
+## **7. 1.1단계 기록 (증명)**
+
+### **과학적 기여**
+
+> **"자가 적응형 컴파일러의 기초는 하드웨어 자원을 수식화한 비용 모델에 있다."**
+
+- ✅ 5가지 하드웨어 매개변수 정의
+- ✅ Total Latency 수식화
+- ✅ 메모리 계층 제약 명시화
+
+### **엔지니어링 기여**
+
+> **"MLIR 인터페이스를 통해 연산별 비용을 정량화함으로써, AI 모델이 최적화 공간(Search Space)을 탐색할 지표를 제공한다."**
+
+- ✅ HardwareAwareInterface 설계
+- ✅ 6가지 Cost Analysis 메서드
+- ✅ Roofline 모델 통합 가능성
+
+### **교육적 기여**
+
+> **"SRAM과 DRAM의 성능 차이(1000배)는 단순 수치가 아니라, 컴파일러 설계의 핵심 제약이다."**
+
+- ✅ Case A/B/C 비교 분석
+- ✅ 메모리 병목 현상 정량화
+- ✅ 최적화 선택의 수학적 근거
+
+---
+
+## **8. 다음 단계: 1.2 탐색 공간 정의**
+
+### **1.2단계에서 할 일**
+
+```
+현재 (1.1): 개별 연산의 비용을 계산하는 방법 정의
+    ↓
+다음 (1.2): 실제 데이터를 모아서 비용 모델 검증
+    ├─ 수천 개의 (tile size, hardware, operation) 조합
+    ├─ 각 조합의 실제 실행 시간 측정
+    ├─ 비용 모델 예측과 실제 성능 비교
+    └─ ML 모델이 학습할 데이터셋 생성
+```
+
+---
+
+**1.1단계 완료**: ✅
+
+**준비됨**: 1.2 진행 대기 중

@@ -1,0 +1,308 @@
+# Phase 6.4 — L1 Runtime Kernel Production Lock
+
+## 컨텍스트
+
+**목표**: Phase 6.3에서 "capability 있는가?" 바이너리 체크 완료.
+Phase 6.4는 "capability 범위 내인가?"로 심화.
+경로 침입 방지 + 네트워크 whitelist + 리소스 제한 → L1 Production-Ready 달성.
+
+**현재 GAP**:
+- checkBuiltinCapability(): capability 존재 여부만 확인, 경로/도메인 미검증
+- limit(cpu=5000) annotation: AST에만 파싱, 실제 집행 없음
+- http_get, http_request, process_spawn: BUILTIN_REQUIRED_CAPABILITIES에 등록되었지만 stdlib에 미구현 (stub 필요)
+- file_read/file_write: 실제 fs 실행 코드 있음 (경로 검증 미적용)
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 작업 |
+|------|------|
+| `src/vm.ts` | 4가지 강화: path/network 검증 + resource limit + 성능 카운터 |
+| `src/stdlib/builtins.ts` | http_get, http_request, process_spawn stub 추가 |
+| `src/vm-integration-test.ts` | 신규 15개 통합 테스트 |
+
+---
+
+## Step 1: vm.ts — Path Traversal Runtime Check
+
+### 1-1: checkBuiltinCapability() 확장 (현재 라인 85-98)
+
+현재는 capability 존재 여부만 확인.
+file_read/file_write 호출 시 인자로 전달된 실제 경로를 캡처하여 검증:
+
+```typescript
+// Op.Call 핸들러 내에서 builtin 호출 전 (callee.tag === "builtin" 분기)
+} else if (callee.tag === "builtin") {
+  // args를 꺼내기 전에 스택에서 미리 읽기
+  const peekArgs = this.stack.slice(this.stack.length - argc, this.stack.length);
+  this.checkBuiltinCapability(callee.name, peekArgs);  // args 전달
+  ...
+}
+```
+
+### 1-2: checkBuiltinCapability() 시그니처 변경
+
+```typescript
+private checkBuiltinCapability(builtinName: string, args: Value[] = []): void {
+  const required = this.BUILTIN_REQUIRED_CAPABILITIES.get(builtinName);
+  if (!required) return;
+
+  const caps = this.getCurrentCapabilities();
+  const hasCapability = caps.some(c => c.cap === required);
+
+  if (!hasCapability) {
+    this.runtimeError(
+      `[CapabilityError] '${builtinName}' requires capability '${required}', ` +
+      `but current function does not declare it`
+    );
+  }
+
+  // Phase 6.4: Path/Network 상세 검증
+  if (required === "read_file" || required === "write_file") {
+    const pathArg = args[0]?.tag === "str" ? args[0].val : null;
+    if (pathArg !== null) {
+      const allowedCaps = caps.filter(c => c.cap === required);
+      const allowed = allowedCaps.some(c => !c.arg || this.pathIsUnder(pathArg, c.arg));
+      if (!allowed) {
+        const allowedPaths = allowedCaps.map(c => c.arg ?? "*").join(", ");
+        this.runtimeError(
+          `[CapabilityError] Access to '${pathArg}' denied. ` +
+          `Allowed paths: [${allowedPaths}]`
+        );
+      }
+    }
+  }
+
+  if (required === "network") {
+    const urlArg = args[0]?.tag === "str" ? args[0].val : null;
+    if (urlArg !== null) {
+      const domain = this.extractDomain(urlArg);
+      const allowedCaps = caps.filter(c => c.cap === "network");
+      const allowed = allowedCaps.some(c => !c.arg || this.hostMatches(domain, c.arg));
+      if (!allowed) {
+        const allowedHosts = allowedCaps.map(c => c.arg ?? "*").join(", ");
+        this.runtimeError(
+          `[CapabilityError] Network access to '${domain}' denied. ` +
+          `Allowed hosts: [${allowedHosts}]`
+        );
+      }
+    }
+  }
+}
+```
+
+### 1-3: 헬퍼 메서드 추가
+
+```typescript
+private pathIsUnder(target: string, allowedPrefix: string): boolean {
+  if (target.includes("..")) return false;  // path traversal 즉시 거부
+  const normalize = (p: string) => p.replace(/\/+/g, "/").replace(/\/$/, "");
+  const t = normalize(target);
+  const p = normalize(allowedPrefix);
+  return t === p || t.startsWith(p + "/");
+}
+
+private extractDomain(url: string): string {
+  try {
+    // "https://api.openai.com/v1/chat" → "api.openai.com"
+    const match = url.match(/^(?:https?:\/\/)?([^\/\?#:]+)/);
+    return match ? match[1] : url;
+  } catch {
+    return url;
+  }
+}
+
+private hostMatches(target: string, pattern: string): boolean {
+  if (pattern === target) return true;
+  if (pattern.startsWith("*.")) {
+    const base = pattern.slice(2);
+    return target.endsWith("." + base) &&
+           !target.slice(0, -base.length - 1).includes(".");
+  }
+  return false;
+}
+```
+
+---
+
+## Step 2: stdlib/builtins.ts — http/process stub 추가
+
+http_get, http_request, process_spawn은 BUILTIN_REQUIRED_CAPABILITIES에 등록되어 있으나 미구현.
+Phase 6.4에서 stub 추가 (실제 실행 없음, 테스트 가능하도록):
+
+```typescript
+// builtins.ts 말단에 추가
+registerBuiltin("http_get", (args) => {
+  const url = args[0]?.tag === "str" ? args[0].val : "";
+  // Stub: 실제 HTTP 요청 없음, capability 체크는 VM에서 이미 완료
+  return { tag: "str", val: `[HTTP GET stub: ${url}]` };
+});
+
+registerBuiltin("http_request", (args) => {
+  const url = args[0]?.tag === "str" ? args[0].val : "";
+  return { tag: "str", val: `[HTTP request stub: ${url}]` };
+});
+
+registerBuiltin("process_spawn", (args) => {
+  const cmd = args[0]?.tag === "str" ? args[0].val : "";
+  return { tag: "str", val: `[process stub: ${cmd}]` };
+});
+```
+
+---
+
+## Step 3: vm.ts — Resource Limit (limit annotation 집행)
+
+### 3-1: Frame에 resourceLimits 추가
+
+```typescript
+type Frame = {
+  retAddr: number; baseSlot: number; fn: string; upvalues: Value[];
+  capabilities: Array<{cap: string; arg?: string}>;
+  resourceLimits: { cpu?: number; memory?: number; io?: number };  // ← 추가
+  opCount: number;  // 실행된 opcode 수
+};
+```
+
+### 3-2: compileFnBody 에서 limit annotations → resourceLimits 추출
+
+compiler.ts의 compileFnBody에 limit 처리 추가:
+```typescript
+const resourceLimits: Record<string, number> = {}
+annotations
+  .filter((a: any) => a.kind === "limit")
+  .forEach((a: any) => { resourceLimits[a.resource] = a.value })
+// fn Value에 resourceLimits도 저장
+addConst({ tag: "fn", ..., capabilities, resourceLimits })
+```
+
+### 3-3: Op.Call에서 Frame에 resourceLimits 전달
+
+```typescript
+this.frames.push({
+  ...,
+  capabilities: callee.capabilities || [],
+  resourceLimits: (callee as any).resourceLimits || {},
+  opCount: 0,
+});
+```
+
+### 3-4: execOp() 첫 부분에서 CPU 체크
+
+```typescript
+private execOp(op: number): void {
+  // Phase 6.4: Resource limit 체크 (CPU + Memory + IO)
+  if (this.frames.length > 0) {
+    const frame = this.frames[this.frames.length - 1];
+    frame.opCount++;
+
+    // CPU: opcode 실행 횟수로 측정
+    if (frame.resourceLimits.cpu && frame.opCount > frame.resourceLimits.cpu) {
+      this.runtimeError(
+        `[ResourceLimitError] CPU limit exceeded (${frame.resourceLimits.cpu} ops)`
+      );
+    }
+
+    // Memory: heapManager.allocated로 측정 (값 단위)
+    if (frame.resourceLimits.memory) {
+      const heapUsed = this.heapManager.getAllocated();
+      if (heapUsed > frame.resourceLimits.memory) {
+        this.runtimeError(
+          `[ResourceLimitError] Memory limit exceeded (${frame.resourceLimits.memory} slots)`
+        );
+      }
+    }
+  }
+  // ... 기존 switch(op) ...
+}
+```
+
+### 3-5: IO 카운터 (file_read/write 호출 횟수)
+
+Frame에 ioCount 추가:
+```typescript
+type Frame = { ...; opCount: number; ioCount: number }
+```
+
+checkBuiltinCapability() 내에서 IO 집행:
+```typescript
+if (required === "read_file" || required === "write_file") {
+  if (frames.length > 0) {
+    const frame = this.frames[this.frames.length - 1];
+    frame.ioCount++;
+    if (frame.resourceLimits.io && frame.ioCount > frame.resourceLimits.io) {
+      this.runtimeError(
+        `[ResourceLimitError] IO limit exceeded (${frame.resourceLimits.io} ops)`
+      );
+    }
+  }
+}
+```
+
+---
+
+## Step 4: vm-integration-test.ts — 15개 통합 테스트
+
+기존 unit test와 다른 통합 시나리오 중심.
+
+```
+Suite A — Path/Network Runtime Check (5개):
+  1. file_read에 ".." 포함 경로 → CapabilityError
+  2. file_read에 허용 경로 prefix → 정상
+  3. file_read에 비허용 경로 → CapabilityError
+  4. http_get에 허용 도메인 → 정상
+  5. http_get에 비허용 도메인 → CapabilityError
+
+Suite B — Resource Limit (5개):
+  6. limit(cpu=10) + 10개 이하 ops → 정상
+  7. limit(cpu=10) + 11개 이상 ops → ResourceLimitError
+  8. limit annotation 없는 함수 → 제한 없음
+  9. 중첩 함수 각각 독립 limit → 내부 함수 limit 초과 시 에러
+  10. try/catch로 ResourceLimitError 처리 가능
+
+Suite C — 통합 & 성능 (5개):
+  11. annotation 없는 1000번 재귀 → 정상 (limit 없으면 허용)
+  12. 다중 호출에서 capabilities 일관성
+  13. 성능: 10,000 ops < 100ms
+  14. 기존 132개 테스트 전체 호환성 유지
+  15. end-to-end: 전체 capability 시스템 통합 검증
+```
+
+---
+
+## 검증 순서
+
+```bash
+npm run build
+node dist/vm-integration-test.js   # 신규 15개
+bash /tmp/run_all_tests.sh         # 전체 147개 (132 + 15)
+```
+
+목표: **147/147 전체 통과**
+
+---
+
+## 구현 순서
+
+```
+1. vm.ts       — checkBuiltinCapability args 추가 + pathIsUnder/extractDomain/hostMatches
+2. vm.ts       — Op.Call에서 args를 먼저 peek하여 경로/도메인 검증
+3. stdlib/builtins.ts — http_get, http_request, process_spawn stub 추가
+4. compiler.ts — resourceLimits 추출 + fn Value에 포함
+5. vm.ts       — Frame.resourceLimits + opCount + execOp() CPU 체크
+6. vm-integration-test.ts — 15개 테스트
+7. npm run build → 전체 테스트
+```
+
+---
+
+## 리스크 통제
+
+| 리스크 | 대책 |
+|--------|------|
+| Op.Call에서 args를 스택에서 peek할 때 제거 타이밍 | splice 전에 slice로 peek (기존 로직 유지) |
+| opCount 증가로 성능 영향 | frame 없는 경우(최상위) 체크 스킵 |
+| execOp() 진입 시마다 limit 체크 오버헤드 | frames.length === 0이면 바로 return |
+| resourceLimits 필드 추가로 기존 코드 깨짐 | {} 기본값으로 옵셔널 처리 |
+| http_get stub이 실제 호출처럼 동작 | stub은 VM capability 체크 후 실행, 실제 IO 없음 |

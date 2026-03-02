@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""
+통신-연산 중첩 (Communication-Computation Overlap)
+
+Async 토큰을 활용하여 데이터 전송과 연산을 동시에 진행
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+import json
+
+
+@dataclass
+class AsyncOperation:
+    """비동기 연산"""
+    op_id: str
+    op_type: str  # "compute", "transfer", "barrier"
+    device_id: int
+
+    start_time_ms: float
+    duration_ms: float
+    end_time_ms: float
+
+    # 의존성
+    depends_on: List[str]  # 토큰 ID 리스트
+
+    # 데이터
+    data_size_bytes: Optional[float] = None
+    bandwidth_gbps: Optional[float] = None
+
+
+class PrefetchingOptimizer:
+    """Prefetch 최적화"""
+
+    def __init__(self):
+        self.prefetch_opportunities = []
+
+    def analyze_data_reuse(self,
+                          task_graph) -> List[Dict]:
+        """데이터 재사용 패턴 분석"""
+
+        opportunities = []
+
+        sorted_tasks = task_graph.topological_sort()
+
+        for i, current_task_id in enumerate(sorted_tasks):
+            # 다음 작업 찾기
+            if i + 1 >= len(sorted_tasks):
+                continue
+
+            next_task_id = sorted_tasks[i + 1]
+
+            # 다음 작업의 입력 데이터가 현재 작업의 출력인지 확인
+            current_task = task_graph.tasks[current_task_id]
+            next_task = task_graph.tasks[next_task_id]
+
+            # 공통 데이터 찾기
+            common_data = set(current_task.output_tensors) & set(next_task.input_tensors)
+
+            if common_data:
+                # 다음 작업이 다른 장치에서 실행되면 전송 필요
+                if current_task.target_device != next_task.target_device:
+                    opportunities.append({
+                        "from_task": current_task_id,
+                        "to_task": next_task_id,
+                        "data": list(common_data),
+                        "prefetch_possible": True
+                    })
+
+        self.prefetch_opportunities = opportunities
+        return opportunities
+
+    def compute_prefetch_window(self,
+                               current_task_time_ms: float,
+                               next_task_time_ms: float,
+                               transfer_time_ms: float) -> Tuple[float, bool]:
+        """Prefetch 가능 시간 윈도우 계산"""
+
+        # 현재 작업이 끝나기 전에 데이터 전송을 시작할 수 있는지 확인
+        available_time = current_task_time_ms - transfer_time_ms
+
+        if available_time > 0:
+            # Prefetch 가능
+            return available_time, True
+        else:
+            # Prefetch 불가능 (전송이 시간 내에 완료 안 됨)
+            return 0.0, False
+
+    def generate_prefetch_schedule(self,
+                                 opportunities: List[Dict],
+                                 task_times: Dict[str, float],
+                                 transfer_times: Dict[str, float]) -> Dict:
+        """Prefetch 스케줄 생성"""
+
+        schedule = {
+            "prefetches": [],
+            "total_overlap_ms": 0.0
+        }
+
+        for opp in opportunities:
+            from_task = opp["from_task"]
+            to_task = opp["to_task"]
+            data = opp["data"]
+
+            from_time = task_times.get(from_task, 0)
+            to_time = task_times.get(to_task, 0)
+
+            # 데이터 크기 추정 (문자열 크기)
+            data_size_estimate = sum(len(d) * 1024 for d in data)  # 대략적 추정
+            transfer_time = transfer_times.get(f"{from_task}->{to_task}", 10.0)
+
+            window_time, is_prefetchable = self.compute_prefetch_window(
+                from_time, to_time, transfer_time
+            )
+
+            if is_prefetchable:
+                prefetch_start = from_time - transfer_time
+                overlap_time = transfer_time  # 전체 전송이 겹침
+
+                schedule["prefetches"].append({
+                    "from_task": from_task,
+                    "to_task": to_task,
+                    "data": data,
+                    "prefetch_start_ms": max(0, prefetch_start),
+                    "transfer_time_ms": transfer_time,
+                    "overlap_time_ms": overlap_time
+                })
+
+                schedule["total_overlap_ms"] += overlap_time
+
+        return schedule
+
+
+class AsyncTokenAllocator:
+    """Async 토큰 할당"""
+
+    def __init__(self):
+        self.tokens: Dict[str, AsyncOperation] = {}
+        self.token_counter = 0
+
+    def allocate_token(self,
+                      op_type: str,
+                      device_id: int,
+                      duration_ms: float,
+                      depends_on: List[str],
+                      data_size_bytes: Optional[float] = None) -> str:
+        """비동기 토큰 할당"""
+
+        token_id = f"async_token_{self.token_counter}"
+        self.token_counter += 1
+
+        # 의존성 토큰의 완료 시간 계산
+        max_dep_end_time = 0.0
+        for dep_token in depends_on:
+            if dep_token in self.tokens:
+                max_dep_end_time = max(max_dep_end_time,
+                                      self.tokens[dep_token].end_time_ms)
+
+        start_time = max_dep_end_time
+        end_time = start_time + duration_ms
+
+        op = AsyncOperation(
+            op_id=token_id,
+            op_type=op_type,
+            device_id=device_id,
+            start_time_ms=start_time,
+            duration_ms=duration_ms,
+            end_time_ms=end_time,
+            depends_on=depends_on,
+            data_size_bytes=data_size_bytes
+        )
+
+        self.tokens[token_id] = op
+        return token_id
+
+    def execute_start(self,
+                     op_type: str,
+                     device_id: int,
+                     duration_ms: float,
+                     depends_on: Optional[List[str]] = None) -> str:
+        """async.execute_start 구현"""
+
+        if depends_on is None:
+            depends_on = []
+
+        return self.allocate_token(op_type, device_id, duration_ms, depends_on)
+
+    def await_all(self, token_ids: List[str]) -> str:
+        """async.await_all 구현"""
+
+        # 모든 토큰의 완료 시간의 최대값
+        max_end_time = max([self.tokens[tid].end_time_ms for tid in token_ids
+                           if tid in self.tokens], default=0.0)
+
+        # 완료 토큰 생성
+        completion_token = f"async_completion_{self.token_counter}"
+        self.token_counter += 1
+
+        print(f"[AsyncTokenAllocator] All tokens await complete at {max_end_time:.2f}ms")
+
+        return completion_token
+
+    def export_timeline(self) -> str:
+        """타임라인 시각화"""
+
+        if not self.tokens:
+            return "No async operations"
+
+        timeline = "\nAsync Operation Timeline:\n"
+        timeline += "─" * 80 + "\n"
+
+        sorted_ops = sorted(self.tokens.values(), key=lambda x: x.start_time_ms)
+
+        for op in sorted_ops:
+            duration = op.end_time_ms - op.start_time_ms
+            bar_length = int(duration / 10)
+            timeline += f"[{op.op_id}] Device {op.op_id.split('_')[2] if '_' in op.op_id else '?'}\n"
+            timeline += f"  Start: {op.start_time_ms:.2f}ms → End: {op.end_time_ms:.2f}ms ({duration:.2f}ms)\n"
+            timeline += f"  {'█' * bar_length}\n"
+
+        return timeline
+
+
+class OverlapAnalyzer:
+    """중첩 가능성 분석"""
+
+    def analyze_overlap_potential(self,
+                                 tasks: List[Dict],
+                                 transfer_times: Dict) -> Dict:
+        """중첩 가능성 분석"""
+
+        analysis = {
+            "num_tasks": len(tasks),
+            "overlap_opportunities": [],
+            "max_potential_overlap_ms": 0.0
+        }
+
+        # 각 작업 쌍에 대해 중첩 가능성 분석
+        for i in range(len(tasks) - 1):
+            current_task = tasks[i]
+            next_task = tasks[i + 1]
+
+            # 두 작업이 다른 장치에서 실행되는 경우
+            if current_task.get("device") != next_task.get("device"):
+                # 전송 시간 추정
+                transfer_key = f"{current_task['task_id']}->{next_task['task_id']}"
+                transfer_time = transfer_times.get(transfer_key, 10.0)
+
+                # 현재 작업 시간
+                current_duration = current_task.get("duration_ms", 20.0)
+
+                # 중첩 가능 시간
+                overlap_time = min(current_duration, transfer_time)
+
+                if overlap_time > 0:
+                    analysis["overlap_opportunities"].append({
+                        "from_task": current_task["task_id"],
+                        "to_task": next_task["task_id"],
+                        "max_overlap_ms": overlap_time,
+                        "transfer_time_ms": transfer_time,
+                        "current_task_duration_ms": current_duration
+                    })
+
+                    analysis["max_potential_overlap_ms"] += overlap_time
+
+        return analysis
+
+    def quantify_speedup(self,
+                        sequential_time_ms: float,
+                        parallel_time_ms: float) -> Dict:
+        """성능 향상 정량화"""
+
+        speedup = sequential_time_ms / parallel_time_ms if parallel_time_ms > 0 else 1.0
+        efficiency = speedup / 2 * 100  # 2개 자원 기준
+
+        return {
+            "sequential_time_ms": sequential_time_ms,
+            "parallel_time_ms": parallel_time_ms,
+            "speedup": speedup,
+            "efficiency_percent": efficiency,
+            "time_saved_ms": sequential_time_ms - parallel_time_ms
+        }
+
+    def generate_overlap_report(self, analysis: Dict) -> str:
+        """중첩 분석 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║        COMMUNICATION-COMPUTATION OVERLAP ANALYSIS                 ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        report += f"Total Tasks: {analysis['num_tasks']}\n"
+        report += f"Max Potential Overlap: {analysis['max_potential_overlap_ms']:.2f}ms\n\n"
+
+        report += "Overlap Opportunities:\n"
+        for i, opp in enumerate(analysis["overlap_opportunities"], 1):
+            report += f"\n{i}. {opp['from_task']} → {opp['to_task']}\n"
+            report += f"   Current Task Duration: {opp['current_task_duration_ms']:.2f}ms\n"
+            report += f"   Transfer Time: {opp['transfer_time_ms']:.2f}ms\n"
+            report += f"   Max Overlap: {opp['max_overlap_ms']:.2f}ms\n"
+
+        report += "\n" + "─" * 68 + "\n"
+
+        return report
+

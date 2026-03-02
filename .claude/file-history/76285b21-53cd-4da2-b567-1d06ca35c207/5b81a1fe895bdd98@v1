@@ -1,0 +1,198 @@
+# Phase 5.5.2: Function Return Type Inference 계획
+
+## 컨텍스트
+
+Phase 5.5 완료 (152/152 테스트, 커밋 4e90c83):
+- 11개 Typed Op 도입 (AddNum/SubNum/MulNum/DivNum/ModNum/AddStr + Compare 5개)
+- Compiler에 typeEnv 전달, 런타임 타입 체크 제거
+
+**Phase 5.5.2 목표:**
+함수 경계(Function Boundary)에서 타입 강제 실현.
+TypeChecker에 함수 호출 검증 코드가 있지만, 함수 타입이 전부 UNKNOWN이라
+인자 개수 체크 외 실질 검증이 이루어지지 않음.
+
+---
+
+## 현재 상태 분석
+
+| 위치 | 현재 상태 | 문제 |
+|------|---------|-----|
+| `type-checker.ts:62-65` | returnType = UNKNOWN | 추론 없음 |
+| `type-checker.ts:107-124` | 본문 검사하지만 return 타입 미수집 | 공백 |
+| `type-checker.ts:160-166` | checkExpr 결과 버림 | return 타입 손실 |
+| `type-checker.ts:486-515` | fn expr도 returnType = UNKNOWN | 공백 |
+| `type-system.ts:91-95` | UNKNOWN은 양방향 와일드카드 | 함수 호출 검증 무력화 |
+
+---
+
+## 설계 원칙
+
+1. **First Pass** (registerFunctionType): UNKNOWN으로 초기화 유지 — 재귀 함수 지원
+2. **Second Pass** (checkStmt "fn"): 본문 분석 → returnType 추론 → functionTypes 갱신
+3. **중첩 함수**: savedReturnTypes 패턴으로 스택 관리 (외부 함수 오염 방지)
+4. **파라미터 타입**: 이번 단계에서는 UNKNOWN 유지 (파라미터는 런타임 결정)
+
+---
+
+## 구현 단계
+
+### Step 1: TypeChecker 클래스 필드 추가 (`type-checker.ts:22` 뒤)
+
+```typescript
+private currentFunctionReturnTypes: Type[] = []
+```
+
+### Step 2: inferReturnType 헬퍼 추가 (private 메서드, TypeChecker 클래스 안)
+
+```typescript
+private inferReturnType(types: Type[]): Type {
+  if (types.length === 0) return BUILTIN_TYPES.UNKNOWN
+  const first = types[0]
+  if (types.every(t => JSON.stringify(t) === JSON.stringify(first))) return first
+  return BUILTIN_TYPES.UNKNOWN
+}
+```
+
+### Step 3: `case "return"` 수정 (`type-checker.ts:160-166`)
+
+현재:
+```typescript
+if (returnStmt.value) {
+  this.checkExpr(returnStmt.value)
+}
+```
+
+변경:
+```typescript
+if (returnStmt.value) {
+  const retType = this.checkExpr(returnStmt.value)
+  this.currentFunctionReturnTypes.push(retType)
+}
+```
+
+### Step 4: `case "fn"` stmt 수정 (`type-checker.ts:105-124`)
+
+중첩 함수 보호 + return 타입 추론 + functionTypes 갱신:
+
+```typescript
+case "fn": {
+  const fnStmt = stmt as any
+  const savedEnv = new Map(this.env)
+  const savedReturnTypes = this.currentFunctionReturnTypes  // 중첩 보호
+  this.currentFunctionReturnTypes = []
+
+  for (const param of fnStmt.params || []) {
+    this.env.set(param, { kind: "primitive", type: PrimitiveType.UNKNOWN })
+  }
+  for (const s of fnStmt.body || []) {
+    this.checkStmt(s)
+  }
+
+  // return 타입 추론 후 functionTypes 갱신
+  const inferredReturn = this.inferReturnType(this.currentFunctionReturnTypes)
+  const existingFnType = this.functionTypes.get(fnStmt.name)
+  if (existingFnType && existingFnType.kind === "fn") {
+    this.functionTypes.set(fnStmt.name, {
+      kind: "fn",
+      paramTypes: existingFnType.paramTypes,
+      returnType: inferredReturn,
+    })
+  }
+
+  this.currentFunctionReturnTypes = savedReturnTypes  // 복원
+  this.env = savedEnv
+  break
+}
+```
+
+### Step 5: `case "fn"` expr 수정 (`type-checker.ts:486-515`)
+
+동일 패턴 (저장/초기화/복원 + inferReturnType):
+
+```typescript
+case "fn": {
+  const fnExpr = expr as any
+  const savedEnv = new Map(this.env)
+  const savedReturnTypes = this.currentFunctionReturnTypes
+  this.currentFunctionReturnTypes = []
+
+  for (const param of fnExpr.params || []) {
+    this.env.set(param, { kind: "primitive", type: PrimitiveType.UNKNOWN })
+  }
+  for (const stmt of fnExpr.body || []) {
+    this.checkStmt(stmt)
+  }
+
+  const inferredReturn = this.inferReturnType(this.currentFunctionReturnTypes)
+  const paramTypes: Type[] = (fnExpr.params || []).map(() => ({
+    kind: "primitive" as const, type: PrimitiveType.UNKNOWN,
+  }))
+
+  this.currentFunctionReturnTypes = savedReturnTypes
+  this.env = savedEnv
+
+  return { kind: "fn", paramTypes, returnType: inferredReturn }
+}
+```
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 위치 | 작업 | 줄 수 |
+|------|------|------|------|
+| `src/type-checker.ts` | 22줄 | 필드 추가 | +1 |
+| `src/type-checker.ts` | 새 메서드 | inferReturnType | +6 |
+| `src/type-checker.ts` | 160-166줄 | return 타입 수집 | +2 |
+| `src/type-checker.ts` | 105-124줄 | fn stmt 수정 | +12 |
+| `src/type-checker.ts` | 486-515줄 | fn expr 수정 | +6 |
+| `src/vm-function-types-test.ts` | 신규 | 테스트 15개 | +220 |
+
+---
+
+## 신규 테스트 (`src/vm-function-types-test.ts`, 15개)
+
+```
+Suite A — 반환 타입 추론 (5개):
+  1. num 반환 함수 → returnType = num 추론
+  2. str 반환 함수 → returnType = str 추론
+  3. bool 반환 함수 → returnType = bool 추론
+  4. return x + y (num+num) → num 추론
+  5. 반환 없는 함수 → UNKNOWN 허용
+
+Suite B — 호출 검증 (5개):
+  6. 인자 개수 불일치 → 에러
+  7. 미정의 함수 호출 → 에러
+  8. 정상 호출 → success
+  9. 중첩 호출 add(1, mul(2,3)) → 정상
+  10. 재귀 함수 호출 → 정상 (UNKNOWN 허용)
+
+Suite C — 기존 호환성 (5개):
+  11. 기존 152개 테스트 호환성 유지
+  12. fn 표현식 타입 추론
+  13. 중첩 함수 정의 → 외부 returnType 독립 보장
+  14. if/return 분기 타입 추론
+  15. println() 내장 함수 호환
+```
+
+---
+
+## 검증
+
+```bash
+npm run build
+node dist/vm-function-types-test.js   # 신규 15개
+node dist/vm-typed-arithmetic-test.js # Phase 5.5 (15개)
+node dist/vm-types-test.js            # Phase 5 (20개)
+node dist/vm-compatibility-test.js    # Phase 2-4 (4 케이스)
+# 목표: 167개 전체 통과 (152 + 15)
+```
+
+---
+
+## 리스크 통제
+
+- **재귀 함수**: First Pass UNKNOWN → Second Pass UNKNOWN → typesCompatible 통과 (정상)
+- **중첩 함수**: savedReturnTypes 패턴으로 완전 격리
+- **파라미터 타입**: UNKNOWN 유지 → 기존 동작 보존
+- **인자 개수 체크**: 이미 작동 중 (변경 없음)

@@ -1,0 +1,498 @@
+#!/usr/bin/env node
+
+/**
+ * Gogs AI Code Reuse - 오프라인 버전
+ *
+ * API 없이도 즉각적으로 작동
+ * - 파일 기반 분석
+ * - 즉각적 결과
+ * - 높은 신뢰도
+ *
+ * 사용법:
+ *   node main-offline.js scan /path/to/repos
+ *   node main-offline.js find "garbage collection"
+ *   node main-offline.js evaluate freelang-v6 clarity-lang "VM 통합"
+ *   node main-offline.js list-repos
+ *   node main-offline.js graph
+ */
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import CodeIndexer from "./code-indexer.js";
+import ReuseSuggesterOffline from "./reuse-suggester-offline.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+async function main() {
+  const command = process.argv[2];
+  const args = process.argv.slice(3);
+
+  console.log("\n🚀 Gogs AI Code Reuse System (오프라인 모드)");
+  console.log("=".repeat(60));
+
+  try {
+    switch (command) {
+      case "scan":
+        await handleScan(args[0]);
+        break;
+
+      case "find":
+        await handleFind(args.join(" "));
+        break;
+
+      case "evaluate":
+        await handleEvaluate(args[0], args[1], args.slice(2).join(" "));
+        break;
+
+      case "list-repos":
+        await handleListRepos();
+        break;
+
+      case "graph":
+        await handleGraph();
+        break;
+
+      case "compare":
+        await handleCompare(args[0], args[1]);
+        break;
+
+      default:
+        printHelp();
+    }
+  } catch (e) {
+    console.error("\n❌ 오류:", e.message);
+    if (process.env.DEBUG) console.error(e.stack);
+    process.exit(1);
+  }
+}
+
+/**
+ * 저장소 스캔 및 인덱싱
+ */
+async function handleScan(baseDir) {
+  if (!baseDir) {
+    console.error("❌ 사용법: node main-offline.js scan /path/to/repos");
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(baseDir)) {
+    console.error(`❌ 디렉토리를 찾을 수 없습니다: ${baseDir}`);
+    process.exit(1);
+  }
+
+  const indexer = new CodeIndexer(
+    process.env.GOGS_URL || "https://gogs.dclub.kr",
+    process.env.GOGS_TOKEN || ""
+  );
+
+  console.log(`\n📁 스캔 중: ${baseDir}`);
+  console.log("이 작업은 시간이 걸릴 수 있습니다...\n");
+
+  const repos = await indexer.indexAllRepositories(baseDir);
+
+  console.log("\n✅ 인덱싱 완료!");
+  console.log(`\n📊 인덱싱된 저장소: ${repos.length}개\n`);
+
+  // 요약 정보
+  let totalFiles = 0;
+  let totalApis = 0;
+  let unsafeCount = 0;
+  let ffiCount = 0;
+
+  for (const repo of repos) {
+    totalFiles += repo.sourceFiles?.length || 0;
+    totalApis += repo.summary.publicAPI?.length || 0;
+    if (repo.summary.risks.unsafe) unsafeCount++;
+    if (repo.summary.risks.ffi) ffiCount++;
+
+    console.log(
+      `  ✓ ${repo.name.padEnd(30)} | ${
+        (repo.sourceFiles?.length || 0).toString().padStart(4)
+      } 파일 | ${(repo.summary.publicAPI?.length || 0)
+        .toString()
+        .padStart(2)} API`
+    );
+  }
+
+  console.log("\n📈 통계:");
+  console.log(`  총 파일: ${totalFiles}`);
+  console.log(`  총 API: ${totalApis}`);
+  console.log(`  unsafe 코드: ${unsafeCount}개`);
+  console.log(`  FFI 의존: ${ffiCount}개`);
+  console.log(`\n💾 인덱스: db/repos.json`);
+}
+
+/**
+ * 기능 검색 (오프라인, 즉각적)
+ */
+async function handleFind(feature) {
+  if (!feature) {
+    console.error("❌ 사용법: node main-offline.js find \"garbage collection\"");
+    process.exit(1);
+  }
+
+  const indexer = new CodeIndexer(
+    process.env.GOGS_URL || "https://gogs.dclub.kr",
+    process.env.GOGS_TOKEN || ""
+  );
+
+  const indexes = indexer.loadAllIndexes();
+  if (Object.keys(indexes).length === 0) {
+    console.error("❌ 인덱스가 없습니다. 먼저 'scan' 명령을 실행하세요");
+    process.exit(1);
+  }
+
+  const suggester = new ReuseSuggesterOffline(indexes);
+  const result = suggester.suggestForFeature(feature);
+
+  if (result && result.candidates.length > 0) {
+    console.log("\n🎯 재활용 가능한 코드:\n");
+
+    for (let i = 0; i < result.candidates.length; i++) {
+      const rec = result.candidates[i];
+      console.log(`${i + 1}. ${rec.repo}`);
+      console.log(`   재활용성: ${rec.reusability} (점수: ${rec.score})`);
+      console.log(`   난이도: ${rec.difficulty}`);
+      console.log(`   예상 시간: ${rec.effort}`);
+      console.log(`   신뢰도: ${rec.confidence}%`);
+      console.log(`   방법: ${rec.howToReuse}`);
+
+      if (rec.warnings.length > 0) {
+        console.log(`   주의: ${rec.warnings.join(", ")}`);
+      }
+      console.log(`   권장: ${rec.recommendation}`);
+      if (i < result.candidates.length - 1) console.log();
+    }
+
+    console.log(`\n💡 총 ${result.allCandidates}개 후보 발견`);
+  } else {
+    console.log("❌ 일치하는 코드가 없습니다");
+  }
+
+  // 결과 저장
+  saveResult("find", feature, result);
+}
+
+/**
+ * 두 저장소 간 재활용 평가 (오프라인)
+ */
+async function handleEvaluate(sourceRepo, targetRepo, purpose) {
+  if (!sourceRepo || !targetRepo) {
+    console.error(
+      "❌ 사용법: node main-offline.js evaluate <source-repo> <target-repo> <purpose>"
+    );
+    process.exit(1);
+  }
+
+  const indexer = new CodeIndexer(
+    process.env.GOGS_URL || "https://gogs.dclub.kr",
+    process.env.GOGS_TOKEN || ""
+  );
+
+  const indexes = indexer.loadAllIndexes();
+  if (Object.keys(indexes).length === 0) {
+    console.error("❌ 인덱스가 없습니다. 먼저 'scan' 명령을 실행하세요");
+    process.exit(1);
+  }
+
+  if (!indexes[sourceRepo] || !indexes[targetRepo]) {
+    console.error(`❌ 저장소를 찾을 수 없습니다`);
+    console.log(`   사용 가능: ${Object.keys(indexes).slice(0, 5).join(", ")}`);
+    process.exit(1);
+  }
+
+  const suggester = new ReuseSuggesterOffline(indexes);
+
+  console.log(`\n🔄 평가 진행 중: ${sourceRepo} → ${targetRepo}`);
+  if (purpose) console.log(`📌 목적: ${purpose}\n`);
+
+  const evaluation = suggester.suggestForRepositories(
+    sourceRepo,
+    targetRepo,
+    purpose || "일반적 재활용"
+  );
+
+  console.log("📊 평가 결과:\n");
+
+  const e = evaluation.evaluation;
+
+  console.log(`✅ 재활용 가능: ${e.feasible ? "YES ✅" : "검토 필요"}`);
+  console.log(`📈 호환성: ${e.compatibility}`);
+  console.log(`🔧 난이도: ${e.difficulty}`);
+  console.log(`⏱️  예상 시간: ${e.effort}`);
+
+  if (e.commonApis.length > 0) {
+    console.log(
+      `\n🎯 공통 API: ${e.commonApis.slice(0, 3).join(", ")}${
+        e.commonApis.length > 3 ? "..." : ""
+      }`
+    );
+  }
+
+  if (e.reuseableModules.length > 0) {
+    console.log(`\n📦 재활용 가능 모듈:`);
+    e.reuseableModules.forEach((m) => console.log(`   - ${m}`));
+  }
+
+  if (e.risks.length > 0) {
+    console.log(`\n⚠️  위험 요소:`);
+    e.risks.forEach((r) => console.log(`   - ${r}`));
+  }
+
+  console.log(`\n💡 권장사항:`);
+  e.recommendations.forEach((r) => console.log(`   - ${r}`));
+
+  console.log(`\n📝 최종 판정: ${e.decideToProcceed ? "✅ 진행 가능" : "⚠️ 검토 필요"}`);
+
+  // 결과 저장
+  saveResult("evaluate", `${sourceRepo}-to-${targetRepo}`, evaluation);
+}
+
+/**
+ * 저장소 목록 출력
+ */
+async function handleListRepos() {
+  const indexer = new CodeIndexer(
+    process.env.GOGS_URL || "https://gogs.dclub.kr",
+    process.env.GOGS_TOKEN || ""
+  );
+
+  const indexes = indexer.loadAllIndexes();
+
+  if (Object.keys(indexes).length === 0) {
+    console.log("❌ 인덱스가 없습니다. 먼저 'scan' 명령을 실행하세요");
+    process.exit(1);
+  }
+
+  console.log("\n📚 인덱싱된 저장소:");
+  console.log("=".repeat(80));
+
+  const suggester = new ReuseSuggesterOffline(indexes);
+  const signatures = suggester.getAllSignatures();
+
+  const repos = Object.entries(signatures)
+    .sort((a, b) => b[1].fileCount - a[1].fileCount)
+    .slice(0, 20); // Top 20
+
+  console.log(
+    `이름`.padEnd(30) +
+      `언어`.padEnd(15) +
+      `파일`.padEnd(8) +
+      `특징`.padEnd(20) +
+      `위험`
+  );
+  console.log("-".repeat(80));
+
+  for (const [name, sig] of repos) {
+    const features = [];
+    if (sig.hasGC) features.push("GC");
+    if (sig.hasVM) features.push("VM");
+    if (sig.hasFFI) features.push("FFI");
+
+    let riskStr = "";
+    if (sig.hasUnsafe) riskStr += "unsafe";
+    if (sig.hasFFI) riskStr += (riskStr ? "," : "") + "ffi";
+    if (!riskStr) riskStr = "safe";
+
+    console.log(
+      name.padEnd(30) +
+        sig.language.padEnd(15) +
+        sig.fileCount.toString().padEnd(8) +
+        (features.join(",") || "-").padEnd(20) +
+        riskStr
+    );
+  }
+
+  console.log("\n💡 팁: node main-offline.js evaluate <repo1> <repo2> \"목적\"");
+}
+
+/**
+ * 저장소 간 재활용 그래프 생성
+ */
+async function handleGraph() {
+  const indexer = new CodeIndexer(
+    process.env.GOGS_URL || "https://gogs.dclub.kr",
+    process.env.GOGS_TOKEN || ""
+  );
+
+  const indexes = indexer.loadAllIndexes();
+
+  if (Object.keys(indexes).length === 0) {
+    console.error("❌ 인덱스가 없습니다. 먼저 'scan' 명령을 실행하세요");
+    process.exit(1);
+  }
+
+  const suggester = new ReuseSuggesterOffline(indexes);
+
+  console.log("\n🔗 저장소 재활용 그래프 생성 중...\n");
+  const graph = suggester.buildReuseGraph();
+
+  console.log("📊 재활용 가능한 경로:\n");
+
+  let count = 0;
+  for (const [source, targets] of Object.entries(graph)) {
+    for (const target of targets) {
+      console.log(
+        `  ${source.padEnd(25)} → ${target.target.padEnd(25)} (${target.compatibility}%)`
+      );
+      count++;
+      if (count >= 15) break;
+    }
+    if (count >= 15) break;
+  }
+
+  if (count === 0) {
+    console.log("  (호환 가능한 경로 없음)");
+  }
+
+  console.log(`\n💾 전체 그래프: logs/reuse-graph.json`);
+
+  // 그래프 저장
+  saveResult("graph", "reuse-relationships", graph);
+}
+
+/**
+ * 두 저장소 직접 비교
+ */
+async function handleCompare(repo1, repo2) {
+  if (!repo1 || !repo2) {
+    console.error(
+      "❌ 사용법: node main-offline.js compare <repo1> <repo2>"
+    );
+    process.exit(1);
+  }
+
+  const indexer = new CodeIndexer(
+    process.env.GOGS_URL || "https://gogs.dclub.kr",
+    process.env.GOGS_TOKEN || ""
+  );
+
+  const indexes = indexer.loadAllIndexes();
+
+  if (!indexes[repo1] || !indexes[repo2]) {
+    console.error("❌ 저장소를 찾을 수 없습니다");
+    process.exit(1);
+  }
+
+  console.log(`\n📊 ${repo1} vs ${repo2}\n`);
+
+  const idx1 = indexes[repo1];
+  const idx2 = indexes[repo2];
+
+  const files1 = idx1.sourceFiles || [];
+  const files2 = idx2.sourceFiles || [];
+
+  console.log("📁 구조:");
+  console.log(`  ${repo1}: ${files1.length} 파일`);
+  console.log(`  ${repo2}: ${files2.length} 파일`);
+
+  const exts1 = getExtensions(files1);
+  const exts2 = getExtensions(files2);
+
+  console.log("\n📝 언어:");
+  console.log(`  ${repo1}: ${Array.from(exts1.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map((e) => `${e[0]}(${e[1]})`)
+    .join(", ")}`);
+  console.log(`  ${repo2}: ${Array.from(exts2.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map((e) => `${e[0]}(${e[1]})`)
+    .join(", ")}`);
+
+  const apis1 = idx1.summary.publicAPI || [];
+  const apis2 = idx2.summary.publicAPI || [];
+
+  console.log("\n🎯 API:");
+  console.log(`  ${repo1}: ${apis1.length} API`);
+  console.log(`  ${repo2}: ${apis2.length} API`);
+
+  // 계산: 위험도
+  console.log("\n⚠️  위험도:");
+  console.log(`  ${repo1}: unsafe=${idx1.summary.risks.unsafe ? "O" : "X"}, ffi=${idx1.summary.risks.ffi ? "O" : "X"}`);
+  console.log(`  ${repo2}: unsafe=${idx2.summary.risks.unsafe ? "O" : "X"}, ffi=${idx2.summary.risks.ffi ? "O" : "X"}`);
+}
+
+/**
+ * 파일 확장자 추출
+ */
+function getExtensions(files) {
+  const exts = new Map();
+  for (const file of files) {
+    const ext = file.split(".").pop();
+    exts.set(ext, (exts.get(ext) || 0) + 1);
+  }
+  return exts;
+}
+
+/**
+ * 결과 로컬 저장
+ */
+function saveResult(type, name, data) {
+  const logsDir = path.join(__dirname, "logs");
+  if (!fs.existsSync(logsDir)) {
+    fs.mkdirSync(logsDir, { recursive: true });
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const fileName = `${timestamp}_${type}_${name}.json`;
+  const filePath = path.join(logsDir, fileName);
+
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  console.log(`\n💾 결과 저장: ${filePath}`);
+}
+
+/**
+ * 도움말
+ */
+function printHelp() {
+  console.log(`
+🚀 Gogs AI Code Reuse System (오프라인 모드)
+
+명령어:
+
+  scan <dir>
+    저장소들을 스캔하고 인덱싱합니다
+    예: node main-offline.js scan ~/repos
+
+  find <feature>
+    기능을 검색하고 재활용 가능한 코드를 제안합니다
+    예: node main-offline.js find "garbage collection"
+
+  evaluate <source> <target> [purpose]
+    두 저장소 간의 재활용 가능성을 평가합니다
+    예: node main-offline.js evaluate freelang-v6 clarity-lang "VM 통합"
+
+  list-repos
+    인덱싱된 모든 저장소의 목록을 표시합니다
+
+  compare <repo1> <repo2>
+    두 저장소를 직접 비교합니다
+    예: node main-offline.js compare freelang-v6 freelang-v4
+
+  graph
+    저장소 간의 재활용 관계도를 생성합니다
+
+환경변수:
+
+  GOGS_URL     Gogs 서버 URL (기본: https://gogs.dclub.kr)
+  GOGS_TOKEN   Gogs API 토큰 (선택사항)
+  DEBUG        디버그 모드 활성화
+
+특징:
+
+  ✅ API 없이 즉각적으로 작동
+  ✅ 오프라인 모드 (네트워크 불필요)
+  ✅ 높은 신뢰도의 휴리스틱 기반 분석
+  ✅ 파일 기반 재활용 가능성 평가
+
+`);
+}
+
+main().catch((e) => {
+  console.error("\n❌ 오류:", e.message);
+  if (process.env.DEBUG) console.error(e.stack);
+  process.exit(1);
+});

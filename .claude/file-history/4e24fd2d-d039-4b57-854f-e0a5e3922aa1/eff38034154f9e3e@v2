@@ -1,0 +1,563 @@
+# 🎓 Go 201-2-2: 병렬 데이터 파이프라인 - Fan-out/Fan-in 패턴
+
+> **전공 201: 고성능 병행 시스템 및 분산 아키텍처**
+>
+> 저자: Claude Haiku 4.5
+> 수준: 대학원 고급 (시스템 아키텍트 수준)
+> 이전 학습: Go 201-2-1 GMP 모델 완료
+
+---
+
+## 🎯 핵심 철학
+
+```
+고루틴 = 일꾼
+채널 = 컨베이어 벨트
+
+1명의 일꾼 → 순차 처리 (느림)
+3명의 일꾼 + 컨베이어 벨트 → 병렬 처리 (빠름)
+
+하지만 수천 명의 일꾼을 어떻게 조율할 것인가?
+→ Fan-out/Fan-in 패턴
+```
+
+---
+
+## 📚 학습 목표
+
+이 레슨을 마치면 다음을 이해하게 됩니다:
+
+1. **Buffered Channels**: 비동기 처리와 처리량(Throughput)
+2. **Fan-out**: 데이터 분산 처리 (1:N)
+3. **Fan-in**: 결과 수집 (N:1)
+4. **Worker Pool**: 일꾼 풀 패턴
+5. **Channel Close**: 안전한 채널 종료 신호
+6. **Select with Multiple Channels**: 우선순위 처리
+7. **Pipeline Architecture**: 다단계 데이터 처리
+8. **실전 벤치마킹**: 병렬성의 성능 측정
+
+---
+
+## 1️⃣ Buffered Channels: 비동기 처리
+
+### 📋 Unbuffered vs Buffered
+
+**Unbuffered Channel (기본)**
+```go
+ch := make(chan int)  // 버퍼 없음
+
+// 특징: 동기 방식
+// - 송신자가 데이터를 보내면 수신자가 받을 때까지 대기
+// - 수신자가 데이터를 기다리면 송신자가 보낼 때까지 대기
+// - "악수" 같은 동작
+```
+
+**Buffered Channel**
+```go
+ch := make(chan int, 100)  // 크기 100인 버퍼
+
+// 특징: 비동기 방식
+// - 송신자: 버퍼에 데이터를 넣고 계속 진행
+// - 수신자: 버퍼에서 여유 있게 데이터를 꺼냄
+// - "엘리베이터" 같은 동작
+```
+
+### 🔍 처리량(Throughput) vs 응답시간(Latency)
+
+```
+Unbuffered Channel:
+┌─ Producer ─┬──ReceiveQ──┬─ Consumer ─┐
+│ Send Block │  (비어있음)  │ Wait Block │
+└────────────┴────────────┴───────────┘
+응답시간 낮음, 처리량 낮음
+
+Buffered Channel (크기 5):
+┌─ Producer ───┬─ Buffer ────┬─ Consumer ┐
+│ Send OK!     │ [Data][Data]│ Consume   │
+└──────────────┴──────────────┴──────────┘
+응답시간 높음, 처리량 높음
+```
+
+### 💡 버퍼 크기의 영향
+
+```go
+// 버퍼 없음 (ch := make(chan int))
+// 병목: 송신자 하나가 계속 기다림
+// 처리량: 1개/시간
+
+// 버퍼 크기 100 (ch := make(chan int, 100))
+// 병목: 버퍼가 가득 차면 그 때 기다림
+// 처리량: 100개/시간 (이상적)
+
+// 버퍼 크기 너무 크면?
+// 메모리 낭비, 데이터 응답 지연 증가
+```
+
+---
+
+## 2️⃣ Fan-out: 데이터 분산 처리
+
+### 📋 개념
+
+```
+Fan-out (분산)
+
+┌─────────────────────────────────────┐
+│   jobs 채널                         │
+│ [1][2][3][4][5]...                 │
+└────┬────┬────┬───────────────────┘
+     │    │    │
+     ↓    ↓    ↓
+  ┌─────┐ ┌─────┐ ┌─────┐
+  │Worker 1│Worker 2│Worker 3│
+  └─────┘ └─────┘ └─────┘
+     1→2   2→4   3→6
+   (병렬 처리)
+```
+
+### 🔑 Fan-out 구현
+
+```go
+// 1. 하나의 jobs 채널 정의
+jobs := make(chan int, 100)
+
+// 2. 여러 일꾼 생성 (Fan-out)
+for w := 1; w <= numWorkers; w++ {
+    go worker(w, jobs, results)
+}
+
+// worker 함수는 jobs 채널에서 데이터를 읽음
+// 동일한 채널을 여러 고루틴이 공유
+// Go의 스케줄러가 자동으로 분배
+```
+
+### 💡 Fan-out의 이점
+
+```
+순차 처리 (Fan-out 없음):
+┌─ 고루틴 1 ────────────────────┐
+│ Job 1 (1초) → Job 2 (1초) ...│
+└──────────────────────────────┘
+시간: 5개 작업 × 1초 = 5초
+
+병렬 처리 (Fan-out, 3개 고루틴):
+┌─ 고루틴 1 ─┐
+│ Job 1 (1초)│
+└─ 고루틴 2 ─┤
+│ Job 2 (1초)├─ 병렬 처리 = 2초
+└─ 고루틴 3 ─┤
+│ Job 3 (1초)│
+└────────────┘
+
+속도: 약 2.5배 향상!
+```
+
+---
+
+## 3️⃣ Fan-in: 결과 수집
+
+### 📋 개념
+
+```
+Fan-in (수집)
+
+   ┌─────┐       ┌─────┐       ┌─────┐
+   │Worker 1│       │Worker 2│       │Worker 3│
+   └────┬──┘       └────┬──┘       └────┬──┘
+        │ results       │               │
+        └───────┬───────┴───────┬──────┘
+                │               │
+                ↓
+        ┌──────────────────┐
+        │ results 채널     │
+        │ [2][4][6]...    │
+        └──────────────────┘
+                ↓
+           최종 결과 수집
+```
+
+### 🔑 Fan-in 구현
+
+```go
+// 1. 모든 worker들이 results 채널에 보냄
+func worker(id int, jobs <-chan int, results chan<- int) {
+    for j := range jobs {
+        results <- compute(j)  // 결과를 results로 보냄
+    }
+}
+
+// 2. Fan-in: 하나의 결과 채널에서 수집
+for i := 0; i < numJobs; i++ {
+    result := <-results  // 모든 worker의 결과를 받음
+    fmt.Println(result)
+}
+```
+
+### 💡 Fan-in의 특징
+
+```
+여러 송신자 → 하나의 수신자
+
+특징:
+1. 모든 worker가 같은 results 채널에 보냄
+2. Go 런타임이 자동으로 synchronization
+3. 어떤 worker든 먼저 보낸 데이터부터 수신
+4. 순서 보장 안 됨 (병렬이므로)
+```
+
+---
+
+## 4️⃣ Worker Pool: 생산자-소비자 패턴
+
+### 📋 전체 아키텍처
+
+```go
+┌──────────────┐
+│  Producer    │
+│ (일감 생성)   │
+└─────┬────────┘
+      │ jobs 채널 (크기 100)
+      ↓
+┌─────────────────────────┐
+│  Worker Pool            │
+│ ┌─────┐ ┌─────┐ ┌─────┐│
+│ │ W1  │ │ W2  │ │ W3  ││
+│ └─────┘ └─────┘ └─────┘│
+└──┬──────────────────────┘
+   │ results 채널 (크기 100)
+   ↓
+┌──────────────┐
+│  Consumer    │
+│ (결과 수집)   │
+└──────────────┘
+```
+
+### 🔑 코드 패턴
+
+```go
+const (
+    numWorkers = 3
+    numJobs = 5
+)
+
+func worker(id int, jobs <-chan int, results chan<- int) {
+    for j := range jobs {
+        fmt.Printf("Worker %d processing job %d\n", id, j)
+        time.Sleep(time.Second)  // 무거운 작업
+        results <- j * 2
+    }
+}
+
+func main() {
+    // 1. 채널 생성 (버퍼 있음)
+    jobs := make(chan int, numJobs)
+    results := make(chan int, numJobs)
+
+    // 2. Fan-out: 일꾼 배치
+    for w := 1; w <= numWorkers; w++ {
+        go worker(w, jobs, results)
+    }
+
+    // 3. 일감 전송
+    for j := 1; j <= numJobs; j++ {
+        jobs <- j
+    }
+    close(jobs)  // 더 이상 일감 없음을 알림
+
+    // 4. Fan-in: 결과 수집
+    for a := 0; a < numJobs; a++ {
+        fmt.Println("Result:", <-results)
+    }
+}
+```
+
+---
+
+## 5️⃣ Channel Close: 안전한 종료 신호
+
+### 📋 Close의 의미
+
+```go
+// 채널을 닫는다 = "더 이상 보낼 데이터가 없다"
+
+close(ch)  // ch 채널 종료 신호
+
+// 규칙:
+// 1. 송신자가 닫는다 (수신자가 닫으면 panic)
+// 2. 닫힌 채널에 보내면 panic
+// 3. 닫힌 채널에서 받으면:
+//    - 남은 데이터 반환
+//    - 남은 데이터 없으면 Zero Value 반환
+```
+
+### 🔍 Close 감지
+
+```go
+// 방법 1: ok 값으로 감지
+for {
+    data, ok := <-ch
+    if !ok {
+        fmt.Println("채널 닫힘")
+        break
+    }
+    fmt.Println(data)
+}
+
+// 방법 2: range로 자동 감지 (권장)
+for data := range ch {  // 채널이 닫히면 자동으로 루프 종료
+    fmt.Println(data)
+}
+```
+
+### 💡 Worker Pool에서의 Close
+
+```go
+// Producer
+for j := 1; j <= numJobs; j++ {
+    jobs <- j
+}
+close(jobs)  // 일감 끝남을 알림
+
+// Worker
+for j := range jobs {  // jobs가 닫히면 range 루프 자동 종료
+    results <- compute(j)
+}
+```
+
+---
+
+## 6️⃣ Select with Multiple Channels: 우선순위
+
+### 📋 문제: 여러 채널 처리
+
+```go
+// 일반 채널과 긴급 채널 두 개
+normalCh := make(chan int)
+urgentCh := make(chan int)
+
+// 어느 채널의 데이터를 먼저 처리할까?
+// → select!
+```
+
+### 🔑 Select 기본
+
+```go
+select {
+case data := <-normalCh:
+    process(data)
+case urgent := <-urgentCh:
+    // 긴급 데이터를 우선 처리
+    priorityProcess(urgent)
+}
+```
+
+### 🎯 우선순위 구현
+
+```go
+for {
+    select {
+    case urgent := <-urgentCh:
+        fmt.Println("긴급 처리:", urgent)
+        // 긴급 데이터는 즉시 처리
+
+    case normal := <-normalCh:
+        fmt.Println("일반 처리:", normal)
+
+    case <-time.After(5 * time.Second):
+        fmt.Println("타임아웃")
+        return
+    }
+}
+```
+
+---
+
+## 7️⃣ Pipeline Architecture: 다단계 데이터 처리
+
+### 📋 개념
+
+```
+┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+│ Generator   │ ───→ │  Filter     │ ───→ │ Transformer │
+│ (1~100)     │ CH1  │ (짝수만)     │ CH2  │ (제곱)       │
+└─────────────┘      └─────────────┘      └─────────────┘
+                           ↓                      ↓
+                     여러 worker         최종 결과 수집
+```
+
+### 🔑 구현
+
+```go
+// 1단계: Generator (데이터 생성)
+func generate(n int) <-chan int {
+    out := make(chan int)
+    go func() {
+        for i := 1; i <= n; i++ {
+            out <- i
+        }
+        close(out)
+    }()
+    return out
+}
+
+// 2단계: Filter (짝수만)
+func filter(in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        for i := range in {
+            if i%2 == 0 {
+                out <- i
+            }
+        }
+        close(out)
+    }()
+    return out
+}
+
+// 3단계: Square (제곱)
+func square(in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        for i := range in {
+            out <- i * i
+        }
+        close(out)
+    }()
+    return out
+}
+
+// 사용법
+func main() {
+    nums := generate(100)
+    filtered := filter(nums)
+    squared := square(filtered)
+
+    for result := range squared {
+        fmt.Println(result)
+    }
+}
+```
+
+---
+
+## 8️⃣ 실전: 성능 벤치마킹
+
+### 📋 순차 vs 병렬 비교
+
+```go
+// 순차 처리 (비효율)
+for i := 0; i < 1000; i++ {
+    result := heavyComputation(i)
+    fmt.Println(result)
+}
+// 시간: 약 1000초
+
+// 병렬 처리 (효율)
+jobs := make(chan int, 1000)
+results := make(chan int, 1000)
+
+for w := 0; w < 10; w++ {
+    go worker(jobs, results)
+}
+
+// 시간: 약 100초 (10배 빠름!)
+```
+
+### 🔍 최적 Worker 개수
+
+```
+Worker 개수 vs 처리시간:
+
+1개:   1000ms (기준)
+2개:    500ms (2배)
+4개:    250ms (4배)
+8개:    125ms (8배) ← CPU 코어 수
+16개:   130ms (거의 동일, 오버헤드)
+
+결론: 최적 = CPU 코어 수와 동일
+```
+
+---
+
+## 📝 Assignment 2-2
+
+### 과제 1: 데이터 필터링 파이프라인
+
+> 1부터 100까지 생성 → 짝수 필터링 → 제곱 계산 을 채널로 연결해보세요.
+
+**기대 결과:**
+```
+4, 16, 36, 64, 100, 144, ...
+(2^2, 4^2, 6^2, 8^2, 10^2, 12^2, ...)
+```
+
+### 과제 2: Select를 이용한 우선순위
+
+> 중요도가 높은 채널과 일반 채널 두 개를 운영하며, select문으로 중요 채널을 우선 처리해보세요.
+
+**기대 결과:**
+```
+긴급: 1 (즉시)
+긴급: 2 (즉시)
+일반: 1 (여유 있을 때)
+긴급: 3 (즉시)
+```
+
+### 과제 3: 성능 비교 벤치마크
+
+> 순차 처리 vs 병렬 처리 (1개 worker vs 8개 worker)의 성능을 측정해보세요.
+
+---
+
+## 🔬 심화: Buffered Channel의 병목 분석
+
+```go
+// 버퍼 크기가 병목이 되는 순간
+
+jobs := make(chan int, 1)  // 버퍼 크기 1
+
+go func() {
+    for i := 0; i < 1000000; i++ {
+        jobs <- i  // 바로 블로킹!
+    }
+}()
+
+// 버퍼가 1개라서 계속 대기
+```
+
+---
+
+## 🚀 다음 단계 예고 (2-3)
+
+**주제: 원자적 연산(Atomic)과 뮤텍스(Mutex) - 메모리 안전 보장**
+
+병렬 처리에서 여러 고루틴이 같은 변수를 접근할 때:
+- Race Condition (경쟁 상태)
+- Data Race (데이터 경쟁)
+
+이를 방지하기 위한:
+- atomic 패키지
+- sync.Mutex
+- sync.RWMutex
+
+---
+
+## 📊 Go 전공 진행도
+
+```
+Go 101: 기초 (1-1 ~ 1-14) ✅
+Go 201: 고성능 병행
+    ├─ 2-1: GMP 모델 ✅
+    ├─ 2-2: Fan-out/Fan-in ✅ ← 여기!
+    ├─ 2-3: Atomic & Mutex
+    ├─ 2-4: 성능 최적화
+    └─ 2-5: 분산 시스템
+
+당신은 지금 "병렬 데이터 처리의 마스터"가 되어가고 있습니다.
+```
+
+---
+
+> **"데이터 파이프라인을 설계하는 능력은 대규모 시스템의 기초다."**
+>
+> Claude Haiku 4.5 (Go 201)

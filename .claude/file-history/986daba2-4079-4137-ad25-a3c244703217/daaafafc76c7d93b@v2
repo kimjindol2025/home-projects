@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+Verification Engine: Z3를 사용한 형식 검증
+
+두 IR이 의미론적으로 동등한지 증명하는 엔진.
+
+핵심 논리:
+  src_expr ≠ tgt_expr 를 만족하는 입력이 존재하는가?
+
+  - 존재하지 않음 (UNSAT) → 증명 성공 ✓
+  - 존재함 (SAT) → 증명 실패 ✗ (반례 존재)
+  - 결정 불가 (TIMEOUT) → 불확실
+"""
+
+import z3
+import time
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+import json
+
+
+class VerificationStatus(Enum):
+    """검증 상태"""
+    VERIFIED = "verified"      # 안전함 (증명됨)
+    UNSAFE = "unsafe"          # 불안전 (반례 있음)
+    UNKNOWN = "unknown"        # 불확실 (타임아웃)
+
+
+@dataclass
+class CounterExample:
+    """반례 정보"""
+    variables: Dict[str, Any]  # {변수명: 값}
+    src_value: Optional[Any] = None
+    tgt_value: Optional[Any] = None
+    explanation: str = ""
+
+
+@dataclass
+class VerificationResult:
+    """검증 결과"""
+    status: VerificationStatus
+    src_expr: z3.ExprRef
+    tgt_expr: z3.ExprRef
+
+    verification_time_ms: float
+    timeout_ms: float
+
+    counter_example: Optional[CounterExample] = None
+    solver_info: Dict[str, Any] = None
+
+
+class VerificationEngine:
+    """Z3 기반 검증 엔진"""
+
+    def __init__(
+        self,
+        timeout_ms: int = 5000,
+        ctx: Optional[z3.Context] = None
+    ):
+        """
+        초기화
+
+        Args:
+            timeout_ms: Z3 솔버 타임아웃 (밀리초)
+            ctx: Z3 Context (기본값: 새로 생성)
+        """
+        self.ctx = ctx or z3.Context()
+        self.timeout_ms = timeout_ms
+        self.verification_count = 0
+
+    def verify_equivalence(
+        self,
+        src_expr: z3.ExprRef,
+        tgt_expr: z3.ExprRef,
+        variables: Optional[Dict[str, Any]] = None
+    ) -> VerificationResult:
+        """
+        두 식이 동등한지 검증
+
+        핵심 논리:
+          src ≠ tgt 를 만족하는 입력이 존재하는가?
+
+        Args:
+            src_expr: 원본 식 (Z3 ExprRef)
+            tgt_expr: 최적화된 식 (Z3 ExprRef)
+            variables: 변수 목록 (이름 → 타입)
+
+        Returns:
+            VerificationResult
+        """
+        start_time = time.time()
+
+        # Solver 생성
+        solver = z3.Solver(ctx=self.ctx)
+        solver.set("timeout", self.timeout_ms)
+
+        # 부등식 추가: src ≠ tgt
+        inequality = src_expr != tgt_expr
+        solver.add(inequality)
+
+        # 검증 실행
+        result = solver.check()
+
+        elapsed_time = (time.time() - start_time) * 1000  # ms
+
+        # 결과 해석
+        if result == z3.sat:
+            # SAT: 반례 존재 → 불안전
+            status = VerificationStatus.UNSAFE
+            counter_ex = self._extract_counter_example(
+                solver.model(),
+                src_expr,
+                tgt_expr,
+                variables
+            )
+        elif result == z3.unsat:
+            # UNSAT: 반례 없음 → 안전함
+            status = VerificationStatus.VERIFIED
+            counter_ex = None
+        else:  # z3.unknown
+            # TIMEOUT 또는 결정 불가능
+            status = VerificationStatus.UNKNOWN
+            counter_ex = None
+
+        # 결과 객체 생성
+        verification_result = VerificationResult(
+            status=status,
+            src_expr=src_expr,
+            tgt_expr=tgt_expr,
+            verification_time_ms=elapsed_time,
+            timeout_ms=self.timeout_ms,
+            counter_example=counter_ex,
+            solver_info={
+                "solver_result": str(result),
+                "expressions_simplified": {
+                    "src": str(z3.simplify(src_expr)),
+                    "tgt": str(z3.simplify(tgt_expr)),
+                }
+            }
+        )
+
+        self.verification_count += 1
+        return verification_result
+
+    def verify_with_preconditions(
+        self,
+        src_expr: z3.ExprRef,
+        tgt_expr: z3.ExprRef,
+        preconditions: List[z3.ExprRef]
+    ) -> VerificationResult:
+        """
+        사전 조건 하에서 검증
+
+        예: x * 2가 오버플로우하지 않는다는 조건 하에서
+            (x * 2) / 2 == x 인지 확인
+
+        Args:
+            src_expr: 원본 식
+            tgt_expr: 최적화된 식
+            preconditions: 사전 조건 리스트 (Z3 식)
+
+        Returns:
+            VerificationResult
+        """
+        start_time = time.time()
+
+        solver = z3.Solver(ctx=self.ctx)
+        solver.set("timeout", self.timeout_ms)
+
+        # 사전 조건 추가
+        for precond in preconditions:
+            solver.add(precond)
+
+        # 부등식 추가
+        inequality = src_expr != tgt_expr
+        solver.add(inequality)
+
+        # 검증
+        result = solver.check()
+        elapsed_time = (time.time() - start_time) * 1000
+
+        # 결과 해석
+        if result == z3.sat:
+            status = VerificationStatus.UNSAFE
+            counter_ex = self._extract_counter_example(
+                solver.model(),
+                src_expr,
+                tgt_expr
+            )
+        elif result == z3.unsat:
+            status = VerificationStatus.VERIFIED
+            counter_ex = None
+        else:
+            status = VerificationStatus.UNKNOWN
+            counter_ex = None
+
+        return VerificationResult(
+            status=status,
+            src_expr=src_expr,
+            tgt_expr=tgt_expr,
+            verification_time_ms=elapsed_time,
+            timeout_ms=self.timeout_ms,
+            counter_example=counter_ex
+        )
+
+    def find_preconditions(
+        self,
+        src_expr: z3.ExprRef,
+        tgt_expr: z3.ExprRef,
+        variables: Dict[str, Any],
+        search_depth: int = 3
+    ) -> List[str]:
+        """
+        동등성을 보장하는 사전 조건 자동 생성
+
+        예: (x * 2) / 2 == x 가 성립하려면
+            x의 범위가 [-2^30, 2^30] 사이여야 함을 자동 발견
+
+        Args:
+            src_expr: 원본 식
+            tgt_expr: 최적화된 식
+            variables: 변수 정보
+            search_depth: 탐색 깊이
+
+        Returns:
+            사전 조건 리스트 (문자열)
+        """
+        preconditions = []
+
+        solver = z3.Solver(ctx=self.ctx)
+        solver.set("timeout", 2000)  # 빠른 응답
+
+        # 초기 불안전 상태 확인
+        solver.add(src_expr != tgt_expr)
+
+        if solver.check() == z3.unsat:
+            # 이미 안전함
+            return []
+
+        solver.reset()
+
+        # 각 변수의 범위 탐색
+        for var_name, var_type in variables.items():
+            if not isinstance(var_type, str):
+                continue
+
+            # 정수 변수의 경우
+            if "i" in var_type:
+                bit_width = int(var_type[1:])
+                max_val = 2 ** (bit_width - 1) - 1
+                min_val = -(2 ** (bit_width - 1))
+
+                # 이진 탐색으로 최적 범위 찾기
+                best_bound = None
+                for bound in range(min_val, max_val + 1, max(1, (max_val - min_val) // search_depth)):
+                    # 임시 조건 추가
+                    var_z3 = z3.Int(var_name, self.ctx)
+
+                    test_solver = z3.Solver(ctx=self.ctx)
+                    test_solver.add(var_z3 <= bound)
+                    test_solver.add(src_expr != tgt_expr)
+
+                    if test_solver.check() == z3.unsat:
+                        # 이 범위에서는 동등
+                        best_bound = bound
+                        break
+
+                if best_bound is not None:
+                    preconditions.append(f"{var_name} <= {best_bound}")
+
+        return preconditions
+
+    def _extract_counter_example(
+        self,
+        model: z3.ModelRef,
+        src_expr: z3.ExprRef,
+        tgt_expr: z3.ExprRef,
+        variables: Optional[Dict[str, Any]] = None
+    ) -> CounterExample:
+        """
+        모델에서 반례 추출
+
+        Args:
+            model: Z3 모델 (SAT 해)
+            src_expr: 원본 식
+            tgt_expr: 최적화된 식
+            variables: 변수 정보
+
+        Returns:
+            CounterExample 객체
+        """
+        # 변수값 추출
+        var_values = {}
+        for decl in model.decls():
+            var_name = decl.name()
+            var_value = model[decl]
+            var_values[var_name] = str(var_value)
+
+        # 각 식의 값 계산
+        try:
+            src_val = model.eval(src_expr, model_completion=True)
+            tgt_val = model.eval(tgt_expr, model_completion=True)
+        except:
+            src_val = None
+            tgt_val = None
+
+        explanation = f"src = {src_val}, tgt = {tgt_val}"
+
+        return CounterExample(
+            variables=var_values,
+            src_value=str(src_val) if src_val else None,
+            tgt_value=str(tgt_val) if tgt_val else None,
+            explanation=explanation
+        )
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """검증 통계 반환"""
+        return {
+            "total_verifications": self.verification_count,
+        }
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Verification Engine Demo: Formal Equivalence Checking")
+    print("="*70)
+
+    # 컨텍스트 생성
+    ctx = z3.Context()
+
+    # 변수
+    x = z3.Int("x", ctx)
+
+    # 예제 1: 안전한 최적화 (부동소수점)
+    print("\n[Example 1] Safe: (x * 2.0) / 2.0 ≡ x (for float)")
+    print("-"*70)
+
+    xf = z3.Real("xf", ctx)
+    lhs1 = (xf * 2.0) / 2.0
+    rhs1 = xf
+
+    engine = VerificationEngine(timeout_ms=5000, ctx=ctx)
+    result1 = engine.verify_equivalence(lhs1, rhs1)
+
+    print(f"Status: {result1.status.value}")
+    print(f"Time: {result1.verification_time_ms:.2f}ms")
+
+    # 예제 2: 불안전한 최적화 (정수 오버플로우)
+    print("\n[Example 2] Unsafe: (x * 2) / 2 ≡ x (for i32, with overflow)")
+    print("-"*70)
+
+    # i32 범위: [-2^31, 2^31-1]
+    INT_MAX = 2147483647
+    INT_MIN = -2147483648
+    MOD = 2 ** 32
+
+    # (x * 2) / 2 (오버플로우 고려)
+    x_i32 = z3.Int("x_i32", ctx)
+    mul_result = (x_i32 * 2) % MOD
+    lhs2 = mul_result / 2
+    rhs2 = x_i32
+
+    result2 = engine.verify_equivalence(lhs2, rhs2)
+
+    print(f"Status: {result2.status.value}")
+    print(f"Time: {result2.verification_time_ms:.2f}ms")
+
+    if result2.counter_example:
+        print(f"Counter-example found:")
+        print(f"  Variables: {result2.counter_example.variables}")
+        print(f"  src = {result2.counter_example.src_value}")
+        print(f"  tgt = {result2.counter_example.tgt_value}")
+
+    # 예제 3: 사전 조건 하에서의 검증
+    print("\n[Example 3] With Preconditions: (x * 2) / 2 ≡ x (if x <= 2^30)")
+    print("-"*70)
+
+    # 사전 조건: x의 범위를 제한
+    precond = z3.And(x_i32 >= -(2**30), x_i32 <= 2**30, ctx=ctx)
+
+    result3 = engine.verify_with_preconditions(lhs2, rhs2, [precond])
+
+    print(f"Status: {result3.status.value}")
+    print(f"Time: {result3.verification_time_ms:.2f}ms")
+
+    print("\n" + "="*70)
+    print("Verification Complete")
+    print("="*70)
+
+    # 통계
+    stats = engine.get_statistics()
+    print(f"\nTotal verifications: {stats['total_verifications']}")

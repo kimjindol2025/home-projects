@@ -1,0 +1,504 @@
+"""
+v7.2 배송 서비스 (Delivery Service)
+
+주문과 결제가 완료된 후 배송을 관리합니다.
+"""
+
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Generator, Optional, Tuple
+from dataclasses import dataclass, asdict
+import uuid
+import random
+
+# ============================================================================
+# 비즈니스 로직 레이어
+# ============================================================================
+
+
+class DeliveryStatus(Enum):
+    """배송 상태"""
+    PENDING = "PENDING"
+    PICKED_UP = "PICKED_UP"
+    IN_TRANSIT = "IN_TRANSIT"
+    OUT_FOR_DELIVERY = "OUT_FOR_DELIVERY"
+    DELIVERED = "DELIVERED"
+    FAILED = "FAILED"
+
+
+class DeliveryType(Enum):
+    """배송 유형"""
+    STANDARD = "STANDARD"
+    EXPRESS = "EXPRESS"
+    OVERNIGHT = "OVERNIGHT"
+
+
+@dataclass
+class DeliveryLocation:
+    """배송 주소"""
+    street: str
+    city: str
+    country: str
+    postal_code: str
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
+class DeliveryShipment:
+    """배송 기록"""
+    shipment_id: str
+    order_id: str
+    delivery_type: DeliveryType
+    from_location: DeliveryLocation
+    to_location: DeliveryLocation
+    status: DeliveryStatus
+    estimated_delivery: str
+    created_at: str = None
+    updated_at: str = None
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.utcnow().isoformat()
+        if self.updated_at is None:
+            self.updated_at = datetime.utcnow().isoformat()
+
+    def to_dict(self) -> Dict:
+        data = asdict(self)
+        data["delivery_type"] = self.delivery_type.value
+        data["status"] = self.status.value
+        data["from_location"] = self.from_location.to_dict()
+        data["to_location"] = self.to_location.to_dict()
+        return data
+
+
+class DeliveryBusinessLogic:
+    """
+    배송 비즈니스 로직
+
+    1. create_shipment (Unary): 배송 생성
+    2. track_shipment_stream (Server Streaming): 배송 실시간 추적
+    3. batch_create_shipments (Client Streaming): 배송 배치 생성
+    4. monitor_fleet_bidirectional (Bidirectional): 차량 실시간 모니터링
+    """
+
+    # 배송 시간 설정
+    DELIVERY_TIMES = {
+        DeliveryType.STANDARD: 5,  # 5일
+        DeliveryType.EXPRESS: 2,  # 2일
+        DeliveryType.OVERNIGHT: 1,  # 1일
+    }
+
+    # 모의 배송 센터
+    WAREHOUSES = {
+        "WH-NYC": DeliveryLocation(
+            street="123 Madison Ave",
+            city="New York",
+            country="USA",
+            postal_code="10001",
+        ),
+        "WH-LA": DeliveryLocation(
+            street="456 Sunset Blvd",
+            city="Los Angeles",
+            country="USA",
+            postal_code="90001",
+        ),
+        "WH-CHI": DeliveryLocation(
+            street="789 Michigan Ave",
+            city="Chicago",
+            country="USA",
+            postal_code="60601",
+        ),
+    }
+
+    def __init__(self):
+        """배송 저장소 초기화"""
+        self.shipments: Dict[str, DeliveryShipment] = {}
+        self.metrics = {
+            "total_created": 0,
+            "total_delivered": 0,
+            "total_failed": 0,
+            "avg_delivery_days": 0.0,
+        }
+
+    # ========================================================================
+    # 1. Unary RPC: create_shipment
+    # ========================================================================
+
+    def create_shipment(
+        self,
+        order_id: str,
+        delivery_type: str,
+        to_location: Dict,
+    ) -> Dict:
+        """
+        배송 생성 (Unary RPC)
+
+        Args:
+            order_id: 주문 ID
+            delivery_type: 배송 유형
+            to_location: 배송 주소
+
+        Returns:
+            배송 생성 결과
+        """
+        shipment_id = f"SHP-{uuid.uuid4().hex[:8].upper()}"
+
+        try:
+            d_type = DeliveryType[delivery_type.upper()]
+        except KeyError:
+            return {"success": False, "error": f"지원하지 않는 배송 유형: {delivery_type}"}
+
+        # 배송 센터에서 선택
+        from_warehouse = random.choice(list(self.WAREHOUSES.values()))
+
+        # 배송 주소 생성
+        to_loc = DeliveryLocation(
+            street=to_location.get("street", "Unknown"),
+            city=to_location.get("city", "Unknown"),
+            country=to_location.get("country", "Unknown"),
+            postal_code=to_location.get("postal_code", "00000"),
+        )
+
+        # 예상 배송일 계산
+        days = self.DELIVERY_TIMES[d_type]
+        estimated_delivery = (datetime.utcnow() + timedelta(days=days)).isoformat()
+
+        shipment = DeliveryShipment(
+            shipment_id=shipment_id,
+            order_id=order_id,
+            delivery_type=d_type,
+            from_location=from_warehouse,
+            to_location=to_loc,
+            status=DeliveryStatus.PENDING,
+            estimated_delivery=estimated_delivery,
+        )
+
+        self.shipments[shipment_id] = shipment
+        self.metrics["total_created"] += 1
+
+        return {
+            "success": True,
+            "shipment": shipment.to_dict(),
+            "message": f"배송 {shipment_id} 생성됨",
+        }
+
+    # ========================================================================
+    # 2. Server Streaming RPC: track_shipment_stream
+    # ========================================================================
+
+    def track_shipment_stream(
+        self,
+        shipment_id: str,
+    ) -> Generator[Dict, None, None]:
+        """
+        배송 실시간 추적 (Server Streaming RPC)
+
+        배송 진행 상황을 단계별로 스트림합니다.
+
+        Args:
+            shipment_id: 배송 ID
+
+        Yields:
+            각 배송 단계의 상태
+        """
+        if shipment_id not in self.shipments:
+            yield {
+                "success": False,
+                "error": f"배송 {shipment_id}을(를) 찾을 수 없습니다",
+            }
+            return
+
+        shipment = self.shipments[shipment_id]
+
+        statuses = [
+            (DeliveryStatus.PICKED_UP, "배송 센터에서 픽업됨"),
+            (DeliveryStatus.IN_TRANSIT, "운송 중"),
+            (DeliveryStatus.OUT_FOR_DELIVERY, "배송 중"),
+            (DeliveryStatus.DELIVERED, "배송 완료"),
+        ]
+
+        current_time = datetime.utcnow()
+
+        for status, message in statuses:
+            shipment.status = status
+            shipment.updated_at = current_time.isoformat()
+            current_time += timedelta(hours=random.randint(2, 12))
+
+            # 1% 배송 실패 확률
+            if random.random() < 0.01:
+                shipment.status = DeliveryStatus.FAILED
+                yield {
+                    "success": False,
+                    "status": "배송 실패",
+                    "error": "배송 중 문제 발생",
+                    "shipment_id": shipment_id,
+                }
+                self.metrics["total_failed"] += 1
+                return
+
+            yield {
+                "success": True,
+                "shipment": shipment.to_dict(),
+                "message": message,
+                "current_location": f"{shipment.from_location.city} → {shipment.to_location.city}",
+            }
+
+        self.metrics["total_delivered"] += 1
+
+    # ========================================================================
+    # 3. Client Streaming RPC: batch_create_shipments
+    # ========================================================================
+
+    def batch_create_shipments(
+        self,
+        shipment_requests: List[Dict],
+    ) -> Dict:
+        """
+        배송 배치 생성 (Client Streaming RPC)
+
+        여러 배송 요청을 처리합니다.
+
+        Args:
+            shipment_requests: 배송 요청 리스트
+
+        Returns:
+            배치 생성 결과
+        """
+        successful = []
+        failed = []
+
+        for req in shipment_requests:
+            try:
+                result = self.create_shipment(
+                    order_id=req.get("order_id"),
+                    delivery_type=req.get("delivery_type"),
+                    to_location=req.get("to_location"),
+                )
+
+                if result["success"]:
+                    successful.append(result["shipment"])
+                else:
+                    failed.append({**req, "error": result["error"]})
+
+            except Exception as e:
+                failed.append({**req, "error": str(e)})
+
+        return {
+            "success": len(failed) == 0,
+            "total_received": len(shipment_requests),
+            "total_successful": len(successful),
+            "total_failed": len(failed),
+            "successful_shipments": successful,
+            "failed_shipments": failed if failed else None,
+            "message": f"배송 배치 처리 완료: {len(successful)}/{len(shipment_requests)}",
+        }
+
+    # ========================================================================
+    # 4. Bidirectional Streaming RPC: monitor_fleet_bidirectional
+    # ========================================================================
+
+    def monitor_fleet_bidirectional(
+        self,
+        monitor_requests: List[Dict],
+    ) -> Generator[Dict, None, None]:
+        """
+        차량 실시간 모니터링 (Bidirectional Streaming RPC)
+
+        각 배송의 실시간 위치와 상태를 모니터링합니다.
+
+        Args:
+            monitor_requests: 모니터링 요청 리스트
+
+        Yields:
+            각 배송의 실시간 업데이트
+        """
+        for i, request in enumerate(monitor_requests, 1):
+            shipment_id = request.get("shipment_id")
+
+            if shipment_id not in self.shipments:
+                yield {
+                    "success": False,
+                    "sequence": i,
+                    "error": f"배송 {shipment_id}을(를) 찾을 수 없습니다",
+                }
+                continue
+
+            shipment = self.shipments[shipment_id]
+
+            # 모의 GPS 좌표 생성 (NYC to LA)
+            start_lat, start_lon = 40.7128, -74.0060  # NYC
+            end_lat, end_lon = 34.0522, -118.2437  # LA
+
+            for step in range(5):
+                progress = step / 4  # 0 to 1
+                current_lat = start_lat + (end_lat - start_lat) * progress
+                current_lon = start_lon + (end_lon - start_lon) * progress
+
+                yield {
+                    "success": True,
+                    "sequence": i,
+                    "shipment_id": shipment_id,
+                    "status": shipment.status.value,
+                    "latitude": current_lat,
+                    "longitude": current_lon,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "progress_percent": int(progress * 100),
+                }
+
+    # ========================================================================
+    # 유틸리티
+    # ========================================================================
+
+    def get_shipment(self, shipment_id: str) -> Optional[Dict]:
+        """배송 조회"""
+        if shipment_id in self.shipments:
+            return self.shipments[shipment_id].to_dict()
+        return None
+
+    def get_shipments_by_order(self, order_id: str) -> List[Dict]:
+        """주문별 배송 조회"""
+        return [
+            shipment.to_dict()
+            for shipment in self.shipments.values()
+            if shipment.order_id == order_id
+        ]
+
+    def get_metrics(self) -> Dict:
+        """메트릭 조회"""
+        return {
+            **self.metrics,
+        }
+
+
+# ============================================================================
+# gRPC 서비스 레이어 (선택적)
+# ============================================================================
+
+try:
+    import grpc
+    from ..generated import delivery_pb2, delivery_pb2_grpc
+
+    GRPC_AVAILABLE = True
+
+    class DeliveryServicer(delivery_pb2_grpc.DeliveryServiceServicer):
+        """gRPC DeliveryService 구현"""
+
+        def __init__(
+            self, business_logic: Optional[DeliveryBusinessLogic] = None
+        ):
+            self.logic = business_logic or DeliveryBusinessLogic()
+
+        def CreateShipment(self, request, context):
+            """Unary RPC"""
+            try:
+                result = self.logic.create_shipment(
+                    order_id=request.order_id,
+                    delivery_type=request.delivery_type,
+                    to_location={
+                        "street": request.to_location.street,
+                        "city": request.to_location.city,
+                        "country": request.to_location.country,
+                        "postal_code": request.to_location.postal_code,
+                    },
+                )
+
+                if result["success"]:
+                    shipment = result["shipment"]
+                    return delivery_pb2.CreateShipmentResponse(
+                        success=True,
+                        shipment_id=shipment["shipment_id"],
+                        estimated_delivery=shipment["estimated_delivery"],
+                        message=result["message"],
+                    )
+                else:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, result["error"])
+
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def TrackShipmentStream(self, request, context):
+            """Server Streaming RPC"""
+            try:
+                for tracking in self.logic.track_shipment_stream(
+                    shipment_id=request.shipment_id
+                ):
+                    if tracking["success"]:
+                        yield delivery_pb2.TrackShipmentResponse(
+                            success=True,
+                            status=tracking.get("shipment", {}).get("status", ""),
+                            message=tracking.get("message", ""),
+                            current_location=tracking.get("current_location", ""),
+                        )
+                    else:
+                        context.abort(
+                            grpc.StatusCode.NOT_FOUND,
+                            tracking.get("error", "Unknown error"),
+                        )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def BatchCreateShipments(self, request_iterator, context):
+            """Client Streaming RPC"""
+            try:
+                shipment_requests = [
+                    {
+                        "order_id": req.order_id,
+                        "delivery_type": req.delivery_type,
+                        "to_location": {
+                            "street": req.to_location.street,
+                            "city": req.to_location.city,
+                            "country": req.to_location.country,
+                            "postal_code": req.to_location.postal_code,
+                        },
+                    }
+                    for req in request_iterator
+                ]
+
+                result = self.logic.batch_create_shipments(shipment_requests)
+
+                return delivery_pb2.BatchCreateShipmentsResponse(
+                    success=result["success"],
+                    total_received=result["total_received"],
+                    total_successful=result["total_successful"],
+                    total_failed=result["total_failed"],
+                    message=result["message"],
+                )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def MonitorFleetBidirectional(self, request_iterator, context):
+            """Bidirectional Streaming RPC"""
+            try:
+                requests = list(request_iterator)
+                for response in self.logic.monitor_fleet_bidirectional(
+                    [{"shipment_id": req.shipment_id} for req in requests]
+                ):
+                    if response["success"]:
+                        yield delivery_pb2.MonitorFleetResponse(
+                            success=True,
+                            shipment_id=response.get("shipment_id", ""),
+                            status=response.get("status", ""),
+                            latitude=response.get("latitude", 0.0),
+                            longitude=response.get("longitude", 0.0),
+                            progress_percent=response.get("progress_percent", 0),
+                        )
+                    else:
+                        yield delivery_pb2.MonitorFleetResponse(
+                            success=False,
+                            message=response.get("error", "Unknown error"),
+                        )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+except ImportError:
+    GRPC_AVAILABLE = False
+
+    class DeliveryServicer:
+        """그루핑을 위한 더미 클래스"""
+
+        def __init__(
+            self, business_logic: Optional[DeliveryBusinessLogic] = None
+        ):
+            self.logic = business_logic or DeliveryBusinessLogic()

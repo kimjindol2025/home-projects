@@ -1,0 +1,250 @@
+package dispatcher
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
+
+	"grie-engine/internal/shm"
+)
+
+// WorkerState tracks the state of a Julia worker
+type WorkerState struct {
+	ID        int
+	PID       int
+	SHM       *shm.SharedMemManager
+	state     atomic.Value // string: IDLE, BUSY, ERROR
+	lastSeen  int64        // atomic: Unix nano
+	processed uint64       // atomic: count
+}
+
+// IsIdle checks if worker is ready to accept jobs
+func (w *WorkerState) IsIdle() bool {
+	s := w.state.Load()
+	if s == nil {
+		return true
+	}
+	return s.(string) == "IDLE"
+}
+
+// SetState updates worker state atomically
+func (w *WorkerState) SetState(s string) {
+	w.state.Store(s)
+}
+
+// UpdateLastSeen updates the last activity timestamp
+func (w *WorkerState) UpdateLastSeen() {
+	atomic.StoreInt64(&w.lastSeen, time.Now().UnixNano())
+}
+
+// GetLastSeen gets the last activity timestamp
+func (w *WorkerState) GetLastSeen() time.Time {
+	nano := atomic.LoadInt64(&w.lastSeen)
+	return time.Unix(0, nano)
+}
+
+// IncrementProcessed increments the job counter
+func (w *WorkerState) IncrementProcessed() uint64 {
+	return atomic.AddUint64(&w.processed, 1)
+}
+
+// Dispatcher: 메인 오케스트레이터
+// 데이터를 받아 가용한 워커에게 라운드-로빈으로 배분
+type Dispatcher struct {
+	workers       []*WorkerState
+	ringBuffer    *RingBuffer
+	roundRobin    uint64 // atomic: 다음 워커 인덱스
+	jobIDCounter  uint64 // atomic: 작업 ID
+	totalReceived uint64 // atomic: 수신한 작업 수
+	totalDropped  uint64 // atomic: 버린 작업 수
+
+	// Backpressure
+	backpressure atomic.Value // bool
+	maxQueueLen  int
+}
+
+// NewDispatcher creates a new dispatcher with N workers
+func NewDispatcher(workerCount int, ringBufferCapacity uint64) (*Dispatcher, error) {
+	rb, err := NewRingBuffer(ringBufferCapacity)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ring buffer: %w", err)
+	}
+
+	workers := make([]*WorkerState, workerCount)
+	for i := 0; i < workerCount; i++ {
+		workers[i] = &WorkerState{
+			ID: i,
+		}
+		workers[i].SetState("IDLE")
+	}
+
+	d := &Dispatcher{
+		workers:      workers,
+		ringBuffer:   rb,
+		roundRobin:   0,
+		jobIDCounter: 0,
+		maxQueueLen:  int(float64(ringBufferCapacity) * 0.8), // 80% of capacity
+	}
+
+	d.backpressure.Store(false)
+
+	return d, nil
+}
+
+// Submit submits a new job to the dispatcher
+// Returns job ID if successful, -1 if dropped due to backpressure
+func (d *Dispatcher) Submit(payload []byte, priority int) (uint64, error) {
+	// Check backpressure
+	if d.IsBackpressured() {
+		atomic.AddUint64(&d.totalDropped, 1)
+		return ^uint64(0), fmt.Errorf("backpressure active - job dropped")
+	}
+
+	// Create job
+	jobID := atomic.AddUint64(&d.jobIDCounter, 1)
+	job := Job{
+		ID:       jobID,
+		Priority: priority,
+		Payload:  payload,
+		Response: make(chan []byte, 1), // Buffered to avoid blocking
+	}
+
+	// Try to publish to ring buffer
+	if !d.ringBuffer.Publish(job) {
+		atomic.AddUint64(&d.totalDropped, 1)
+		return ^uint64(0), fmt.Errorf("ring buffer full - job dropped")
+	}
+
+	atomic.AddUint64(&d.totalReceived, 1)
+
+	// Update backpressure flag
+	queueSize := d.ringBuffer.Size()
+	if queueSize > uint64(d.maxQueueLen) {
+		d.backpressure.Store(true)
+	}
+
+	return jobID, nil
+}
+
+// Run starts the dispatcher (runs until context is cancelled)
+// This distributes jobs from ring buffer to workers
+func (d *Dispatcher) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		default:
+			// Try to distribute jobs
+			job, ok := d.ringBuffer.Subscribe()
+			if !ok {
+				// No jobs available, sleep briefly
+				time.Sleep(100 * time.Microsecond)
+				continue
+			}
+
+			// Find next available worker (round-robin)
+			workerIdx := d.findNextWorker()
+			if workerIdx < 0 {
+				// All workers busy, push back to ring buffer? (advanced feature)
+				continue
+			}
+
+			// Assign job to worker
+			worker := d.workers[workerIdx]
+			worker.SetState("BUSY")
+			worker.UpdateLastSeen()
+
+			// Send to worker via channel (non-blocking)
+			go d.assignJobToWorker(ctx, worker, job)
+
+			// Update backpressure
+			if d.ringBuffer.Size() < uint64(d.maxQueueLen) {
+				d.backpressure.Store(false)
+			}
+		}
+	}
+}
+
+// findNextWorker finds the next idle worker using round-robin
+// Returns -1 if no idle worker found
+func (d *Dispatcher) findNextWorker() int {
+	start := atomic.AddUint64(&d.roundRobin, 1)
+	workerCount := uint64(len(d.workers))
+
+	for i := uint64(0); i < workerCount; i++ {
+		idx := (start + i) % workerCount
+		if d.workers[idx].IsIdle() {
+			return int(idx)
+		}
+	}
+
+	return -1 // All workers busy
+}
+
+// assignJobToWorker assigns a job to a specific worker
+// This runs in a separate goroutine to avoid blocking the dispatcher
+func (d *Dispatcher) assignJobToWorker(ctx context.Context, worker *WorkerState, job *Job) {
+	// TODO: In real implementation, communicate with Julia via shared memory
+	// For now, simulate processing
+	defer func() {
+		worker.SetState("IDLE")
+		worker.IncrementProcessed()
+	}()
+
+	// Simulate work
+	time.Sleep(10 * time.Millisecond)
+
+	// Send dummy response
+	select {
+	case job.Response <- []byte("processed"):
+	case <-ctx.Done():
+	}
+}
+
+// IsBackpressured checks if backpressure is active
+func (d *Dispatcher) IsBackpressured() bool {
+	val := d.backpressure.Load()
+	if val == nil {
+		return false
+	}
+	if b, ok := val.(bool); ok {
+		return b
+	}
+	return false
+}
+
+// Stats returns dispatcher statistics
+func (d *Dispatcher) Stats() map[string]interface{} {
+	idleCount := 0
+	busyCount := 0
+	for _, w := range d.workers {
+		if w.IsIdle() {
+			idleCount++
+		} else {
+			busyCount++
+		}
+	}
+
+	return map[string]interface{}{
+		"total_workers":   len(d.workers),
+		"idle_workers":    idleCount,
+		"busy_workers":    busyCount,
+		"queue_size":      d.ringBuffer.Size(),
+		"queue_capacity":  d.ringBuffer.Capacity(),
+		"total_received":  atomic.LoadUint64(&d.totalReceived),
+		"total_dropped":   atomic.LoadUint64(&d.totalDropped),
+		"backpressured":   d.IsBackpressured(),
+		"round_robin":     atomic.LoadUint64(&d.roundRobin),
+	}
+}
+
+// Close gracefully shuts down the dispatcher
+func (d *Dispatcher) Close() error {
+	// Wait for workers to finish
+	for _, w := range d.workers {
+		w.SetState("SHUTDOWN")
+	}
+	return nil
+}

@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""
+Inference Engine: MLIR IR 최적화를 위한 실시간 추론
+
+새로운 MLIR IR 코드를 받아서:
+1. State 벡터 추출 (IR 분석)
+2. 정책 네트워크로 최적 행동 선택
+3. Transform Dialect 생성
+4. MLIR 모듈에 적용
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, Any, Optional, Tuple, List
+from dataclasses import dataclass
+import time
+from pathlib import Path
+
+
+@dataclass
+class OptimizationState:
+    """최적화 결정"""
+    tile_sizes: List[int]
+    loop_order: List[int]
+    vector_width: int
+    fusion_enabled: bool
+    interchange_enabled: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tile_sizes": self.tile_sizes,
+            "loop_order": self.loop_order,
+            "vector_width": self.vector_width,
+            "fusion_enabled": self.fusion_enabled,
+            "interchange_enabled": self.interchange_enabled,
+        }
+
+
+@dataclass
+class HardwareSpec:
+    """하드웨어 명세"""
+    peak_flops: float      # GFLOPS
+    memory_bandwidth: float  # GB/s
+    sram_size: int         # bytes
+    memory_latency: float  # cycles
+    device_name: str = "NVIDIA H100"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "peak_flops": self.peak_flops,
+            "memory_bandwidth": self.memory_bandwidth,
+            "sram_size": self.sram_size,
+            "memory_latency": self.memory_latency,
+            "device_name": self.device_name,
+        }
+
+
+class StateExtractor:
+    """MLIR IR에서 상태 벡터 추출 (100 dims)"""
+
+    def __init__(self, hardware_spec: HardwareSpec):
+        self.hardware_spec = hardware_spec
+        self.state_dim = 100
+
+    def extract(self, ir_module_info: Dict[str, Any]) -> np.ndarray:
+        """
+        IR 정보에서 상태 벡터 추출
+
+        Args:
+            ir_module_info: IR 분석 정보
+                - loop_depth: 최대 루프 깊이
+                - operation_type: 연산 종류
+                - tensor_shapes: 텐서 모양들
+                - memory_footprint: 메모리 풋프린트
+                - ...
+
+        Returns:
+            상태 벡터 (100 dims)
+        """
+        state = np.zeros(self.state_dim, dtype=np.float32)
+
+        # 루프 정보 (dims 0-10)
+        loop_info = ir_module_info.get("loop_info", {})
+        state[0] = min(loop_info.get("depth", 0), 10) / 10.0  # 정규화
+        state[1] = min(loop_info.get("innermost_loops", 0), 10) / 10.0
+        state[2] = loop_info.get("total_iterations", 1e6) / 1e9  # 정규화
+
+        # 연산 종류 (dims 11-30)
+        op_info = ir_module_info.get("operation_info", {})
+        ops = ["matmul", "conv2d", "batchnorm", "elementwise", "reduce"]
+        for i, op_name in enumerate(ops):
+            state[11 + i] = 1.0 if op_info.get(op_name, False) else 0.0
+
+        # 텐서 정보 (dims 31-50)
+        tensor_info = ir_module_info.get("tensor_info", {})
+        shapes = tensor_info.get("shapes", [])
+        for i, shape in enumerate(shapes[:5]):  # 최대 5개 텐서
+            if i < 5:
+                # 텐서 차원 수 정규화 (최대 4)
+                state[31 + i] = (min(len(shape), 4) - 1) / 3.0
+
+        # 메모리 정보 (dims 51-70)
+        memory_info = ir_module_info.get("memory_info", {})
+        footprint_mb = memory_info.get("footprint", 0) / (1024 * 1024)
+        state[51] = min(footprint_mb / 1024, 1.0)  # 정규화 (최대 1GB)
+
+        bandwidth_util = memory_info.get("bandwidth_util", 0.0)
+        state[52] = bandwidth_util
+
+        cache_hit = memory_info.get("cache_hit_rate", 0.5)
+        state[53] = cache_hit
+
+        reuse_distance = memory_info.get("reuse_distance", 1.0)
+        state[54] = min(reuse_distance / 100, 1.0)
+
+        # 하드웨어 스펙 (dims 71-99)
+        state[71] = (self.hardware_spec.peak_flops / 1000) / 10  # 정규화
+        state[72] = self.hardware_spec.memory_bandwidth / 1000  # 정규화
+        state[73] = min(self.hardware_spec.sram_size / (10 * 1024 * 1024), 1.0)  # 정규화
+        state[74] = self.hardware_spec.memory_latency / 1000  # 정규화
+
+        return state
+
+    def extract_from_ir_string(self, ir_code: str) -> np.ndarray:
+        """
+        IR 코드 문자열에서 직접 상태 추출 (간단한 파싱)
+
+        Args:
+            ir_code: MLIR IR 코드 (문자열)
+
+        Returns:
+            상태 벡터
+        """
+        # 실제 구현에서는 MLIR C API를 사용하여 정확한 분석
+        # 여기서는 간단한 휴리스틱 사용
+
+        ir_info = {
+            "loop_info": {
+                "depth": ir_code.count("scf.for"),
+                "innermost_loops": ir_code.count("affine.for"),
+                "total_iterations": 1e6,  # 추정
+            },
+            "operation_info": {
+                "matmul": "linalg.matmul" in ir_code,
+                "conv2d": "linalg.conv_2d" in ir_code,
+                "batchnorm": "linalg.batch_norm" in ir_code,
+                "elementwise": "arith." in ir_code,
+                "reduce": "linalg.generic" in ir_code,
+            },
+            "tensor_info": {
+                "shapes": self._extract_shapes(ir_code),
+            },
+            "memory_info": {
+                "footprint": 512 * 1024 * 1024,  # 512 MB (추정)
+                "bandwidth_util": 0.7,
+                "cache_hit_rate": 0.85,
+                "reuse_distance": 10.0,
+            }
+        }
+
+        return self.extract(ir_info)
+
+    def _extract_shapes(self, ir_code: str) -> List[Tuple[int, ...]]:
+        """IR 코드에서 텐서 모양 추출 (휴리스틱)"""
+        shapes = []
+        # 간단한 예: tensor<1024x1024xf32> 형식 찾기
+        import re
+        pattern = r"tensor<(\d+(?:x\d+)*)x"
+        matches = re.findall(pattern, ir_code)
+        for match in matches[:5]:
+            dims = tuple(int(d) for d in match.split("x"))
+            shapes.append(dims)
+        return shapes
+
+
+class ActionInterpreter:
+    """이산 행동을 최적화 결정으로 변환"""
+
+    # 행동 공간 정의
+    TILE_SIZES = [2**i for i in range(4, 11)]  # [16, 32, 64, ..., 1024]
+    VECTOR_WIDTHS = [4, 8, 16, 32, 64]
+    LOOP_ORDERS = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ]
+
+    def __init__(self):
+        # 행동 공간 구성
+        self.num_tile_sizes = len(self.TILE_SIZES)
+        self.num_tile_combos = self.num_tile_sizes ** 3  # 3D 타일 크기
+
+        self.num_loop_orders = len(self.LOOP_ORDERS)
+        self.num_vector_widths = len(self.VECTOR_WIDTHS)
+        self.num_fusion_options = 2
+        self.num_interchange_options = 2
+
+        # 총 행동 수
+        self.total_actions = (
+            self.num_tile_combos *
+            self.num_loop_orders *
+            self.num_vector_widths *
+            self.num_fusion_options *
+            self.num_interchange_options
+        )
+
+        print(f"Action space:")
+        print(f"  - Tile combinations: {self.num_tile_combos}")
+        print(f"  - Loop orders: {self.num_loop_orders}")
+        print(f"  - Vector widths: {self.num_vector_widths}")
+        print(f"  - Fusion options: {self.num_fusion_options}")
+        print(f"  - Interchange options: {self.num_interchange_options}")
+        print(f"  - Total: {self.total_actions}")
+
+    def action_to_optimization(self, action: int) -> OptimizationState:
+        """
+        이산 행동 ID를 최적화 결정으로 변환
+
+        Args:
+            action: 0 ~ (total_actions - 1)
+
+        Returns:
+            최적화 결정
+        """
+        if not (0 <= action < self.total_actions):
+            raise ValueError(
+                f"Action {action} out of range [0, {self.total_actions})"
+            )
+
+        # 행동을 요소로 분해 (역변환)
+        remaining = action
+
+        # 1. Interchange 옵션
+        interchange_enabled = bool(remaining % self.num_interchange_options)
+        remaining //= self.num_interchange_options
+
+        # 2. Fusion 옵션
+        fusion_enabled = bool(remaining % self.num_fusion_options)
+        remaining //= self.num_fusion_options
+
+        # 3. Vector width
+        vector_width_idx = remaining % self.num_vector_widths
+        vector_width = self.VECTOR_WIDTHS[vector_width_idx]
+        remaining //= self.num_vector_widths
+
+        # 4. Loop order
+        loop_order_idx = remaining % self.num_loop_orders
+        loop_order = self.LOOP_ORDERS[loop_order_idx]
+        remaining //= self.num_loop_orders
+
+        # 5. Tile sizes (3D)
+        tile_3d = remaining
+        tile_k = tile_3d % self.num_tile_sizes
+        tile_3d //= self.num_tile_sizes
+
+        tile_j = tile_3d % self.num_tile_sizes
+        tile_3d //= self.num_tile_sizes
+
+        tile_i = tile_3d % self.num_tile_sizes
+
+        tile_sizes = [
+            self.TILE_SIZES[tile_i],
+            self.TILE_SIZES[tile_j],
+            self.TILE_SIZES[tile_k],
+        ]
+
+        return OptimizationState(
+            tile_sizes=tile_sizes,
+            loop_order=loop_order,
+            vector_width=vector_width,
+            fusion_enabled=fusion_enabled,
+            interchange_enabled=interchange_enabled,
+        )
+
+    def optimization_to_action(self, opt: OptimizationState) -> int:
+        """
+        최적화 결정을 이산 행동 ID로 변환 (역변환)
+
+        Args:
+            opt: OptimizationState
+
+        Returns:
+            행동 ID (0 ~ total_actions - 1)
+        """
+        action = 0
+
+        # Tile sizes
+        tile_i_idx = self.TILE_SIZES.index(opt.tile_sizes[0])
+        tile_j_idx = self.TILE_SIZES.index(opt.tile_sizes[1])
+        tile_k_idx = self.TILE_SIZES.index(opt.tile_sizes[2])
+
+        action += tile_i_idx
+        action += tile_j_idx * self.num_tile_sizes
+        action += tile_k_idx * (self.num_tile_sizes ** 2)
+
+        # Loop order
+        loop_order_idx = self.LOOP_ORDERS.index(opt.loop_order)
+        action += loop_order_idx * self.num_tile_combos
+
+        # Vector width
+        vector_width_idx = self.VECTOR_WIDTHS.index(opt.vector_width)
+        action += vector_width_idx * self.num_tile_combos * self.num_loop_orders
+
+        # Fusion
+        fusion_bit = 1 if opt.fusion_enabled else 0
+        action += fusion_bit * (
+            self.num_tile_combos * self.num_loop_orders * self.num_vector_widths
+        )
+
+        # Interchange
+        interchange_bit = 1 if opt.interchange_enabled else 0
+        action += interchange_bit * (
+            self.num_tile_combos * self.num_loop_orders * self.num_vector_widths *
+            self.num_fusion_options
+        )
+
+        return action
+
+
+class TransformDialectBuilder:
+    """최적화 결정을 MLIR Transform Dialect로 변환"""
+
+    @staticmethod
+    def build_transform(
+        optimization: OptimizationState,
+        operation_name: str = "linalg.matmul"
+    ) -> str:
+        """
+        최적화 결정을 MLIR Transform Dialect 코드로 변환
+
+        Args:
+            optimization: 최적화 결정
+            operation_name: 대상 연산 (예: "linalg.matmul")
+
+        Returns:
+            MLIR Transform Dialect 코드
+        """
+        lines = []
+
+        lines.append("transform.sequence failures(propagate) {")
+        lines.append("^bb0(%arg0: !pdl.operation):")
+
+        # 1. Match 연산
+        lines.append(
+            f'  %0 = transform.structured.match '
+            f'ops{{["{operation_name}"]}} in %arg0'
+        )
+
+        # 2. Tiling
+        tile_str = ", ".join(str(t) for t in optimization.tile_sizes)
+        lines.append(
+            f"  %1, %loops:3 = transform.structured.tile %0 [{tile_str}]"
+        )
+
+        # 3. Vectorization (옵션)
+        if optimization.vector_width > 1:
+            lines.append(
+                f"  %2 = transform.structured.vectorize %1 "
+                f"vector_sizes [{optimization.vector_width}]"
+            )
+        else:
+            lines.append(
+                f"  %2 = transform.structured.vectorize %1"
+            )
+
+        # 4. Loop Interchange (옵션)
+        if optimization.interchange_enabled and optimization.loop_order != [0, 1, 2]:
+            loop_names = ", ".join(f"%loops#{i}" for i in optimization.loop_order)
+            lines.append(
+                f"  %3 = transform.loop.interchange {loop_names}"
+            )
+
+        # 5. Fusion (옵션)
+        if optimization.fusion_enabled:
+            lines.append(
+                "  transform.structured.fuse_into_containing_op %1 into %2"
+            )
+
+        lines.append("  transform.yield")
+        lines.append("}")
+
+        return "\n".join(lines)
+
+
+class InferenceEngine:
+    """통합 추론 엔진"""
+
+    def __init__(
+        self,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        hardware_spec: HardwareSpec,
+        device: str = "cpu"
+    ):
+        """
+        추론 엔진 초기화
+
+        Args:
+            policy_net: 정책 네트워크
+            value_net: 가치 네트워크
+            hardware_spec: 하드웨어 명세
+            device: 실행 디바이스 ('cpu' 또는 'cuda')
+        """
+        self.device = device
+        self.policy_net = policy_net.to(device)
+        self.value_net = value_net.to(device)
+        self.policy_net.eval()
+        self.value_net.eval()
+
+        self.state_extractor = StateExtractor(hardware_spec)
+        self.action_interpreter = ActionInterpreter()
+        self.transform_builder = TransformDialectBuilder()
+
+        self.hardware_spec = hardware_spec
+
+        # 통계
+        self.inference_times = []
+        self.total_inferences = 0
+
+    def optimize_ir(
+        self,
+        ir_code: str,
+        operation_name: str = "linalg.matmul",
+        use_deterministic: bool = True
+    ) -> Dict[str, Any]:
+        """
+        IR 코드를 최적화하기 위한 Transform Dialect 생성
+
+        Args:
+            ir_code: MLIR IR 코드 문자열
+            operation_name: 대상 연산
+            use_deterministic: 정책 네트워크의 행동 선택 방식
+                - True: argmax (결정론적, 빠름)
+                - False: 샘플링 (확률적, 다양함)
+
+        Returns:
+            최적화 결과 (Transform Dialect, 메타데이터 등)
+        """
+        start_time = time.time()
+
+        # 1. State 추출
+        state = self.state_extractor.extract_from_ir_string(ir_code)
+
+        # 2. 정책 추론
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).to(self.device).unsqueeze(0)
+            logits, action_probs = self.policy_net(state_tensor)
+
+            if use_deterministic:
+                action = torch.argmax(action_probs, dim=-1).item()
+            else:
+                action = torch.multinomial(
+                    action_probs.squeeze(),
+                    num_samples=1
+                ).item()
+
+            action_prob = action_probs[0, action].item()
+            value = self.value_net(state_tensor).squeeze().item()
+
+        # 3. Action 해석
+        optimization = self.action_interpreter.action_to_optimization(action)
+
+        # 4. Transform Dialect 생성
+        transform_code = self.transform_builder.build_transform(
+            optimization,
+            operation_name
+        )
+
+        # 결과 구성
+        inference_time = (time.time() - start_time) * 1000  # ms
+        self.inference_times.append(inference_time)
+        self.total_inferences += 1
+
+        result = {
+            "transform_dialect": transform_code,
+            "optimization": optimization.to_dict(),
+            "action": action,
+            "action_probability": float(action_prob),
+            "value_estimate": float(value),
+            "state": state.tolist(),
+            "inference_time_ms": inference_time,
+            "operation_name": operation_name,
+        }
+
+        return result
+
+    def batch_optimize_ir(
+        self,
+        ir_codes: List[str],
+        operation_names: Optional[List[str]] = None,
+        use_deterministic: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        여러 IR 코드를 배치로 최적화 (효율성)
+
+        Args:
+            ir_codes: IR 코드 리스트
+            operation_names: 연산 이름 리스트 (기본값: 모두 matmul)
+            use_deterministic: 결정론적 행동 선택 여부
+
+        Returns:
+            최적화 결과 리스트
+        """
+        if operation_names is None:
+            operation_names = ["linalg.matmul"] * len(ir_codes)
+
+        results = []
+        for ir_code, op_name in zip(ir_codes, operation_names):
+            result = self.optimize_ir(ir_code, op_name, use_deterministic)
+            results.append(result)
+
+        return results
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """추론 통계 반환"""
+        if not self.inference_times:
+            return {"total_inferences": 0}
+
+        return {
+            "total_inferences": self.total_inferences,
+            "mean_inference_time_ms": np.mean(self.inference_times),
+            "std_inference_time_ms": np.std(self.inference_times),
+            "min_inference_time_ms": np.min(self.inference_times),
+            "max_inference_time_ms": np.max(self.inference_times),
+        }
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("=" * 70)
+    print("Inference Engine Demo")
+    print("=" * 70)
+
+    # 1. 하드웨어 명세 설정 (NVIDIA H100)
+    hardware = HardwareSpec(
+        peak_flops=1979.0,  # GFLOPS
+        memory_bandwidth=3936.0,  # GB/s
+        sram_size=192 * 1024 * 1024,  # 192 MB
+        memory_latency=100,  # cycles
+    )
+
+    print("\n[Hardware Spec]")
+    for k, v in hardware.to_dict().items():
+        print(f"  {k}: {v}")
+
+    # 2. 더미 네트워크 생성
+    class DummyPolicyNet(nn.Module):
+        def forward(self, x):
+            batch_size = x.shape[0]
+            logits = torch.randn(batch_size, 1000)
+            probs = torch.softmax(logits, dim=-1)
+            return logits, probs
+
+    class DummyValueNet(nn.Module):
+        def forward(self, x):
+            batch_size = x.shape[0]
+            return torch.randn(batch_size, 1)
+
+    policy_net = DummyPolicyNet()
+    value_net = DummyValueNet()
+
+    # 3. 추론 엔진 생성
+    engine = InferenceEngine(policy_net, value_net, hardware)
+
+    # 4. 예제 IR 코드
+    example_ir = """
+    func.func @matmul(%A: tensor<1024x1024xf32>, %B: tensor<1024x1024xf32>)
+        -> tensor<1024x1024xf32> {
+      %C = linalg.matmul ins(%A, %B: tensor<1024x1024xf32>, tensor<1024x1024xf32>)
+                         outs(%C: tensor<1024x1024xf32>) -> tensor<1024x1024xf32>
+      return %C : tensor<1024x1024xf32>
+    }
+    """
+
+    # 5. 추론 실행
+    print("\n[Inference Test]")
+    result = engine.optimize_ir(example_ir, "linalg.matmul")
+
+    print(f"✓ Inference completed")
+    print(f"  - Action: {result['action']}")
+    print(f"  - Action Probability: {result['action_probability']:.6f}")
+    print(f"  - Value Estimate: {result['value_estimate']:.6f}")
+    print(f"  - Inference Time: {result['inference_time_ms']:.3f} ms")
+
+    print(f"\n[Generated Transform Dialect]")
+    print(result['transform_dialect'])
+
+    print(f"\n[Optimization Decision]")
+    for k, v in result['optimization'].items():
+        print(f"  {k}: {v}")
+
+    # 6. 배치 추론
+    print("\n[Batch Inference Test]")
+    results = engine.batch_optimize_ir([example_ir] * 3)
+    print(f"✓ Batch inference completed: {len(results)} items")
+
+    # 7. 통계
+    print("\n[Statistics]")
+    stats = engine.get_statistics()
+    for k, v in stats.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.3f}")
+        else:
+            print(f"  {k}: {v}")

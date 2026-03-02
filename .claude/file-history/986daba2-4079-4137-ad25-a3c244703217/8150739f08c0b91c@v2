@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+부동소수점 분석기 (Floating-Point Analyzer)
+
+IEEE 754 표준에 따른 부동소수점의 수학적 모델링.
+각 정밀도별 epsilon, 반올림 오차, 표현 범위 등을 계산합니다.
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Tuple
+import struct
+import math
+
+
+class FloatingPointFormat(Enum):
+    """부동소수점 형식"""
+    FP32 = "float32"       # 표준 32비트
+    FP64 = "float64"       # 64비트 (double)
+    FP16 = "float16"       # 16비트 (half precision)
+    BF16 = "bfloat16"      # Brain Float 16 (TPU용)
+    INT8 = "int8"          # 정수 8비트 (양자화)
+
+
+@dataclass
+class FloatingPointSpec:
+    """부동소수점 형식 사양"""
+    name: str
+    sign_bits: int
+    exponent_bits: int
+    mantissa_bits: int
+    bias: int
+    epsilon: float          # machine epsilon (ULP at 1.0)
+    min_normal: float       # 최소 정규화된 수
+    max_normal: float       # 최대 정규화된 수
+    min_subnormal: float    # 최소 비정규수
+
+    @property
+    def total_bits(self) -> int:
+        return self.sign_bits + self.exponent_bits + self.mantissa_bits
+
+    def relative_error_bound(self, n_ops: int) -> float:
+        """n번 연산 후 상대 오차 경계 (간단한 모델)"""
+        # δ ≤ n * ε / (1 - n*ε) ≈ n*ε (if n*ε << 1)
+        if n_ops * self.epsilon >= 1:
+            return float('inf')  # 불안정
+        return n_ops * self.epsilon / (1 - n_ops * self.epsilon)
+
+    def absolute_error_bound_at(self, value: float, n_ops: int) -> float:
+        """값 value에서 n번 연산 후 절대 오차 경계"""
+        rel_error = self.relative_error_bound(n_ops)
+        return abs(value) * rel_error
+
+    def __str__(self) -> str:
+        return (f"{self.name} ({self.total_bits}bit): "
+                f"ε={self.epsilon:.2e}, "
+                f"range=[{self.min_normal:.2e}, {self.max_normal:.2e}]")
+
+
+class FloatingPointAnalyzer:
+    """부동소수점 분석 엔진"""
+
+    # IEEE 754 표준 정의
+    FP32_SPEC = FloatingPointSpec(
+        name="FP32",
+        sign_bits=1,
+        exponent_bits=8,
+        mantissa_bits=23,
+        bias=127,
+        epsilon=2.0**(-23),  # ≈ 1.19e-7
+        min_normal=2.0**(-126),  # ≈ 1.17e-38
+        max_normal=(2 - 2.0**(-23)) * 2.0**127,  # ≈ 3.40e38
+        min_subnormal=2.0**(-149)  # ≈ 1.40e-45
+    )
+
+    FP64_SPEC = FloatingPointSpec(
+        name="FP64",
+        sign_bits=1,
+        exponent_bits=11,
+        mantissa_bits=52,
+        bias=1023,
+        epsilon=2.0**(-52),  # ≈ 2.22e-16
+        min_normal=2.0**(-1022),  # ≈ 2.22e-308
+        max_normal=(2 - 2.0**(-52)) * 2.0**1023,  # ≈ 1.79e308
+        min_subnormal=2.0**(-1074)  # ≈ 4.94e-324
+    )
+
+    FP16_SPEC = FloatingPointSpec(
+        name="FP16",
+        sign_bits=1,
+        exponent_bits=5,
+        mantissa_bits=10,
+        bias=15,
+        epsilon=2.0**(-10),  # ≈ 9.77e-4
+        min_normal=2.0**(-14),  # ≈ 6.10e-5
+        max_normal=(2 - 2.0**(-10)) * 2.0**15,  # ≈ 6.55e4
+        min_subnormal=2.0**(-24)  # ≈ 5.96e-8
+    )
+
+    BF16_SPEC = FloatingPointSpec(
+        name="BF16",
+        sign_bits=1,
+        exponent_bits=8,  # FP32와 같은 지수 범위!
+        mantissa_bits=7,
+        bias=127,
+        epsilon=2.0**(-7),  # ≈ 7.81e-3 (FP16보다 큼!)
+        min_normal=2.0**(-126),  # FP32와 동일
+        max_normal=(2 - 2.0**(-7)) * 2.0**127,  # FP32와 거의 동일
+        min_subnormal=2.0**(-133)  # 더 작음
+    )
+
+    @classmethod
+    def get_spec(cls, fmt: FloatingPointFormat) -> FloatingPointSpec:
+        """형식별 사양 반환"""
+        specs = {
+            FloatingPointFormat.FP32: cls.FP32_SPEC,
+            FloatingPointFormat.FP64: cls.FP64_SPEC,
+            FloatingPointFormat.FP16: cls.FP16_SPEC,
+            FloatingPointFormat.BF16: cls.BF16_SPEC,
+        }
+        if fmt not in specs:
+            raise ValueError(f"Unsupported format: {fmt}")
+        return specs[fmt]
+
+    @staticmethod
+    def ulp(value: float, spec: FloatingPointSpec) -> float:
+        """Unit in Last Place (마지막 자리 단위)"""
+        if value == 0:
+            return spec.min_subnormal
+
+        exponent = math.floor(math.log2(abs(value)))
+        # ULP = 2^(exponent - mantissa_bits)
+        return 2.0 ** (exponent - spec.mantissa_bits)
+
+    @staticmethod
+    def relative_error_in_operation(result: float,
+                                    exact: float,
+                                    spec: FloatingPointSpec) -> float:
+        """연산의 상대 오차 (정확한 값과 비교)"""
+        if exact == 0:
+            return abs(result - exact) / spec.epsilon if spec.epsilon != 0 else float('inf')
+        return abs(result - exact) / abs(exact)
+
+    @staticmethod
+    def rounding_error_bound(value: float, spec: FloatingPointSpec) -> float:
+        """값을 해당 형식으로 반올림했을 때의 오차 경계"""
+        # 반올림 오차 <= ULP / 2
+        return FloatingPointAnalyzer.ulp(value, spec) / 2
+
+    @staticmethod
+    def cast_error_bound(value: float,
+                        src_spec: FloatingPointSpec,
+                        tgt_spec: FloatingPointSpec) -> float:
+        """한 형식에서 다른 형식으로 캐스트할 때의 오차"""
+        # 목표 형식에서의 반올림 오차
+        return FloatingPointAnalyzer.ulp(value, tgt_spec) / 2
+
+    @staticmethod
+    def addition_error_bound(a: float, b: float,
+                            spec: FloatingPointSpec) -> float:
+        """덧셈 오차 경계"""
+        exact_sum = a + b
+        if exact_sum == 0:
+            return spec.epsilon
+        # 각각의 반올림 오차 + 결과의 반올림 오차
+        ea = FloatingPointAnalyzer.rounding_error_bound(a, spec)
+        eb = FloatingPointAnalyzer.rounding_error_bound(b, spec)
+        e_result = FloatingPointAnalyzer.rounding_error_bound(exact_sum, spec)
+        return ea + eb + e_result
+
+    @staticmethod
+    def multiplication_error_bound(a: float, b: float,
+                                  spec: FloatingPointSpec) -> float:
+        """곱셈 오차 경계"""
+        exact_product = a * b
+        if exact_product == 0:
+            return spec.epsilon
+        # (a ± εa) * (b ± εb) ≈ a*b ± (a*εb + b*εa + εa*εb)
+        ea = FloatingPointAnalyzer.ulp(a, spec)
+        eb = FloatingPointAnalyzer.ulp(b, spec)
+        # 1차 근사
+        relative_error = abs(ea/a) + abs(eb/b)
+        absolute_error = abs(exact_product) * relative_error
+        # 결과의 반올림 오차 추가
+        e_result = FloatingPointAnalyzer.rounding_error_bound(exact_product, spec)
+        return absolute_error + e_result
+
+    @staticmethod
+    def accumulated_error_worst_case(n_operations: int,
+                                     spec: FloatingPointSpec) -> float:
+        """최악의 경우 누적 오차 (모든 오차가 같은 방향)"""
+        return n_operations * spec.epsilon
+
+    @staticmethod
+    def accumulated_error_statistical(n_operations: int,
+                                      spec: FloatingPointSpec) -> float:
+        """통계적 누적 오차 (오차가 무작위 방향)"""
+        import math
+        return math.sqrt(n_operations) * spec.epsilon
+
+    @staticmethod
+    def compare_precisions(value: float) -> None:
+        """다양한 정밀도에서의 표현 비교"""
+        print(f"\nValue: {value:.15g}")
+        print("-" * 70)
+
+        for fmt in [FloatingPointFormat.FP32, FloatingPointFormat.FP16,
+                   FloatingPointFormat.BF16, FloatingPointFormat.FP64]:
+            spec = FloatingPointAnalyzer.get_spec(fmt)
+            ulp_val = FloatingPointAnalyzer.ulp(value, spec)
+            error = FloatingPointAnalyzer.rounding_error_bound(value, spec)
+
+            print(f"{spec.name:6s} | ULP: {ulp_val:.3e} | Error: {error:.3e} | "
+                  f"Relative: {error/abs(value):.3%}")
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Floating-Point Analyzer Demo")
+    print("="*70)
+
+    analyzer = FloatingPointAnalyzer()
+
+    # 예제 1: 형식별 스펙
+    print("\n[Example 1] Floating-Point Format Specifications")
+    print("-"*70)
+
+    for fmt in [FloatingPointFormat.FP32, FloatingPointFormat.FP16,
+               FloatingPointFormat.BF16, FloatingPointFormat.FP64]:
+        spec = analyzer.get_spec(fmt)
+        print(f"{spec.name:6s}: ε={spec.epsilon:.3e}, "
+              f"range=[{spec.min_normal:.2e}, {spec.max_normal:.2e}]")
+
+    # 예제 2: 오차 누적
+    print("\n[Example 2] Error Accumulation")
+    print("-"*70)
+
+    fp32_spec = analyzer.get_spec(FloatingPointFormat.FP32)
+    fp16_spec = analyzer.get_spec(FloatingPointFormat.FP16)
+    bf16_spec = analyzer.get_spec(FloatingPointFormat.BF16)
+
+    n_ops = 1000
+    print(f"After {n_ops} operations:")
+    print(f"FP32: Worst case: {analyzer.accumulated_error_worst_case(n_ops, fp32_spec):.3e}, "
+          f"Statistical: {analyzer.accumulated_error_statistical(n_ops, fp32_spec):.3e}")
+    print(f"FP16: Worst case: {analyzer.accumulated_error_worst_case(n_ops, fp16_spec):.3e}, "
+          f"Statistical: {analyzer.accumulated_error_statistical(n_ops, fp16_spec):.3e}")
+    print(f"BF16: Worst case: {analyzer.accumulated_error_worst_case(n_ops, bf16_spec):.3e}, "
+          f"Statistical: {analyzer.accumulated_error_statistical(n_ops, bf16_spec):.3e}")
+
+    # 예제 3: 다양한 값에서의 정밀도
+    print("\n[Example 3] Precision at Different Values")
+    print("-"*70)
+
+    for value in [1.0, 10.0, 100.0, 0.1, 1e-6]:
+        analyzer.compare_precisions(value)
+
+    # 예제 4: 캐스트 오차
+    print("\n[Example 4] Cast Error: FP32 → BF16")
+    print("-"*70)
+
+    value = 123.456
+
+    cast_error = analyzer.cast_error_bound(
+        value,
+        analyzer.get_spec(FloatingPointFormat.FP32),
+        analyzer.get_spec(FloatingPointFormat.BF16)
+    )
+
+    fp32_spec = analyzer.get_spec(FloatingPointFormat.FP32)
+    bf16_spec = analyzer.get_spec(FloatingPointFormat.BF16)
+
+    print(f"Value: {value}")
+    print(f"FP32 ULP: {analyzer.ulp(value, fp32_spec):.3e}")
+    print(f"BF16 ULP: {analyzer.ulp(value, bf16_spec):.3e}")
+    print(f"Cast error: {cast_error:.3e}")
+    print(f"Relative error: {cast_error/value:.3%}")
+
+    print("\n" + "="*70)
+    print("Floating-Point Analysis Complete")
+    print("="*70)

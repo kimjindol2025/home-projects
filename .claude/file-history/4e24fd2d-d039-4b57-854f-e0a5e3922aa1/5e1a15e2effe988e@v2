@@ -1,0 +1,603 @@
+# Go 전공 401-4-4: PGO와 정밀 프로파일링 - 데이터가 증명하는 최적화
+
+> **경고**: 이 과정은 **데이터 기반 최적화**의 정점입니다.
+> 추측과 직관이 아닌, 실제 실행 데이터(Profile)로 성능을 극대화합니다.
+> 데이터가 증명하는 최적화를 기록합니다. (Your record is your proof.)
+
+---
+
+## 📚 목차
+
+1. [PGO (Profile-Guided Optimization)](#섹션-1-pgo-profile-guided-optimization)
+2. [정밀 벤치마킹: testing.B](#섹션-2-정밀-벤치마킹-testingb)
+3. [pprof 프로파일링](#섹션-3-pprof-프로파일링)
+4. [CPU 프로파일 분석](#섹션-4-cpu-프로파일-분석)
+5. [메모리 프로파일 분석](#섹션-5-메모리-프로파일-분석)
+6. [GOMEMLIMIT과 GC 튜닝](#섹션-6-gomemlimit과-gc-튜닝)
+7. [runtime/trace 심층 분석](#섹션-7-runtimetrace-심층-분석)
+8. [Assignment 4-4: 실전 최적화](#섹션-8-assignment-44-실전-최적화)
+
+---
+
+## 섹션 1️⃣: PGO (Profile-Guided Optimization)
+
+### 🎯 PGO란?
+
+**PGO (Profile-Guided Optimization)**는 Go 1.20부터 도입된 혁신 기능입니다.
+
+```
+일반적인 컴파일 (정적 분석):
+    Go 소스 코드
+         ↓ (코드만 보고 추측)
+    컴파일러의 기본 최적화
+         ↓
+    바이너리
+
+PGO 컴파일 (데이터 기반):
+    Go 소스 코드
+         ↓
+    일반 빌드 & 실행
+         ↓ (실제 실행 기록 수집)
+    CPU 프로파일 (default.pgo)
+         ↓ (데이터를 보고 결정)
+    PGO 최적화 빌드
+         ↓
+    고도 최적화 바이너리 (+2-14%)
+```
+
+### 📊 작동 원리
+
+```
+Step 1️⃣: 프로파일 수집 (Production 환경)
+    # 일반 빌드로 프로그램 실행
+    go build -o myapp .
+
+    # 프로파일 데이터 수집
+    ./myapp  # 또는 운영 환경에서 자동 수집
+
+Step 2️⃣: PGO 최적화 빌드 (개발 환경)
+    # default.pgo 파일이 같은 디렉토리에 있으면 자동 감지
+    go build -o myapp-optimized .
+
+    # 컴파일러가 다음을 자동 최적화:
+    # - 자주 호출되는 함수 우선 인라이닝
+    # - hot path 코드 배치 최적화
+    # - 불필요한 분기 제거
+
+Step 3️⃣: 성능 비교
+    # PGO 없는 빌드
+    time ./myapp
+
+    # PGO 있는 빌드
+    time ./myapp-optimized
+
+    # 성능 개선: 2-14% (일반적)
+```
+
+### 💡 PGO의 장점
+
+| 항목 | 효과 |
+|------|------|
+| **코드 변경 없음** | 빌드 옵션만 변경 |
+| **성능 향상** | 2-14% (평균 3-5%) |
+| **안정성** | 기존 기능은 동일 |
+| **자동 적용** | default.pgo 감지 자동 |
+
+### 🔍 PGO 프로파일 생성
+
+```go
+// 프로파일 데이터 자동 수집
+import _ "net/http/pprof"  // HTTP를 통해 pprof 노출
+
+func main() {
+    go func() {
+        log.Println(http.ListenAndServe("localhost:6060", nil))
+    }()
+
+    // 실제 작업 수행
+    for i := 0; i < 1000000; i++ {
+        doWork()
+    }
+}
+
+// 프로파일 수집 (30초간)
+// go tool pprof -http=:8080 http://localhost:6060/debug/pprof/profile?seconds=30
+```
+
+---
+
+## 섹션 2️⃣: 정밀 벤치마킹 (testing.B)
+
+### 🎯 벤치마킹의 3가지 차원
+
+```
+1️⃣ 속도 (Speed)
+   - 연산 속도 (ns/op)
+   - 처리량 (ops/sec)
+
+2️⃣ 메모리 (Memory)
+   - 할당 횟수 (allocs/op)
+   - 할당 크기 (B/op)
+   - 누수 여부 (memory leak)
+
+3️⃣ 병렬성 (Parallelism)
+   - 경합(Contention) 발생 여부
+   - 멀티코어 확장성
+```
+
+### 💻 벤치마킹 예제
+
+```go
+// 기본 벤치마크
+func BenchmarkSimpleAdd(b *testing.B) {
+    for i := 0; i < b.N; i++ {
+        _ = 1 + 2
+    }
+    // 출력: BenchmarkSimpleAdd-8  1000000000  1.234 ns/op
+}
+
+// 메모리 할당 추적
+func BenchmarkSliceAppend(b *testing.B) {
+    b.ReportAllocs()  // 할당량 추적 활성화
+    for i := 0; i < b.N; i++ {
+        s := []int{}
+        s = append(s, 1, 2, 3, 4, 5)
+    }
+    // 출력: BenchmarkSliceAppend-8   123456  9876 ns/op  560 B/op  6 allocs/op
+    //       ns/op: 나노초   B/op: 바이트   allocs/op: 할당 횟수
+}
+
+// 병렬 벤치마크 (멀티코어)
+func BenchmarkConcurrentMap(b *testing.B) {
+    m := sync.Map{}
+    b.RunParallel(func(pb *testing.PB) {
+        i := 0
+        for pb.Next() {
+            m.Store(i, i)
+            i++
+        }
+    })
+    // 여러 고루틴이 동시에 실행 → 경합 감지
+}
+
+// 벤치마크 전/후 설정
+func BenchmarkWithSetup(b *testing.B) {
+    // Setup
+    data := prepareData()
+
+    b.ResetTimer()  // 타이머 재설정 (setup 시간 제외)
+
+    for i := 0; i < b.N; i++ {
+        processData(data)
+    }
+
+    b.StopTimer()   // 타이머 중지
+    cleanup()       // 정리 작업
+}
+```
+
+### 📊 벤치마크 실행 명령어
+
+```bash
+# 기본 벤치마크
+go test -bench=. -benchmem
+
+# 상세 출력
+go test -bench=. -benchmem -benchtime=5s -run=^$
+
+# 특정 벤치마크만
+go test -bench=BenchmarkSliceAppend
+
+# 결과 비교
+go test -bench=. -benchmem > old.txt
+# (코드 수정)
+go test -bench=. -benchmem > new.txt
+benchstat old.txt new.txt
+```
+
+---
+
+## 섹션 3️⃣: pprof 프로파일링
+
+### 🎯 pprof란?
+
+Go의 내장 프로파일러로, 다음 5가지 프로파일을 제공합니다:
+
+```
+1️⃣ CPU Profile
+   - 어떤 함수가 CPU 시간을 가장 많이 사용하는가?
+   - 병목 함수(Hot Path) 발견
+
+2️⃣ Heap Profile
+   - 어떤 객체가 메모리를 점유하고 있는가?
+   - 메모리 누수 발견
+
+3️⃣ Alloc Profile
+   - 어떤 함수가 메모리를 가장 많이 할당하는가?
+   - 할당 최적화 대상 발견
+
+4️⃣ Goroutine Profile
+   - 현재 고루틴들이 어디서 블로킹되어 있는가?
+   - 데드락 또는 성능 저하 원인 발견
+
+5️⃣ Mutex Profile
+   - 어떤 뮤텍스에서 경합이 발생하는가?
+   - 동시성 병목 발견
+```
+
+### 💻 pprof 사용 방법
+
+```go
+// 방법 1: HTTP 서버에서 실시간 pprof 접근
+import _ "net/http/pprof"
+
+func main() {
+    go http.ListenAndServe("localhost:6060", nil)
+    // 접근: http://localhost:6060/debug/pprof/
+}
+
+// 방법 2: 파일로 프로파일 저장
+import "runtime/pprof"
+
+func main() {
+    f, _ := os.Create("cpu.prof")
+    pprof.StartCPUProfile(f)
+    defer pprof.StopCPUProfile()
+
+    // 작업 수행
+    for i := 0; i < 1000000; i++ {
+        doWork()
+    }
+}
+
+// 방법 3: 테스트 벤치마크에서 프로파일
+// go test -bench=. -cpuprofile=cpu.prof
+// go tool pprof cpu.prof
+```
+
+### 🔍 프로파일 분석
+
+```bash
+# CPU 프로파일 분석 (대화형)
+go tool pprof cpu.prof
+
+# 브라우저로 플레임 그래프 보기
+go tool pprof -http=:8080 cpu.prof
+
+# 메모리 프로파일
+go tool pprof -http=:8080 mem.prof
+
+# 실시간 접근 (HTTP 서버 실행 중)
+go tool pprof http://localhost:6060/debug/pprof/heap
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+```
+
+---
+
+## 섹션 4️⃣: CPU 프로파일 분석
+
+### 📊 Flame Graph 읽기
+
+```
+너비: 함수의 CPU 시간
+높이: 호출 스택 깊이
+
+예:
+┌─────────────────────────────────────┐
+│ main (전체 100%)                    │
+├─────────────┬───────────┬───────────┤
+│ funcA (40%) │funcB(35%)│ funcC(25%)│
+├────┬────────┼──┬────┬──┤
+│f1  │f2      │f3 │f4 │f5│
+└────┴────────┴──┴────┴──┘
+
+해석:
+- funcA가 가장 넓음 → 가장 큰 병목
+- 최적화 우선순위: funcA > funcB > funcC
+```
+
+### 💡 CPU 프로파일 해석
+
+```
+top10 명령어 (pprof 대화형):
+    flat: 이 함수 자체가 사용한 CPU 시간
+    cum:  이 함수 + 호출한 함수들의 총 CPU 시간
+
+예:
+    flat    cum     func
+    2.50s   5.00s   main.heavyFunction
+    1.50s   1.50s   math.Sqrt
+```
+
+---
+
+## 섹션 5️⃣: 메모리 프로파일 분석
+
+### 🎯 메모리 누수 발견
+
+```go
+// ❌ 메모리 누수 패턴
+func leakyFunction() {
+    // 전역 슬라이스에 계속 추가 (절대 해제 안 됨)
+    globalSlice = append(globalSlice, data...)
+}
+
+// ✅ 안전한 패턴
+func safeFunction(ch chan Data) {
+    for d := range ch {
+        processOnce(d)  // 메모리 재사용 또는 해제
+    }
+}
+```
+
+### 📊 메모리 프로파일 명령어
+
+```bash
+# Heap 프로파일 (할당된 메모리)
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# Alloc 프로파일 (할당한 전체 메모리, 현재 사용 여부 무관)
+go tool pprof http://localhost:6060/debug/pprof/allocs
+
+# pprof 명령어
+(pprof) top10          # 상위 10개 메모리 사용 함수
+(pprof) list funcName  # 함수 소스코드와 함께 메모리 사용량 보기
+```
+
+---
+
+## 섹션 6️⃣: GOMEMLIMIT과 GC 튜닝
+
+### 🎯 GOMEMLIMIT (Go 1.19+)
+
+Go 1.19부터 도입된 **최대 메모리 제한**:
+
+```
+과거 방식 (GOGC만 있었음):
+    GOGC=100
+    → GC는 힙 크기 100% 증가했을 때 실행
+    → 메모리 사용량은 예측 불가능
+
+현대 방식 (GOMEMLIMIT 추가):
+    GOMEMLIMIT=512MiB
+    → "최대 512MB까지만 써라"
+    → GC가 자동으로 빈도 조절
+    → 메모리 사용량을 예측 가능하게 제어
+```
+
+### 💻 GOMEMLIMIT 사용
+
+```go
+// 방법 1: 환경 변수
+// export GOMEMLIMIT=512MiB
+// go run main.go
+
+// 방법 2: 프로그래밍 방식
+import "runtime/debug"
+
+func main() {
+    debug.SetMemoryLimit(512 * 1024 * 1024)  // 512MB
+
+    // 이제 런타임이 메모리 사용량을 512MB 이하로 유지
+}
+```
+
+### 📊 GOMEMLIMIT 효과
+
+```
+메모리 사용량 (시간 흐름):
+
+GOGC=100만 사용:
+    ├─────────────────────────────────
+    │ 500MB
+    │       ╱╲
+    │      ╱  ╲ GC
+    │ 250MB
+    │
+    └─────────────────────────────────
+    메모리가 500MB까지 늘어나야 GC 실행
+
+GOMEMLIMIT=256MiB 추가:
+    ├─────────────────────────────────
+    │ 256MB ═════════════════ (한계)
+    │       ╱╲ ╱╲ ╱╲ ╱╲ ╱╲
+    │      ╱  ╲╱  ╱  ╱
+    │
+    └─────────────────────────────────
+    메모리가 256MB에 도달하면 빠르게 GC 실행
+    → K8s OOM Kill 방지
+```
+
+---
+
+## 섹션 7️⃣: runtime/trace 심층 분석
+
+### 🎯 runtime/trace란?
+
+**pprof가 통계**라면, **trace는 일대기**(Timeline)입니다.
+
+```
+pprof (통계):           trace (타임라인):
+- 어떤 함수가 느린가?   - 언제 어느 함수가 실행되었는가?
+- 상위 10개 함수        - 고루틴이 언제 멈췄는가?
+- 전체 개요             - 스케줄링 지연은?
+                        - 마이크로초 단위 시간축
+```
+
+### 💻 runtime/trace 사용
+
+```go
+import "runtime/trace"
+
+func main() {
+    f, _ := os.Create("trace.out")
+    defer f.Close()
+
+    trace.Start(f)
+    defer trace.Stop()
+
+    // 작업 수행
+    for i := 0; i < 1000000; i++ {
+        doWork()
+    }
+}
+
+// 분석
+// go tool trace trace.out
+// → 브라우저에서 시각화
+```
+
+### 📊 Trace 분석 항목
+
+```
+1️⃣ Goroutine 분석
+   - 고루틴 생명주기 (생성 → 실행 → 종료)
+   - 각 고루틴이 어느 프로세서(P)에서 실행되는가?
+
+2️⃣ 네트워크 이벤트
+   - 채널 송수신
+   - 뮤텍스 경합
+
+3️⃣ 메모리 이벤트
+   - 가비지 컬렉션 (STW 보이기)
+   - 메모리 할당
+
+4️⃣ 프로세서 활용도
+   - 각 P가 얼마나 일하는가?
+   - 유휴 시간은?
+```
+
+---
+
+## 섹션 8️⃣: Assignment 4-4: 실전 최적화
+
+### 📝 과제 1: PGO 실습
+
+```bash
+# Step 1: CPU 연산이 많은 프로그램 작성
+cat > compute.go << 'EOF'
+package main
+
+import "fmt"
+
+func fib(n int) int {
+    if n <= 1 { return n }
+    return fib(n-1) + fib(n-2)
+}
+
+func main() {
+    for i := 0; i < 30; i++ {
+        _ = fib(i)
+    }
+    fmt.Println("Done")
+}
+EOF
+
+# Step 2: 일반 빌드
+go build -o compute-base .
+
+# Step 3: 프로파일 수집 (cpu.prof 생성)
+go test -bench=fib -cpuprofile=cpu.prof
+
+# Step 4: default.pgo 생성
+cp cpu.prof default.pgo
+
+# Step 5: PGO 최적화 빌드
+go build -o compute-pgo .
+
+# Step 6: 성능 비교
+time ./compute-base
+time ./compute-pgo
+# 결과: compute-pgo가 2-10% 빠름
+```
+
+### 📝 과제 2: Flame Graph 분석
+
+```bash
+# CPU 프로파일 생성
+go test -bench=. -cpuprofile=cpu.prof
+
+# Flame Graph 브라우저로 보기
+go tool pprof -http=:8080 cpu.prof
+
+# 분석 항목:
+# 1. 가장 넓은(높은 CPU 사용) 함수 찾기
+# 2. 그 함수의 호출자 추적
+# 3. 최적화 대상 결정
+# 4. 코드 변경 후 재벤치마크
+```
+
+### 📝 과제 3: 메모리 누수 감지
+
+```bash
+# Heap 프로파일 수집
+go test -run=TestMemoryLeak -memprofile=mem.prof
+
+# 누수 함수 찾기
+go tool pprof -http=:8080 mem.prof
+
+# 확인 항목:
+# 1. alloc profile에만 있고 heap에 없는 객체
+# 2. 메모리 사용량이 시간과 함께 증가하는가?
+# 3. GC 후에도 줄어들지 않는 메모리
+```
+
+### 📝 과제 4: GOMEMLIMIT 효과 확인
+
+```bash
+# 메모리 제한 없음
+go run myapp.go
+
+# 메모리 제한 (512MB)
+GOMEMLIMIT=512MiB go run myapp.go
+
+# 프로파일 비교
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# 확인:
+# - GC 빈도 변화
+# - 피크 메모리 사용량
+# - 응답 시간 변화
+```
+
+---
+
+## 🎓 핵심 정리
+
+```
+【 PGO와 정밀 프로파일링 요약 】
+
+1️⃣ PGO (Profile-Guided Optimization)
+   ✓ Go 1.20+
+   ✓ 실제 실행 데이터 기반 최적화
+   ✓ 코드 변경 없이 2-14% 성능 향상
+
+2️⃣ 벤치마킹 (testing.B)
+   ✓ b.ReportAllocs(): 메모리 할당 추적
+   ✓ b.RunParallel(): 멀티코어 테스트
+   ✓ benchstat: 결과 비교
+
+3️⃣ pprof (Profile 분석)
+   ✓ CPU, Heap, Alloc, Goroutine, Mutex
+   ✓ Flame Graph: 시각적 분석
+   ✓ top10: 상위 병목 함수
+
+4️⃣ GOMEMLIMIT (Go 1.19+)
+   ✓ 최대 메모리 제한
+   ✓ K8s OOM Kill 방지
+   ✓ GC 빈도 자동 조절
+
+5️⃣ runtime/trace
+   ✓ 마이크로초 단위 타임라인
+   ✓ 고루틴 생명주기 추적
+   ✓ 스케줄링 분석
+
+6️⃣ 데이터가 증명하는 최적화
+```
+
+---
+
+**데이터가 증명하는 최적화를 기록합니다.** 📊
+**기록이 증명이다. (Your record is your proof.)** ✨
+
+마지막 업데이트: 2026-02-25

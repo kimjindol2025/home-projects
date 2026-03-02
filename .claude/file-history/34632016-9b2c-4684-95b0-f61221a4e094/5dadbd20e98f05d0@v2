@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""
+MindLang 메트릭 통합 수집 서비스
+다양한 소스에서 메트릭을 수집하고 통합 관리
+
+기능:
+- 멀티 소스 메트릭 수집
+- 실시간 메트릭 처리
+- 메트릭 정규화 및 변환
+- 메트릭 저장소 관리
+- 실시간 스트리밍 지원
+"""
+
+import json
+import time
+import threading
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Callable, Tuple
+from collections import deque
+import statistics
+
+
+@dataclass
+class MetricPoint:
+    """메트릭 데이터 포인트"""
+    timestamp: float
+    metric_name: str
+    value: float
+    source: str
+    labels: Dict[str, str]  # 추가 메타데이터 (service, region, etc.)
+    unit: str = ""
+
+
+@dataclass
+class MetricSource:
+    """메트릭 소스"""
+    name: str
+    description: str
+    enabled: bool = True
+    interval_seconds: int = 60
+    timeout_seconds: int = 30
+    retry_count: int = 3
+
+
+class MetricBuffer:
+    """메트릭 버퍼 (시간 윈도우 기반)"""
+
+    def __init__(self, metric_name: str, window_size: int = 3600, capacity: int = 10000):
+        self.metric_name = metric_name
+        self.window_size = window_size  # 초
+        self.capacity = capacity
+        self.points: deque = deque(maxlen=capacity)
+
+    def add_point(self, point: MetricPoint):
+        """메트릭 포인트 추가"""
+        self.points.append(point)
+
+    def get_recent_points(self, seconds: int) -> List[MetricPoint]:
+        """최근 N초의 포인트 반환"""
+        cutoff_time = time.time() - seconds
+        return [p for p in self.points if p.timestamp >= cutoff_time]
+
+    def get_statistics(self, seconds: int = 300) -> Dict:
+        """통계 계산"""
+        recent = self.get_recent_points(seconds)
+
+        if not recent:
+            return {}
+
+        values = [p.value for p in recent]
+
+        return {
+            'count': len(values),
+            'min': min(values),
+            'max': max(values),
+            'mean': statistics.mean(values),
+            'median': statistics.median(values),
+            'stdev': statistics.stdev(values) if len(values) > 1 else 0,
+            'latest': values[-1],
+            'time_range': {
+                'start': recent[0].timestamp,
+                'end': recent[-1].timestamp
+            }
+        }
+
+    def get_trend(self, seconds: int = 300) -> str:
+        """추세 파악 (up, down, stable)"""
+        recent = self.get_recent_points(seconds)
+
+        if len(recent) < 2:
+            return "insufficient_data"
+
+        values = [p.value for p in recent]
+        first_half = statistics.mean(values[:len(values)//2])
+        second_half = statistics.mean(values[len(values)//2:])
+
+        change_pct = abs((second_half - first_half) / first_half) if first_half != 0 else 0
+
+        if change_pct < 0.05:
+            return "stable"
+        elif second_half > first_half:
+            return "up"
+        else:
+            return "down"
+
+
+class MetricsAggregator:
+    """메트릭 통합 수집 서비스"""
+
+    def __init__(self, max_retention_hours: int = 24):
+        self.sources: Dict[str, MetricSource] = {}
+        self.buffers: Dict[str, MetricBuffer] = {}
+        self.max_retention_hours = max_retention_hours
+        self.callbacks: List[Callable] = []
+        self.is_running = False
+        self._init_default_sources()
+
+    def _init_default_sources(self):
+        """기본 메트릭 소스 등록"""
+        sources = [
+            MetricSource(
+                "system_metrics",
+                "시스템 성능 메트릭 (CPU, 메모리, 디스크)",
+                interval_seconds=30
+            ),
+            MetricSource(
+                "application_metrics",
+                "애플리케이션 메트릭 (응답시간, 처리량)",
+                interval_seconds=30
+            ),
+            MetricSource(
+                "network_metrics",
+                "네트워크 메트릭 (대역폭, 패킷 손실)",
+                interval_seconds=60
+            ),
+            MetricSource(
+                "business_metrics",
+                "비즈니스 메트릭 (비용, 수익)",
+                interval_seconds=300
+            ),
+            MetricSource(
+                "custom_metrics",
+                "커스텀 애플리케이션 메트릭",
+                interval_seconds=60
+            )
+        ]
+
+        for source in sources:
+            self.register_source(source)
+
+    def register_source(self, source: MetricSource):
+        """메트릭 소스 등록"""
+        self.sources[source.name] = source
+        print(f"✅ 메트릭 소스 등록: {source.name}")
+
+    def add_metric_point(self, point: MetricPoint):
+        """메트릭 포인트 추가"""
+        # 버퍼 생성 (필요시)
+        if point.metric_name not in self.buffers:
+            self.buffers[point.metric_name] = MetricBuffer(point.metric_name)
+
+        # 포인트 추가
+        self.buffers[point.metric_name].add_point(point)
+
+        # 콜백 실행
+        for callback in self.callbacks:
+            try:
+                callback(point)
+            except Exception as e:
+                print(f"❌ 콜백 실행 오류: {e}")
+
+    def ingest_metrics(self, source_name: str, metrics: Dict[str, float], labels: Dict = None):
+        """메트릭 수집 (여러 메트릭 동시)"""
+        if source_name not in self.sources:
+            print(f"⚠️  알 수 없는 소스: {source_name}")
+            return
+
+        if labels is None:
+            labels = {}
+
+        timestamp = time.time()
+
+        for metric_name, value in metrics.items():
+            point = MetricPoint(
+                timestamp=timestamp,
+                metric_name=metric_name,
+                value=value,
+                source=source_name,
+                labels=labels
+            )
+            self.add_metric_point(point)
+
+    def get_metric_statistics(self, metric_name: str, seconds: int = 300) -> Dict:
+        """메트릭 통계 조회"""
+        if metric_name not in self.buffers:
+            return {}
+
+        return self.buffers[metric_name].get_statistics(seconds)
+
+    def get_metric_trend(self, metric_name: str, seconds: int = 300) -> str:
+        """메트릭 추세 조회"""
+        if metric_name not in self.buffers:
+            return "unknown"
+
+        return self.buffers[metric_name].get_trend(seconds)
+
+    def get_recent_metrics(self, metric_name: str, seconds: int = 300) -> List[Dict]:
+        """최근 메트릭 조회"""
+        if metric_name not in self.buffers:
+            return []
+
+        points = self.buffers[metric_name].get_recent_points(seconds)
+        return [
+            {
+                'timestamp': p.timestamp,
+                'value': p.value,
+                'source': p.source,
+                'labels': p.labels
+            }
+            for p in points
+        ]
+
+    def correlate_metrics(self, metric1: str, metric2: str, seconds: int = 300) -> Dict:
+        """두 메트릭 간 상관관계 분석"""
+        points1 = self.buffers.get(metric1, MetricBuffer(metric1)).get_recent_points(seconds)
+        points2 = self.buffers.get(metric2, MetricBuffer(metric2)).get_recent_points(seconds)
+
+        if len(points1) < 2 or len(points2) < 2:
+            return {'error': 'insufficient_data'}
+
+        # 시간 정렬 및 동기화
+        all_times = sorted(set([p.timestamp for p in points1 + points2]))
+
+        if not all_times:
+            return {'error': 'no_data'}
+
+        # 선형 보간으로 동기화
+        values1 = self._interpolate_values(points1, all_times)
+        values2 = self._interpolate_values(points2, all_times)
+
+        if not values1 or not values2:
+            return {'error': 'interpolation_failed'}
+
+        # 피어슨 상관계수
+        correlation = self._pearson_correlation(values1, values2)
+
+        return {
+            'metric1': metric1,
+            'metric2': metric2,
+            'correlation': correlation,
+            'interpretation': self._interpret_correlation(correlation),
+            'data_points': len(all_times)
+        }
+
+    def get_aggregated_view(self, metric_names: List[str], seconds: int = 300) -> Dict:
+        """통합 뷰 생성"""
+        view = {
+            'timestamp': datetime.now().isoformat(),
+            'time_window_seconds': seconds,
+            'metrics': {}
+        }
+
+        for metric_name in metric_names:
+            if metric_name in self.buffers:
+                stats = self.get_metric_statistics(metric_name, seconds)
+                trend = self.get_metric_trend(metric_name, seconds)
+
+                view['metrics'][metric_name] = {
+                    'statistics': stats,
+                    'trend': trend,
+                    'data_points': stats.get('count', 0)
+                }
+
+        return view
+
+    def register_callback(self, callback: Callable):
+        """메트릭 수신 콜백 등록"""
+        self.callbacks.append(callback)
+
+    def start_simulation(self):
+        """시뮬레이션 모드 시작 (테스트용)"""
+        print("\n🎯 메트릭 시뮬레이션 시작\n")
+
+        self.is_running = True
+        iteration = 0
+
+        while self.is_running and iteration < 100:
+            iteration += 1
+
+            # 시스템 메트릭
+            self.ingest_metrics(
+                "system_metrics",
+                {
+                    'cpu_usage': 50 + (iteration % 40),
+                    'memory_usage': 60 + (iteration % 30),
+                    'disk_usage': 65 + (iteration % 20),
+                    'io_wait': 5 + (iteration % 10)
+                },
+                {'host': 'server-01', 'region': 'us-east-1'}
+            )
+
+            # 애플리케이션 메트릭
+            self.ingest_metrics(
+                "application_metrics",
+                {
+                    'response_time_ms': 100 + (iteration % 200),
+                    'throughput': 1000 + (iteration * 5 % 500),
+                    'error_rate': 0.01 + (iteration % 5) * 0.001
+                },
+                {'service': 'api-gateway', 'version': 'v3.0'}
+            )
+
+            # 네트워크 메트릭
+            self.ingest_metrics(
+                "network_metrics",
+                {
+                    'bandwidth_in_mbps': 100 + (iteration % 150),
+                    'bandwidth_out_mbps': 80 + (iteration % 120),
+                    'packet_loss_percent': 0.1 + (iteration % 5) * 0.05
+                },
+                {'interface': 'eth0'}
+            )
+
+            # 비즈니스 메트릭
+            self.ingest_metrics(
+                "business_metrics",
+                {
+                    'cost_per_hour': 120 + (iteration % 40),
+                    'requests_per_second': 500 + (iteration % 300)
+                },
+                {'region': 'global'}
+            )
+
+            time.sleep(1)
+
+        print(f"✅ 시뮬레이션 완료: {iteration}개 데이터 포인트 생성")
+
+    def stop_simulation(self):
+        """시뮬레이션 중지"""
+        self.is_running = False
+
+    def get_health_check(self) -> Dict:
+        """서비스 헬스 체크"""
+        active_metrics = len(self.buffers)
+        total_points = sum(len(b.points) for b in self.buffers.values())
+
+        return {
+            'status': 'healthy' if active_metrics > 0 else 'degraded',
+            'active_metrics': active_metrics,
+            'total_data_points': total_points,
+            'registered_sources': len(self.sources),
+            'enabled_sources': sum(1 for s in self.sources.values() if s.enabled),
+            'timestamp': datetime.now().isoformat()
+        }
+
+    def export_metrics(self, filename: str = None) -> Optional[str]:
+        """메트릭 데이터 내보내기"""
+        if filename is None:
+            filename = f"metrics_export_{int(time.time())}.json"
+
+        export_data = {
+            'timestamp': datetime.now().isoformat(),
+            'metrics': {}
+        }
+
+        for metric_name, buffer in self.buffers.items():
+            export_data['metrics'][metric_name] = {
+                'points': [
+                    {
+                        'timestamp': p.timestamp,
+                        'value': p.value,
+                        'source': p.source,
+                        'labels': p.labels
+                    }
+                    for p in list(buffer.points)[-1000:]  # 최근 1000개만
+                ],
+                'statistics': buffer.get_statistics(3600)
+            }
+
+        try:
+            with open(filename, 'w') as f:
+                json.dump(export_data, f, indent=2)
+
+            print(f"✅ 메트릭 내보내기 완료: {filename}")
+            return filename
+
+        except Exception as e:
+            print(f"❌ 내보내기 실패: {e}")
+            return None
+
+    def _interpolate_values(self, points: List[MetricPoint], times: List[float]) -> List[float]:
+        """선형 보간"""
+        if not points or not times:
+            return []
+
+        values = []
+        point_dict = {p.timestamp: p.value for p in points}
+
+        for t in times:
+            if t in point_dict:
+                values.append(point_dict[t])
+            else:
+                # 가장 가까운 값 찾기
+                closest = min(points, key=lambda p: abs(p.timestamp - t))
+                values.append(closest.value)
+
+        return values
+
+    def _pearson_correlation(self, values1: List[float], values2: List[float]) -> float:
+        """피어슨 상관계수"""
+        if len(values1) != len(values2) or len(values1) < 2:
+            return 0.0
+
+        mean1 = statistics.mean(values1)
+        mean2 = statistics.mean(values2)
+
+        numerator = sum((v1 - mean1) * (v2 - mean2) for v1, v2 in zip(values1, values2))
+        stdev1 = statistics.stdev(values1)
+        stdev2 = statistics.stdev(values2)
+
+        if stdev1 == 0 or stdev2 == 0:
+            return 0.0
+
+        return numerator / (len(values1) * stdev1 * stdev2)
+
+    def _interpret_correlation(self, correlation: float) -> str:
+        """상관계수 해석"""
+        abs_corr = abs(correlation)
+
+        if abs_corr > 0.8:
+            strength = "매우 강한"
+        elif abs_corr > 0.6:
+            strength = "강한"
+        elif abs_corr > 0.4:
+            strength = "중간"
+        elif abs_corr > 0.2:
+            strength = "약한"
+        else:
+            strength = "매우 약한"
+
+        direction = "양의" if correlation > 0 else "음의"
+        return f"{strength} {direction}"
+
+    def print_status(self):
+        """상태 출력"""
+        print("\n" + "=" * 70)
+        print("📊 메트릭 수집 서비스 상태")
+        print("=" * 70 + "\n")
+
+        health = self.get_health_check()
+        print(f"상태: {health['status'].upper()}")
+        print(f"활성 메트릭: {health['active_metrics']}개")
+        print(f"총 데이터 포인트: {health['total_data_points']}개")
+        print(f"등록된 소스: {health['registered_sources']}개")
+        print(f"활성화된 소스: {health['enabled_sources']}개\n")
+
+        print("📈 메트릭별 통계:\n")
+        print(f"{'메트릭':<30} {'데이터포인트':<15} {'최근값':<15} {'추세':<15}")
+        print("-" * 75)
+
+        for metric_name in sorted(self.buffers.keys()):
+            stats = self.get_metric_statistics(metric_name, 300)
+            trend = self.get_metric_trend(metric_name, 300)
+
+            if stats:
+                latest = stats.get('latest', 'N/A')
+                count = stats.get('count', 0)
+
+                if isinstance(latest, float):
+                    latest_str = f"{latest:.2f}"
+                else:
+                    latest_str = str(latest)
+
+                print(f"{metric_name:<30} {count:<15} {latest_str:<15} {trend:<15}")
+
+        print("\n" + "=" * 70 + "\n")
+
+
+# CLI 인터페이스
+if __name__ == "__main__":
+    import sys
+
+    aggregator = MetricsAggregator()
+
+    if len(sys.argv) < 2:
+        print("사용법: python metrics_aggregator.py [command] [args]")
+        print("  start           - 메트릭 시뮬레이션 시작")
+        print("  status          - 서비스 상태 확인")
+        print("  stats <metric>  - 메트릭 통계 조회")
+        print("  trend <metric>  - 메트릭 추세 조회")
+        print("  correlate <m1> <m2> - 메트릭 상관관계 분석")
+        print("  export [file]   - 메트릭 내보내기")
+        return
+
+    command = sys.argv[1]
+
+    if command == "start":
+        aggregator.start_simulation()
+
+    elif command == "status":
+        aggregator.print_status()
+
+    elif command == "stats":
+        metric = sys.argv[2] if len(sys.argv) > 2 else "cpu_usage"
+        stats = aggregator.get_metric_statistics(metric, 300)
+        print(f"\n📊 {metric} 통계 (최근 5분)\n")
+        for key, value in stats.items():
+            if key != 'time_range':
+                print(f"{key}: {value}")
+
+    elif command == "trend":
+        metric = sys.argv[2] if len(sys.argv) > 2 else "cpu_usage"
+        trend = aggregator.get_metric_trend(metric, 300)
+        print(f"\n📈 {metric} 추세: {trend}")
+
+    elif command == "correlate":
+        if len(sys.argv) >= 4:
+            metric1 = sys.argv[2]
+            metric2 = sys.argv[3]
+            result = aggregator.correlate_metrics(metric1, metric2)
+            print(f"\n🔗 {metric1} vs {metric2}\n")
+            for key, value in result.items():
+                print(f"{key}: {value}")
+        else:
+            print("메트릭 2개를 지정하세요")
+
+    elif command == "export":
+        filename = sys.argv[2] if len(sys.argv) > 2 else None
+        aggregator.export_metrics(filename)

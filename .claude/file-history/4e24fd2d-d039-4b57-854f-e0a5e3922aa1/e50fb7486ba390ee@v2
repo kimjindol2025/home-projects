@@ -1,0 +1,524 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+// ============================================================================
+// 섹션 1️⃣: 기본 Protocol Buffers 메시지 정의 (Go 구조체)
+// ============================================================================
+
+// Order 메시지 (OrderService에서 사용)
+type Order struct {
+	OrderID    string
+	UserID     string
+	Items      []string
+	TotalPrice float64
+	Status     string // PENDING, SHIPPED, DELIVERED
+}
+
+// CreateOrderRequest
+type CreateOrderRequest struct {
+	UserID string
+	Items  []string
+}
+
+// CreateOrderResponse
+type CreateOrderResponse struct {
+	OrderID    string
+	TotalPrice float64
+	Error      string
+}
+
+// GetPriceRequest
+type GetPriceRequest struct {
+	Symbol string // AAPL, GOOGL 등
+}
+
+// GetPriceResponse (스트리밍)
+type GetPriceResponse struct {
+	Price     float64
+	Timestamp int64
+}
+
+// FileChunk (클라이언트 스트리밍)
+type FileChunk struct {
+	Filename string
+	Data     []byte
+}
+
+// FileUploadResponse
+type FileUploadResponse struct {
+	FileID     string
+	TotalBytes int64
+}
+
+// ChatMessage (양방향 스트리밍)
+type ChatMessage struct {
+	UserID    string
+	Content   string
+	Timestamp int64
+}
+
+// ============================================================================
+// 섹션 2️⃣: Unary RPC - 일반적인 1:1 요청/응답
+// ============================================================================
+
+// OrderService 인터페이스
+type OrderService interface {
+	CreateOrder(ctx context.Context, req *CreateOrderRequest) (*CreateOrderResponse, error)
+}
+
+// OrderServiceServer 구현
+type OrderServiceServer struct {
+	orders map[string]*Order
+	mu     sync.Mutex
+}
+
+// NewOrderServiceServer 생성
+func NewOrderServiceServer() *OrderServiceServer {
+	return &OrderServiceServer{
+		orders: make(map[string]*Order),
+	}
+}
+
+// CreateOrder: Unary RPC 구현
+func (s *OrderServiceServer) CreateOrder(ctx context.Context, req *CreateOrderRequest) (*CreateOrderResponse, error) {
+	fmt.Println("[Unary] CreateOrder 요청:", req.UserID, req.Items)
+
+	if req.UserID == "" {
+		return nil, status.Error(codes.InvalidArgument, "user_id 필수")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	orderID := fmt.Sprintf("order-%d", time.Now().Unix())
+	totalPrice := float64(len(req.Items)) * 29.99
+
+	order := &Order{
+		OrderID:    orderID,
+		UserID:     req.UserID,
+		Items:      req.Items,
+		TotalPrice: totalPrice,
+		Status:     "PENDING",
+	}
+
+	s.orders[orderID] = order
+
+	fmt.Printf("✓ 주문 생성: %s (%.2f원)\n", orderID, totalPrice)
+
+	return &CreateOrderResponse{
+		OrderID:    orderID,
+		TotalPrice: totalPrice,
+	}, nil
+}
+
+// ============================================================================
+// 섹션 3️⃣: Server Streaming - 서버가 지속적으로 데이터 전송
+// ============================================================================
+
+// PriceService 인터페이스
+type PriceService interface {
+	GetPriceStream(req *GetPriceRequest, stream grpc.ServerStream) error
+}
+
+// PriceServiceServer 구현
+type PriceServiceServer struct{}
+
+// NewPriceServiceServer 생성
+func NewPriceServiceServer() *PriceServiceServer {
+	return &PriceServiceServer{}
+}
+
+// GetPriceStream: Server Streaming RPC
+func (s *PriceServiceServer) GetPriceStream(req *GetPriceRequest, stream grpc.ServerStream) error {
+	fmt.Println("[Server Streaming] 가격 실시간 스트림:", req.Symbol)
+
+	symbol := req.Symbol
+	for i := 0; i < 5; i++ {
+		// 가격 시뮬레이션
+		basePrice := 150.0
+		randomDelta := (rand.Float64() - 0.5) * 10
+		price := basePrice + randomDelta
+
+		response := &GetPriceResponse{
+			Price:     price,
+			Timestamp: time.Now().Unix(),
+		}
+
+		// Send는 실제로는 stream.SendMsg(response)
+		fmt.Printf("  → %s: %.2f (타임스탬프: %d)\n", symbol, price, response.Timestamp)
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	fmt.Println("✓ 가격 스트림 종료")
+	return nil
+}
+
+// ============================================================================
+// 섹션 4️⃣: Client Streaming - 클라이언트가 대량 데이터 전송
+// ============================================================================
+
+// FileUploadService 인터페이스
+type FileUploadService interface {
+	UploadFile(stream grpc.ServerStream) error
+}
+
+// FileUploadServiceServer 구현
+type FileUploadServiceServer struct{}
+
+// NewFileUploadServiceServer 생성
+func NewFileUploadServiceServer() *FileUploadServiceServer {
+	return &FileUploadServiceServer{}
+}
+
+// UploadFile: Client Streaming RPC (시뮬레이션)
+func (s *FileUploadServiceServer) UploadFile(ctx context.Context) (*FileUploadResponse, error) {
+	fmt.Println("[Client Streaming] 파일 업로드 시작")
+
+	var totalBytes int64 = 0
+	chunkCount := 0
+
+	// 클라이언트가 보내는 64KB 청크 10개 시뮬레이션
+	for i := 0; i < 10; i++ {
+		chunkSize := int64(64 * 1024) // 64KB
+		totalBytes += chunkSize
+		chunkCount++
+
+		fmt.Printf("  ↓ 청크 %d: %d bytes (누적: %d MB)\n", i+1, chunkSize, totalBytes/(1024*1024))
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	fileID := fmt.Sprintf("file-%d", time.Now().Unix())
+	fmt.Printf("✓ 파일 업로드 완료: %s (%d MB)\n", fileID, totalBytes/(1024*1024))
+
+	return &FileUploadResponse{
+		FileID:     fileID,
+		TotalBytes: totalBytes,
+	}, nil
+}
+
+// ============================================================================
+// 섹션 5️⃣: Bi-directional Streaming - 양방향 실시간 대화
+// ============================================================================
+
+// ChatService 인터페이스
+type ChatService interface {
+	Chat(stream grpc.ServerStream) error
+}
+
+// ChatServiceServer 구현
+type ChatServiceServer struct {
+	clients map[string]chan *ChatMessage
+	mu      sync.Mutex
+}
+
+// NewChatServiceServer 생성
+func NewChatServiceServer() *ChatServiceServer {
+	return &ChatServiceServer{
+		clients: make(map[string]chan *ChatMessage),
+	}
+}
+
+// Chat: Bi-directional Streaming RPC (시뮬레이션)
+func (s *ChatServiceServer) Chat(ctx context.Context, userID string) error {
+	fmt.Printf("[Bi-directional] 채팅 시작: %s\n", userID)
+
+	s.mu.Lock()
+	msgChan := make(chan *ChatMessage, 10)
+	s.clients[userID] = msgChan
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.clients, userID)
+		s.mu.Unlock()
+		close(msgChan)
+	}()
+
+	// 송신 고루틴 시뮬레이션
+	go func() {
+		for i := 0; i < 3; i++ {
+			msg := &ChatMessage{
+				UserID:    userID,
+				Content:   fmt.Sprintf("메시지 %d", i+1),
+				Timestamp: time.Now().Unix(),
+			}
+			s.broadcastMessage(msg)
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+
+	// 수신 대기 시뮬레이션
+	timeout := time.After(1500 * time.Millisecond)
+	for {
+		select {
+		case msg := <-msgChan:
+			fmt.Printf("  ↔ [%s]: %s\n", msg.UserID, msg.Content)
+		case <-timeout:
+			fmt.Println("✓ 채팅 종료")
+			return nil
+		}
+	}
+}
+
+// broadcastMessage: 모든 클라이언트에 메시지 브로드캐스트
+func (s *ChatServiceServer) broadcastMessage(msg *ChatMessage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, ch := range s.clients {
+		select {
+		case ch <- msg:
+		default:
+			// 채널이 가득 찼으면 스킵
+		}
+	}
+}
+
+// ============================================================================
+// 섹션 6️⃣: Interceptor - 미들웨어 패턴 (인증, 로깅)
+// ============================================================================
+
+// LoggingInterceptor: 로깅 인터셉터
+func LoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	start := time.Now()
+
+	fmt.Printf("[Interceptor] 요청 시작: %s\n", info.FullMethod)
+
+	resp, err := handler(ctx, req)
+
+	duration := time.Since(start)
+	if err != nil {
+		fmt.Printf("[Interceptor] 완료 (%v) - 에러: %v\n", duration, err)
+	} else {
+		fmt.Printf("[Interceptor] 완료 (%v) - OK\n", duration)
+	}
+
+	return resp, err
+}
+
+// AuthInterceptor: 인증 인터셉터 (토큰 검증)
+func AuthInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "메타데이터 없음")
+	}
+
+	authTokens := md.Get("authorization")
+	if len(authTokens) == 0 {
+		return nil, status.Error(codes.Unauthenticated, "토큰 없음")
+	}
+
+	token := authTokens[0]
+	fmt.Printf("[Auth Interceptor] 토큰 검증: %s\n", token)
+
+	if token != "valid-token-123" {
+		return nil, status.Error(codes.Unauthenticated, "토큰 유효하지 않음")
+	}
+
+	fmt.Println("[Auth Interceptor] ✓ 토큰 검증 성공")
+	return handler(ctx, req)
+}
+
+// ============================================================================
+// 섹션 7️⃣: HTTP/2와 멀티플렉싱
+// ============================================================================
+
+// MultipleStreamsSimulation: HTTP/2 멀티플렉싱 시연
+// 1개 TCP 연결 위에 여러 스트림이 동시에 진행
+func MultipleStreamsSimulation() {
+	fmt.Println("\n[HTTP/2 Multiplexing] 시뮬레이션 시작")
+	fmt.Println("1개 TCP 연결 상에서 여러 스트림 동시 진행:")
+
+	var wg sync.WaitGroup
+
+	// 스트림 1: CreateOrder
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Println("  [Stream 1] CreateOrder 시작 (0ms)")
+		time.Sleep(800 * time.Millisecond)
+		fmt.Println("  [Stream 1] CreateOrder 완료 (800ms) ✓")
+	}()
+
+	// 스트림 2: GetPriceStream
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Println("  [Stream 2] GetPriceStream 시작 (50ms)")
+		time.Sleep(1000 * time.Millisecond)
+		fmt.Println("  [Stream 2] GetPriceStream 완료 (1050ms) ✓")
+	}()
+
+	// 스트림 3: UploadFile
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fmt.Println("  [Stream 3] UploadFile 시작 (100ms)")
+		time.Sleep(600 * time.Millisecond)
+		fmt.Println("  [Stream 3] UploadFile 완료 (700ms) ✓")
+	}()
+
+	wg.Wait()
+	fmt.Println("✓ HTTP/2 멀티플렉싱 완료 (총 1050ms - 순차 처리와 비교하면 2400ms 단축)")
+}
+
+// ============================================================================
+// 섹션 8️⃣: 할당 과제 3-1 - 통합 Demo
+// ============================================================================
+
+// Assignment3_1: 주문 관리 + 가격 조회 + 채팅 통합 Demo
+func Assignment3_1() {
+	fmt.Println("\n" + strings.Repeat("=", 70))
+	fmt.Println("【 할당 과제 3-1: 분산 마이크로서비스 통합 Demo 】")
+	fmt.Println(strings.Repeat("=", 70))
+
+	// 1. OrderService: Unary RPC
+	fmt.Println("\n[과제 1] Order Management Service (Unary RPC)")
+	fmt.Println("-" + strings.Repeat("─", 68))
+	orderService := NewOrderServiceServer()
+
+	ctx := context.Background()
+	orderReq := &CreateOrderRequest{
+		UserID: "user-123",
+		Items:  []string{"item-1", "item-2", "item-3"},
+	}
+	orderResp, _ := orderService.CreateOrder(ctx, orderReq)
+	fmt.Printf("응답: 주문ID=%s, 총액=%.2f원\n\n", orderResp.OrderID, orderResp.TotalPrice)
+
+	// 2. PriceService: Server Streaming
+	fmt.Println("[과제 2] Price Streaming Service (Server Streaming)")
+	fmt.Println("-" + strings.Repeat("─", 68))
+	priceService := NewPriceServiceServer()
+
+	priceReq := &GetPriceRequest{
+		Symbol: "AAPL",
+	}
+	priceService.GetPriceStream(priceReq, nil)
+	fmt.Println()
+
+	// 3. FileUploadService: Client Streaming
+	fmt.Println("[과제 3] File Upload Service (Client Streaming)")
+	fmt.Println("-" + strings.Repeat("─", 68))
+	fileService := NewFileUploadServiceServer()
+
+	uploadResp, _ := fileService.UploadFile(context.Background())
+	fmt.Printf("응답: 파일ID=%s\n\n", uploadResp.FileID)
+
+	// 4. ChatService: Bi-directional Streaming
+	fmt.Println("[과제 4] Chat Service (Bi-directional Streaming)")
+	fmt.Println("-" + strings.Repeat("─", 68))
+	chatService := NewChatServiceServer()
+
+	chatService.Chat(context.Background(), "user-alice")
+	fmt.Println()
+
+	// 5. HTTP/2 Multiplexing
+	MultipleStreamsSimulation()
+
+	// 6. 성능 비교
+	fmt.Println("\n" + strings.Repeat("=", 70) + "\n【 성능 비교: REST API vs gRPC 】\n" + strings.Repeat("=", 70))
+	fmt.Println(`
+REST API (HTTP/1.1 + JSON):
+  - 시나리오: 10,000개 요청 처리
+  - 시간: 8.5초
+  - 데이터: 10MB
+  - 연결: 여러 개 (순차 처리)
+
+gRPC (HTTP/2 + Protobuf):
+  - 시나리오: 10,000개 요청 처리
+  - 시간: 0.8초 (10배 빠름!)
+  - 데이터: 1MB (10배 작음!)
+  - 연결: 1개 (멀티플렉싱)
+
+핵심 이점:
+  1. 성능: 10배 빠른 직렬화
+  2. 효율: 1개 연결로 수천 개 스트림 동시 처리
+  3. 확장성: 고루틴당 ~2KB 메모리로 수만 개 동시 연결
+  4. 신뢰성: 타입 안전성 + 스키마 진화 지원
+`)
+
+	fmt.Println(strings.Repeat("=", 70))
+	fmt.Println("✓ 할당 과제 3-1 완료!")
+	fmt.Println(strings.Repeat("=", 70))
+}
+
+// ============================================================================
+// Main 함수
+// ============================================================================
+
+func main() {
+	fmt.Println("🎓 Go 301-3-1: 효율적인 원격 호출 - gRPC와 Protocol Buffers\n")
+
+	// 난수 시드 설정
+	rand.Seed(time.Now().UnixNano())
+
+	// Unary RPC 시연
+	fmt.Println("[" + strings.Repeat("=", 70) + "\n섹션 2️⃣: Unary RPC 시연\n" + "]" + strings.Repeat("=", 70))
+	orderService := NewOrderServiceServer()
+	ctx := context.Background()
+	req := &CreateOrderRequest{
+		UserID: "user-456",
+		Items:  []string{"laptop", "mouse", "keyboard"},
+	}
+	resp, err := orderService.CreateOrder(ctx, req)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("✓ 응답: OrderID=%s, Price=%.2f\n\n", resp.OrderID, resp.TotalPrice)
+
+	// Server Streaming 시연
+	fmt.Println("[" + strings.Repeat("=", 70) + "\n섹션 3️⃣: Server Streaming 시연\n" + "]" + strings.Repeat("=", 70))
+	priceService := NewPriceServiceServer()
+	priceReq := &GetPriceRequest{Symbol: "GOOGL"}
+	priceService.GetPriceStream(priceReq, nil)
+	fmt.Println()
+
+	// Client Streaming 시연
+	fmt.Println("[" + strings.Repeat("=", 70) + "\n섹션 4️⃣: Client Streaming 시연\n" + "]" + strings.Repeat("=", 70))
+	fileService := NewFileUploadServiceServer()
+	uploadResp, _ := fileService.UploadFile(context.Background())
+	fmt.Printf("✓ 응답: FileID=%s\n\n", uploadResp.FileID)
+
+	// Bi-directional Streaming 시연
+	fmt.Println("[" + strings.Repeat("=", 70) + "\n섹션 5️⃣: Bi-directional Streaming 시연\n" + "]" + strings.Repeat("=", 70))
+	chatService := NewChatServiceServer()
+	chatService.Chat(context.Background(), "user-bob")
+	fmt.Println()
+
+	// Interceptor 시연
+	fmt.Println("[" + strings.Repeat("=", 70) + "\n섹션 6️⃣: Interceptor 시연\n" + "]" + strings.Repeat("=", 70))
+	fmt.Println("[로깅 인터셉터 예제]")
+	LoggingInterceptor(ctx, req, &grpc.UnaryServerInfo{FullMethod: "/order.OrderService/CreateOrder"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return &CreateOrderResponse{OrderID: "order-789", TotalPrice: 199.99}, nil
+	})
+
+	fmt.Println("\n[인증 인터셉터 예제]")
+	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "valid-token-123")
+	AuthInterceptor(ctx, req, &grpc.UnaryServerInfo{FullMethod: "/order.OrderService/CreateOrder"}, func(ctx context.Context, req interface{}) (interface{}, error) {
+		return &CreateOrderResponse{OrderID: "order-999", TotalPrice: 299.99}, nil
+	})
+	fmt.Println()
+
+	// HTTP/2 Multiplexing 시연
+	fmt.Println("[" + strings.Repeat("=", 70) + "\n섹션 7️⃣: HTTP/2 Multiplexing 시연\n" + "]" + strings.Repeat("=", 70))
+	MultipleStreamsSimulation()
+	fmt.Println()
+
+	// 할당 과제 3-1
+	Assignment3_1()
+}

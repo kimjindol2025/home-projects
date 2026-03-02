@@ -1,0 +1,294 @@
+// 🔐 v8.1: 통합 테스트와 라이브러리 설계 (Integration Testing)
+// 📖 "경계 밖에서의 시선"
+// 🎯 "라이브러리의 공개 인터페이스를 외부 사용자 관점에서 검증"
+//
+// 핵심 개념:
+// - pub struct/fn: 외부에 노출된 공개 인터페이스
+// - 모듈 구조: use 문으로 재사용 가능한 모듈화
+// - 에러 처리: pub enum Error로 통일된 에러 관리
+// - 테스트 전용: #[cfg(test)] 모듈과 tests/ 외부 테스트의 분리
+
+use std::fmt;
+use std::error::Error as StdError;
+
+// ==================== 공개 에러 타입 ====================
+
+/// 금고 시스템의 모든 에러를 정의합니다.
+/// 외부 사용자가 처리해야 할 가능한 모든 오류를 표현합니다.
+#[derive(Debug, Clone)]
+pub enum VaultError {
+    /// 잘못된 키 길이
+    InvalidKeyLength { expected: usize, got: usize },
+    /// 접근 거부
+    AccessDenied,
+    /// 잘못된 입력 형식
+    InvalidInput(String),
+    /// 내부 검증 실패
+    ValidationFailed(String),
+}
+
+impl fmt::Display for VaultError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            VaultError::InvalidKeyLength { expected, got } => {
+                write!(f, "Invalid key length: expected {}, got {}", expected, got)
+            }
+            VaultError::AccessDenied => write!(f, "Access denied"),
+            VaultError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
+            VaultError::ValidationFailed(msg) => write!(f, "Validation failed: {}", msg),
+        }
+    }
+}
+
+impl StdError for VaultError {}
+
+/// 외부에서 Result 타입을 쉽게 사용할 수 있도록 정의합니다.
+pub type VaultResult<T> = Result<T, VaultError>;
+
+// ==================== 공개 핵심 타입 ====================
+
+/// gogs 시스템의 핵심 보안 금고입니다.
+///
+/// # 공개 인터페이스
+/// 외부 사용자는 이 구조체를 통해서만 금고 기능을 사용합니다.
+/// 내부 구현(secret_key)은 private이므로 직접 접근 불가합니다.
+///
+/// # 예제
+/// ```
+/// use gogs_project::GogsVault;
+/// let vault = GogsVault::new("SECRET_KEY_123");
+/// assert!(vault.access("SECRET_KEY_123").is_ok());
+/// ```
+#[derive(Clone)]
+pub struct GogsVault {
+    secret_key: String,
+}
+
+impl GogsVault {
+    /// 새로운 금고를 생성합니다.
+    ///
+    /// # 인자
+    /// - `key`: 16자 이상의 보안 키
+    ///
+    /// # 반환
+    /// `VaultResult<GogsVault>` - 성공 또는 에러
+    ///
+    /// # 예제
+    /// ```
+    /// use gogs_project::GogsVault;
+    /// let vault = GogsVault::new("VERY_SECRET_KEY_12345");
+    /// assert!(vault.is_ok());
+    /// ```
+    pub fn new(key: &str) -> VaultResult<Self> {
+        const MIN_KEY_LENGTH: usize = 16;
+
+        if key.len() < MIN_KEY_LENGTH {
+            return Err(VaultError::InvalidKeyLength {
+                expected: MIN_KEY_LENGTH,
+                got: key.len(),
+            });
+        }
+
+        Ok(GogsVault {
+            secret_key: key.to_string(),
+        })
+    }
+
+    /// 제공된 입력이 올바른 키인지 검증합니다.
+    ///
+    /// # 인자
+    /// - `input`: 검증할 입력값
+    ///
+    /// # 반환
+    /// `VaultResult<bool>` - 접근 허용 여부
+    ///
+    /// # 예제
+    /// ```
+    /// use gogs_project::GogsVault;
+    /// let vault = GogsVault::new("SECRET_KEY_12345").unwrap();
+    /// assert!(vault.access("SECRET_KEY_12345").unwrap());
+    /// assert!(!vault.access("WRONG_KEY_12345").unwrap());
+    /// ```
+    pub fn access(&self, input: &str) -> VaultResult<bool> {
+        if input.is_empty() {
+            return Err(VaultError::InvalidInput("Empty input".to_string()));
+        }
+
+        Ok(self.secret_key == input)
+    }
+
+    /// 금고의 정보를 반환합니다 (키 자체는 노출하지 않음).
+    ///
+    /// # 반환
+    /// 금고의 상태 정보
+    pub fn info(&self) -> VaultInfo {
+        VaultInfo {
+            key_length: self.secret_key.len(),
+            status: "locked",
+        }
+    }
+}
+
+impl fmt::Debug for GogsVault {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("GogsVault")
+            .field("key_length", &self.secret_key.len())
+            .field("status", &"locked")
+            .finish()
+    }
+}
+
+// ==================== 공개 보조 타입 ====================
+
+/// 금고의 정보를 나타냅니다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VaultInfo {
+    /// 저장된 키의 길이
+    pub key_length: usize,
+    /// 금고의 상태
+    pub status: &'static str,
+}
+
+/// 보안 이벤트를 기록합니다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecurityEvent {
+    /// 이벤트 타입
+    pub event_type: String,
+    /// 타임스탬프
+    pub timestamp: u64,
+    /// 결과 (성공/실패)
+    pub success: bool,
+}
+
+// ==================== 공개 검증자 ====================
+
+/// 입력 데이터를 검증하는 공개 함수입니다.
+///
+/// # 인자
+/// - `data`: 검증할 데이터
+///
+/// # 반환
+/// `VaultResult<bool>` - 검증 결과
+///
+/// # 예제
+/// ```
+/// use gogs_project::validate_input;
+/// assert!(validate_input("VALID_INPUT_123").unwrap());
+/// assert!(!validate_input("").unwrap());
+/// ```
+pub fn validate_input(data: &str) -> VaultResult<bool> {
+    if data.is_empty() {
+        return Ok(false);
+    }
+
+    if data.len() < 8 {
+        return Err(VaultError::InvalidInput("Too short".to_string()));
+    }
+
+    Ok(true)
+}
+
+/// 보안 이벤트를 생성합니다.
+///
+/// # 인자
+/// - `event_type`: 이벤트 타입
+/// - `success`: 성공 여부
+///
+/// # 반환
+/// `SecurityEvent` - 생성된 이벤트
+pub fn create_event(event_type: &str, success: bool) -> SecurityEvent {
+    SecurityEvent {
+        event_type: event_type.to_string(),
+        timestamp: 1708606800u64, // 2026-02-22
+        success,
+    }
+}
+
+// ==================== 공개 모듈 ====================
+
+/// 보안 관련 유틸리티
+pub mod security {
+    use super::*;
+
+    /// 핸들러 함수들
+    pub struct SecurityHandler;
+
+    impl SecurityHandler {
+        /// 접근 로그를 기록합니다 (공개 메서드).
+        pub fn log_access(event: &SecurityEvent) -> String {
+            format!(
+                "[{}] {}: {}",
+                event.timestamp,
+                event.event_type,
+                if event.success { "SUCCESS" } else { "FAILED" }
+            )
+        }
+
+        /// 보안 정책을 확인합니다.
+        pub fn check_policy(level: u32) -> bool {
+            level >= 5
+        }
+    }
+}
+
+/// 감시 관련 기능
+pub mod monitoring {
+    use super::*;
+
+    /// 이벤트를 모니터링합니다.
+    pub fn monitor_event(event: &SecurityEvent) -> VaultResult<()> {
+        if !event.event_type.is_empty() {
+            Ok(())
+        } else {
+            Err(VaultError::InvalidInput("Empty event type".to_string()))
+        }
+    }
+
+    /// 통계를 수집합니다.
+    pub fn collect_stats(success_count: u32, total_count: u32) -> f64 {
+        if total_count == 0 {
+            return 0.0;
+        }
+        (success_count as f64 / total_count as f64) * 100.0
+    }
+}
+
+// ==================== 공개 테스트 헬퍼 ====================
+
+#[cfg(test)]
+pub mod test_helpers {
+    use super::*;
+
+    /// 테스트용 금고를 생성합니다 (기본 키 사용).
+    pub fn create_test_vault() -> GogsVault {
+        GogsVault::new("TEST_SECRET_KEY_12345").unwrap()
+    }
+
+    /// 테스트용 이벤트를 생성합니다.
+    pub fn create_test_event() -> SecurityEvent {
+        create_event("test_access", true)
+    }
+}
+
+#[cfg(test)]
+mod internal_tests {
+    use super::*;
+
+    #[test]
+    fn test_vault_creation() {
+        let vault = GogsVault::new("SECURE_KEY_123456");
+        assert!(vault.is_ok());
+    }
+
+    #[test]
+    fn test_vault_access() {
+        let vault = GogsVault::new("SECURE_KEY_123456").unwrap();
+        assert!(vault.access("SECURE_KEY_123456").unwrap());
+    }
+
+    #[test]
+    fn test_invalid_key_length() {
+        let vault = GogsVault::new("SHORT");
+        assert!(vault.is_err());
+    }
+}

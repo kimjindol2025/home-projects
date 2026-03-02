@@ -1,0 +1,221 @@
+/**
+ * SQLite FFI 바인딩
+ *
+ * better-sqlite3를 사용한 고성능 동기 바인딩
+ */
+
+import Database3 from 'better-sqlite3';
+import type {
+  DatabaseConfig,
+  Statement as IStatement,
+  RunResult,
+  TransactionOptions,
+  SQLCallback
+} from './types';
+
+/**
+ * Statement 래퍼
+ */
+export class Statement implements IStatement {
+  private _stmt: any;
+  private _db: Database;
+
+  sql: string;
+  readonly: boolean;
+
+  constructor(stmt: any, db: Database, sql: string, readonly: boolean = false) {
+    this._stmt = stmt;
+    this._db = db;
+    this.sql = sql;
+    this.readonly = readonly;
+  }
+
+  bind(...params: any[]): this {
+    // better-sqlite3는 자동 바인딩이므로 no-op
+    return this;
+  }
+
+  get(...params: any[]): any | undefined {
+    return this._stmt.get(...params);
+  }
+
+  all(...params: any[]): any[] {
+    return this._stmt.all(...params);
+  }
+
+  *iterate(...params: any[]): IterableIterator<any> {
+    for (const row of this._stmt.iterate(...params)) {
+      yield row;
+    }
+  }
+
+  run(...params: any[]): RunResult {
+    const info = this._stmt.run(...params);
+    return {
+      changes: info.changes,
+      lastInsertRowid: info.lastInsertRowid
+    };
+  }
+
+  free(): void {
+    // better-sqlite3는 자동 관리
+  }
+}
+
+/**
+ * Database 래퍼
+ */
+export class Database {
+  private _db: Database3.Database;
+  private _config: DatabaseConfig;
+  private _statements = new Map<string, Statement>();
+
+  constructor(config: DatabaseConfig | string) {
+    if (typeof config === 'string') {
+      config = { filename: config };
+    }
+
+    this._config = {
+      timeout: 5000,
+      foreignKeys: true,
+      wal: true,
+      ...config
+    };
+
+    this._db = new Database3(this._config.filename, {
+      readonly: this._config.readonly,
+      fileMustExist: this._config.fileMustExist,
+      timeout: this._config.timeout
+    });
+
+    // 설정 적용
+    if (this._config.foreignKeys) {
+      this._db.pragma('foreign_keys = ON');
+    }
+    if (this._config.wal) {
+      this._db.pragma('journal_mode = WAL');
+    }
+  }
+
+  /**
+   * SQL 명령문 준비
+   */
+  prepare(sql: string): Statement {
+    if (this._statements.has(sql)) {
+      return this._statements.get(sql)!;
+    }
+
+    const stmt = this._db.prepare(sql);
+    const readonly = this._isReadOnly(sql);
+    const wrapped = new Statement(stmt, this, sql, readonly);
+
+    this._statements.set(sql, wrapped);
+    return wrapped;
+  }
+
+  /**
+   * SQL 직접 실행
+   */
+  exec(sql: string): this {
+    this._db.exec(sql);
+    return this;
+  }
+
+  /**
+   * 쿼리 실행 (단일 행)
+   */
+  query<T = any>(sql: string, ...params: any[]): T | undefined {
+    return this.prepare(sql).get(...params) as T | undefined;
+  }
+
+  /**
+   * 쿼리 실행 (모든 행)
+   */
+  queryAll<T = any>(sql: string, ...params: any[]): T[] {
+    return this.prepare(sql).all(...params) as T[];
+  }
+
+  /**
+   * 명령문 실행
+   */
+  run(sql: string, ...params: any[]): RunResult {
+    return this.prepare(sql).run(...params);
+  }
+
+  /**
+   * 트랜잭션 실행
+   */
+  transaction<T>(
+    callback: SQLCallback<T>,
+    options?: TransactionOptions
+  ): T {
+    const mode = options?.mode || 'DEFERRED';
+
+    try {
+      this._db.exec(`BEGIN ${mode}`);
+      const result = callback(this);
+      this._db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this._db.exec('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
+   * 백업 생성
+   */
+  backup(destPath: string): void {
+    const dest = new Database3(destPath);
+    this._db.backup(dest);
+    dest.close();
+  }
+
+  /**
+   * 데이터베이스 최적화
+   */
+  optimize(): void {
+    this._db.exec('PRAGMA optimize');
+    this._db.exec('VACUUM');
+  }
+
+  /**
+   * 통계 조회
+   */
+  getStats(): {
+    pageCount: number;
+    pageSize: number;
+    freelistCount: number;
+  } {
+    const pageCount = this._db.pragma('page_count', { simple: true }) as number;
+    const pageSize = this._db.pragma('page_size', { simple: true }) as number;
+    const freelistCount = this._db.pragma('freelist_count', { simple: true }) as number;
+
+    return { pageCount, pageSize, freelistCount };
+  }
+
+  /**
+   * 데이터베이스 닫기
+   */
+  close(): void {
+    this._statements.clear();
+    this._db.close();
+  }
+
+  /**
+   * SQL이 읽기 전용인지 확인
+   */
+  private _isReadOnly(sql: string): boolean {
+    const trimmed = sql.trim().toUpperCase();
+    return trimmed.startsWith('SELECT');
+  }
+
+  /**
+   * 내부 데이터베이스 객체 접근 (필요시)
+   */
+  get native(): Database3.Database {
+    return this._db;
+  }
+}
+
+export default Database;

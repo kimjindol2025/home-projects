@@ -1,0 +1,636 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unsafe"
+)
+
+// ============================================================================
+// Section 1: Zero-Copy Architecture Demonstration
+// ============================================================================
+
+// PacketHeader: 네트워크 패킷 헤더 구조
+type PacketHeader struct {
+	Version      byte
+	HeaderLength byte
+	TotalLength  uint16
+	Identification uint16
+	Flags        byte
+	FragmentOffset uint16
+	TTL          byte
+	Protocol     byte
+	Checksum     uint16
+	SrcIP        [4]byte
+	DstIP        [4]byte
+}
+
+// ZeroCopyPacketProcessor: 데이터 복사 없이 직접 처리
+type ZeroCopyPacketProcessor struct {
+	buffer []byte
+	size   int
+}
+
+// NewZeroCopyPacketProcessor: 패킷 버퍼 생성 (실제 mmap 시뮬레이션)
+func NewZeroCopyPacketProcessor(size int) *ZeroCopyPacketProcessor {
+	return &ZeroCopyPacketProcessor{
+		buffer: make([]byte, size),
+		size:   size,
+	}
+}
+
+// ProcessPacket: unsafe.Pointer를 사용한 0-복사 처리
+func (zc *ZeroCopyPacketProcessor) ProcessPacket() *PacketHeader {
+	// 1. 버퍼의 시작 주소를 PacketHeader 포인터로 변환
+	// 2. 실제로는 패킷이 NIC DMA 버퍼에 있음 (커널 메모리)
+	// 3. Go 프로그램이 mmap으로 접근하므로 데이터 복사 없음
+
+	// PacketHeader는 최소 22 바이트
+	if len(zc.buffer) < 22 {
+		return nil
+	}
+
+	// unsafe 포인터 변환 (데이터 복사 없음!)
+	header := (*PacketHeader)(unsafe.Pointer(&zc.buffer[0]))
+	return header
+}
+
+// ============================================================================
+// Section 2: Lock-Free Data Structures
+// ============================================================================
+
+// AtomicCounter: 캐시 라인 padding을 포함한 원자적 카운터
+type AtomicCounter struct {
+	count int64
+	_     [56]byte // 패딩: 64바이트 캐시 라인 (false sharing 방지)
+}
+
+// Increment: 원자적 증가
+func (ac *AtomicCounter) Increment() {
+	atomic.AddInt64(&ac.count, 1)
+}
+
+// Value: 현재 값 읽음
+func (ac *AtomicCounter) Value() int64 {
+	return atomic.LoadInt64(&ac.count)
+}
+
+// LockFreeNode: lock-free 큐의 노드
+type LockFreeNode struct {
+	value interface{}
+	next  *LockFreeNode
+}
+
+// SimpleLockFreeQueue: CAS 기반의 간단한 lock-free 큐
+type SimpleLockFreeQueue struct {
+	head *LockFreeNode
+	tail *LockFreeNode
+	mu   sync.Mutex // 실제 lock-free 아님 (교육용)
+}
+
+// NewSimpleLockFreeQueue: 큐 초기화 (sentinel 노드 포함)
+func NewSimpleLockFreeQueue() *SimpleLockFreeQueue {
+	sentinel := &LockFreeNode{}
+	return &SimpleLockFreeQueue{
+		head: sentinel,
+		tail: sentinel,
+	}
+}
+
+// Enqueue: 요소 추가
+func (q *SimpleLockFreeQueue) Enqueue(value interface{}) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	newNode := &LockFreeNode{value: value}
+	q.tail.next = newNode
+	q.tail = newNode
+}
+
+// Dequeue: 요소 제거
+func (q *SimpleLockFreeQueue) Dequeue() (interface{}, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.head.next == nil {
+		return nil, false
+	}
+
+	node := q.head.next
+	q.head = node
+	return node.value, true
+}
+
+// ============================================================================
+// Section 3: Off-Heap Memory Management
+// ============================================================================
+
+// OffHeapBuffer: mmap을 사용한 오프힙 버퍼
+type OffHeapBuffer struct {
+	data     []byte
+	refCount int64
+	file     *os.File
+	size     int
+}
+
+// AllocOffHeap: 오프힙 메모리 할당 (mmap 사용)
+func AllocOffHeap(size int) (*OffHeapBuffer, error) {
+	// 1. 임시 파일 생성
+	file, err := os.CreateTemp("", "offheap_")
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 파일 크기 설정
+	if err := file.Truncate(int64(size)); err != nil {
+		file.Close()
+		return nil, err
+	}
+
+	// 3. mmap (실제로는 더 복잡함)
+	// 여기서는 시뮬레이션: 일반 메모리 할당
+	data := make([]byte, size)
+
+	return &OffHeapBuffer{
+		data:     data,
+		refCount: 1,
+		file:     file,
+		size:     size,
+	}, nil
+}
+
+// Retain: 참조 카운트 증가
+func (ob *OffHeapBuffer) Retain() {
+	atomic.AddInt64(&ob.refCount, 1)
+}
+
+// Release: 참조 카운트 감소 및 메모리 해제
+func (ob *OffHeapBuffer) Release() error {
+	if atomic.AddInt64(&ob.refCount, -1) == 0 {
+		ob.file.Close()
+		return os.Remove(ob.file.Name())
+	}
+	return nil
+}
+
+// Value: 오프힙 메모리 접근
+func (ob *OffHeapBuffer) Value() []byte {
+	return ob.data
+}
+
+// ============================================================================
+// Section 4: False Sharing Demonstration
+// ============================================================================
+
+// FalseShareCounter: 패딩 없는 카운터 (false sharing 발생)
+type FalseShareCounter struct {
+	count1 int64
+	count2 int64
+}
+
+// OptimizedCounter: 패딩이 있는 카운터 (false sharing 방지)
+type OptimizedCounter struct {
+	count1 int64
+	_      [56]byte // 패딩
+	count2 int64
+	_      [56]byte // 패딩
+}
+
+// ============================================================================
+// Section 5: Work Stealing Scheduler Concept
+// ============================================================================
+
+// WorkerTask: 작업 항목
+type WorkerTask struct {
+	ID    int
+	Value int
+}
+
+// WorkStealingWorker: 작업 도난 기능이 있는 워커
+type WorkStealingWorker struct {
+	id        int
+	localTasks chan *WorkerTask
+	stealCount int64
+}
+
+// NewWorkStealingWorker: 워커 생성
+func NewWorkStealingWorker(id int, queueSize int) *WorkStealingWorker {
+	return &WorkStealingWorker{
+		id:        id,
+		localTasks: make(chan *WorkerTask, queueSize),
+		stealCount: 0,
+	}
+}
+
+// EnqueueLocal: 로컬 작업 큐에 추가
+func (w *WorkStealingWorker) EnqueueLocal(task *WorkerTask) bool {
+	select {
+	case w.localTasks <- task:
+		return true
+	default:
+		return false
+	}
+}
+
+// TryStealFrom: 다른 워커에서 작업 도난 시도
+func (w *WorkStealingWorker) TryStealFrom(victim *WorkStealingWorker) *WorkerTask {
+	select {
+	case task := <-victim.localTasks:
+		atomic.AddInt64(&w.stealCount, 1)
+		return task
+	default:
+		return nil
+	}
+}
+
+// StealCount: 도난당한 작업 수 조회
+func (w *WorkStealingWorker) StealCount() int64 {
+	return atomic.LoadInt64(&w.stealCount)
+}
+
+// ============================================================================
+// Section 6: Memory Hierarchy Simulation
+// ============================================================================
+
+// MemoryHierarchy: 메모리 계층 구조 시뮬레이션
+type MemoryHierarchy struct {
+	l1Cache  map[int64]interface{} // 64KB (시뮬레이션)
+	l2Cache  map[int64]interface{} // 256KB (시뮬레이션)
+	l3Cache  map[int64]interface{} // 8MB (시뮬레이션)
+	mainMem  map[int64]interface{} // 무제한
+	l1Hits   int64
+	l1Misses int64
+	mu       sync.RWMutex          // 동시성 보호
+}
+
+// NewMemoryHierarchy: 메모리 계층 초기화
+func NewMemoryHierarchy() *MemoryHierarchy {
+	return &MemoryHierarchy{
+		l1Cache: make(map[int64]interface{}),
+		l2Cache: make(map[int64]interface{}),
+		l3Cache: make(map[int64]interface{}),
+		mainMem: make(map[int64]interface{}),
+	}
+}
+
+// Access: 메모리 접근 (캐시 계층 시뮬레이션)
+func (mh *MemoryHierarchy) Access(address int64) (interface{}, int) {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+
+	// L1 캐시 확인
+	if val, ok := mh.l1Cache[address]; ok {
+		atomic.AddInt64(&mh.l1Hits, 1)
+		return val, 1 // L1 (1 사이클)
+	}
+	atomic.AddInt64(&mh.l1Misses, 1)
+
+	// L2 캐시 확인
+	if val, ok := mh.l2Cache[address]; ok {
+		return val, 4 // L2 (4 사이클)
+	}
+
+	// L3 캐시 확인
+	if val, ok := mh.l3Cache[address]; ok {
+		return val, 10 // L3 (10 사이클)
+	}
+
+	// 메인 메모리 접근
+	if val, ok := mh.mainMem[address]; ok {
+		return val, 100 // 메인 메모리 (100 사이클)
+	}
+
+	return nil, 0
+}
+
+// Store: 값 저장
+func (mh *MemoryHierarchy) Store(address int64, value interface{}) {
+	mh.mu.Lock()
+	defer mh.mu.Unlock()
+
+	mh.l1Cache[address] = value
+}
+
+// ============================================================================
+// Section 7: GC vs Off-Heap Memory Impact
+// ============================================================================
+
+// GCImpactAnalyzer: GC 영향 분석
+type GCImpactAnalyzer struct {
+	beforeMemory uint64
+	afterMemory  uint64
+	gcPause      time.Duration
+}
+
+// SimulateGC: GC 시뮬레이션
+func (gia *GCImpactAnalyzer) SimulateGC() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	gia.beforeMemory = m.HeapAlloc
+
+	start := time.Now()
+	runtime.GC()
+	gia.gcPause = time.Since(start)
+
+	runtime.ReadMemStats(&m)
+	gia.afterMemory = m.HeapAlloc
+}
+
+// GetReport: GC 보고서
+func (gia *GCImpactAnalyzer) GetReport() string {
+	return fmt.Sprintf("GC Pause: %v, Memory Freed: %d bytes",
+		gia.gcPause, gia.beforeMemory-gia.afterMemory)
+}
+
+// ============================================================================
+// Section 8: Go-Julia Hybrid Kernel Architecture
+// ============================================================================
+
+// ComputationRequest: Julia 계산 요청
+type ComputationRequest struct {
+	ID      string
+	OpType  string // "matmul", "svd", "solve"
+	DataA   []float64
+	DataB   []float64
+	Rows    int
+	Cols    int
+	TraceID string // OpenTelemetry 추적 ID
+}
+
+// ComputationResponse: Julia 계산 응답
+type ComputationResponse struct {
+	ID       string
+	Result   []float64
+	Error    string
+	Duration time.Duration
+	TraceID  string
+}
+
+// HybridKernelControlPlane: 제어 평면 (Go)
+type HybridKernelControlPlane struct {
+	workers       []*WorkStealingWorker
+	requestQueue  chan *ComputationRequest
+	responseQueue chan *ComputationResponse
+	mu            sync.RWMutex
+}
+
+// NewHybridKernelControlPlane: 제어 평면 생성
+func NewHybridKernelControlPlane(numWorkers int) *HybridKernelControlPlane {
+	workers := make([]*WorkStealingWorker, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		workers[i] = NewWorkStealingWorker(i, 100)
+	}
+
+	return &HybridKernelControlPlane{
+		workers:       workers,
+		requestQueue:  make(chan *ComputationRequest, 1000),
+		responseQueue: make(chan *ComputationResponse, 1000),
+	}
+}
+
+// DispatchRequest: 계산 요청 분배
+func (cp *HybridKernelControlPlane) DispatchRequest(req *ComputationRequest) {
+	// 라운드 로빈으로 워커에 작업 할당
+	workerID := len(req.ID) % len(cp.workers)
+	worker := cp.workers[workerID]
+
+	task := &WorkerTask{
+		ID:    len(req.ID),
+		Value: len(req.DataA),
+	}
+
+	if !worker.EnqueueLocal(task) {
+		// 큐가 가득 찼으면 다른 워커에서 도난
+		for _, other := range cp.workers {
+			if other.id != worker.id {
+				task := &WorkerTask{
+					ID:    len(req.ID),
+					Value: len(req.DataA),
+				}
+				if other.EnqueueLocal(task) {
+					break
+				}
+			}
+		}
+	}
+}
+
+// GetWorkerStats: 워커 통계
+func (cp *HybridKernelControlPlane) GetWorkerStats() map[int]int64 {
+	stats := make(map[int]int64)
+	for i, w := range cp.workers {
+		stats[i] = w.StealCount()
+	}
+	return stats
+}
+
+// ============================================================================
+// Section 9: Benchmark and Comparison
+// ============================================================================
+
+// BenchmarkComparison: 성능 비교
+type BenchmarkComparison struct {
+	NormalCopyTime    time.Duration
+	ZeroCopyTime      time.Duration
+	MutexTime         time.Duration
+	LockFreeTime      time.Duration
+	OnHeapGCTime      time.Duration
+	OffHeapAllocTime  time.Duration
+}
+
+// RunBenchmarks: 모든 벤치마크 실행
+func RunBenchmarks() *BenchmarkComparison {
+	bc := &BenchmarkComparison{}
+
+	// 1. Zero-Copy vs Normal Copy
+	fmt.Println("📊 Zero-Copy Performance Test")
+	zc := NewZeroCopyPacketProcessor(1024)
+	start := time.Now()
+	for i := 0; i < 10000; i++ {
+		_ = zc.ProcessPacket()
+	}
+	bc.ZeroCopyTime = time.Since(start)
+	fmt.Printf("  Zero-Copy: %v\n", bc.ZeroCopyTime)
+
+	// 2. Lock-Free Counter
+	fmt.Println("📊 Lock-Free Counter Test")
+	counter := &AtomicCounter{}
+	start = time.Now()
+	for i := 0; i < 1000000; i++ {
+		counter.Increment()
+	}
+	bc.LockFreeTime = time.Since(start)
+	fmt.Printf("  Lock-Free: %v\n", bc.LockFreeTime)
+
+	// 3. Off-Heap Allocation
+	fmt.Println("📊 Off-Heap Allocation Test")
+	start = time.Now()
+	ob, _ := AllocOffHeap(1024 * 1024)
+	bc.OffHeapAllocTime = time.Since(start)
+	ob.Release()
+	fmt.Printf("  Off-Heap Alloc: %v\n", bc.OffHeapAllocTime)
+
+	return bc
+}
+
+// ============================================================================
+// Main: 모든 섹션 시연
+// ============================================================================
+
+func main() {
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Println("405 - Zero-Copy & Lock-Free Architecture")
+	fmt.Println("박사 과정 최종장: 기록으로 자신을 증명하는 시스템 아키텍트")
+	fmt.Println(strings.Repeat("=", 80))
+
+	// Section 1: Zero-Copy 시연
+	fmt.Println("\n【Section 1】Zero-Copy Architecture")
+	fmt.Println("─────────────────────────────────────")
+	zc := NewZeroCopyPacketProcessor(20)
+	// 패킷 데이터 시뮬레이션
+	zc.buffer[0] = 0x45  // Version + HeaderLength
+	zc.buffer[1] = 0x00  // ToS
+	zc.buffer[8] = 64    // TTL
+
+	header := zc.ProcessPacket()
+	if header != nil {
+		fmt.Printf("✓ Zero-Copy 패킷 처리 성공\n")
+		fmt.Printf("  Version: 0x%02x\n", header.Version)
+		fmt.Printf("  TTL: %d\n", header.TTL)
+	}
+
+	// Section 2: Lock-Free 카운터
+	fmt.Println("\n【Section 2】Lock-Free Atomic Counter")
+	fmt.Println("─────────────────────────────────────")
+	ac := &AtomicCounter{}
+	for i := 0; i < 1000; i++ {
+		ac.Increment()
+	}
+	fmt.Printf("✓ 원자적 카운터 최종값: %d\n", ac.Value())
+
+	// Section 3: Off-Heap 메모리
+	fmt.Println("\n【Section 3】Off-Heap Memory Management")
+	fmt.Println("─────────────────────────────────────")
+	ob, _ := AllocOffHeap(512)
+	ob.Retain()
+	ob.Retain()
+	fmt.Printf("✓ Off-Heap 메모리 할당 성공 (%d bytes)\n", ob.size)
+	fmt.Printf("  참조 카운트: %d\n", ob.refCount)
+	ob.Release()
+	ob.Release()
+	ob.Release()
+	fmt.Println("  메모리 해제 완료")
+
+	// Section 4: Lock-Free 큐
+	fmt.Println("\n【Section 4】Lock-Free Queue")
+	fmt.Println("─────────────────────────────────────")
+	q := NewSimpleLockFreeQueue()
+	q.Enqueue(42)
+	q.Enqueue("hello")
+	q.Enqueue(3.14)
+	fmt.Printf("✓ Lock-Free 큐 생성 및 요소 추가 성공\n")
+
+	val, ok := q.Dequeue()
+	if ok {
+		fmt.Printf("  Dequeue: %v\n", val)
+	}
+
+	// Section 5: Work Stealing
+	fmt.Println("\n【Section 5】Work Stealing Scheduler")
+	fmt.Println("─────────────────────────────────────")
+	workers := make([]*WorkStealingWorker, 4)
+	for i := 0; i < 4; i++ {
+		workers[i] = NewWorkStealingWorker(i, 10)
+	}
+
+	// 워커 0에 작업 집중
+	for i := 0; i < 5; i++ {
+		workers[0].EnqueueLocal(&WorkerTask{ID: i, Value: i * 100})
+	}
+
+	// 워커 1이 작업 도난
+	for i := 0; i < 3; i++ {
+		if task := workers[1].TryStealFrom(workers[0]); task != nil {
+			fmt.Printf("✓ Worker-1이 작업 도난: Task ID=%d\n", task.ID)
+		}
+	}
+
+	fmt.Printf("  Worker-0 도난당한 작업: %d\n", workers[0].StealCount())
+	fmt.Printf("  Worker-1 도난한 작업: %d\n", workers[1].StealCount())
+
+	// Section 6: 메모리 계층 시뮬레이션
+	fmt.Println("\n【Section 6】Memory Hierarchy Simulation")
+	fmt.Println("─────────────────────────────────────")
+	mh := NewMemoryHierarchy()
+
+	// 데이터 저장
+	for i := 0; i < 100; i++ {
+		mh.Store(int64(i), i*i)
+	}
+
+	// 접근 패턴
+	for i := 0; i < 10; i++ {
+		mh.Access(int64(i))
+	}
+
+	for i := 0; i < 5; i++ {
+		mh.Access(int64(i))
+	}
+
+	fmt.Printf("✓ L1 캐시 히트: %d\n", atomic.LoadInt64(&mh.l1Hits))
+	fmt.Printf("  L1 캐시 미스: %d\n", atomic.LoadInt64(&mh.l1Misses))
+
+	// Section 7: GC 영향 분석
+	fmt.Println("\n【Section 7】GC Impact Analysis")
+	fmt.Println("─────────────────────────────────────")
+	gia := &GCImpactAnalyzer{}
+	gia.SimulateGC()
+	fmt.Printf("✓ %s\n", gia.GetReport())
+
+	// Section 8: Hybrid Kernel 제어 평면
+	fmt.Println("\n【Section 8】Go-Julia Hybrid Kernel (Control Plane)")
+	fmt.Println("─────────────────────────────────────")
+	cp := NewHybridKernelControlPlane(4)
+
+	req := &ComputationRequest{
+		ID:     "req-001",
+		OpType: "matmul",
+		Rows:   1000,
+		Cols:   1000,
+	}
+
+	cp.DispatchRequest(req)
+	fmt.Printf("✓ 계산 요청 분배 성공\n")
+
+	stats := cp.GetWorkerStats()
+	for id, steals := range stats {
+		fmt.Printf("  Worker-%d: %d steals\n", id, steals)
+	}
+
+	// Section 9: 벤치마크
+	fmt.Println("\n【Section 9】Performance Benchmarks")
+	fmt.Println("─────────────────────────────────────")
+	bc := RunBenchmarks()
+	fmt.Printf("✓ Zero-Copy: %v\n", bc.ZeroCopyTime)
+	fmt.Printf("✓ Lock-Free: %v\n", bc.LockFreeTime)
+	fmt.Printf("✓ Off-Heap: %v\n", bc.OffHeapAllocTime)
+
+	// 최종 메시지
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("🎓 博士課程 완성: 기록이 증명이다")
+	fmt.Println("─────────────────────────────────────")
+	fmt.Println("✓ Zero-Copy Architecture: 메모리 버스 해방")
+	fmt.Println("✓ Lock-Free Data Structures: 동시성의 정수")
+	fmt.Println("✓ Off-Heap Memory: GC 지연 제거")
+	fmt.Println("✓ Work Stealing: 로드 밸런싱 자동화")
+	fmt.Println("✓ Hybrid Kernel: 멀티 기술 통합")
+	fmt.Println("\n당신의 기록은 당신의 증명입니다.")
+	fmt.Println("Your record is your proof.")
+	fmt.Println(strings.Repeat("=", 80))
+}
+

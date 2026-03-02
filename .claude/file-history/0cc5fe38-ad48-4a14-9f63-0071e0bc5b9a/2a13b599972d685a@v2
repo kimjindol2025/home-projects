@@ -1,0 +1,401 @@
+// ============================================================================
+// 평가기(Evaluator): 제어 흐름 구현
+// ============================================================================
+
+use crate::ast::{Block, Expression, Program, Statement};
+use crate::environment::Environment;
+
+/// 런타임 값
+#[derive(Debug, Clone, PartialEq)]
+pub enum GogsObject {
+    Integer(i64),
+    Boolean(bool),
+    Null,
+    Error(String),
+    ReturnValue(Box<GogsObject>),
+}
+
+impl GogsObject {
+    /// 값의 타입 이름
+    pub fn type_name(&self) -> &str {
+        match self {
+            GogsObject::Integer(_) => "INTEGER",
+            GogsObject::Boolean(_) => "BOOLEAN",
+            GogsObject::Null => "NULL",
+            GogsObject::Error(_) => "ERROR",
+            GogsObject::ReturnValue(_) => "RETURN_VALUE",
+        }
+    }
+
+    /// 에러인지 확인
+    pub fn is_error(&self) -> bool {
+        matches!(self, GogsObject::Error(_))
+    }
+
+    /// 반환값 감싸기 해제
+    pub fn unwrap_return_value(self) -> Self {
+        match self {
+            GogsObject::ReturnValue(obj) => *obj,
+            other => other,
+        }
+    }
+}
+
+/// 평가기
+pub struct Evaluator;
+
+impl Evaluator {
+    /// 프로그램 실행
+    pub fn eval_program(program: &Program, env: &mut Environment) -> GogsObject {
+        let mut last = GogsObject::Null;
+
+        for stmt in &program.statements {
+            last = Self::eval_statement(stmt, env);
+
+            if let GogsObject::ReturnValue(_) = last {
+                return last.unwrap_return_value();
+            }
+
+            if last.is_error() {
+                return last;
+            }
+        }
+
+        last
+    }
+
+    /// 문장 평가
+    pub fn eval_statement(stmt: &Statement, env: &mut Environment) -> GogsObject {
+        match stmt {
+            Statement::Expression(expr) => Self::eval_expression(expr, env),
+
+            Statement::Let { name, value } => {
+                let val = Self::eval_expression(value, env);
+
+                if val.is_error() {
+                    return val;
+                }
+
+                if let GogsObject::Integer(n) = val {
+                    env.set(name.clone(), n);
+                    GogsObject::Integer(n)
+                } else {
+                    GogsObject::Error(format!("Cannot assign non-integer value to {}", name))
+                }
+            }
+
+            Statement::Return(expr) => {
+                let val = Self::eval_expression(expr, env);
+                if val.is_error() {
+                    val
+                } else {
+                    GogsObject::ReturnValue(Box::new(val))
+                }
+            }
+        }
+    }
+
+    /// 표현식 평가
+    pub fn eval_expression(expr: &Expression, env: &mut Environment) -> GogsObject {
+        match expr {
+            Expression::IntegerLiteral(n) => GogsObject::Integer(*n),
+
+            Expression::BooleanLiteral(b) => GogsObject::Boolean(*b),
+
+            Expression::Null => GogsObject::Null,
+
+            Expression::Identifier(name) => {
+                if let Some(val) = env.get(name) {
+                    GogsObject::Integer(val)
+                } else {
+                    GogsObject::Error(format!("Unknown identifier: {}", name))
+                }
+            }
+
+            Expression::Prefix(op, right) => {
+                let right_val = Self::eval_expression(right, env);
+
+                if right_val.is_error() {
+                    return right_val;
+                }
+
+                Self::eval_prefix_expression(op, right_val)
+            }
+
+            Expression::Infix(op, left, right) => {
+                let left_val = Self::eval_expression(left, env);
+
+                if left_val.is_error() {
+                    return left_val;
+                }
+
+                let right_val = Self::eval_expression(right, env);
+
+                if right_val.is_error() {
+                    return right_val;
+                }
+
+                Self::eval_infix_expression(op, left_val, right_val)
+            }
+
+            // ============================================================================
+            // [제어 흐름: 조건문] 핵심 로직
+            // ============================================================================
+            Expression::If {
+                condition,
+                consequence,
+                alternative,
+            } => {
+                // 1. 조건식 평가
+                let condition_res = Self::eval_expression(condition, env);
+
+                if condition_res.is_error() {
+                    return condition_res;
+                }
+
+                // 2. [판단] Truthiness 검사
+                if Self::is_truthy(condition_res) {
+                    // 참인 경우: consequence 블록 실행
+                    Self::eval_block(consequence, env)
+                } else if let Some(alt) = alternative {
+                    // 거짓이고 else 블록이 있는 경우: alternative 블록 실행
+                    Self::eval_block(alt, env)
+                } else {
+                    // else 블록이 없는 경우: null 반환
+                    GogsObject::Null
+                }
+            }
+
+            // ============================================================================
+            // [제어 흐름: 반복문] 핵심 로직
+            // ============================================================================
+            Expression::While { condition, body } => {
+                let mut last_val = GogsObject::Null;
+
+                // 조건이 true인 동안 반복
+                loop {
+                    let condition_res = Self::eval_expression(condition, env);
+
+                    if condition_res.is_error() {
+                        return condition_res;
+                    }
+
+                    if !Self::is_truthy(condition_res) {
+                        break;
+                    }
+
+                    // 블록 실행
+                    last_val = Self::eval_block(body, env);
+
+                    // 반환값이 있으면 루프 탈출
+                    if let GogsObject::ReturnValue(_) = last_val {
+                        return last_val.unwrap_return_value();
+                    }
+
+                    if last_val.is_error() {
+                        return last_val;
+                    }
+                }
+
+                last_val
+            }
+
+            Expression::Block(block) => Self::eval_block(block, env),
+
+            Expression::FunctionLiteral { parameters: _, body: _ } => {
+                // 함수도 객체로 반환 (추후 구현)
+                GogsObject::Error("Functions not yet supported in v14.6".to_string())
+            }
+
+            Expression::Call(_, _) => {
+                GogsObject::Error("Function calls not yet supported in v14.6".to_string())
+            }
+
+            Expression::Array(_) => {
+                GogsObject::Error("Arrays not yet supported in v14.6".to_string())
+            }
+
+            Expression::Index(_, _) => {
+                GogsObject::Error("Indexing not yet supported in v14.6".to_string())
+            }
+
+            Expression::ReturnValue(expr) => {
+                let val = Self::eval_expression(expr, env);
+                if val.is_error() {
+                    val
+                } else {
+                    GogsObject::ReturnValue(Box::new(val))
+                }
+            }
+        }
+    }
+
+    /// 블록 평가 (새로운 스코프 생성)
+    pub fn eval_block(block: &Block, parent_env: &mut Environment) -> GogsObject {
+        // 블록 내에서만 유효한 새로운 환경 생성
+        let mut block_env = Environment::extend(parent_env);
+        let mut last = GogsObject::Null;
+
+        for stmt in &block.statements {
+            last = Self::eval_statement(stmt, &mut block_env);
+
+            if let GogsObject::ReturnValue(_) = last {
+                return last;
+            }
+
+            if last.is_error() {
+                return last;
+            }
+        }
+
+        last
+    }
+
+    /// 단항 연산 평가
+    pub fn eval_prefix_expression(op: &str, right: GogsObject) -> GogsObject {
+        let right_type = right.type_name().to_string();
+        match (op, right) {
+            ("!", GogsObject::Boolean(b)) => GogsObject::Boolean(!b),
+            ("!", GogsObject::Null) => GogsObject::Boolean(true),
+            ("!", GogsObject::Integer(0)) => GogsObject::Boolean(true),
+            ("!", GogsObject::Integer(_)) => GogsObject::Boolean(false),
+
+            ("-", GogsObject::Integer(n)) => GogsObject::Integer(-n),
+
+            _ => GogsObject::Error(format!(
+                "Unknown prefix operation: {}{}",
+                op, right_type
+            )),
+        }
+    }
+
+    /// 이항 연산 평가
+    pub fn eval_infix_expression(op: &str, left: GogsObject, right: GogsObject) -> GogsObject {
+        let left_type = left.type_name().to_string();
+        let right_type = right.type_name().to_string();
+        match (left, right) {
+            // 산술 연산
+            (GogsObject::Integer(l), GogsObject::Integer(r)) => {
+                match op {
+                    "+" => GogsObject::Integer(l + r),
+                    "-" => GogsObject::Integer(l - r),
+                    "*" => GogsObject::Integer(l * r),
+                    "/" => {
+                        if r == 0 {
+                            GogsObject::Error("Division by zero".to_string())
+                        } else {
+                            GogsObject::Integer(l / r)
+                        }
+                    }
+                    "%" => GogsObject::Integer(l % r),
+
+                    // 비교 연산
+                    "==" => GogsObject::Boolean(l == r),
+                    "!=" => GogsObject::Boolean(l != r),
+                    "<" => GogsObject::Boolean(l < r),
+                    ">" => GogsObject::Boolean(l > r),
+                    "<=" => GogsObject::Boolean(l <= r),
+                    ">=" => GogsObject::Boolean(l >= r),
+
+                    _ => GogsObject::Error(format!("Unknown integer operation: {} {} {}", l, op, r)),
+                }
+            }
+
+            // 불리언 연산
+            (GogsObject::Boolean(l), GogsObject::Boolean(r)) => {
+                match op {
+                    "==" => GogsObject::Boolean(l == r),
+                    "!=" => GogsObject::Boolean(l != r),
+                    "&&" => GogsObject::Boolean(l && r),
+                    "||" => GogsObject::Boolean(l || r),
+
+                    _ => GogsObject::Error(format!(
+                        "Unknown boolean operation: {} {} {}",
+                        l, op, r
+                    )),
+                }
+            }
+
+            _ => GogsObject::Error(format!(
+                "Type mismatch in binary operation: {} {} {}",
+                left_type,
+                op,
+                right_type
+            )),
+        }
+    }
+
+    /// Truthiness 판정
+    /// - false, null, 0 → false
+    /// - 나머지 → true
+    pub fn is_truthy(obj: GogsObject) -> bool {
+        match obj {
+            GogsObject::Null => false,
+            GogsObject::Boolean(b) => b,
+            GogsObject::Integer(0) => false,
+            GogsObject::Integer(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_integer_evaluation() {
+        let expr = Expression::IntegerLiteral(42);
+        let mut env = Environment::global();
+        let result = Evaluator::eval_expression(&expr, &mut env);
+        assert_eq!(result, GogsObject::Integer(42));
+    }
+
+    #[test]
+    fn test_boolean_evaluation() {
+        let expr = Expression::BooleanLiteral(true);
+        let mut env = Environment::global();
+        let result = Evaluator::eval_expression(&expr, &mut env);
+        assert_eq!(result, GogsObject::Boolean(true));
+    }
+
+    #[test]
+    fn test_if_true() {
+        let if_expr = Expression::If {
+            condition: Box::new(Expression::BooleanLiteral(true)),
+            consequence: Block::new(vec![Statement::expression(Expression::IntegerLiteral(10))]),
+            alternative: Some(Block::new(vec![Statement::expression(
+                Expression::IntegerLiteral(20),
+            )])),
+        };
+
+        let mut env = Environment::global();
+        let result = Evaluator::eval_expression(&if_expr, &mut env);
+        assert_eq!(result, GogsObject::Integer(10));
+    }
+
+    #[test]
+    fn test_if_false() {
+        let if_expr = Expression::If {
+            condition: Box::new(Expression::BooleanLiteral(false)),
+            consequence: Block::new(vec![Statement::expression(Expression::IntegerLiteral(10))]),
+            alternative: Some(Block::new(vec![Statement::expression(
+                Expression::IntegerLiteral(20),
+            )])),
+        };
+
+        let mut env = Environment::global();
+        let result = Evaluator::eval_expression(&if_expr, &mut env);
+        assert_eq!(result, GogsObject::Integer(20));
+    }
+
+    #[test]
+    fn test_truthiness() {
+        assert!(Evaluator::is_truthy(GogsObject::Boolean(true)));
+        assert!(!Evaluator::is_truthy(GogsObject::Boolean(false)));
+        assert!(!Evaluator::is_truthy(GogsObject::Null));
+        assert!(!Evaluator::is_truthy(GogsObject::Integer(0)));
+        assert!(Evaluator::is_truthy(GogsObject::Integer(1)));
+        assert!(Evaluator::is_truthy(GogsObject::Integer(-1)));
+    }
+}

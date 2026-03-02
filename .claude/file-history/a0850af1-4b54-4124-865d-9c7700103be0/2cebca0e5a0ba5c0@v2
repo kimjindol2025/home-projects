@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+🏛️ v7.1: 분산 메시지 큐 시스템 아키텍처
+Producer-Consumer 패턴으로 구현한 확장 가능한 작업 처리 시스템
+
+대학원 과정: 느슨한 결합과 비동기 처리의 핵심
+"""
+
+import asyncio
+import time
+import random
+from collections import deque
+from datetime import datetime
+from typing import Dict, List, Any
+from dataclasses import dataclass
+from enum import Enum
+
+# ============= 데이터 타입 정의 =============
+
+class TaskStatus(Enum):
+    """작업 상태"""
+    PENDING = "대기 중"
+    PROCESSING = "처리 중"
+    COMPLETED = "완료"
+    FAILED = "실패"
+
+@dataclass
+class Task:
+    """작업 객체"""
+    task_id: str
+    data: str
+    created_at: str
+    status: TaskStatus = TaskStatus.PENDING
+
+    def __repr__(self):
+        return f"Task(id={self.task_id}, data={self.data}, status={self.status.value})"
+
+# ============= 메시지 브로커 (중앙 작업 큐) =============
+
+class GogsMessageBroker:
+    """
+    분산 시스템의 중앙 메시지 브로커
+
+    역할:
+    1. Producer가 보낸 작업을 안전하게 저장
+    2. Consumer에게 작업 분배
+    3. 작업 상태 추적
+    """
+
+    def __init__(self, max_queue_size: int = 100):
+        self.queue = deque(maxlen=max_queue_size)
+        self.completed_tasks: Dict[str, Task] = {}
+        self.processing_tasks: Dict[str, Task] = {}
+        self.condition = asyncio.Condition()
+        self.stats = {
+            'total_produced': 0,
+            'total_consumed': 0,
+            'total_failed': 0
+        }
+
+    async def produce(self, task: Task) -> bool:
+        """
+        Producer: 작업을 큐에 추가
+
+        장점:
+        - Producer와 Consumer가 독립적
+        - Producer는 즉시 반환 (비동기)
+        - 갑작스런 부하 증가도 처리 가능
+        """
+        async with self.condition:
+            if len(self.queue) >= self.queue.maxlen:
+                print(f"⚠️  [{datetime.now().strftime('%H:%M:%S')}] 큐가 가득 참! (작업 드롭됨)")
+                return False
+
+            self.queue.append(task)
+            self.stats['total_produced'] += 1
+
+            print(f"📥 [{datetime.now().strftime('%H:%M:%S')}] Producer: {task.task_id} 투입 (큐 크기: {len(self.queue)})")
+
+            # 대기 중인 Consumer에게 알림
+            self.condition.notify_all()
+
+            return True
+
+    async def consume(self, worker_name: str) -> Task:
+        """
+        Consumer: 큐에서 작업을 꺼내 처리
+
+        장점:
+        - 작업이 없으면 대기 (CPU 낭비 안 함)
+        - 여러 Consumer가 동시에 작업 처리
+        - 장애 격리: 한 Consumer 실패해도 다른 Consumer 계속 작동
+        """
+        async with self.condition:
+            # 작업이 올 때까지 대기
+            while not self.queue:
+                await self.condition.wait()
+
+            task = self.queue.popleft()
+            task.status = TaskStatus.PROCESSING
+            self.processing_tasks[task.task_id] = task
+
+            print(f"📤 [{datetime.now().strftime('%H:%M:%S')}] {worker_name}: {task.task_id} 꺼냄 (큐 크기: {len(self.queue)})")
+
+            return task
+
+    async def mark_completed(self, task_id: str, worker_name: str, success: bool = True):
+        """작업 완료 처리"""
+        if task_id in self.processing_tasks:
+            task = self.processing_tasks.pop(task_id)
+
+            if success:
+                task.status = TaskStatus.COMPLETED
+                self.completed_tasks[task_id] = task
+                self.stats['total_consumed'] += 1
+                print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] {worker_name}: {task_id} 완료")
+            else:
+                task.status = TaskStatus.FAILED
+                self.stats['total_failed'] += 1
+                print(f"❌ [{datetime.now().strftime('%H:%M:%S')}] {worker_name}: {task_id} 실패")
+
+    def get_status(self) -> Dict[str, Any]:
+        """시스템 상태 조회"""
+        return {
+            'queue_size': len(self.queue),
+            'processing': len(self.processing_tasks),
+            'completed': len(self.completed_tasks),
+            'stats': self.stats
+        }
+
+# ============= Producer (작업 생성자) =============
+
+class Producer:
+    """
+    시스템 사용자의 요청을 받아 작업으로 변환
+
+    실제 예시:
+    - 웹 요청 → 이미지 처리 작업
+    - 이메일 송신 요청 → 메일 발송 작업
+    - 데이터 분석 요청 → 분석 작업
+    """
+
+    def __init__(self, broker: GogsMessageBroker, producer_id: str):
+        self.broker = broker
+        self.producer_id = producer_id
+        self.task_counter = 0
+
+    async def send_task(self, data: str) -> bool:
+        """작업 전송"""
+        self.task_counter += 1
+        task = Task(
+            task_id=f"{self.producer_id}-{self.task_counter}",
+            data=data,
+            created_at=datetime.now().isoformat()
+        )
+        return await self.broker.produce(task)
+
+# ============= Consumer (작업 처리자) =============
+
+class Consumer:
+    """
+    큐에서 작업을 꺼내 실제로 처리
+
+    확장 특성:
+    - 작업이 많으면 Consumer 추가
+    - 작업이 적으면 Consumer 감소
+    - 자동 스케일링 가능
+    """
+
+    def __init__(self, broker: GogsMessageBroker, worker_name: str):
+        self.broker = broker
+        self.worker_name = worker_name
+        self.processed_count = 0
+
+    async def process_tasks(self, duration: float = None):
+        """
+        지속적으로 작업 처리
+
+        duration: 작업 시간 (초). None이면 무한 대기
+        """
+        start_time = time.time()
+
+        while True:
+            if duration and (time.time() - start_time) > duration:
+                break
+
+            try:
+                # 작업 꺼내기
+                task = await self.broker.consume(self.worker_name)
+
+                # 실제 작업 시뮬레이션 (0.5~2초)
+                process_time = random.uniform(0.5, 2.0)
+                await asyncio.sleep(process_time)
+
+                # 작업 완료 표시
+                success = random.random() > 0.1  # 90% 성공률
+                await self.broker.mark_completed(task.task_id, self.worker_name, success)
+
+                self.processed_count += 1
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"❌ {self.worker_name}: 처리 오류: {e}")
+
+# ============= 시스템 모니터 =============
+
+class SystemMonitor:
+    """시스템 상태 모니터링"""
+
+    def __init__(self, broker: GogsMessageBroker):
+        self.broker = broker
+
+    async def monitor(self, interval: float = 2.0, duration: float = None):
+        """주기적으로 시스템 상태 출력"""
+        start_time = time.time()
+
+        while True:
+            if duration and (time.time() - start_time) > duration:
+                break
+
+            status = self.broker.get_status()
+            print(f"\n📊 [{datetime.now().strftime('%H:%M:%S')}] 시스템 상태")
+            print(f"   큐 크기: {status['queue_size']}")
+            print(f"   처리 중: {status['processing']}")
+            print(f"   완료됨: {status['completed']}")
+            print(f"   통계: {status['stats']}")
+
+            await asyncio.sleep(interval)
+
+# ============= 메인 시뮬레이션 =============
+
+async def run_distributed_queue_simulation():
+    """분산 메시지 큐 시뮬레이션 실행"""
+
+    print("\n" + "="*80)
+    print("🏛️ v7.1: 분산 메시지 큐 시스템 시뮬레이션")
+    print("="*80 + "\n")
+
+    # 1. 메시지 브로커 생성
+    broker = GogsMessageBroker(max_queue_size=20)
+    print("✅ 메시지 브로커 시작\n")
+
+    # 2. Producer 생성
+    producer1 = Producer(broker, "Producer-1")
+    producer2 = Producer(broker, "Producer-2")
+    print("✅ Producer 2개 시작\n")
+
+    # 3. Consumer 생성 (Worker Pool)
+    consumer1 = Consumer(broker, "Worker-Alpha")
+    consumer2 = Consumer(broker, "Worker-Bravo")
+    print("✅ Consumer (Worker) 2개 시작\n")
+
+    # 4. 모니터 생성
+    monitor = SystemMonitor(broker)
+    print("✅ 시스템 모니터 시작\n")
+
+    print("="*80)
+    print("【 시뮬레이션 시작 】")
+    print("="*80 + "\n")
+
+    # Producer 작업 생성
+    async def produce_tasks():
+        """지속적으로 작업 생성"""
+        for i in range(15):
+            await producer1.send_task(f"분석 작업 {i+1}")
+            await asyncio.sleep(0.5)
+
+            if i % 3 == 0:
+                await producer2.send_task(f"정제 작업 {i+1}")
+
+        print("\n📢 Producer 작업 완료")
+
+    # Consumer 작업 처리
+    async def consume_tasks():
+        """작업 처리"""
+        await consumer1.process_tasks(duration=20)
+
+    async def consume_tasks_2():
+        """작업 처리 (Consumer 2)"""
+        await consumer2.process_tasks(duration=20)
+
+    # 모니터 시작
+    async def monitor_system():
+        """시스템 모니터링"""
+        await monitor.monitor(interval=2.0, duration=20)
+
+    # 모든 작업 동시 실행
+    await asyncio.gather(
+        produce_tasks(),
+        consume_tasks(),
+        consume_tasks_2(),
+        monitor_system()
+    )
+
+    print("\n" + "="*80)
+    print("【 시뮬레이션 완료 】")
+    print("="*80 + "\n")
+
+    # 최종 통계
+    final_status = broker.get_status()
+    print("📊 최종 통계:")
+    print(f"  생산 작업: {final_status['stats']['total_produced']}")
+    print(f"  완료 작업: {final_status['stats']['total_consumed']}")
+    print(f"  실패 작업: {final_status['stats']['total_failed']}")
+    print(f"  남은 작업: {final_status['queue_size']}")
+    print(f"  처리 중: {final_status['processing']}\n")
+
+    print("✨ 분산 메시지 큐 시뮬레이션 성공!")
+    print("기록이 증명이다 gogs 🎓\n")
+
+# ============= 메인 실행 =============
+
+if __name__ == "__main__":
+    asyncio.run(run_distributed_queue_simulation())

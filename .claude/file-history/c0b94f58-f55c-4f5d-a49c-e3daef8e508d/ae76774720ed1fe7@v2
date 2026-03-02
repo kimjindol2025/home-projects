@@ -1,0 +1,362 @@
+"""
+Pulse 런타임 모듈
+Pulse 코드 실행 엔진
+"""
+
+import asyncio
+import re
+from typing import Dict, Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class PulseRuntime:
+    """Pulse 코드 실행 엔진"""
+
+    def __init__(self, llm_manager=None, nlu_processor=None):
+        self.llm_manager = llm_manager
+        self.nlu_processor = nlu_processor
+        self.agents = {}
+        self.logger = logger
+
+    async def execute(self, pulse_code: str) -> str:
+        """
+        Pulse 코드를 실행하고 결과 반환
+
+        Args:
+            pulse_code: Pulse 언어로 작성된 코드
+
+        Returns:
+            실행 결과 (자연어)
+        """
+
+        try:
+            # 1. 코드 파싱
+            config = self._parse_pulse_code(pulse_code)
+            self.logger.info(f"✅ Pulse 코드 파싱 완료: {config}")
+
+            # 2. Intent 생성
+            from .nlu import Intent
+
+            intent = Intent(
+                role=config.get("role", "자동화 에이전트"),
+                models=config.get("models", ["qwen2.5:7b"]),
+                tools=config.get("tools", []),
+                goal=config.get("goal", ""),
+                deployment=config.get("deployment", "realtime"),
+                schedule=config.get("schedule"),
+                constraints=config.get("constraints", {}),
+                flow=config.get("flow"),
+                confidence=0.95,
+                nlu_method="PulseParser"
+            )
+
+            # 3. 에이전트 생성 및 배포
+            from .agent import Agent
+
+            agent = Agent(intent, self.llm_manager)
+            deployment_result = await agent.deploy()
+
+            # 4. 결과 반환
+            return self._format_result(config, deployment_result, agent)
+
+        except Exception as e:
+            self.logger.error(f"❌ Pulse 실행 중 오류: {e}")
+            return f"❌ 실행 중 오류 발생: {str(e)}"
+
+    def _parse_pulse_code(self, code: str) -> Dict[str, Any]:
+        """
+        Pulse 코드를 파싱해서 구조화된 설정 추출
+
+        Args:
+            code: Pulse 코드 문자열
+
+        Returns:
+            파싱된 설정 딕셔너리
+        """
+        config = {
+            "role": "자동화 에이전트",
+            "models": [],
+            "tools": [],
+            "goal": "",
+            "deployment": "realtime",
+            "schedule": None,
+            "constraints": {},
+            "flow": None
+        }
+
+        lines = code.strip().split("\n")
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):  # 빈 줄이나 주석 무시
+                continue
+
+            # 역할 파싱
+            if line.startswith("로서") or "로서" in line:
+                config["role"] = self._extract_value(line, "로서")
+
+            # 모델 파싱
+            elif "-모델" in line or "모델:" in line:
+                models = self._extract_list(line)
+                config["models"] = models if models else config["models"]
+
+            # 도구 파싱
+            elif "-도구" in line or "-api" in line or "도구:" in line:
+                tools = self._extract_tools(line)
+                config["tools"] = tools if tools else config["tools"]
+
+            # 목표 파싱
+            elif line.startswith("해야할일") or line.startswith("목표:"):
+                config["goal"] = self._extract_value(line, "해야할일")
+
+            # 배포 파싱
+            elif line.startswith("실행") or "배포" in line:
+                deployment = self._extract_value(line, "실행")
+                config["deployment"] = self._parse_deployment(deployment)
+
+            # 제약 파싱
+            elif "응답" in line and ("<" in line or ">" in line or "=" in line):
+                constraints = self._parse_constraints(line)
+                config["constraints"].update(constraints)
+
+            # 스케줄 파싱
+            elif "매일" in line or "매주" in line or "매시간" in line:
+                schedule = self._parse_schedule(line)
+                if schedule:
+                    config["schedule"] = schedule
+                    config["deployment"] = "scheduled"
+
+            # 흐름 파싱
+            elif line.startswith("흐름"):
+                config["flow"] = self._extract_value(line, "흐름")
+
+        return config
+
+    def _extract_value(self, line: str, prefix: str) -> str:
+        """
+        라인에서 값 추출
+
+        Args:
+            line: 라인 텍스트
+            prefix: 접두사
+
+        Returns:
+            추출된 값
+        """
+        if prefix in line:
+            return line.split(prefix, 1)[1].strip()
+        return ""
+
+    def _extract_list(self, line: str) -> list:
+        """
+        라인에서 리스트 추출 (쉼표 구분)
+
+        Args:
+            line: 라인 텍스트
+
+        Returns:
+            리스트
+        """
+        # 괄호 내용 추출: [모델1, 모델2]
+        match = re.search(r'\[([^\]]+)\]', line)
+        if match:
+            items = match.group(1).split(",")
+            return [item.strip() for item in items]
+
+        # 쉼표로 구분된 항목
+        if "," in line:
+            items = line.split(",")
+            return [item.strip() for item in items]
+
+        return []
+
+    def _extract_tools(self, line: str) -> list:
+        """
+        라인에서 도구 추출
+
+        Args:
+            line: 라인 텍스트
+
+        Returns:
+            도구 리스트
+        """
+        tools = []
+
+        # "-도구" 또는 "-api" 접미사로 끝나는 항목 찾기
+        items = re.findall(r'(\w+)-(?:도구|api)', line)
+        for item in items:
+            tool_map = {
+                "slack": "slack",
+                "email": "email",
+                "web": "web_search",
+                "search": "web_search",
+                "github": "github",
+                "git": "github",
+                "twitter": "twitter"
+            }
+            tools.append(tool_map.get(item, item))
+
+        return tools
+
+    def _parse_deployment(self, deployment_str: str) -> str:
+        """
+        배포 문자열을 표준 배포 방식으로 변환
+
+        Args:
+            deployment_str: 배포 문자열
+
+        Returns:
+            표준 배포 방식
+        """
+        if "slack" in deployment_str.lower():
+            return "slack"
+        elif "email" in deployment_str.lower() or "메일" in deployment_str:
+            return "email"
+        elif "스케줄" in deployment_str or "매일" in deployment_str:
+            return "scheduled"
+        elif "지금" in deployment_str or "즉시" in deployment_str:
+            return "immediate"
+        return "realtime"
+
+    def _parse_constraints(self, line: str) -> Dict[str, Any]:
+        """
+        제약 조건 파싱
+
+        Args:
+            line: 제약 조건 라인
+
+        Returns:
+            제약 조건 딕셔너리
+        """
+        constraints = {}
+
+        # 응답 시간 제약: "응답<1.5초"
+        time_match = re.search(r'응답\s*([<>=]+)\s*(\d+(?:\.\d+)?)\s*(초|ms)', line)
+        if time_match:
+            op = time_match.group(1)
+            value = float(time_match.group(2))
+            unit = time_match.group(3)
+
+            # 밀리초로 변환
+            ms = value * 1000 if "초" in unit else value
+            constraints["max_response_ms"] = int(ms)
+
+        # 신뢰도 제약: "신뢰도>0.85"
+        confidence_match = re.search(r'(?:신뢰도|정확도)\s*([<>=]+)\s*([0-9.]+)', line)
+        if confidence_match:
+            constraints["min_confidence"] = float(confidence_match.group(2))
+
+        return constraints
+
+    def _parse_schedule(self, line: str) -> Optional[Dict[str, Any]]:
+        """
+        스케줄 파싱
+
+        Args:
+            line: 스케줄 라인
+
+        Returns:
+            스케줄 딕셔너리
+        """
+
+        # 일일: "매일 09:00"
+        daily_match = re.search(r'매일\s+(\d{1,2})[시:]\s*(\d{1,2})?', line)
+        if daily_match:
+            hour = int(daily_match.group(1))
+            minute = int(daily_match.group(2) or 0)
+            return {
+                "type": "daily",
+                "time": f"{hour:02d}:{minute:02d}",
+                "hour": hour,
+                "minute": minute
+            }
+
+        # 주별: "매주 월요일"
+        weekly_match = re.search(r'매주\s*(월|화|수|목|금|토|일)', line)
+        if weekly_match:
+            day_kr_to_en = {
+                "월": "mon",
+                "화": "tue",
+                "수": "wed",
+                "목": "thu",
+                "금": "fri",
+                "토": "sat",
+                "일": "sun"
+            }
+            day = day_kr_to_en.get(weekly_match.group(1))
+            return {"type": "weekly", "day": day}
+
+        # 반복: "매 30분"
+        interval_match = re.search(r'매\s+(\d+)\s*(분|시간)', line)
+        if interval_match:
+            value = int(interval_match.group(1))
+            unit = interval_match.group(2)
+            seconds = value * (60 if "분" in unit else 3600)
+            return {"type": "interval", "seconds": seconds}
+
+        return None
+
+    def _format_result(self, config: Dict[str, Any], deployment_result: Dict[str, Any], agent) -> str:
+        """
+        결과를 자연어로 포맷팅
+
+        Args:
+            config: 파싱된 설정
+            deployment_result: 배포 결과
+            agent: 에이전트 객체
+
+        Returns:
+            포맷팅된 결과 문자열
+        """
+
+        role = config.get("role", "에이전트")
+        deployment = config.get("deployment", "")
+
+        if deployment_result.get("success"):
+            result = f"✅ **{role}** 배포 완료!\n\n"
+
+            if deployment == "slack":
+                channel = deployment_result.get("channel", "#general")
+                result += f"📱 Slack {channel}에서 자동으로 실행됩니다.\n"
+
+            elif deployment == "email":
+                result += f"📧 이메일 감시가 활성화되었습니다.\n자동 응답이 준비됨!\n"
+
+            elif deployment == "scheduled":
+                schedule = config.get("schedule", {})
+                schedule_type = schedule.get("type", "unknown")
+                if schedule_type == "daily":
+                    result += f"📅 매일 {schedule.get('time', '09:00')}에 실행됩니다.\n"
+                elif schedule_type == "weekly":
+                    result += f"📅 매주 {schedule.get('day', '월요일')}에 실행됩니다.\n"
+                else:
+                    result += f"📅 스케줄대로 실행됩니다.\n"
+
+            elif deployment == "immediate":
+                result += f"⚡ 지금 바로 실행되었습니다!\n"
+
+            else:
+                result += f"🔄 실시간 감시가 활성화되었습니다.\n"
+
+            result += f"\n**에이전트 ID**: `{agent.id}`\n"
+            result += f"**상태**: `{deployment_result.get('status', 'running')}`"
+
+            return result
+
+        else:
+            return f"❌ 배포 실패: {deployment_result.get('error', '알 수 없는 오류')}"
+
+    def get_agent(self, agent_id: str) -> Optional[Any]:
+        """에이전트 조회"""
+        return self.agents.get(agent_id)
+
+    async def stop_agent(self, agent_id: str) -> bool:
+        """에이전트 중지"""
+        agent = self.agents.get(agent_id)
+        if agent:
+            await agent.stop()
+            del self.agents[agent_id]
+            return True
+        return False

@@ -1,0 +1,539 @@
+"""
+분산 큐 - 고수준 추상화 계층
+
+메시지 브로커를 기반으로 한 다양한 큐 전략을 제공
+- 우선순위 큐
+- 지연 큐 (Delayed Queue)
+- 배치 큐
+- 재시도 큐 (Retry Queue)
+"""
+
+import asyncio
+from typing import Any, Callable, Optional, List, Dict
+from datetime import datetime, timedelta
+import logging
+from collections import deque
+from .message_broker import GogsMessageBroker, Message, PriorityMessageBroker
+
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class DistributedQueue:
+    """분산 큐 추상 기본 클래스"""
+
+    def __init__(self, name: str = "Queue"):
+        self.name = name
+        self.enqueue_count = 0
+        self.dequeue_count = 0
+
+    async def enqueue(self, item: Any) -> bool:
+        """아이템 추가"""
+        raise NotImplementedError
+
+    async def dequeue(self, timeout: Optional[float] = None) -> Optional[Any]:
+        """아이템 제거"""
+        raise NotImplementedError
+
+    async def get_size(self) -> int:
+        """큐 크기 조회"""
+        raise NotImplementedError
+
+
+class BrokerBasedQueue(DistributedQueue):
+    """메시지 브로커 기반 큐
+
+    GogsMessageBroker를 활용한 기본 큐 구현
+    """
+
+    def __init__(self, broker: GogsMessageBroker, name: str = "BrokerQueue"):
+        super().__init__(name)
+        self.broker = broker
+
+    async def enqueue(self, item: Any) -> bool:
+        """아이템 추가
+
+        Args:
+            item: 추가할 아이템
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            message = Message(
+                id=f"{self.name}-{self.enqueue_count}",
+                payload=item,
+                priority=0,
+                timestamp=datetime.now()
+            )
+            result = await self.broker.produce(message)
+            if result:
+                self.enqueue_count += 1
+            return result
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] enqueue 실패: {e}")
+            return False
+
+    async def dequeue(self, timeout: Optional[float] = None) -> Optional[Any]:
+        """아이템 제거
+
+        Args:
+            timeout: 대기 타임아웃
+
+        Returns:
+            Optional[Any]: 아이템 (없으면 None)
+        """
+        try:
+            message = await self.broker.consume(self.name, timeout=timeout)
+            if message:
+                self.dequeue_count += 1
+                await self.broker.acknowledge(message)
+                return message.payload
+            return None
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] dequeue 실패: {e}")
+            return None
+
+    async def get_size(self) -> int:
+        """큐 크기 조회"""
+        try:
+            status = await self.broker.get_queue_status()
+            return status["queue_size"]
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] get_size 실패: {e}")
+            return 0
+
+
+class PriorityQueue(DistributedQueue):
+    """우선순위 큐
+
+    우선순위별로 메시지를 처리
+    - 0: 낮음 (일반 작업)
+    - 1: 중간 (중요 작업)
+    - 2: 높음 (긴급 작업)
+    """
+
+    def __init__(self, broker: PriorityMessageBroker, name: str = "PriorityQueue"):
+        super().__init__(name)
+        self.broker = broker
+
+    async def enqueue(self, item: Any, priority: int = 0) -> bool:
+        """우선순위와 함께 아이템 추가
+
+        Args:
+            item: 추가할 아이템
+            priority: 우선순위 (0~2)
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            # 우선순위 정규화
+            priority = max(0, min(2, priority))
+
+            message = Message(
+                id=f"{self.name}-{self.enqueue_count}",
+                payload=item,
+                priority=priority,
+                timestamp=datetime.now()
+            )
+            result = await self.broker.produce(message)
+            if result:
+                self.enqueue_count += 1
+                logger.info(
+                    f"📍 [{self.name}] 우선순위 {priority} 아이템 추가"
+                )
+            return result
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] enqueue 실패: {e}")
+            return False
+
+    async def dequeue(self, timeout: Optional[float] = None) -> Optional[Any]:
+        """우선순위 순서대로 아이템 제거
+
+        Args:
+            timeout: 대기 타임아웃
+
+        Returns:
+            Optional[Any]: 아이템 (없으면 None)
+        """
+        try:
+            message = await self.broker.consume(self.name, timeout=timeout)
+            if message:
+                self.dequeue_count += 1
+                await self.broker.acknowledge(message)
+                logger.info(
+                    f"📍 [{self.name}] 우선순위 {message.priority} 아이템 제거"
+                )
+                return message.payload
+            return None
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] dequeue 실패: {e}")
+            return None
+
+    async def get_size(self) -> int:
+        """큐 크기 조회"""
+        try:
+            status = await self.broker.get_queue_status()
+            return status["queue_size"]
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] get_size 실패: {e}")
+            return 0
+
+
+class DelayedQueue(DistributedQueue):
+    """지연 큐 - 일정 시간 후에 처리
+
+    특정 시간이 경과한 후에만 소비할 수 있는 큐
+    (예: 스케줄된 작업, 재시도 스케줄)
+    """
+
+    def __init__(self, broker: GogsMessageBroker, name: str = "DelayedQueue"):
+        super().__init__(name)
+        self.broker = broker
+        self.delayed_messages: deque = deque()  # (scheduled_time, message)
+
+    async def enqueue(self, item: Any, delay_seconds: float = 0) -> bool:
+        """지연 시간과 함께 아이템 추가
+
+        Args:
+            item: 추가할 아이템
+            delay_seconds: 지연 시간 (초)
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            scheduled_time = datetime.now() + timedelta(seconds=delay_seconds)
+
+            message = Message(
+                id=f"{self.name}-{self.enqueue_count}",
+                payload={"item": item, "scheduled_time": scheduled_time.isoformat()},
+                priority=0,
+                timestamp=datetime.now()
+            )
+
+            # 지연 메시지 저장
+            self.delayed_messages.append((scheduled_time, message))
+            self.enqueue_count += 1
+
+            logger.info(
+                f"⏰ [{self.name}] {delay_seconds:.1f}초 지연 아이템 추가"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] enqueue 실패: {e}")
+            return False
+
+    async def dequeue(self, timeout: Optional[float] = None) -> Optional[Any]:
+        """준비된 아이템 제거 (지연 시간 경과 확인)
+
+        Args:
+            timeout: 대기 타임아웃
+
+        Returns:
+            Optional[Any]: 아이템 (없으면 None)
+        """
+        try:
+            now = datetime.now()
+
+            # 준비된 메시지 확인
+            while self.delayed_messages:
+                scheduled_time, message = self.delayed_messages[0]
+
+                if scheduled_time <= now:
+                    # 지연 시간 경과
+                    self.delayed_messages.popleft()
+                    self.dequeue_count += 1
+
+                    await self.broker.produce(message)
+                    logger.info(
+                        f"⏰ [{self.name}] 지연 아이템 준비 완료: {message.id}"
+                    )
+                    return message.payload["item"]
+                else:
+                    # 아직 준비 안 됨
+                    wait_time = (scheduled_time - now).total_seconds()
+                    logger.debug(
+                        f"⏳ [{self.name}] {wait_time:.1f}초 더 대기 필요"
+                    )
+                    break
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] dequeue 실패: {e}")
+            return None
+
+    async def get_size(self) -> int:
+        """대기 중인 지연 아이템 수"""
+        return len(self.delayed_messages)
+
+
+class BatchQueue(DistributedQueue):
+    """배치 큐 - 일정 수량 또는 시간 후 처리
+
+    여러 아이템을 모아 배치로 처리
+    (예: 벌크 데이터베이스 삽입, 배치 알림)
+    """
+
+    def __init__(
+        self,
+        broker: GogsMessageBroker,
+        batch_size: int = 10,
+        timeout_seconds: float = 5.0,
+        name: str = "BatchQueue"
+    ):
+        super().__init__(name)
+        self.broker = broker
+        self.batch_size = batch_size
+        self.timeout_seconds = timeout_seconds
+        self.pending_items: deque = deque()
+        self.last_flush_time = datetime.now()
+
+    async def enqueue(self, item: Any) -> bool:
+        """아이템 추가 (배치 조건 확인)
+
+        Args:
+            item: 추가할 아이템
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            self.pending_items.append(item)
+            self.enqueue_count += 1
+
+            # 배치 조건 확인
+            should_flush = await self._should_flush()
+
+            if should_flush:
+                await self.flush()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] enqueue 실패: {e}")
+            return False
+
+    async def _should_flush(self) -> bool:
+        """배치 플러시 필요 여부 확인
+
+        Returns:
+            bool: 플러시 필요 여부
+        """
+        # 크기 기준
+        if len(self.pending_items) >= self.batch_size:
+            return True
+
+        # 시간 기준
+        elapsed = (datetime.now() - self.last_flush_time).total_seconds()
+        if elapsed >= self.timeout_seconds:
+            return True
+
+        return False
+
+    async def flush(self) -> bool:
+        """배치 플러시 - 모인 아이템들을 브로커에 전송
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            if not self.pending_items:
+                return True
+
+            batch_items = list(self.pending_items)
+            self.pending_items.clear()
+            self.last_flush_time = datetime.now()
+
+            message = Message(
+                id=f"{self.name}-batch-{self.enqueue_count}",
+                payload={"items": batch_items, "count": len(batch_items)},
+                priority=1,
+                timestamp=datetime.now()
+            )
+
+            result = await self.broker.produce(message)
+
+            if result:
+                logger.info(
+                    f"📦 [{self.name}] 배치 플러시: {len(batch_items)}개 아이템"
+                )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] flush 실패: {e}")
+            return False
+
+    async def dequeue(self, timeout: Optional[float] = None) -> Optional[List[Any]]:
+        """배치 아이템 제거
+
+        Args:
+            timeout: 대기 타임아웃
+
+        Returns:
+            Optional[List[Any]]: 배치 아이템 리스트
+        """
+        try:
+            message = await self.broker.consume(self.name, timeout=timeout)
+            if message:
+                self.dequeue_count += 1
+                await self.broker.acknowledge(message)
+
+                payload = message.payload
+                batch_items = payload.get("items", [])
+
+                logger.info(
+                    f"📦 [{self.name}] 배치 처리: {len(batch_items)}개 아이템"
+                )
+                return batch_items
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] dequeue 실패: {e}")
+            return None
+
+    async def get_size(self) -> int:
+        """대기 중인 아이템 수"""
+        return len(self.pending_items)
+
+
+class RetryQueue(DistributedQueue):
+    """재시도 큐 - 실패한 작업의 재시도 관리
+
+    처리 실패한 아이템을 일정 시간 후 자동 재시도
+    """
+
+    def __init__(
+        self,
+        broker: GogsMessageBroker,
+        max_retries: int = 3,
+        retry_delay_seconds: float = 5.0,
+        name: str = "RetryQueue"
+    ):
+        super().__init__(name)
+        self.broker = broker
+        self.max_retries = max_retries
+        self.retry_delay_seconds = retry_delay_seconds
+        self.retry_items: deque = deque()  # (attempt, scheduled_time, item)
+
+    async def enqueue_retry(self, item: Any, attempt: int = 1) -> bool:
+        """재시도 큐에 아이템 추가
+
+        Args:
+            item: 재시도할 아이템
+            attempt: 시도 횟수
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            if attempt > self.max_retries:
+                logger.error(
+                    f"❌ [{self.name}] 재시도 초과: {item} ({attempt}/{self.max_retries})"
+                )
+                return False
+
+            # 지수 백오프 (exponential backoff)
+            delay = self.retry_delay_seconds * (2 ** (attempt - 1))
+            scheduled_time = datetime.now() + timedelta(seconds=delay)
+
+            self.retry_items.append((attempt, scheduled_time, item))
+
+            logger.info(
+                f"🔄 [{self.name}] 재시도 스케줄: {item} "
+                f"({attempt}/{self.max_retries}, {delay:.1f}초 후)"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] enqueue_retry 실패: {e}")
+            return False
+
+    async def dequeue(self, timeout: Optional[float] = None) -> Optional[Dict]:
+        """준비된 재시도 아이템 제거
+
+        Returns:
+            Optional[Dict]: {"item": ..., "attempt": ...}
+        """
+        try:
+            now = datetime.now()
+
+            # 준비된 아이템 확인
+            while self.retry_items:
+                attempt, scheduled_time, item = self.retry_items[0]
+
+                if scheduled_time <= now:
+                    self.retry_items.popleft()
+                    self.dequeue_count += 1
+
+                    logger.info(
+                        f"🔄 [{self.name}] 재시도 실행: {item} ({attempt}/{self.max_retries})"
+                    )
+                    return {"item": item, "attempt": attempt}
+                else:
+                    break
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ [{self.name}] dequeue 실패: {e}")
+            return None
+
+    async def get_size(self) -> int:
+        """재시도 대기 중인 아이템 수"""
+        return len(self.retry_items)
+
+    def get_stats(self) -> Dict:
+        """통계"""
+        return {
+            "name": self.name,
+            "enqueue_count": self.enqueue_count,
+            "dequeue_count": self.dequeue_count,
+            "pending": len(self.retry_items),
+            "max_retries": self.max_retries
+        }
+
+
+class QueueFactory:
+    """큐 팩토리 - 적절한 큐 생성"""
+
+    @staticmethod
+    def create_queue(
+        queue_type: str,
+        broker: GogsMessageBroker,
+        **kwargs
+    ) -> DistributedQueue:
+        """큐 생성
+
+        Args:
+            queue_type: 큐 타입
+                - "basic": 기본 큐
+                - "priority": 우선순위 큐
+                - "delayed": 지연 큐
+                - "batch": 배치 큐
+                - "retry": 재시도 큐
+            broker: 메시지 브로커
+            **kwargs: 큐별 매개변수
+
+        Returns:
+            DistributedQueue: 생성된 큐
+        """
+        if queue_type == "basic":
+            return BrokerBasedQueue(broker, **kwargs)
+        elif queue_type == "priority":
+            return PriorityQueue(broker, **kwargs)
+        elif queue_type == "delayed":
+            return DelayedQueue(broker, **kwargs)
+        elif queue_type == "batch":
+            return BatchQueue(broker, **kwargs)
+        elif queue_type == "retry":
+            return RetryQueue(broker, **kwargs)
+        else:
+            raise ValueError(f"Unknown queue type: {queue_type}")

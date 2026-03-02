@@ -1,0 +1,338 @@
+#!/usr/bin/env node
+
+/**
+ * Code Indexer
+ *
+ * Gogs 저장소 스캔 → JSON 인덱스 생성
+ *
+ * 생성 파일:
+ * - db/repos.json (저장소 목록)
+ * - db/{repo-name}.json (저장소별 상세)
+ */
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import Anthropic from "@anthropic-ai/sdk";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const client = new Anthropic();
+
+class CodeIndexer {
+  constructor(gogsBaseUrl, gogsToken) {
+    this.gogsBaseUrl = gogsBaseUrl;
+    this.gogsToken = gogsToken;
+    this.dbDir = path.join(__dirname, "db");
+    this.ensureDbDir();
+  }
+
+  ensureDbDir() {
+    if (!fs.existsSync(this.dbDir)) {
+      fs.mkdirSync(this.dbDir, { recursive: true });
+    }
+  }
+
+  /**
+   * Gogs API로 모든 저장소 조회
+   */
+  async listRepositories() {
+    try {
+      const url = `${this.gogsBaseUrl}/api/v1/user/repos`;
+      const response = await fetch(url, {
+        headers: {
+          "Authorization": `token ${this.gogsToken}`,
+          "Accept": "application/json"
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Gogs API error: ${response.status}`);
+      }
+
+      const repos = await response.json();
+      return repos.map(r => ({
+        name: r.name,
+        url: r.clone_url,
+        description: r.description,
+        language: r.language,
+        stars: r.stars_count,
+        updated_at: r.updated_at
+      }));
+    } catch (e) {
+      console.error("❌ Gogs 연결 실패:", e.message);
+      return [];
+    }
+  }
+
+  /**
+   * 로컬 디렉토리에서 저장소 분석 (클론된 경우)
+   */
+  async analyzeLocalRepository(repoPath, repoName) {
+    console.log(`📂 분석 중: ${repoName}`);
+
+    const sourceFiles = this.getSourceFiles(repoPath);
+    const summary = {
+      name: repoName,
+      path: repoPath,
+      files: sourceFiles.length,
+      sourceFiles: sourceFiles,
+      analysis: {}
+    };
+
+    // 주요 파일들 분석
+    const keyFiles = this.identifyKeyFiles(sourceFiles);
+
+    for (const file of keyFiles.slice(0, 5)) {
+      // 상위 5개 파일만 분석
+      try {
+        const content = fs.readFileSync(
+          path.join(repoPath, file),
+          "utf-8"
+        ).substring(0, 3000); // 처음 3000자만
+
+        const analysis = await this.analyzeFileWithAI(file, content);
+        summary.analysis[file] = analysis;
+      } catch (e) {
+        console.warn(`⚠️ ${file} 분석 실패:`, e.message);
+      }
+    }
+
+    // 저장소 레벨 종합
+    summary.summary = await this.synthesizeRepositorySummary(summary);
+
+    return summary;
+  }
+
+  /**
+   * 소스 파일 발견
+   */
+  getSourceFiles(repoPath) {
+    const extensions = [".rs", ".js", ".ts", ".py", ".go", ".cpp", ".c"];
+    const ignores = ["node_modules", ".git", "target", "dist", ".cache"];
+    const files = [];
+
+    const walk = (dir, relativePath = "") => {
+      try {
+        const entries = fs.readdirSync(dir);
+
+        for (const entry of entries) {
+          if (ignores.some(ig => entry.includes(ig))) continue;
+
+          const fullPath = path.join(dir, entry);
+          const rel = path.join(relativePath, entry);
+          const stat = fs.statSync(fullPath);
+
+          if (stat.isDirectory()) {
+            walk(fullPath, rel);
+          } else if (
+            extensions.some(ext => entry.endsWith(ext)) &&
+            stat.size < 100000 // 100KB 이상 스킵
+          ) {
+            files.push(rel);
+          }
+        }
+      } catch (e) {
+        // 접근 권한 없음
+      }
+    };
+
+    walk(repoPath);
+    return files.sort();
+  }
+
+  /**
+   * 중요한 파일 식별
+   */
+  identifyKeyFiles(sourceFiles) {
+    const priorities = [
+      "src/lib.rs",
+      "src/main.rs",
+      "src/vm.rs",
+      "src/gc.rs",
+      "src/ffi.rs",
+      "src/compiler.rs",
+      "src/index.js",
+      "src/main.js",
+      "main.py",
+      "core.py"
+    ];
+
+    const keyFiles = [];
+    for (const priority of priorities) {
+      if (sourceFiles.includes(priority)) {
+        keyFiles.push(priority);
+      }
+    }
+
+    // 부족하면 처음 파일들 추가
+    if (keyFiles.length < 5) {
+      keyFiles.push(...sourceFiles.slice(0, 5 - keyFiles.length));
+    }
+
+    return keyFiles;
+  }
+
+  /**
+   * AI로 파일 분석
+   */
+  async analyzeFileWithAI(fileName, content) {
+    const prompt = `
+    파일: ${fileName}
+
+    코드:
+    ${content}
+
+    다음을 JSON으로 분석:
+    {
+      "purpose": "파일의 목적",
+      "publicAPI": ["public 함수/클래스", ...],
+      "patterns": ["사용된 디자인 패턴", ...],
+      "dependencies": ["external library", ...],
+      "unsafe": true/false,
+      "ffi": true/false,
+      "globalState": true/false,
+      "complexity": "LOW|MEDIUM|HIGH"
+    }
+    `;
+
+    try {
+      const response = await client.messages.create({
+        model: "claude-opus-4-6",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }]
+      });
+
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+
+      return { raw: text };
+    } catch (e) {
+      console.warn(`⚠️ AI 분석 실패:`, e.message);
+      return { error: e.message };
+    }
+  }
+
+  /**
+   * 저장소 레벨 종합
+   */
+  async synthesizeRepositorySummary(analysis) {
+    const allAPIs = [];
+    const allDeps = new Set();
+    let hasUnsafe = false;
+    let hasFFI = false;
+
+    for (const fileAnalysis of Object.values(analysis.analysis)) {
+      if (fileAnalysis.publicAPI) {
+        allAPIs.push(...fileAnalysis.publicAPI);
+      }
+      if (fileAnalysis.dependencies) {
+        fileAnalysis.dependencies.forEach(d => allDeps.add(d));
+      }
+      hasUnsafe = hasUnsafe || fileAnalysis.unsafe;
+      hasFFI = hasFFI || fileAnalysis.ffi;
+    }
+
+    return {
+      publicAPI: [...new Set(allAPIs)],
+      externalDeps: Array.from(allDeps),
+      risks: {
+        unsafe: hasUnsafe,
+        ffi: hasFFI
+      },
+      fileCount: analysis.files,
+      analyzed: Object.keys(analysis.analysis).length
+    };
+  }
+
+  /**
+   * 인덱스 저장
+   */
+  saveIndex(repoName, analysis) {
+    const filePath = path.join(this.dbDir, `${repoName}.json`);
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify(analysis, null, 2)
+    );
+    console.log(`✅ 저장됨: ${filePath}`);
+  }
+
+  /**
+   * 모든 저장소 인덱싱
+   */
+  async indexAllRepositories(baseDir) {
+    console.log(`\n🔍 저장소 인덱싱 시작: ${baseDir}`);
+    console.log("=".repeat(60));
+
+    const entries = fs.readdirSync(baseDir);
+    const repos = entries.filter(e => {
+      const stat = fs.statSync(path.join(baseDir, e));
+      return stat.isDirectory() && !e.startsWith(".");
+    });
+
+    const allRepos = [];
+
+    for (const repo of repos) {
+      const repoPath = path.join(baseDir, repo);
+      const analysis = await this.analyzeLocalRepository(repoPath, repo);
+      this.saveIndex(repo, analysis);
+      allRepos.push({
+        name: repo,
+        summary: analysis.summary
+      });
+    }
+
+    // 저장소 목록 저장
+    const indexPath = path.join(this.dbDir, "repos.json");
+    fs.writeFileSync(
+      indexPath,
+      JSON.stringify(
+        {
+          timestamp: new Date().toISOString(),
+          totalRepos: allRepos.length,
+          repos: allRepos
+        },
+        null,
+        2
+      )
+    );
+
+    console.log("\n" + "=".repeat(60));
+    console.log(`✅ 인덱싱 완료: ${allRepos.length}개 저장소`);
+
+    return allRepos;
+  }
+
+  /**
+   * 인덱스 조회
+   */
+  loadIndex(repoName) {
+    const filePath = path.join(this.dbDir, `${repoName}.json`);
+    if (fs.existsSync(filePath)) {
+      return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    }
+    return null;
+  }
+
+  /**
+   * 모든 인덱스 로드
+   */
+  loadAllIndexes() {
+    const files = fs.readdirSync(this.dbDir);
+    const indexes = {};
+
+    for (const file of files) {
+      if (file.endsWith(".json") && file !== "repos.json") {
+        const repoName = file.replace(".json", "");
+        indexes[repoName] = this.loadIndex(repoName);
+      }
+    }
+
+    return indexes;
+  }
+}
+
+export default CodeIndexer;

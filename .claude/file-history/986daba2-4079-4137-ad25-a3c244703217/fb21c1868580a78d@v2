@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+통신 비용 모델 (Communication Cost Model)
+
+각 샤딩 전략의 연산 시간과 통신 시간 계산
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import json
+import math
+
+
+@dataclass
+class OperationCost:
+    """연산 비용"""
+    operation_name: str  # "matmul", "reduce" 등
+    work_flops: float  # FLOPs 수
+    peak_flops_per_device: float  # 각 장치의 성능
+    num_devices: int
+
+    def compute_time_ms(self) -> float:
+        """연산 시간 (ms)"""
+        total_flops = self.peak_flops_per_device * self.num_devices
+        return (self.work_flops / total_flops) * 1000 if total_flops > 0 else 0
+
+
+@dataclass
+class CommunicationCost:
+    """통신 비용"""
+    operation: str  # "all_reduce", "all_gather" 등
+    data_size_bytes: float
+    num_devices: int
+    bandwidth_gbps: float
+    latency_us: float
+
+    def time_ms(self) -> float:
+        """통신 시간 (ms)"""
+
+        data_size_gb = self.data_size_bytes / (1024 ** 3)
+        transfer_time_ms = (data_size_gb / self.bandwidth_gbps) * 1000
+
+        if self.operation == "all_reduce":
+            # Ring AllReduce: 2*(N-1) steps
+            steps = 2 * (self.num_devices - 1)
+            adjusted_time = transfer_time_ms * steps / self.num_devices
+
+        elif self.operation == "all_gather":
+            # AllGather: (N-1) steps
+            steps = self.num_devices - 1
+            adjusted_time = transfer_time_ms * steps / self.num_devices
+
+        elif self.operation == "reduce_scatter":
+            # ReduceScatter: (N-1) steps
+            steps = self.num_devices - 1
+            adjusted_time = transfer_time_ms * steps / self.num_devices
+
+        elif self.operation == "all_to_all":
+            # AllToAll: N steps (각 장치가 모든 다른 장치에 전송)
+            adjusted_time = transfer_time_ms * (self.num_devices - 1)
+
+        else:
+            adjusted_time = transfer_time_ms
+
+        # 지연 추가
+        latency_ms = self.latency_us / 1000
+        return adjusted_time + latency_ms
+
+
+class CostModelAnalyzer:
+    """비용 모델 분석"""
+
+    def __init__(self):
+        self.device_flops: Dict[int, float] = {}
+        self.bandwidth_gbps: float = 900.0
+        self.latency_us: float = 1.0
+
+    def set_device_capability(self,
+                             device_id: int,
+                             peak_flops_tflops: float) -> None:
+        """장치 성능 설정"""
+        self.device_flops[device_id] = peak_flops_tflops * 1e12
+
+    def set_network_capability(self,
+                              bandwidth_gbps: float,
+                              latency_us: float) -> None:
+        """네트워크 성능 설정"""
+        self.bandwidth_gbps = bandwidth_gbps
+        self.latency_us = latency_us
+
+    def cost_matmul_with_sharding(self,
+                                 a_shape: Tuple[int, ...],
+                                 b_shape: Tuple[int, ...],
+                                 num_devices: int,
+                                 sharding_strategy: str) -> Dict:
+        """MatMul의 비용 계산 (샤딩 전략별)"""
+
+        # MatMul 연산량: 2 * M * K * N
+        m, k = a_shape[-2], a_shape[-1]
+        n = b_shape[-1]
+        work_flops = 2 * m * k * n
+
+        # 총 성능
+        avg_flops = sum(self.device_flops.values()) / len(self.device_flops) if self.device_flops else 1e12
+        total_flops = avg_flops * num_devices
+
+        compute_time = (work_flops / total_flops) * 1000  # ms
+
+        # 샤딩 전략별 통신
+        if sharding_strategy == "row_sharding":
+            # Weight를 Row로 분할, AllGather 필요
+            comm_volume = (k * n * 4)  # FP32
+            comm_op = CommunicationCost(
+                "all_gather", comm_volume, num_devices,
+                self.bandwidth_gbps, self.latency_us
+            )
+            comm_time = comm_op.time_ms()
+
+        elif sharding_strategy == "column_sharding":
+            # Activation을 Column으로 분할, AllReduce 필요
+            comm_volume = (m * n * 4)  # FP32
+            comm_op = CommunicationCost(
+                "all_reduce", comm_volume, num_devices,
+                self.bandwidth_gbps, self.latency_us
+            )
+            comm_time = comm_op.time_ms()
+
+        elif sharding_strategy == "replicate":
+            # 통신 불필요
+            comm_time = 0
+
+        else:
+            comm_time = 0
+
+        return {
+            "strategy": sharding_strategy,
+            "compute_time_ms": compute_time,
+            "communication_time_ms": comm_time,
+            "total_time_ms": compute_time + comm_time
+        }
+
+    def cost_layer_with_all_strategies(self,
+                                      layer_name: str,
+                                      weight_shape: Tuple[int, ...],
+                                      activation_shape: Tuple[int, ...],
+                                      num_devices: int) -> Dict:
+        """레이어의 모든 샤딩 전략 비용 비교"""
+
+        strategies = ["replicate", "row_sharding", "column_sharding"]
+        results = {}
+
+        for strategy in strategies:
+            cost = self.cost_matmul_with_sharding(
+                activation_shape,
+                weight_shape,
+                num_devices,
+                strategy
+            )
+            results[strategy] = cost
+
+        return {
+            "layer": layer_name,
+            "strategies": results
+        }
+
+    def cost_pipeline_with_mixed_sharding(self,
+                                         layers: List[Tuple[str, Tuple, Tuple]],
+                                         num_devices: int,
+                                         sharding_sequence: List[str]) -> Dict:
+        """파이프라인의 혼합 샤딩 비용 계산"""
+
+        total_compute = 0.0
+        total_communication = 0.0
+        resharding_cost = 0.0
+
+        previous_sharding = None
+
+        for i, (layer_name, weight_shape, activation_shape) in enumerate(layers):
+            current_sharding = sharding_sequence[i] if i < len(sharding_sequence) else "replicate"
+
+            # 이 레이어의 비용
+            layer_cost = self.cost_matmul_with_sharding(
+                activation_shape, weight_shape, num_devices, current_sharding
+            )
+
+            total_compute += layer_cost["compute_time_ms"]
+            total_communication += layer_cost["communication_time_ms"]
+
+            # Resharding 비용 (이전 레이어와 다른 경우)
+            if previous_sharding and previous_sharding != current_sharding:
+                # All-to-All 통신으로 레이아웃 변경
+                data_size = activation_shape[-1] * activation_shape[-2] * 4  # FP32
+                reshape_comm = CommunicationCost(
+                    "all_to_all", data_size, num_devices,
+                    self.bandwidth_gbps, self.latency_us
+                )
+                resharding_cost += reshape_comm.time_ms()
+
+            previous_sharding = current_sharding
+
+        return {
+            "layers": len(layers),
+            "total_compute_ms": total_compute,
+            "total_communication_ms": total_communication,
+            "resharding_cost_ms": resharding_cost,
+            "total_time_ms": total_compute + total_communication + resharding_cost,
+            "sharding_sequence": sharding_sequence
+        }
+
+    def estimate_optimal_sharding(self,
+                                  layer_name: str,
+                                  weight_shape: Tuple[int, ...],
+                                  activation_shape: Tuple[int, ...],
+                                  num_devices: int) -> str:
+        """이 레이어의 최적 샤딩 결정"""
+
+        costs = self.cost_layer_with_all_strategies(
+            layer_name, weight_shape, activation_shape, num_devices
+        )
+
+        # 각 전략의 총 시간으로 비교
+        best_strategy = min(
+            costs["strategies"].items(),
+            key=lambda x: x[1]["total_time_ms"]
+        )
+
+        return best_strategy[0]
+
+    def cross_layer_optimization(self,
+                                layers: List[Tuple[str, Tuple, Tuple]],
+                                num_devices: int) -> Dict:
+        """레이어 간 최적화: Resharding 비용 포함"""
+
+        # 각 레이어의 개별 최적 샤딩
+        individual_sharding = []
+        for layer_name, weight_shape, activation_shape in layers:
+            optimal = self.estimate_optimal_sharding(
+                layer_name, weight_shape, activation_shape, num_devices
+            )
+            individual_sharding.append(optimal)
+
+        # 개별 최적 조합
+        individual_cost = self.cost_pipeline_with_mixed_sharding(
+            layers, num_devices, individual_sharding
+        )
+
+        # Resharding 최소화 조합 (인접 레이어의 샤딩을 동일하게)
+        smoothed_sharding = []
+        prev = None
+        for i, layer_opt in enumerate(individual_sharding):
+            if prev is None:
+                smoothed_sharding.append(layer_opt)
+            else:
+                # 이전과 동일하면 유지, 아니면 통신 비용 고려
+                if layer_opt == prev:
+                    smoothed_sharding.append(layer_opt)
+                else:
+                    # 둘 중 더 많은 레이어를 만족하는 것 선택
+                    smoothed_sharding.append(prev)
+
+            prev = smoothed_sharding[-1]
+
+        smoothed_cost = self.cost_pipeline_with_mixed_sharding(
+            layers, num_devices, smoothed_sharding
+        )
+
+        return {
+            "individual_optimal": {
+                "sharding": individual_sharding,
+                "cost": individual_cost
+            },
+            "resharding_minimized": {
+                "sharding": smoothed_sharding,
+                "cost": smoothed_cost
+            }
+        }
+
+    def report_cost_analysis(self, analysis: Dict) -> str:
+        """비용 분석 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║            COMMUNICATION COST MODEL ANALYSIS                       ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        if "strategies" in analysis:
+            report += f"Layer: {analysis['layer']}\n\n"
+            for strategy, cost in analysis["strategies"].items():
+                report += f"{strategy.upper()}:\n"
+                report += f"  Compute Time: {cost['compute_time_ms']:.2f} ms\n"
+                report += f"  Communication Time: {cost['communication_time_ms']:.2f} ms\n"
+                report += f"  Total Time: {cost['total_time_ms']:.2f} ms\n"
+                report += "\n"
+
+        report += "─" * 68 + "\n"
+
+        return report
+
+    def export_to_json(self, analysis: Dict) -> str:
+        """분석 결과를 JSON으로 내보내기"""
+        return json.dumps(analysis, indent=2)
+

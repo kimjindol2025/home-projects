@@ -1,0 +1,372 @@
+"""
+NLU (Natural Language Understanding) 모듈
+자연어를 Pulse 의도로 변환
+Redis 캐싱 + LLM 기반 분석
+"""
+
+import json
+import hashlib
+import re
+from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Intent:
+    """Pulse 의도 객체"""
+    role: str  # 로서
+    models: list  # 사용할 모델
+    tools: list  # 사용할 도구
+    goal: str  # 해야할일
+    flow: list = None  # 흐름 (선택)
+    deployment: str = None  # 실행
+    constraints: Dict[str, Any] = None  # 제약
+    schedule: Optional[Dict[str, Any]] = None  # 스케줄 정보
+    confidence: float = 0.0  # NLU 신뢰도
+    nlu_method: str = "unknown"  # 사용된 NLU 방법
+
+
+class FastNLU:
+    """빠른 휴리스틱 기반 NLU"""
+
+    def __init__(self):
+        self.logger = logger
+
+    def analyze(self, text: str) -> Tuple[Intent, float]:
+        """
+        빠른 휴리스틱 NLU 분석
+
+        Args:
+            text: 입력 텍스트
+
+        Returns:
+            (Intent, 신뢰도)
+        """
+        try:
+            role = self._extract_role(text)
+            models = self._extract_models(text)
+            tools = self._extract_tools(text)
+            goal = self._extract_goal(text)
+            deployment = self._extract_deployment(text)
+            constraints = self._extract_constraints(text)
+            schedule = self._extract_schedule(text)
+
+            # 신뢰도 계산
+            confidence = self._calculate_confidence(text, tools, deployment)
+
+            intent = Intent(
+                role=role,
+                models=models,
+                tools=tools,
+                goal=goal,
+                deployment=deployment,
+                constraints=constraints,
+                schedule=schedule,
+                confidence=confidence,
+                nlu_method="FastNLU"
+            )
+
+            self.logger.info(f"⚡ FastNLU: 신뢰도 {confidence:.2f}")
+            return intent, confidence
+
+        except Exception as e:
+            self.logger.error(f"❌ FastNLU 분석 실패: {e}")
+            raise
+
+    def _extract_role(self, text: str) -> str:
+        """역할 추출"""
+        if "봇" in text or "에이전트" in text:
+            if "슬랙" in text:
+                return "슬랙 자동화 봇"
+            elif "뉴스" in text:
+                return "뉴스 큐레이션 에이전트"
+            elif "이메일" in text or "메일" in text:
+                return "이메일 자동화 에이전트"
+            elif "모니터" in text or "감시" in text:
+                return "모니터링 에이전트"
+        return "자동화 에이전트"
+
+    def _extract_models(self, text: str) -> list:
+        """모델 추출"""
+        models = []
+        if "로컬" in text or "ollama" in text.lower():
+            models.append("qwen2.5:7b")
+        if "claude" in text.lower() or "클로드" in text:
+            models.append("claude-3-5-sonnet")
+        if "gpt" in text.lower():
+            models.append("gpt-4")
+        if not models:
+            models.append("qwen2.5:7b")  # 기본값
+        return models
+
+    def _extract_tools(self, text: str) -> list:
+        """도구 추출"""
+        tools = []
+        if "슬랙" in text:
+            tools.append("slack")
+        if "이메일" in text or "메일" in text:
+            tools.append("email")
+        if "검색" in text or "뉴스" in text or "구글" in text:
+            tools.append("web_search")
+        if "깃허브" in text or "github" in text.lower() or "pr" in text.lower():
+            tools.append("github")
+        if "트위터" in text or "x" in text or "소셜" in text:
+            tools.append("twitter")
+        return tools or ["web_search"]  # 기본값
+
+    def _extract_goal(self, text: str) -> str:
+        """목표 추출 - 핵심 요청 부분만"""
+        # 불필요한 표현 제거
+        goal = text.strip()
+        goal = re.sub(r'^(좀|한번|한|번|제발|부탁|해줄까?|해줄래?|할래?)\s+', '', goal)
+        goal = re.sub(r'[?？]$', '', goal)
+        return goal
+
+    def _extract_deployment(self, text: str) -> str:
+        """배포 대상 추출"""
+        if "슬랙" in text or "slack" in text.lower():
+            return "slack"
+        elif "이메일" in text or "메일" in text or "email" in text.lower():
+            return "email"
+        elif "매일" in text or "매시간" in text or "매주" in text:
+            return "scheduled"
+        elif "지금" in text or "즉시" in text:
+            return "immediate"
+        return "realtime"
+
+    def _extract_schedule(self, text: str) -> Optional[Dict[str, Any]]:
+        """스케줄 정보 추출"""
+        schedule = None
+
+        # 매일 + 시간
+        daily_match = re.search(r'매일\s+(\d{1,2})[시:]\s*(\d{1,2})?', text)
+        if daily_match:
+            hour = int(daily_match.group(1))
+            minute = int(daily_match.group(2) or 0)
+            schedule = {
+                "type": "daily",
+                "time": f"{hour:02d}:{minute:02d}",
+                "hour": hour,
+                "minute": minute
+            }
+
+        # 매주
+        weekly_match = re.search(r'매주\s*(월|화|수|목|금|토|일)', text)
+        if weekly_match:
+            day_kr_to_en = {"월": "mon", "화": "tue", "수": "wed", "목": "thu", "금": "fri", "토": "sat", "일": "sun"}
+            day = day_kr_to_en.get(weekly_match.group(1))
+            schedule = {"type": "weekly", "day": day}
+
+        # 반복 간격
+        interval_match = re.search(r'(\d+)\s*(분|시간|시|시간마다|분마다)', text)
+        if interval_match:
+            value = int(interval_match.group(1))
+            unit = interval_match.group(2)
+            seconds = value * (60 if "분" in unit else 3600)
+            schedule = {"type": "interval", "seconds": seconds}
+
+        return schedule
+
+    def _extract_constraints(self, text: str) -> Dict[str, Any]:
+        """제약 추출"""
+        constraints = {}
+
+        # 응답 시간 제약
+        time_match = re.search(r'(\d+(?:\.\d+)?)\s*(초|ms|밀리초)?', text)
+        if time_match:
+            value = float(time_match.group(1))
+            unit = time_match.group(2) or "초"
+            ms = value * 1000 if "초" in unit else value
+            constraints["max_response_ms"] = int(ms)
+
+        # 신뢰도 제약
+        confidence_match = re.search(r'(?:신뢰도|정확도|확률)\s*[>>=]\s*([0-9.]+)', text)
+        if confidence_match:
+            constraints["min_confidence"] = float(confidence_match.group(1))
+
+        if not constraints:
+            constraints = {"max_response_ms": 2000, "min_confidence": 0.80}
+
+        return constraints
+
+    def _calculate_confidence(self, text: str, tools: list, deployment: str) -> float:
+        """신뢰도 계산 (0~1)"""
+        score = 0.5  # 기본값
+
+        # 도구가 명시되어 있으면 신뢰도 증가
+        if tools and tools != ["web_search"]:
+            score += 0.2
+
+        # 배포 방식이 구체적이면 신뢰도 증가
+        if deployment != "realtime":
+            score += 0.15
+
+        # 텍스트 길이 (너무 짧으면 신뢰도 감소)
+        if len(text) > 20:
+            score += 0.15
+
+        return min(score, 1.0)
+
+
+class LLMBasedNLU:
+    """LLM 기반 NLU - 복잡한 요청"""
+
+    def __init__(self, llm_manager):
+        self.llm_manager = llm_manager
+        self.logger = logger
+
+    async def analyze(self, text: str) -> Tuple[Intent, float]:
+        """
+        LLM 기반 복잡한 NLU 분석
+
+        Args:
+            text: 입력 텍스트
+
+        Returns:
+            (Intent, 신뢰도)
+        """
+        try:
+            # LLM에게 구조화된 분석 요청
+            prompt = f"""다음 자연어를 Pulse 에이전트 의도로 변환하세요.
+
+요청: "{text}"
+
+다음 JSON 형식으로 응답하세요:
+{{
+    "role": "에이전트의 역할",
+    "models": ["모델1", "모델2"],
+    "tools": ["도구1", "도구2"],
+    "goal": "수행할 목표",
+    "deployment": "slack|email|scheduled|immediate",
+    "schedule": {{"type": "daily|weekly|interval", "time": "HH:MM"}},
+    "constraints": {{"max_response_ms": 2000, "min_confidence": 0.8}},
+    "confidence": 0.95
+}}"""
+
+            response, metadata = await self.llm_manager.generate_structured(
+                prompt,
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string"},
+                        "models": {"type": "array", "items": {"type": "string"}},
+                        "tools": {"type": "array", "items": {"type": "string"}},
+                        "goal": {"type": "string"},
+                        "deployment": {"type": "string"},
+                        "confidence": {"type": "number"}
+                    }
+                }
+            )
+
+            if isinstance(response, dict) and "error" not in response:
+                intent = Intent(
+                    role=response.get("role", "자동화 에이전트"),
+                    models=response.get("models", ["qwen2.5:7b"]),
+                    tools=response.get("tools", ["web_search"]),
+                    goal=response.get("goal", text),
+                    deployment=response.get("deployment", "realtime"),
+                    schedule=response.get("schedule"),
+                    constraints=response.get("constraints", {}),
+                    confidence=response.get("confidence", 0.90),
+                    nlu_method="LLMBasedNLU"
+                )
+                self.logger.info(f"🤖 LLMBasedNLU: 신뢰도 {intent.confidence:.2f}")
+                return intent, intent.confidence
+
+        except Exception as e:
+            self.logger.error(f"❌ LLMBasedNLU 분석 실패: {e}")
+
+        # 폴백: FastNLU
+        fast_nlu = FastNLU()
+        return await asyncio.to_thread(fast_nlu.analyze, text)
+
+
+class CachedNLUProcessor:
+    """Redis 캐싱을 포함한 NLU 프로세서"""
+
+    def __init__(self, llm_manager, redis_client=None):
+        self.fast_nlu = FastNLU()
+        self.llm_based_nlu = LLMBasedNLU(llm_manager)
+        self.redis = redis_client
+        self.cache_ttl = 3600  # 1시간
+        self.logger = logger
+
+    def _get_cache_key(self, text: str) -> str:
+        """캐시 키 생성"""
+        return f"nlu:{hashlib.md5(text.encode()).hexdigest()}"
+
+    async def analyze(self, text: str, force_llm: bool = False) -> Intent:
+        """
+        캐싱을 포함한 NLU 분석
+
+        Args:
+            text: 입력 텍스트
+            force_llm: LLM 강제 사용 여부
+
+        Returns:
+            Intent 객체
+        """
+        cache_key = self._get_cache_key(text)
+
+        # 1. Redis 캐시 조회
+        if self.redis and not force_llm:
+            try:
+                cached = await self._get_cache(cache_key)
+                if cached:
+                    self.logger.info("✅ NLU 캐시 히트")
+                    return cached
+            except Exception as e:
+                self.logger.warning(f"⚠️ 캐시 조회 실패: {e}")
+
+        # 2. FastNLU 시도 (신뢰도 >= 0.85면 사용)
+        intent, confidence = self.fast_nlu.analyze(text)
+        if confidence >= 0.85 and not force_llm:
+            self.logger.info(f"✅ FastNLU 사용 (신뢰도 {confidence:.2f})")
+            await self._set_cache(cache_key, intent)
+            return intent
+
+        # 3. LLMBasedNLU 사용
+        self.logger.info(f"🤖 LLMBasedNLU 사용 (FastNLU 신뢰도 {confidence:.2f})")
+        intent, confidence = await self.llm_based_nlu.analyze(text)
+        await self._set_cache(cache_key, intent)
+        return intent
+
+    async def _get_cache(self, key: str) -> Optional[Intent]:
+        """캐시에서 Intent 조회"""
+        try:
+            cached_json = await self.redis.get(key)
+            if cached_json:
+                data = json.loads(cached_json)
+                return Intent(**data)
+        except Exception as e:
+            self.logger.warning(f"⚠️ 캐시 조회 오류: {e}")
+        return None
+
+    async def _set_cache(self, key: str, intent: Intent):
+        """캐시에 Intent 저장"""
+        try:
+            intent_json = json.dumps(asdict(intent), default=str)
+            if self.redis:
+                await self.redis.setex(key, self.cache_ttl, intent_json)
+        except Exception as e:
+            self.logger.warning(f"⚠️ 캐시 저장 오류: {e}")
+
+
+# 레거시 호환성을 위한 NLUProcessor 클래스
+class NLUProcessor:
+    """호환성을 위한 래퍼"""
+
+    def __init__(self, llm_manager=None, redis_client=None):
+        self.cached_processor = CachedNLUProcessor(llm_manager, redis_client)
+
+    async def analyze(self, text: str, force_llm: bool = False) -> Intent:
+        """자연어 분석"""
+        return await self.cached_processor.analyze(text, force_llm)
+
+
+# 비동기 호출을 위한 헬퍼
+import asyncio

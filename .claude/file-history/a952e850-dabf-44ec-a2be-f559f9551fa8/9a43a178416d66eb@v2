@@ -1,0 +1,539 @@
+/**
+ * FreeLang v4 보안 함수 — 비밀번호, 토큰, 입력 정제
+ *
+ * 모듈:
+ * 1. 비밀번호 관리 (Bcrypt 스타일 + Salt)
+ * 2. JWT 토큰 검증
+ * 3. 입력 정제 (XSS, SQL Injection, 명령어 인젝션)
+ * 4. OWASP 입력 검증
+ */
+
+import * as crypto from "crypto";
+import { fl_sha256, fl_sha512, fl_md5, fl_hmac, fl_base64_encode, fl_base64_decode, constantTimeEqual } from "./crypto-engine";
+
+// ============================================================
+// 1. 비밀번호 해싱 (PBKDF2 스타일)
+// ============================================================
+
+export interface PasswordHash {
+  hash: string;
+  salt: string;
+  iterations: number;
+  algorithm: string;
+}
+
+/**
+ * PBKDF2 기반 비밀번호 해싱
+ * @param password 평문 비밀번호
+ * @param saltBytes 소금 바이트 수 (기본: 16)
+ * @param iterations 반복 횟수 (기본: 100,000)
+ */
+export function hashPassword(
+  password: string,
+  saltBytes: number = 16,
+  iterations: number = 100000
+): PasswordHash {
+  const salt = crypto.randomBytes(saltBytes).toString("hex");
+
+  const hash = crypto
+    .pbkdf2Sync(password, salt, iterations, 32, "sha256")
+    .toString("hex");
+
+  return {
+    hash,
+    salt,
+    iterations,
+    algorithm: "PBKDF2-SHA256",
+  };
+}
+
+/**
+ * 비밀번호 검증
+ * @param password 입력된 평문 비밀번호
+ * @param storedHash 저장된 PasswordHash
+ */
+export function verifyPassword(password: string, storedHash: PasswordHash): boolean {
+  try {
+    const derivedHash = crypto
+      .pbkdf2Sync(password, storedHash.salt, storedHash.iterations, 32, "sha256")
+      .toString("hex");
+
+    // 상수-시간 비교로 타이밍 공격 방지
+    return crypto.timingSafeEqual(
+      Buffer.from(derivedHash),
+      Buffer.from(storedHash.hash)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 비밀번호 강도 검증
+ * 요구사항:
+ * - 최소 8자
+ * - 대문자 1개 이상
+ * - 소문자 1개 이상
+ * - 숫자 1개 이상
+ * - 특수문자 1개 이상
+ */
+export function validatePasswordStrength(
+  password: string
+): { valid: boolean; strength: "weak" | "medium" | "strong"; issues: string[] } {
+  const issues: string[] = [];
+
+  if (password.length < 8) issues.push("최소 8자 필요");
+  if (!/[A-Z]/.test(password)) issues.push("대문자 1개 이상 필요");
+  if (!/[a-z]/.test(password)) issues.push("소문자 1개 이상 필요");
+  if (!/[0-9]/.test(password)) issues.push("숫자 1개 이상 필요");
+  if (!/[!@#$%^&*()_+\-=\[\]{};:'",.<>?/\\|`~]/.test(password)) {
+    issues.push("특수문자 1개 이상 필요");
+  }
+
+  // 강도 판정: 3개 이상 누락 = weak, 1-2개 누락 = medium, 0개 누락 = strong
+  const strength = issues.length === 0 ? "strong" : issues.length >= 3 ? "weak" : "medium";
+  return {
+    valid: issues.length === 0,
+    strength,
+    issues,
+  };
+}
+
+// ============================================================
+// 2. JWT 토큰 생성 및 검증
+// ============================================================
+
+export interface JWTPayload {
+  sub?: string;        // Subject (user ID)
+  exp?: number;        // Expiration time
+  iat?: number;        // Issued at
+  aud?: string;        // Audience
+  [key: string]: any;
+}
+
+export interface JWTToken {
+  header: Record<string, any>;
+  payload: JWTPayload;
+  signature: string;
+  token: string;
+}
+
+/**
+ * JWT 토큰 생성
+ * @param payload 페이로드
+ * @param secret 서명 키
+ * @param expiresIn 만료 시간 (초, 0 = 무제한)
+ */
+export function createJWT(
+  payload: JWTPayload,
+  secret: string,
+  expiresIn: number = 3600
+): JWTToken {
+  const header = { alg: "HS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+
+  const finalPayload = {
+    ...payload,
+    iat: now,
+    ...(expiresIn !== 0 && { exp: now + expiresIn }),  // expiresIn이 0이 아니면 exp 설정 (음수도 포함)
+  };
+
+  // Base64URL 인코딩 (표준 Base64에서 +,/ 를 -,_ 로 변경)
+  const headerB64 = base64urlEncode(JSON.stringify(header));
+  const payloadB64 = base64urlEncode(JSON.stringify(finalPayload));
+
+  // 서명 생성
+  const message = `${headerB64}.${payloadB64}`;
+  const signature = fl_hmac(message, secret);
+
+  return {
+    header,
+    payload: finalPayload,
+    signature,
+    token: `${message}.${signature}`,
+  };
+}
+
+/**
+ * JWT 토큰 검증
+ * @param token JWT 토큰
+ * @param secret 서명 키
+ */
+export function verifyJWT(token: string, secret: string): { valid: boolean; payload?: JWTPayload; error?: string } {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) {
+      return { valid: false, error: "유효하지 않은 토큰 형식" };
+    }
+
+    const [headerB64, payloadB64, signature] = parts;
+
+    // 서명 검증
+    const message = `${headerB64}.${payloadB64}`;
+    const expectedSignature = fl_hmac(message, secret);
+
+    // 상수-시간 비교
+    if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature))) {
+      return { valid: false, error: "서명 검증 실패" };
+    }
+
+    // 페이로드 디코딩
+    const payloadStr = base64urlDecode(payloadB64);
+    const payload = JSON.parse(payloadStr);
+
+    // 만료 검증
+    if (payload.exp) {
+      const now = Math.floor(Date.now() / 1000);
+      if (now > payload.exp) {
+        return { valid: false, error: "토큰 만료됨" };
+      }
+    }
+
+    return { valid: true, payload };
+  } catch (e: any) {
+    return { valid: false, error: e.message };
+  }
+}
+
+// ============================================================
+// 3. 입력 정제 (XSS, SQL Injection 방지)
+// ============================================================
+
+/**
+ * HTML 엔티티 이스케이프 (XSS 방지)
+ */
+export function sanitizeHTML(input: string): string {
+  const htmlEscapeMap: Record<string, string> = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  };
+  return input.replace(/[&<>"']/g, (char) => htmlEscapeMap[char] || char);
+}
+
+/**
+ * SQL 쿼리 문자열 이스케이프 (기본적인 방지, prepared statements 권장)
+ */
+export function escapeSQLString(input: string): string {
+  // 따옴표를 이중 따옴표로 변환 (SQL 표준)
+  return "'" + input.replace(/'/g, "''") + "'";
+}
+
+/**
+ * 명령어 인젝션 방지 (셸 메타 문자 이스케이프)
+ */
+export function sanitizeShellInput(input: string): string {
+  const shellMetaChars = ["&", "|", ";", "$", "`", "\\", "(", ")", "{", "}", "<", ">", "!", "*", "?", "'", '"'];
+  let result = input;
+  for (const char of shellMetaChars) {
+    result = result.split(char).join("\\" + char);
+  }
+  return result;
+}
+
+/**
+ * 경로 트래버설 공격 방지
+ */
+export function sanitizePath(input: string): string {
+  // ../ 및 절대 경로 제거
+  let sanitized = input.replace(/\.\./g, "").replace(/^\/+/, "");
+  // 너무 짧거나 이상한 경로 필터링
+  sanitized = sanitized.replace(/[<>"|?*\x00-\x1f]/g, "");
+  return sanitized;
+}
+
+/**
+ * 이메일 유효성 검증 (기본적인 정규식)
+ */
+export function validateEmail(email: string): boolean {
+  const re = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return re.test(email) && email.length <= 254;
+}
+
+/**
+ * URL 유효성 검증
+ */
+export function validateURL(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    // javascript: 및 data: 프로토콜 거부
+    if (parsed.protocol === "javascript:" || parsed.protocol === "data:") {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 전화번호 유효성 검증 (기본 국제 형식)
+ */
+export function validatePhoneNumber(phone: string): boolean {
+  const re = /^\+?[1-9]\d{1,14}$/;
+  return re.test(phone.replace(/[\s\-()]/g, ""));
+}
+
+/**
+ * IPv4 주소 유효성 검증
+ */
+export function validateIPv4(ip: string): boolean {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((part) => {
+    const num = parseInt(part, 10);
+    return !isNaN(num) && num >= 0 && num <= 255;
+  });
+}
+
+/**
+ * UUID v4 유효성 검증
+ */
+export function validateUUID(uuid: string): boolean {
+  const re = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return re.test(uuid);
+}
+
+// ============================================================
+// 4. 속도 제한 (Rate Limiting) — 메모리 기반
+// ============================================================
+
+export interface RateLimitConfig {
+  maxRequests: number;  // 시간 창 내 최대 요청 수
+  windowMs: number;     // 시간 창 (ms)
+}
+
+class RateLimiter {
+  private requests: Map<string, number[]> = new Map();
+  private config: RateLimitConfig;
+
+  constructor(config: RateLimitConfig) {
+    this.config = config;
+  }
+
+  isAllowed(key: string): boolean {
+    const now = Date.now();
+    const timestamps = this.requests.get(key) || [];
+
+    // 시간 창 밖의 요청 제거
+    const withinWindow = timestamps.filter((t) => now - t < this.config.windowMs);
+
+    if (withinWindow.length < this.config.maxRequests) {
+      withinWindow.push(now);
+      this.requests.set(key, withinWindow);
+      return true;
+    }
+
+    return false;
+  }
+
+  getRemainingRequests(key: string): number {
+    const now = Date.now();
+    const timestamps = this.requests.get(key) || [];
+    const withinWindow = timestamps.filter((t) => now - t < this.config.windowMs);
+    return Math.max(0, this.config.maxRequests - withinWindow.length);
+  }
+}
+
+export function createRateLimiter(config: RateLimitConfig): RateLimiter {
+  return new RateLimiter(config);
+}
+
+// ============================================================
+// 헬퍼 함수
+// ============================================================
+
+function base64urlEncode(str: string): string {
+  return fl_base64_encode(str)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=/g, "");
+}
+
+function base64urlDecode(str: string): string {
+  // 패딩 복원
+  let padded = str + "===".slice((str.length + 3) % 4);
+  padded = padded.replace(/-/g, "+").replace(/_/g, "/");
+
+  const result = fl_base64_decode(padded);
+  if (!result.ok) throw new Error("base64 디코딩 실패");
+  return (result as any).val;
+}
+
+/**
+ * 임의 토큰 생성
+ */
+export function generateSecureToken(length: number = 32): string {
+  return crypto.randomBytes(length).toString("hex");
+}
+
+/**
+ * 난수 생성 (Secure Random)
+ */
+export function generateSecureRandomInt(min: number, max: number): number {
+  const range = max - min;
+  const bytesNeeded = Math.ceil(Math.log(range) / Math.log(256));
+  const bytes = crypto.randomBytes(bytesNeeded);
+
+  let result = 0;
+  for (let i = 0; i < bytesNeeded; i++) {
+    result = result * 256 + bytes[i];
+  }
+
+  return min + (result % range);
+}
+
+// ============================================================
+// 🆕 Security Namespace Object (Phase 3.3)
+// ============================================================
+
+/**
+ * Security namespace — 보안 함수 모음
+ * 7개 카테고리: 비밀번호, JWT, 암호화, 검증, 정제, 생성, 속도제한
+ */
+export const Security = {
+  // ── Password ──────────────────────────
+  /**
+   * hashPassword — PBKDF2 기반 비밀번호 해싱
+   */
+  hashPassword: (
+    password: string,
+    saltBytes?: number,
+    iterations?: number
+  ): PasswordHash => hashPassword(password, saltBytes, iterations),
+
+  /**
+   * verifyPassword — PBKDF2 비밀번호 검증
+   */
+  verifyPassword: (password: string, storedHash: PasswordHash): boolean =>
+    verifyPassword(password, storedHash),
+
+  /**
+   * validatePasswordStrength — 비밀번호 강도 검증
+   */
+  validatePasswordStrength: (
+    password: string
+  ): { valid: boolean; strength: "weak" | "medium" | "strong"; issues: string[] } =>
+    validatePasswordStrength(password),
+
+  /**
+   * constantTimeEqual — 상수시간 문자열 비교 (타이밍 공격 방지)
+   */
+  constantTimeEqual: (a: string, b: string): boolean => constantTimeEqual(a, b),
+
+  // ── JWT ────────────────────────────────
+  /**
+   * createJWT — JWT 토큰 생성
+   */
+  createJWT: (payload: JWTPayload, secret: string, expiresIn?: number): JWTToken =>
+    createJWT(payload, secret, expiresIn),
+
+  /**
+   * verifyJWT — JWT 토큰 검증
+   */
+  verifyJWT: (
+    token: string,
+    secret: string
+  ): { valid: boolean; payload?: JWTPayload; error?: string } =>
+    verifyJWT(token, secret),
+
+  // ── Crypto Engine ──────────────────────
+  /**
+   * sha256 — SHA-256 해싱
+   */
+  sha256: (input: string): string => fl_sha256(input),
+
+  /**
+   * sha512 — SHA-512 해싱
+   */
+  sha512: (input: string): string => fl_sha512(input),
+
+  /**
+   * md5 — MD5 해싱 (약한 알고리즘 경고)
+   */
+  md5: (input: string): string => fl_md5(input),
+
+  /**
+   * hmac — HMAC-SHA256 메시지 인증
+   */
+  hmac: (message: string, secret: string): string => fl_hmac(message, secret),
+
+  /**
+   * base64Encode — Base64 인코딩
+   */
+  base64Encode: (input: string): string => fl_base64_encode(input),
+
+  /**
+   * base64Decode — Base64 디코딩
+   */
+  base64Decode: (input: string): { ok: true; val: string } | { ok: false; err: string } =>
+    fl_base64_decode(input),
+
+  // ── Validation ─────────────────────────
+  /**
+   * validateEmail — 이메일 형식 검증
+   */
+  validateEmail: (email: string): boolean => validateEmail(email),
+
+  /**
+   * validateIPv4 — IPv4 주소 검증
+   */
+  validateIPv4: (ip: string): boolean => validateIPv4(ip),
+
+  /**
+   * validateURL — URL 형식 검증
+   */
+  validateURL: (url: string): boolean => validateURL(url),
+
+  /**
+   * validateUUID — UUID 형식 검증
+   */
+  validateUUID: (uuid: string): boolean => validateUUID(uuid),
+
+  /**
+   * validatePhoneNumber — 전화번호 형식 검증
+   */
+  validatePhoneNumber: (phone: string): boolean => validatePhoneNumber(phone),
+
+  // ── Sanitization ───────────────────────
+  /**
+   * sanitizeHTML — HTML 입력 정제 (XSS 방지)
+   */
+  sanitizeHTML: (input: string): string => sanitizeHTML(input),
+
+  /**
+   * sanitizePath — 경로 입력 정제 (경로 조회 공격 방지)
+   */
+  sanitizePath: (input: string): string => sanitizePath(input),
+
+  /**
+   * sanitizeShellInput — 셸 명령어 입력 정제 (명령어 인젝션 방지)
+   */
+  sanitizeShellInput: (input: string): string => sanitizeShellInput(input),
+
+  /**
+   * escapeSQLString — SQL 입력 정제 (SQL Injection 방지)
+   */
+  escapeSQLString: (input: string): string => escapeSQLString(input),
+
+  // ── Generation ─────────────────────────
+  /**
+   * generateSecureToken — 보안 토큰 생성
+   */
+  generateSecureToken: (length?: number): string => generateSecureToken(length),
+
+  /**
+   * generateSecureRandomInt — 보안 난수 생성
+   */
+  generateSecureRandomInt: (min: number, max: number): number =>
+    generateSecureRandomInt(min, max),
+
+  // ── Rate Limiting ──────────────────────
+  /**
+   * createRateLimiter — 속도 제한 인스턴스 생성
+   */
+  createRateLimiter: (config: RateLimitConfig): RateLimiter =>
+    createRateLimiter(config),
+} as const;

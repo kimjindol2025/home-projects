@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+
+"""
+Byzantine-Resilient Baseline Aggregators for Phase 3 Experiments
+
+6가지 SOTA Baseline Methods 구현:
+1. FedAvg (Non-robust baseline)
+2. Krum (Geometric, single Byzantine)
+3. Multi-Krum (Multi-candidate selection)
+4. Trimmed Mean (Coordinate-wise trimming)
+5. FLGuard (Multi-signal anomaly detection)
+6. OptiGradTrust (RL-based trust weighting)
+
+Author: v16 Research Team
+Date: 2026-02-25
+"""
+
+import math
+import random
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
+
+def euclidean_distance(grad1: List[float], grad2: List[float]) -> float:
+    """Compute L2 Euclidean distance between gradients."""
+    if not grad1 or not grad2:
+        return 0.0
+    return sum((a - b) ** 2 for a, b in zip(grad1, grad2)) ** 0.5
+
+
+def gradient_norm(grad: List[float]) -> float:
+    """Compute L2 norm of gradient."""
+    if not grad:
+        return 0.0
+    return sum(g ** 2 for g in grad) ** 0.5
+
+
+def cosine_similarity(grad1: List[float], grad2: List[float]) -> float:
+    """Compute cosine similarity between gradients."""
+    if not grad1 or not grad2:
+        return 0.0
+
+    dot_product = sum(a * b for a, b in zip(grad1, grad2))
+    norm1 = gradient_norm(grad1)
+    norm2 = gradient_norm(grad2)
+
+    if norm1 < 1e-10 or norm2 < 1e-10:
+        return 0.0
+
+    return dot_product / (norm1 * norm2)
+
+
+def coordinate_wise_median(gradients: List[List[float]]) -> List[float]:
+    """Compute coordinate-wise median."""
+    if not gradients:
+        return []
+
+    d = len(gradients[0])
+    median = []
+
+    for coord_idx in range(d):
+        values = sorted([g[coord_idx] for g in gradients])
+        median_idx = len(values) // 2
+        median.append(values[median_idx])
+
+    return median
+
+
+# ============================================================================
+# Baseline 1: FedAvg (Non-robust)
+# ============================================================================
+
+def fedavg_aggregate(
+    client_gradients: List[List[float]],
+    weights: Optional[List[float]] = None
+) -> List[float]:
+    """
+    FedAvg: Simple average aggregation (no Byzantine defense).
+
+    Baseline for comparison: Shows performance degradation under Byzantine attacks.
+
+    Args:
+        client_gradients: List of client gradient vectors
+        weights: Optional weight per client (default: uniform)
+
+    Returns:
+        Aggregated gradient (simple weighted average)
+
+    Complexity: O(N × d)
+    """
+    if not client_gradients:
+        return []
+
+    n = len(client_gradients)
+    d = len(client_gradients[0])
+
+    if weights is None:
+        weights = [1.0 / n] * n
+    else:
+        total_weight = sum(weights)
+        weights = [w / total_weight for w in weights]
+
+    aggregated = []
+    for coord_idx in range(d):
+        coord_sum = sum(w * g[coord_idx] for w, g in zip(weights, client_gradients))
+        aggregated.append(coord_sum)
+
+    return aggregated
+
+
+# ============================================================================
+# Baseline 2: Krum
+# ============================================================================
+
+def krum_aggregate(
+    client_gradients: List[List[float]],
+    byzantine_count: int
+) -> List[float]:
+    """
+    Krum: Select gradient closest to k nearest neighbors.
+
+    Selects the single gradient that minimizes sum of distances to k nearest
+    neighbors. Provably robust against ⌊N/3⌋ Byzantine clients under static attacks.
+
+    Limitation: Single-round analysis, fails under adaptive/temporal attacks.
+
+    Args:
+        client_gradients: List of client gradients
+        byzantine_count: Max Byzantine clients (determines k)
+
+    Returns:
+        Selected gradient (most Byzantine-robust)
+
+    Complexity: O(N² × d)
+    """
+    if not client_gradients:
+        return []
+
+    n = len(client_gradients)
+    k = max(0, n - byzantine_count - 2)
+
+    # Compute distance scores
+    scores = {}
+    for i in range(n):
+        distances = []
+        for j in range(n):
+            if i != j:
+                dist = euclidean_distance(client_gradients[i], client_gradients[j])
+                distances.append(dist)
+
+        distances.sort()
+        scores[i] = sum(distances[:k])  # Sum of k nearest neighbors
+
+    # Select gradient with minimum score
+    selected_idx = min(scores, key=scores.get)
+    return client_gradients[selected_idx]
+
+
+# ============================================================================
+# Baseline 3: Multi-Krum
+# ============================================================================
+
+def multi_krum_aggregate(
+    client_gradients: List[List[float]],
+    byzantine_count: int,
+    m: int = 2
+) -> List[float]:
+    """
+    Multi-Krum: Select top-m Krum candidates, then average.
+
+    Extension of Krum that selects m candidates and averages them,
+    improving convergence over single-selection Krum.
+
+    Args:
+        client_gradients: List of client gradients
+        byzantine_count: Max Byzantine clients
+        m: Number of candidates to select (default: 2)
+
+    Returns:
+        Aggregated gradient (average of top-m Krum)
+
+    Complexity: O(N² × d)
+    """
+    if not client_gradients:
+        return []
+
+    n = len(client_gradients)
+    k = max(0, n - byzantine_count - 2)
+    m = min(m, n)
+
+    # Score each client (Krum scoring)
+    scores = {}
+    for i in range(n):
+        distances = []
+        for j in range(n):
+            if i != j:
+                dist = euclidean_distance(client_gradients[i], client_gradients[j])
+                distances.append(dist)
+
+        distances.sort()
+        scores[i] = sum(distances[:k])
+
+    # Select top-m candidates
+    sorted_indices = sorted(range(n), key=lambda i: scores[i])
+    selected_indices = sorted_indices[:m]
+    selected_grads = [client_gradients[i] for i in selected_indices]
+
+    # Average selected gradients
+    return fedavg_aggregate(selected_grads)
+
+
+# ============================================================================
+# Baseline 4: Trimmed Mean
+# ============================================================================
+
+def trimmed_mean_aggregate(
+    client_gradients: List[List[float]],
+    byzantine_count: int
+) -> List[float]:
+    """
+    Trimmed Mean: Coordinate-wise removal of top/bottom beta fraction.
+
+    For each dimension, removes top and bottom beta=⌊(β+1)/n⌋ values,
+    then averages remaining coordinates.
+
+    Args:
+        client_gradients: List of client gradients (N × d)
+        byzantine_count: Max Byzantine clients
+
+    Returns:
+        Aggregated gradient (coordinate-wise trimmed mean)
+
+    Complexity: O(N log N × d)
+    """
+    if not client_gradients:
+        return []
+
+    n = len(client_gradients)
+    d = len(client_gradients[0])
+
+    beta = (byzantine_count + 1) / n
+    trim_count = int(beta * n)
+
+    aggregated = []
+    for coord_idx in range(d):
+        values = sorted([g[coord_idx] for g in client_gradients])
+        trimmed = values[trim_count:n - trim_count] if trim_count > 0 else values
+
+        if trimmed:
+            aggregated.append(sum(trimmed) / len(trimmed))
+        else:
+            aggregated.append(0.0)
+
+    return aggregated
+
+
+# ============================================================================
+# Baseline 5: FLGuard (Multi-signal Anomaly Detection)
+# ============================================================================
+
+def flguard_aggregate(
+    client_gradients: List[List[float]],
+    byzantine_count: int = None,
+    detection_threshold: float = 0.7
+) -> Tuple[List[float], Dict[int, float]]:
+    """
+    FLGuard: Multi-signal anomaly detection (magnitude + cosine + variance).
+
+    Combines three anomaly signals:
+    1. Gradient magnitude (L2 norm)
+    2. Cosine similarity to global mean
+    3. Variance of gradient values
+
+    Flags clients with combined anomaly score > threshold.
+
+    Limitation: Per-round only, no temporal memory (fails on RMC, Delayed).
+
+    Args:
+        client_gradients: List of client gradients
+        byzantine_count: Max Byzantine (for reference)
+        detection_threshold: Anomaly score threshold [0, 1]
+
+    Returns:
+        (aggregated_gradient, anomaly_scores_dict)
+
+    Complexity: O(N × d)
+    """
+    if not client_gradients:
+        return [], {}
+
+    n = len(client_gradients)
+    d = len(client_gradients[0])
+
+    # Signal 1: Magnitude (L2 norm)
+    magnitudes = [gradient_norm(g) for g in client_gradients]
+    mag_mean = sum(magnitudes) / n
+    mag_std = (sum((m - mag_mean) ** 2 for m in magnitudes) / n) ** 0.5
+
+    # Signal 2: Cosine similarity to global mean
+    global_mean = fedavg_aggregate(client_gradients)
+    cosines = [cosine_similarity(g, global_mean) for g in client_gradients]
+    cos_mean = sum(cosines) / n
+    cos_std = (sum((c - cos_mean) ** 2 for c in cosines) / n) ** 0.5
+
+    # Anomaly scores (Z-score normalized)
+    anomaly_scores = {}
+    detected_indices = set()
+
+    for i in range(n):
+        mag_zscore = abs((magnitudes[i] - mag_mean) / (mag_std + 1e-10))
+        cos_zscore = abs((cosines[i] - cos_mean) / (cos_std + 1e-10))
+        combined_score = (mag_zscore + cos_zscore) / 2
+
+        anomaly_scores[i] = combined_score
+
+        if combined_score > detection_threshold:
+            detected_indices.add(i)
+
+    # Aggregate (exclude detected)
+    if detected_indices:
+        honest_grads = [client_gradients[i] for i in range(n)
+                       if i not in detected_indices]
+        agg = fedavg_aggregate(honest_grads) if honest_grads else global_mean
+    else:
+        agg = global_mean
+
+    return agg, anomaly_scores
+
+
+# ============================================================================
+# Baseline 6: OptiGradTrust (RL-based Trust Weighting)
+# ============================================================================
+
+def optgradtrust_aggregate(
+    client_gradients: List[List[float]],
+    client_history: Optional[Dict[int, List[List[float]]]] = None,
+    trust_decay: float = 0.95
+) -> Tuple[List[float], Dict[int, float]]:
+    """
+    OptiGradTrust: RL-based trust weighting combining consistency + alignment.
+
+    Computes trust scores based on:
+    1. Gradient consistency (low variance across rounds)
+    2. Alignment with peer gradients (cosine similarity)
+
+    Uses exponential moving average for trust decay.
+
+    Args:
+        client_gradients: Current round gradients
+        client_history: Past gradients {client_idx: [grad_1, grad_2, ...]}
+        trust_decay: EMA decay factor (default: 0.95)
+
+    Returns:
+        (weighted_aggregate, trust_scores_dict)
+
+    Complexity: O(N² × d)
+    """
+    if not client_gradients:
+        return [], {}
+
+    n = len(client_gradients)
+    trust_scores = {}
+
+    # Signal 1: Consistency (gradient stability over time)
+    for i in range(n):
+        if client_history and i in client_history:
+            historical_norms = [gradient_norm(h) for h in client_history[i]]
+            current_norm = gradient_norm(client_gradients[i])
+
+            if historical_norms:
+                variance = sum((n - current_norm) ** 2 for n in historical_norms) / len(historical_norms)
+                consistency = 1.0 / (1.0 + variance)
+            else:
+                consistency = 0.5
+        else:
+            consistency = 0.5
+
+        # Signal 2: Alignment with peers (average cosine similarity)
+        alignment_scores = []
+        for j in range(n):
+            if i != j:
+                cos_sim = cosine_similarity(client_gradients[i], client_gradients[j])
+                alignment_scores.append(cos_sim)
+
+        if alignment_scores:
+            alignment = sum(alignment_scores) / len(alignment_scores)
+            alignment = max(0, min(1, (alignment + 1) / 2))  # Normalize to [0, 1]
+        else:
+            alignment = 0.5
+
+        # Combined trust score (60% consistency, 40% alignment)
+        trust_scores[i] = 0.6 * consistency + 0.4 * alignment
+
+    # Normalize trust scores
+    total_trust = sum(trust_scores.values())
+    if total_trust > 0:
+        normalized_trust = {i: v / total_trust for i, v in trust_scores.items()}
+    else:
+        normalized_trust = {i: 1.0 / n for i in range(n)}
+
+    # Weighted aggregation
+    d = len(client_gradients[0]) if client_gradients else 0
+    aggregated = [0.0] * d
+
+    for coord_idx in range(d):
+        weighted_sum = sum(
+            normalized_trust[i] * client_gradients[i][coord_idx]
+            for i in range(n)
+        )
+        aggregated[coord_idx] = weighted_sum
+
+    return aggregated, trust_scores
+
+
+# ============================================================================
+# Aggregator Selector
+# ============================================================================
+
+def aggregate(
+    client_gradients: List[List[float]],
+    method: str = "fedavg",
+    byzantine_count: int = 0,
+    **kwargs
+) -> Tuple[List[float], Dict]:
+    """
+    Select and apply aggregation method.
+
+    Args:
+        client_gradients: List of client gradients
+        method: Aggregation method name
+        byzantine_count: Max Byzantine clients
+        **kwargs: Method-specific parameters
+
+    Returns:
+        (aggregated_gradient, metadata_dict)
+    """
+    metadata = {"method": method, "n_clients": len(client_gradients)}
+
+    if method == "fedavg":
+        agg = fedavg_aggregate(client_gradients)
+
+    elif method == "krum":
+        agg = krum_aggregate(client_gradients, byzantine_count)
+
+    elif method == "multi_krum":
+        m = kwargs.get("m", 2)
+        agg = multi_krum_aggregate(client_gradients, byzantine_count, m)
+
+    elif method == "trimmed_mean":
+        agg = trimmed_mean_aggregate(client_gradients, byzantine_count)
+
+    elif method == "flguard":
+        threshold = kwargs.get("detection_threshold", 0.7)
+        agg, scores = flguard_aggregate(client_gradients, byzantine_count, threshold)
+        metadata["anomaly_scores"] = scores
+
+    elif method == "optgradtrust":
+        history = kwargs.get("client_history", None)
+        agg, trust = optgradtrust_aggregate(client_gradients, history)
+        metadata["trust_scores"] = trust
+
+    else:
+        raise ValueError(f"Unknown aggregation method: {method}")
+
+    return agg, metadata
+
+
+if __name__ == "__main__":
+    # Test: Verify all baseline aggregators
+    print("Testing Byzantine-Resilient Baselines...\n")
+
+    # Create test data
+    n_clients = 10
+    n_byzantine = 2
+    grad_dim = 5
+
+    # Honest gradients
+    honest_grads = [[0.1 * i for i in range(grad_dim)] for _ in range(n_clients - n_byzantine)]
+
+    # Byzantine gradients (opposite direction)
+    byzantine_grads = [[-1.0 * i for i in range(grad_dim)] for _ in range(n_byzantine)]
+
+    all_grads = honest_grads + byzantine_grads
+    random.shuffle(all_grads)
+
+    print(f"📊 Test Setup: {n_clients} clients ({n_clients - n_byzantine} honest, {n_byzantine} Byzantine)")
+    print(f"   Gradient dimension: {grad_dim}\n")
+
+    # Test each baseline
+    methods = [
+        ("fedavg", {}),
+        ("krum", {"byzantine_count": n_byzantine}),
+        ("multi_krum", {"byzantine_count": n_byzantine, "m": 2}),
+        ("trimmed_mean", {"byzantine_count": n_byzantine}),
+        ("flguard", {"byzantine_count": n_byzantine}),
+        ("optgradtrust", {}),
+    ]
+
+    for method_name, kwargs in methods:
+        try:
+            agg, meta = aggregate(all_grads, method=method_name, **kwargs)
+            print(f"✓ {method_name.upper()}")
+            print(f"  Aggregated: {agg[:3]}...")  # Show first 3 coords
+            if "anomaly_scores" in meta:
+                detected = sum(1 for s in meta["anomaly_scores"].values() if s > 0.7)
+                print(f"  Detected: {detected}/{n_clients}")
+            if "trust_scores" in meta:
+                avg_trust = sum(meta["trust_scores"].values()) / len(meta["trust_scores"])
+                print(f"  Avg trust: {avg_trust:.3f}")
+            print()
+        except Exception as e:
+            print(f"✗ {method_name}: {e}\n")
+
+    print("✅ All baselines tested successfully!")

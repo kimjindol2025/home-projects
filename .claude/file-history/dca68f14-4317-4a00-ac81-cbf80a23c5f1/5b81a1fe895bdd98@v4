@@ -1,0 +1,252 @@
+# Phase 5.5: Typed Arithmetic Op 도입 계획
+
+## 컨텍스트
+
+Phase 5.4 완료 (137/137 테스트, 커밋 95f61e9):
+- TypeChecker 파이프라인 주입
+- 상수 폴딩 + 상수 중복 제거
+
+**왜 Phase 5.5인가?**
+단순 최적화가 아닌 VM 실행 모델 변경 수준:
+- Op 체계 재설계 (Typed Op 추가)
+- 런타임 타입 체크 제거
+- 향후 JIT/에이전트 런타임에 직접 영향
+
+**핵심 문제:**
+- `Op.Add` 실행 시 내부 `add()` 메서드에서 `.tag` 비교 **최대 6회** 발생
+- `Op.Sub/Mul/Div/Mod`: `popNum()` x2로 각각 2회 체크
+- num+num이 확정된 경우에도 런타임에서 반복 체크 — **낭비**
+
+---
+
+## 코드베이스 분석 결과
+
+| 위치 | 현재 상태 |
+|------|---------|
+| `src/compiler.ts:5-25` | Op enum 55개, Add=3, Sub=4, Mul=5, Div=6, Mod=7 |
+| `src/compiler.ts:55` | `compile(program: Program): Chunk` — typeEnv 없음 |
+| `src/compiler.ts:444-478` | binary 케이스: 타입 정보 없이 단일 Op emit |
+| `src/vm.ts:244-250` | `Op.Add` → `add()` 내부 6회 `.tag` 비교 |
+| `src/vm.ts:251-275` | `Op.Sub/Mul/Div/Mod` → `popNum()` 각각 2회 체크 |
+| `src/vm.ts:907-911` | `popNum()`: `v.tag !== "num"` 체크 후 `.val` 반환 |
+| `src/index.ts:43` | TypeChecker 실행 후 `typeResult.types` 존재 |
+
+---
+
+## 설계 원칙
+
+1. **Generic Op 유지**: `Add`, `Sub` 등 fallback으로 존재 (REPL/dynamic 타입 지원)
+2. **Typed Op는 컴파일 타임 결정**: VM에서 절대 타입 분기 없음
+3. **점진적 도입**: Arithmetic + Compare만 (배열/객체는 Phase 5.6)
+
+---
+
+## 구현 단계
+
+### Step 1: Op enum 확장 (`src/compiler.ts:5-25`)
+
+```typescript
+export enum Op {
+  // 기존 유지...
+  Add, Sub, Mul, Div, Mod, Neg,
+  Eq, Neq, Lt, Gt, Lte, Gte,
+
+  // Phase 5.5 추가 (기존 enum 끝에 추가)
+  AddNum,   // num + num (타입 체크 없음)
+  SubNum,   // num - num
+  MulNum,   // num * num
+  DivNum,   // num / num (0 제수 체크만)
+  ModNum,   // num % num
+  AddStr,   // str + str (타입 체크 없음)
+  EqNum,    // num == num
+  LtNum,    // num < num
+  GtNum,    // num > num
+  LteNum,   // num <= num
+  GteNum,   // num >= num
+}
+```
+
+총 11개 Typed Op 추가. 기존 Op 번호 유지 (하위 호환).
+
+### Step 2: `inferExprType` 헬퍼 추가 (`src/compiler.ts` 내부)
+
+```typescript
+// compile() 함수 내부에 추가
+// typeEnv: TypeChecker가 생성한 Map<string, Type>
+function inferExprType(expr: Expr, typeEnv?: Map<string, any>): string | null {
+  if (expr.kind === "number") return "num";
+  if (expr.kind === "string") return "str";
+  if (expr.kind === "bool") return "bool";
+  if (expr.kind === "ident" && typeEnv) {
+    const t = typeEnv.get(expr.name);
+    if (t?.kind === "primitive") return (t as any).type;
+  }
+  return null; // UNKNOWN → Generic fallback
+}
+```
+
+### Step 3: `compile()` 시그니처 확장 (`src/compiler.ts:55`)
+
+```typescript
+// 현재
+export function compile(program: Program): Chunk
+
+// Phase 5.5
+export function compile(program: Program, typeEnv?: Map<string, any>): Chunk
+```
+
+typeEnv는 `TypeCheckResult.types` (Map<string, Type>)를 받음.
+
+### Step 4: binary 케이스 수정 (`src/compiler.ts:444-478`)
+
+기존 상수 폴딩 코드 유지 후, Typed Op 선택 로직 추가:
+
+```typescript
+case "binary": {
+  // [기존] 상수 폴딩 코드 그대로 유지...
+
+  // [신규] Typed Op 선택
+  const leftType = inferExprType(e.left, typeEnv);
+  const rightType = inferExprType(e.right, typeEnv);
+
+  compileExpr(e.left);
+  compileExpr(e.right);
+
+  // num + num → Typed Arithmetic
+  if (leftType === "num" && rightType === "num") {
+    const typedArith: Record<string, Op> = {
+      "+": Op.AddNum, "-": Op.SubNum, "*": Op.MulNum,
+      "/": Op.DivNum, "%": Op.ModNum,
+      "==": Op.EqNum, "<": Op.LtNum, ">": Op.GtNum,
+      "<=": Op.LteNum, ">=": Op.GteNum,
+    };
+    if (typedArith[e.op] !== undefined) { emit(typedArith[e.op]); break; }
+  }
+  // str + str → AddStr
+  if (leftType === "str" && rightType === "str" && e.op === "+") {
+    emit(Op.AddStr); break;
+  }
+
+  // Generic fallback
+  const genericOps: Record<string, Op> = { "+": Op.Add, ... };
+  emit(genericOps[e.op]);
+  break;
+}
+```
+
+### Step 5: Typed Op 처리기 추가 (`src/vm.ts`)
+
+`execOp` switch 내부에 추가 (~55줄):
+
+```typescript
+case Op.AddNum: {
+  const b = (this.pop() as any).val as number;
+  const a = (this.pop() as any).val as number;
+  const result = { tag: "num" as const, val: a + b };
+  this.stack.push(this.heapPtrToValue(this.valueToHeapPtr(result)));
+  break;
+}
+// SubNum, MulNum, ModNum: 동일 패턴 (~5줄 각)
+
+case Op.DivNum: {
+  const b = (this.pop() as any).val as number;
+  const a = (this.pop() as any).val as number;
+  if (b === 0) this.runtimeError("Division by zero"); // 0 체크만 유지
+  const result = { tag: "num" as const, val: a / b };
+  this.stack.push(this.heapPtrToValue(this.valueToHeapPtr(result)));
+  break;
+}
+
+case Op.AddStr: {
+  const b = (this.pop() as any).val as string;
+  const a = (this.pop() as any).val as string;
+  const result = { tag: "str" as const, val: a + b };
+  this.stack.push(this.heapPtrToValue(this.valueToHeapPtr(result)));
+  break;
+}
+
+case Op.EqNum: {
+  const b = (this.pop() as any).val as number;
+  const a = (this.pop() as any).val as number;
+  const result = { tag: "bool" as const, val: a === b };
+  this.stack.push(this.heapPtrToValue(this.valueToHeapPtr(result)));
+  break;
+}
+// LtNum, GtNum, LteNum, GteNum: 동일 패턴
+```
+
+### Step 6: `src/index.ts` 수정 — typeEnv 전달
+
+```typescript
+// 현재
+const typeResult = checker.check(ast);
+// ...
+const chunk = compile(ast);  // typeEnv 없음
+
+// Phase 5.5
+const typeResult = checker.check(ast);
+// ...
+const chunk = compile(ast, typeResult.success ? typeResult.types : undefined);
+```
+
+### Step 7: 테스트 (`src/vm-typed-arithmetic-test.ts`, 15개)
+
+```
+Suite A — Typed Op 바이트코드 검증 (5개):
+  1. num + num → Op.AddNum 생성 확인
+  2. str + str → Op.AddStr 생성 확인
+  3. unknown + num → Op.Add (generic) fallback
+  4. num * num → Op.MulNum 생성
+  5. num > num → Op.GtNum 생성
+
+Suite B — VM 실행 정확성 (5개):
+  6. AddNum 결과 정확성 (1+2=3)
+  7. SubNum 결과 정확성 (10-4=6)
+  8. MulNum 결과 정확성 (3*4=12)
+  9. DivNum 결과 정확성 (8/2=4)
+  10. AddStr 결과 정확성 ("a"+"b"="ab")
+
+Suite C — 호환성 + 안전성 (5개):
+  11. DivNum 0 나눗셈 → 런타임 에러 발생 확인
+  12. EqNum/LtNum 비교 연산 정확성
+  13. 함수 내부 num 연산 → Typed Op 사용
+  14. 타입 미확인 변수 → Generic Op fallback
+  15. 기존 137개 테스트 전체 호환성
+```
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 작업 | 예상 줄 수 |
+|------|------|---------|
+| `src/compiler.ts` | Op enum 확장 + binary 케이스 + inferExprType | +60줄 |
+| `src/vm.ts` | Typed Op 처리기 11개 추가 | +55줄 |
+| `src/index.ts` | compile() 호출에 typeEnv 전달 | +2줄 |
+| `src/vm-typed-arithmetic-test.ts` | 신규 테스트 15개 | +250줄 |
+
+---
+
+## 검증
+
+```bash
+npm run build
+node dist/vm-typed-arithmetic-test.js  # 신규 15개 테스트
+node dist/vm-optimizer-test.js         # Phase 5.4 호환성 (20개)
+node dist/vm-inference-test.js         # Phase 5.2/5.3 호환성 (20개)
+node dist/vm-types-test.js             # Phase 5 호환성 (20개)
+node dist/vm-compatibility-test.js     # Phase 2-4 호환성 (77개)
+# 목표: 152개 (137 + 15) 전체 통과
+```
+
+---
+
+## 기대 효과
+
+| 연산 | 기존 체크 횟수 | Phase 5.5 체크 횟수 |
+|------|------------|-----------------|
+| `Op.Add` (num+num) | 최대 6회 | 0회 |
+| `Op.Sub` | 2회 | 0회 |
+| `Op.Mul` | 2회 | 0회 |
+| `Op.Div` | 2회 | 1회 (0 체크만) |
+| `Op.Mod` | 2회 | 0회 |

@@ -1,0 +1,426 @@
+# Phase 4: Unsafe 격리 레이어 계획서
+
+## 🎯 목표
+
+**메모리 보호 강화를 통한 안전한 저수준 연산 구현**
+
+- 버퍼 오버플로우 방지
+- 포인터 검증
+- Unsafe 블록 격리
+- 메모리 경계 추적
+
+---
+
+## 📊 현재 상태 분석
+
+### Phase 3 이후 상황
+
+**✅ 완료:**
+- HeapManager: GC 기본 인프라
+- Mark-Sweep: 자동 메모리 관리
+- RefCount: 참조 계수 추적
+- Root 수집: 도달 가능 객체 추적
+
+**❌ 부족한 점:**
+- 메모리 경계 검증 없음
+- 포인터 범위 확인 불가
+- 버퍼 오버플로우 감지 불가
+- Unsafe 연산 격리 없음
+
+---
+
+## 🏗️ Unsafe 격리 레이어 구조
+
+### 1. UnsafeManager (새 파일)
+
+```typescript
+export interface UnsafeZone {
+  id: number           // 격리 영역 ID
+  startAddr: number    // 시작 주소
+  endAddr: number      // 종료 주소
+  maxSize: number      // 최대 크기
+  currentSize: number  // 현재 사용 크기
+  data: Buffer         // 실제 메모리 영역
+  permissions: Set<string>  // 접근 권한
+  createdAt: number    // 생성 시간
+  lastAccess: number   // 마지막 접근
+}
+
+export class UnsafeManager {
+  private zones: Map<number, UnsafeZone> = new Map()
+  private nextZoneId: number = 1
+  private stats = {
+    totalZones: 0
+    totalMemory: 0
+    violationCount: 0
+  }
+
+  // 핵심 메서드
+  createZone(maxSize: number): number
+  expandZone(zoneId: number, newSize: number): boolean
+  validateAccess(zoneId: number, offset: number, size: number): boolean
+  read(zoneId: number, offset: number, size: number): Buffer
+  write(zoneId: number, offset: number, data: Buffer): boolean
+  free(zoneId: number): void
+  detectOverflow(zoneId: number, offset: number, size: number): boolean
+  getStats(): UnsafeStats
+}
+```
+
+### 2. 메모리 경계 검증
+
+**접근 전 확인:**
+```
+requestedOffset + requestedSize <= zoneSize
+```
+
+**위반 시 처리:**
+```
+1. 위반 계수 증가
+2. 접근 거부
+3. 경고 로깅
+4. Panic 옵션 (설정 따라)
+```
+
+### 3. Unsafe 블록 격리
+
+**컴파일러 수준:**
+```freelang
+unsafe {
+  ptr = malloc(100)
+  ptr[10] = 42
+  free(ptr)
+}
+```
+
+**VM 수준:**
+```typescript
+case Op.UnsafeBegin:
+  unsafeZoneId = unsafeManager.createZone(maxSize)
+  break
+
+case Op.UnsafeEnd:
+  unsafeManager.free(unsafeZoneId)
+  unsafeZoneId = -1
+  break
+
+case Op.UnsafeRead/Write:
+  if (unsafeZoneId < 0) runtimeError("Not in unsafe block")
+  validateAccess(unsafeZoneId, offset, size)
+  // 진행
+```
+
+---
+
+## 🧪 테스트 계획
+
+### Suite 1: 기본 메모리 연산 (4개)
+
+#### TEST 1: 안전한 할당/해제
+```freelang
+unsafe {
+  ptr = malloc(10)
+  ptr[0] = 5
+  ptr[9] = 10
+  free(ptr)
+}
+```
+**검증:** 정상 작동, 경계 내 접근
+
+#### TEST 2: 경계 초과 감지
+```freelang
+unsafe {
+  ptr = malloc(5)
+  ptr[10] = 999  // ❌ 경계 초과
+}
+```
+**검증:** 위반 감지, 접근 거부
+
+#### TEST 3: 메모리 확장
+```freelang
+unsafe {
+  ptr = malloc(10)
+  realloc(ptr, 20)  // 10 → 20 확장
+  ptr[19] = 42
+}
+```
+**검증:** 확장 성공, 새 영역 접근 가능
+
+#### TEST 4: 다중 영역 관리
+```freelang
+unsafe {
+  ptr1 = malloc(10)
+  ptr2 = malloc(20)
+  ptr1[5] = 1
+  ptr2[15] = 2
+  free(ptr1)
+  free(ptr2)
+}
+```
+**검증:** 각 영역 독립적 관리
+
+### Suite 2: 오버플로우 감지 (3개)
+
+#### TEST 5: 단순 오버플로우
+```freelang
+unsafe {
+  ptr = malloc(5)
+  for i in range(10) {
+    ptr[i] = i  // i >= 5에서 오버플로우
+  }
+}
+```
+**검증:** 위반 개수 추적
+
+#### TEST 6: 간접 오버플로우
+```freelang
+unsafe {
+  ptr = malloc(10)
+  idx = 15  // 범위 밖
+  ptr[idx] = 999
+}
+```
+**검증:** 오버플로우 감지
+
+#### TEST 7: 통계 정확성
+```freelang
+unsafe {
+  ptr1 = malloc(10)  // 성공
+  ptr1[20] = 1       // 위반 +1
+  ptr2 = malloc(5)   // 성공
+  ptr2[10] = 2       // 위반 +1
+  free(ptr1)
+  free(ptr2)
+}
+```
+**검증:** 통계 = {성공: 2, 위반: 2}
+
+### Suite 3: 격리 검증 (2개)
+
+#### TEST 8: Unsafe 블록 격리
+```freelang
+x = 10
+unsafe {
+  ptr = malloc(5)
+  ptr[0] = x
+}
+y = x  // x는 격리 범위 밖
+```
+**검증:** 격리 경계 유지
+
+#### TEST 9: 중첩 안됨
+```freelang
+unsafe {
+  ptr1 = malloc(10)
+  unsafe {  // ❌ 중첩 불가
+    ptr2 = malloc(5)
+  }
+}
+```
+**검증:** 중첩 블록 오류
+
+### Suite 4: 통합 검증 (1개)
+
+#### TEST 10: Phase 3 + Unsafe 통합
+```freelang
+unsafe {
+  arr = malloc(20)
+  for i in range(5) {
+    arr[i*4] = i
+  }
+  // GC 실행 (Unsafe 영역은 격리)
+  free(arr)
+}
+```
+**검증:** GC와 Unsafe 독립적 작동
+
+---
+
+## 🔧 구현 상세
+
+### 1. UnsafeManager 구현
+
+```typescript
+export class UnsafeManager {
+  public createZone(maxSize: number): number {
+    const id = this.nextZoneId++;
+    const zone: UnsafeZone = {
+      id,
+      startAddr: Math.random() * 1000000,
+      endAddr: startAddr + maxSize,
+      maxSize,
+      currentSize: 0,
+      data: Buffer.alloc(maxSize),
+      permissions: new Set(),
+      createdAt: Date.now(),
+      lastAccess: Date.now()
+    };
+    this.zones.set(id, zone);
+    this.stats.totalZones++;
+    this.stats.totalMemory += maxSize;
+    return id;
+  }
+
+  public validateAccess(
+    zoneId: number,
+    offset: number,
+    size: number
+  ): boolean {
+    const zone = this.zones.get(zoneId);
+    if (!zone) return false;
+
+    if (offset < 0 || offset + size > zone.maxSize) {
+      this.stats.violationCount++;
+      return false;
+    }
+    zone.lastAccess = Date.now();
+    return true;
+  }
+
+  public detectOverflow(
+    zoneId: number,
+    offset: number,
+    size: number
+  ): boolean {
+    return !this.validateAccess(zoneId, offset, size);
+  }
+}
+```
+
+### 2. VM 통합
+
+```typescript
+// VM에 추가
+private unsafeManager: UnsafeManager = new UnsafeManager()
+private currentUnsafeZone: number = -1
+private unsafeDepth: number = 0
+
+case Op.Malloc: {
+  if (this.currentUnsafeZone < 0) {
+    this.runtimeError("malloc outside unsafe block")
+  }
+  const size = this.pop()
+  const zoneId = this.unsafeManager.createZone(size.val)
+  this.stack.push({ tag: "ptr", addr: zoneId })
+  break
+}
+
+case Op.UnsafeRead: {
+  const offset = this.pop()
+  const ptr = this.pop()
+
+  if (this.currentUnsafeZone < 0) {
+    this.runtimeError("Memory access outside unsafe block")
+  }
+
+  if (!this.unsafeManager.validateAccess(
+    ptr.addr,
+    offset.val,
+    1
+  )) {
+    this.runtimeError("Buffer overflow detected")
+  }
+
+  const data = this.unsafeManager.read(ptr.addr, offset.val, 1)
+  this.stack.push({ tag: "num", val: data[0] })
+  break
+}
+```
+
+### 3. 컴파일러 지원 (향후)
+
+```typescript
+case "unsafe":
+  emit(Op.UnsafeBegin)
+  compileStmts(s.body)
+  emit(Op.UnsafeEnd)
+  break
+```
+
+---
+
+## 📈 작업 체크리스트
+
+### Phase 1: 설계 (완료)
+- [x] UnsafeManager 인터페이스 설계
+- [x] 메모리 경계 검증 알고리즘
+- [x] Unsafe 블록 격리 방식
+- [x] 테스트 계획 수립
+
+### Phase 2: 구현 (예정)
+- [ ] UnsafeManager 클래스 구현
+- [ ] VM에 Unsafe 연산 추가
+- [ ] 메모리 경계 검증 로직
+- [ ] 오버플로우 감지 시스템
+
+### Phase 3: 테스트 (예정)
+- [ ] Suite 1: 기본 연산 (4개)
+- [ ] Suite 2: 오버플로우 (3개)
+- [ ] Suite 3: 격리 검증 (2개)
+- [ ] Suite 4: 통합 (1개)
+
+### Phase 4: 검증 (예정)
+- [ ] Phase 3 호환성 (67개 테스트)
+- [ ] Unsafe 테스트 (10개 테스트)
+- [ ] 전체 통합 (77개 테스트)
+
+### Phase 5: 커밋 (예정)
+- [ ] UnsafeManager 구현
+- [ ] VM 통합
+- [ ] 테스트 완료
+- [ ] 최종 커밋
+
+---
+
+## 💡 설계 특징
+
+### 1. **격리 우선**
+- Unsafe 블록은 독립적 메모리 영역
+- GC 영역과 분리
+- 명시적 할당/해제
+
+### 2. **검증 강화**
+- 모든 접근 전 경계 확인
+- 오버플로우 즉시 감지
+- 통계 추적
+
+### 3. **안전성 vs 유연성**
+- 최소한의 오버헤드
+- 필요시만 Unsafe 사용
+- 명확한 격리 경계
+
+### 4. **향후 확장**
+- ASAN (Address Sanitizer) 통합
+- 메모리 프로파일링
+- 정적 분석 도구
+
+---
+
+## 🎓 학습 목표
+
+1. **메모리 보호**: 버퍼 오버플로우 방지의 원리
+2. **격리 기법**: Unsafe 블록 설계 패턴
+3. **검증 알고리즘**: 경계 확인 최적화
+4. **통계 추적**: 메모리 위반 모니터링
+
+---
+
+## 🚀 예상 일정
+
+- **구현**: 2-3시간
+- **테스트**: 1-2시간
+- **검증**: 30분-1시간
+- **총 소요**: 4-5시간
+
+---
+
+## 📝 다음 단계 (Phase 5)
+
+- 타입 시스템 강화
+- 정적 타입 검증
+- 컴파일 타임 최적화
+
+---
+
+*Phase 4 계획: 2025-02-24*
+*프리랭 v6 메모리 안전 프로젝트*

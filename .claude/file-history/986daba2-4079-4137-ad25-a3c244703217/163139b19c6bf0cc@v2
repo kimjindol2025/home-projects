@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Auto mated Profiling System for Self-Adaptive MLIR Pipeline
+=========================================================
+
+Phase 1.2: Search Space Profiling & Data Collection
+
+This script:
+1. Generates valid optimization states (respecting constraints)
+2. Profiles each state (execution time, energy, cache hits)
+3. Calculates reward signals
+4. Saves results to CSV for RL training
+
+박사님의 연구: "저장 필수 너는 기록이 증명이다 gogs"
+"""
+
+import os
+import sys
+import csv
+import json
+import time
+import subprocess
+import hashlib
+from typing import List, Dict, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import math
+
+# ============ Data Structures ============
+
+class MemoryLayout(Enum):
+    ROW_MAJOR = 0
+    COLUMN_MAJOR = 1
+    BLOCKED = 2
+
+class DataType(Enum):
+    FP32 = 0
+    FP16 = 1
+    INT8 = 2
+
+@dataclass
+class HardwareSpec:
+    """하드웨어 스펙 정의"""
+    peak_flops: float         # TFLOPS
+    memory_bandwidth: float   # GB/sec
+    sram_size: int           # bytes
+    memory_latency: float    # cycles
+
+    @staticmethod
+    def nvidia_h100():
+        return HardwareSpec(
+            peak_flops=3.96e12,
+            memory_bandwidth=3.94e12,
+            sram_size=192 * 1024,
+            memory_latency=300
+        )
+
+    @staticmethod
+    def apple_npu():
+        return HardwareSpec(
+            peak_flops=1.6e12,
+            memory_bandwidth=0.2e12,
+            sram_size=16 * 1024,
+            memory_latency=150
+        )
+
+@dataclass
+class OptimizationState:
+    """최적화 상태: 하나의 컴파일러 설정"""
+    tile_sizes: List[int]         # [t_1, t_2, ...]
+    loop_order: List[int]         # [π(0), π(1), ...]
+    vector_width: int             # 4, 8, 16, 32, 64
+    memory_layout: MemoryLayout
+    data_type: DataType
+
+    def to_dict(self) -> Dict:
+        return {
+            'tile_sizes': self.tile_sizes,
+            'loop_order': self.loop_order,
+            'vector_width': self.vector_width,
+            'memory_layout': self.memory_layout.name,
+            'data_type': self.data_type.name
+        }
+
+    def hash(self) -> str:
+        """State의 고유 해시"""
+        s = str(self.to_dict()).encode()
+        return hashlib.md5(s).hexdigest()
+
+    def __str__(self) -> str:
+        return f"T={self.tile_sizes},P={self.loop_order},V={self.vector_width}"
+
+@dataclass
+class ProfilingResult:
+    """프로파일링 결과"""
+    state: OptimizationState
+
+    # Ground truth measurements
+    execution_time_ms: float
+    energy_mj: float
+    memory_bandwidth_usage: float  # %
+    cache_hit_rate: float          # 0.0-1.0
+
+    # Reward
+    reward: float = 0.0
+
+    # Metadata
+    hardware: str = "unknown"
+    operation: str = "unknown"
+    timestamp: float = 0.0
+
+    def to_csv_row(self) -> Dict:
+        return {
+            'state_hash': self.state.hash(),
+            'tile_sizes': str(self.state.tile_sizes),
+            'loop_order': str(self.state.loop_order),
+            'vector_width': self.state.vector_width,
+            'memory_layout': self.state.memory_layout.name,
+            'data_type': self.state.data_type.name,
+            'execution_time_ms': f"{self.execution_time_ms:.3f}",
+            'energy_mj': f"{self.energy_mj:.3f}",
+            'memory_bandwidth_usage': f"{self.memory_bandwidth_usage:.1f}",
+            'cache_hit_rate': f"{self.cache_hit_rate:.3f}",
+            'reward': f"{self.reward:.3f}",
+            'hardware': self.hardware,
+            'operation': self.operation,
+            'timestamp': int(self.timestamp)
+        }
+
+# ============ Search Space Generator ============
+
+class SearchSpaceGenerator:
+    """유효한 최적화 상태 공간 생성"""
+
+    def __init__(self, tensor_shape: List[int], hw_spec: HardwareSpec):
+        self.tensor_shape = tensor_shape
+        self.hw_spec = hw_spec
+        self.ndim = len(tensor_shape)
+
+    def _check_sram_constraint(self, tile_sizes: List[int],
+                               num_inputs: int = 3,
+                               elem_size: int = 4) -> bool:
+        """SRAM 제약 검증"""
+        memory_usage = 1
+        for t in tile_sizes:
+            memory_usage *= t
+        memory_usage *= num_inputs * elem_size
+
+        if memory_usage > self.hw_spec.sram_size:
+            return False
+        return True
+
+    def _check_dimension_constraint(self, tile_sizes: List[int]) -> bool:
+        """차원 크기 제약 검증"""
+        for i, t in enumerate(tile_sizes):
+            if t > self.tensor_shape[i] or t <= 0:
+                return False
+        return True
+
+    def _is_power_of_two(self, n: int) -> bool:
+        """2의 거듭제곱 검증"""
+        return n > 0 and (n & (n - 1)) == 0
+
+    def generate_tile_sizes(self, min_power: int = 4,
+                           max_power: int = 10) -> List[List[int]]:
+        """Tiling space 생성 (2^[min_power..max_power])"""
+        valid_sizes = []
+        powers = range(min_power, max_power + 1)
+
+        # 모든 조합 생성
+        def generate_recursive(dim: int, current: List[int]):
+            if dim == self.ndim:
+                if (self._check_dimension_constraint(current) and
+                    self._check_sram_constraint(current)):
+                    valid_sizes.append(current[:])
+                return
+
+            for p in powers:
+                t = 2 ** p
+                current.append(t)
+                generate_recursive(dim + 1, current)
+                current.pop()
+
+        generate_recursive(0, [])
+        return valid_sizes
+
+    def generate_permutations(self) -> List[List[int]]:
+        """Loop permutation 생성"""
+        import itertools
+        return [list(p) for p in itertools.permutations(range(self.ndim))]
+
+    def generate_vector_widths(self) -> List[int]:
+        """Vectorization width 생성"""
+        return [4, 8, 16, 32, 64]
+
+    def generate_full_search_space(self,
+                                   apply_domain_knowledge: bool = True
+                                   ) -> List[OptimizationState]:
+        """전체 탐색 공간 생성 (제약 적용)"""
+        tile_sizes = self.generate_tile_sizes()
+        loop_orders = self.generate_permutations()
+        vector_widths = self.generate_vector_widths()
+
+        states = []
+        for t in tile_sizes:
+            for p in loop_orders:
+                for v in vector_widths:
+                    # 추가 제약: 벡터화 가능 조건
+                    if apply_domain_knowledge:
+                        # 마지막 차원이 벡터화 가능해야 함
+                        innermost_dim = p[-1]
+                        if t[innermost_dim] < v:
+                            continue
+
+                    state = OptimizationState(
+                        tile_sizes=t,
+                        loop_order=p,
+                        vector_width=v,
+                        memory_layout=MemoryLayout.ROW_MAJOR,
+                        data_type=DataType.FP32
+                    )
+                    states.append(state)
+
+        return states
+
+    def filter_by_data_type(self, states: List[OptimizationState],
+                           preferred_type: DataType
+                           ) -> List[OptimizationState]:
+        """데이터 타입으로 필터링 (TypeConverter)"""
+        return [s for s in states if s.data_type == preferred_type]
+
+# ============ Reward Calculator ============
+
+class RewardCalculator:
+    """보상 신호 계산 (다목적 최적화)"""
+
+    def __init__(self,
+                 weight_throughput: float = 0.5,
+                 weight_energy: float = 0.3,
+                 weight_fairness: float = 0.2):
+        self.w_tp = weight_throughput
+        self.w_en = weight_energy
+        self.w_fa = weight_fairness
+
+    def calculate_reward(self, result: ProfilingResult) -> float:
+        """기본 보상 계산"""
+
+        # Throughput reward: 1 / execution_time
+        r_tp = 1.0 / max(result.execution_time_ms, 0.001)
+
+        # Energy reward: 1 / energy
+        r_en = 1.0 / max(result.energy_mj, 0.001)
+
+        # Fairness reward: cache hit rate
+        r_fa = result.cache_hit_rate
+
+        # Combine
+        reward = (self.w_tp * r_tp +
+                 self.w_en * r_en +
+                 self.w_fa * r_fa)
+
+        return reward
+
+    def apply_penalties(self, base_reward: float,
+                       result: ProfilingResult,
+                       hw_spec: HardwareSpec) -> float:
+        """제약 조건 위반 시 페널티"""
+
+        penalty = 0.0
+
+        # SRAM 초과 페널티 (예상)
+        memory_est = 1
+        for t in result.state.tile_sizes:
+            memory_est *= t
+        memory_est *= 3 * 4  # 3 inputs, FP32
+
+        if memory_est > hw_spec.sram_size:
+            overage = memory_est - hw_spec.sram_size
+            penalty += (overage / hw_spec.sram_size) * 10.0
+
+        return base_reward - penalty
+
+# ============ Profiling Pipeline ============
+
+class AutomatedProfilingPipeline:
+    """자동 프로파일링 파이프라인"""
+
+    def __init__(self, hw_spec: HardwareSpec):
+        self.hw_spec = hw_spec
+        self.reward_calc = RewardCalculator()
+
+    def profile_state(self, state: OptimizationState,
+                     operation_name: str = "matmul") -> ProfilingResult:
+        """단일 상태 프로파일링"""
+
+        # 시뮬레이션 또는 실제 측정
+        # 현재: 비용 모델 사용 (1.1 단계)
+
+        # 연산 수 (MatMul 1024×1024×1024 예)
+        ops = 2 * 1024**3
+
+        # 타일 크기에 따른 메모리
+        memory = 1
+        for t in state.tile_sizes:
+            memory *= t
+        memory *= 3 * 4  # 3 inputs, FP32
+
+        # 실행 시간 (비용 모델 기반)
+        compute_time = ops / self.hw_spec.peak_flops * 1000  # ms
+        memory_time = (memory / self.hw_spec.memory_bandwidth) * 1000 * 1000  # ns->ms
+
+        # 캐시 히트율 추정
+        cache_hit_rate = 0.95 if memory < 64*1024 else (0.92 if memory < 128*1024 else 0.30)
+
+        # 에너지 추정
+        energy = (compute_time + memory_time) * 0.5 / 1000  # mJ (대략)
+
+        total_time = compute_time + memory_time
+
+        result = ProfilingResult(
+            state=state,
+            execution_time_ms=total_time,
+            energy_mj=energy,
+            memory_bandwidth_usage=85.0 if cache_hit_rate > 0.9 else 40.0,
+            cache_hit_rate=cache_hit_rate,
+            hardware=self.hw_spec.__class__.__name__,
+            operation=operation_name,
+            timestamp=time.time()
+        )
+
+        # 보상 계산
+        result.reward = self.reward_calc.calculate_reward(result)
+        result.reward = self.reward_calc.apply_penalties(result.reward, result, self.hw_spec)
+
+        return result
+
+    def profile_batch(self, states: List[OptimizationState],
+                     operation_name: str = "matmul") -> List[ProfilingResult]:
+        """배치 프로파일링"""
+        results = []
+        for i, state in enumerate(states):
+            if (i + 1) % 100 == 0:
+                print(f"  Profiled {i+1}/{len(states)} states...")
+
+            result = self.profile_state(state, operation_name)
+            results.append(result)
+
+        return results
+
+    def save_to_csv(self, filename: str,
+                   results: List[ProfilingResult]) -> None:
+        """결과를 CSV로 저장"""
+        if not results:
+            print("No results to save")
+            return
+
+        with open(filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].to_csv_row().keys())
+            writer.writeheader()
+            for result in results:
+                writer.writerow(result.to_csv_row())
+
+        print(f"Saved {len(results)} results to {filename}")
+
+# ============ Main Execution ============
+
+def main():
+    print("=" * 70)
+    print("Automated Profiling System for Self-Adaptive MLIR")
+    print("Phase 1.2: Search Space & Data Collection")
+    print("=" * 70)
+
+    # 하드웨어 스펙
+    hw_spec = HardwareSpec.nvidia_h100()
+    print(f"\n📊 Hardware: NVIDIA H100")
+    print(f"  Peak FLOPS: {hw_spec.peak_flops:.2e}")
+    print(f"  Memory Bandwidth: {hw_spec.memory_bandwidth:.2e} GB/sec")
+    print(f"  SRAM Size: {hw_spec.sram_size / 1024:.1f} KB")
+
+    # 탐색 공간 생성
+    print(f"\n🔍 Generating search space...")
+    tensor_shape = [1024, 1024, 1024]  # MatMul 1024×1024×1024
+    generator = SearchSpaceGenerator(tensor_shape, hw_spec)
+
+    states = generator.generate_full_search_space(apply_domain_knowledge=True)
+    print(f"  Generated {len(states)} valid states")
+    print(f"  (from ~{2**6 * 6 * 5} naive combinations)")
+
+    # 데이터 타입으로 필터링 (TypeConverter)
+    print(f"\n📋 Filtering by data type (TypeConverter)...")
+    states_fp16 = generator.filter_by_data_type(states, DataType.FP32)
+    print(f"  Filtered to {len(states_fp16)} FP32-compatible states")
+
+    # 프로파일링
+    print(f"\n⚙️ Profiling {len(states_fp16)} states...")
+    pipeline = AutomatedProfilingPipeline(hw_spec)
+    results = pipeline.profile_batch(states_fp16, operation_name="matmul_1024")
+
+    # 결과 분석
+    print(f"\n📈 Analysis:")
+    execution_times = [r.execution_time_ms for r in results]
+    rewards = [r.reward for r in results]
+
+    print(f"  Min execution time: {min(execution_times):.3f} ms")
+    print(f"  Max execution time: {max(execution_times):.3f} ms")
+    print(f"  Best reward: {max(rewards):.3f}")
+    print(f"  Avg reward: {sum(rewards)/len(rewards):.3f}")
+
+    # 최고 성능 상태
+    best_idx = rewards.index(max(rewards))
+    best = results[best_idx]
+    print(f"\n🏆 Best Configuration:")
+    print(f"  Tile Sizes: {best.state.tile_sizes}")
+    print(f"  Loop Order: {best.state.loop_order}")
+    print(f"  Vector Width: {best.state.vector_width}")
+    print(f"  Execution Time: {best.execution_time_ms:.3f} ms")
+    print(f"  Reward: {best.reward:.3f}")
+
+    # CSV로 저장
+    output_file = "profiling_results.csv"
+    pipeline.save_to_csv(output_file, results)
+
+    print(f"\n✅ Profiling complete!")
+    print(f"📁 Results saved to: {output_file}")
+    print(f"📊 Ready for RL training (Phase 1.3)")
+
+if __name__ == "__main__":
+    main()

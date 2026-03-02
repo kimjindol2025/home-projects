@@ -1,0 +1,375 @@
+# ============================================================================
+# layers/persistence.fl - 데이터 접근 계층 (Persistence Layer)
+# ============================================================================
+# Phase 1 구현
+# 작성: 2026-03-02
+# 책임: CRUD 작업, 데이터 계층 추상화
+
+# ─────────────────────────────────────────────────────────────────────────
+# Todo Repository (데이터 접근 객체)
+# ─────────────────────────────────────────────────────────────────────────
+
+struct TodoRepository
+  db: Database
+
+fn newTodoRepository
+  input: db: Database
+  output: TodoRepository
+  intent: "Todo Repository 생성"
+  do
+    return {
+      db: db
+    }
+
+# ─────────────────────────────────────────────────────────────────────────
+# CREATE: 새 Todo 저장
+# ─────────────────────────────────────────────────────────────────────────
+
+fn saveTodo
+  input: (repo: TodoRepository, todo: Todo)
+  output: Result<Todo, string>
+  intent: "Todo를 데이터베이스에 저장 (INSERT)"
+  do
+    # SQL 쿼리 구성
+    let query = buildInsertQuery(
+      "todos",
+      ["title", "description", "completed", "created_at", "updated_at"],
+      [todo.title, todo.description, boolToDBValue(todo.completed),
+       todo.createdAt, todo.updatedAt]
+    )
+
+    # 데이터베이스 실행
+    match executeUpdate(repo.db, query, [
+      todo.title,
+      todo.description,
+      boolToDBValue(todo.completed),
+      todo.createdAt,
+      todo.updatedAt
+    ])
+      Ok(rowsAffected) => {
+        if rowsAffected > 0
+          # 생성된 ID를 반환
+          match getLastInsertId(repo.db)
+            Ok(id) => {
+              let savedTodo = {
+                id: id,
+                title: todo.title,
+                description: todo.description,
+                completed: todo.completed,
+                createdAt: todo.createdAt,
+                updatedAt: todo.updatedAt
+              }
+              Ok(savedTodo)
+            }
+            Err(e) => Err("Failed to get last insert ID: " + e)
+        else
+          Err("Failed to insert todo")
+      }
+      Err(e) => Err("Database error: " + e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# READ: Todo 조회
+# ─────────────────────────────────────────────────────────────────────────
+
+fn findTodoById
+  input: (repo: TodoRepository, id: number)
+  output: Result<Option<Todo>, string>
+  intent: "ID로 특정 Todo 조회"
+  do
+    let query = "SELECT id, title, description, completed, created_at, updated_at " +
+                "FROM todos WHERE id = ?"
+
+    match executeQuery(repo.db, query, [str(id)])
+      Ok(rows) => {
+        if arrayLen(rows) == 0
+          Ok(None)
+        else
+          match rowToTodo(arrayGet(rows, 0))
+            Ok(todo) => Ok(Some(todo))
+            Err(e) => Err("Failed to parse row: " + e)
+      }
+      Err(e) => Err("Database error: " + e)
+
+fn findAllTodos
+  input: (repo: TodoRepository, filter: QueryFilter)
+  output: Result<PagedResult<Todo>, string>
+  intent: "모든 Todo를 필터, 정렬, 페이지네이션과 함께 조회"
+  do
+    # 1. WHERE 절 구성
+    let whereClause = buildWhereClause(filter)
+
+    # 2. 전체 개수 조회
+    let countQuery = "SELECT COUNT(*) as count FROM todos"
+    let countQueryWithWhere = match whereClause
+      Some(where) => countQuery + " WHERE " + where
+      None => countQuery
+
+    match executeQuery(repo.db, countQueryWithWhere, [])
+      Ok(countRows) => {
+        let total = parseCountResult(arrayGet(countRows, 0))
+
+        # 3. 데이터 조회 (정렬, 페이지네이션)
+        let query = "SELECT id, title, description, completed, created_at, updated_at " +
+                    "FROM todos"
+
+        let queryWithWhere = match whereClause
+          Some(where) => query + " WHERE " + where
+          None => query
+
+        let queryWithSort = queryWithWhere +
+                           " ORDER BY " + filter.sortBy + " " + filter.sortOrder
+
+        let offset = (filter.page - 1) * filter.pageSize
+        let queryWithLimit = queryWithSort +
+                            " LIMIT " + str(filter.pageSize) +
+                            " OFFSET " + str(offset)
+
+        match executeQuery(repo.db, queryWithLimit, [])
+          Ok(rows) => {
+            let todos = rowsToTodos(rows)
+            match todos
+              Ok(todoList) => {
+                let paged = createPagedResult(todoList, filter.page, filter.pageSize, total)
+                Ok(paged)
+              }
+              Err(e) => Err("Failed to parse rows: " + e)
+          }
+          Err(e) => Err("Database error: " + e)
+      }
+      Err(e) => Err("Failed to count todos: " + e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# UPDATE: Todo 수정
+# ─────────────────────────────────────────────────────────────────────────
+
+fn updateTodo
+  input: (repo: TodoRepository, id: number, todo: Todo)
+  output: Result<Todo, string>
+  intent: "기존 Todo 업데이트"
+  do
+    # 1. 존재 확인
+    match findTodoById(repo, id)
+      Ok(None) => Err("Todo not found")
+      Ok(Some(_)) => {
+        # 2. 업데이트 쿼리
+        let query = "UPDATE todos SET title = ?, description = ?, " +
+                    "completed = ?, updated_at = ? WHERE id = ?"
+
+        match executeUpdate(repo.db, query, [
+          todo.title,
+          todo.description,
+          boolToDBValue(todo.completed),
+          todo.updatedAt,
+          str(id)
+        ])
+          Ok(rowsAffected) => {
+            if rowsAffected > 0
+              Ok(todo)
+            else
+              Err("Failed to update todo")
+          }
+          Err(e) => Err("Database error: " + e)
+      }
+      Err(e) => Err(e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# DELETE: Todo 삭제
+# ─────────────────────────────────────────────────────────────────────────
+
+fn deleteTodo
+  input: (repo: TodoRepository, id: number)
+  output: Result<void, string>
+  intent: "Todo 삭제"
+  do
+    # 1. 존재 확인
+    match findTodoById(repo, id)
+      Ok(None) => Err("Todo not found")
+      Ok(Some(_)) => {
+        # 2. 삭제 쿼리
+        let query = "DELETE FROM todos WHERE id = ?"
+
+        match executeUpdate(repo.db, query, [str(id)])
+          Ok(rowsAffected) => {
+            if rowsAffected > 0
+              Ok(void)
+            else
+              Err("Failed to delete todo")
+          }
+          Err(e) => Err("Database error: " + e)
+      }
+      Err(e) => Err(e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 데이터 변환
+# ─────────────────────────────────────────────────────────────────────────
+
+fn rowToTodo
+  input: row: map<string, string>
+  output: Result<Todo, string>
+  intent: "DB 행을 Todo 객체로 변환"
+  do
+    # 필드 추출
+    let idStr = row.get("id").getOrElse("0")
+    let title = row.get("title").getOrElse("")
+    let description = row.get("description").getOrElse("")
+    let completedStr = row.get("completed").getOrElse("0")
+    let createdAt = row.get("created_at").getOrElse("")
+    let updatedAt = row.get("updated_at").getOrElse("")
+
+    # 타입 변환
+    let id = stringToNumber(idStr).getOrElse(0)
+    let completed = completedStr == "1"
+
+    let todo = {
+      id: id,
+      title: title,
+      description: description,
+      completed: completed,
+      createdAt: createdAt,
+      updatedAt: updatedAt
+    }
+
+    # 검증
+    if isValidTodo(todo)
+      Ok(todo)
+    else
+      Err("Invalid todo data from database")
+
+fn rowsToTodos
+  input: rows: array<map<string, string>>
+  output: Result<array<Todo>, string>
+  intent: "DB 행들을 Todo 배열로 변환"
+  do
+    let todos = []
+    for i in 0..arrayLen(rows)
+      let row = arrayGet(rows, i)
+      match rowToTodo(row)
+        Ok(todo) => todos = arrayPush(todos, todo)
+        Err(e) => return Err(e)
+    Ok(todos)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 쿼리 빌더
+# ─────────────────────────────────────────────────────────────────────────
+
+fn buildWhereClause
+  input: filter: QueryFilter
+  output: Option<string>
+  intent: "필터로부터 WHERE 절 구성"
+  do
+    let conditions = []
+
+    # completed 필터
+    if filter.completed.isSome()
+      let value = filter.completed.unwrap()
+      let condition = "completed = " + boolToDBValue(value)
+      conditions = arrayPush(conditions, condition)
+
+    # 제목 검색
+    if filter.searchTitle.isSome()
+      let search = filter.searchTitle.unwrap()
+      let condition = "title LIKE '%" + search + "%'"
+      conditions = arrayPush(conditions, condition)
+
+    # 조건들을 AND로 연결
+    if arrayLen(conditions) == 0
+      None
+    else
+      Some(joinStrings(conditions, " AND "))
+
+fn parseCountResult
+  input: row: map<string, string>
+  output: number
+  intent: "COUNT 쿼리 결과 파싱"
+  do
+    let countStr = row.get("count").getOrElse("0")
+    return stringToNumber(countStr).getOrElse(0)
+
+fn getLastInsertId
+  input: db: Database
+  output: Result<number, string>
+  intent: "마지막 삽입 ID 조회"
+  do
+    let query = "SELECT last_insert_rowid() as id"
+    match executeQuery(db, query, [])
+      Ok(rows) => {
+        if arrayLen(rows) > 0
+          let row = arrayGet(rows, 0)
+          let idStr = row.get("id").getOrElse("0")
+          let id = stringToNumber(idStr).getOrElse(0)
+          Ok(id)
+        else
+          Err("Failed to get last insert ID")
+      }
+      Err(e) => Err(e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn boolToDBValue
+  input: b: bool
+  output: string
+  intent: "불린을 DB 값으로 변환 (0 또는 1)"
+  do
+    if b
+      return "1"
+    else
+      return "0"
+
+fn stringToNumber
+  input: str: string
+  output: Option<number>
+  intent: "문자열을 숫자로 변환"
+  do
+    # Phase B 런타임에서 구현
+    return None
+
+fn getOrElse<T>
+  input: (opt: Option<T>, default: T)
+  output: T
+  intent: "Option 값 또는 기본값 반환"
+  do
+    match opt
+      Some(value) => value
+      None => default
+
+fn str
+  input: num: number
+  output: string
+  intent: "숫자를 문자열로 변환"
+  do
+    # Phase B 런타임에서 구현
+    return ""
+
+fn arrayLen<T>
+  input: arr: array<T>
+  output: number
+  intent: "배열 길이"
+  do
+    # Phase B 런타임에서 구현
+    return 0
+
+fn arrayGet<T>
+  input: (arr: array<T>, index: number)
+  output: T
+  intent: "배열 요소 조회"
+  do
+    # Phase B 런타임에서 구현
+    return arr[0]  # 임시
+
+fn arrayPush<T>
+  input: (arr: array<T>, item: T)
+  output: array<T>
+  intent: "배열에 항목 추가"
+  do
+    # Phase B 런타임에서 구현
+    return arr
+
+fn joinStrings
+  input: (items: array<string>, separator: string)
+  output: string
+  intent: "문자열 배열 연결"
+  do
+    # Phase B 런타임에서 구현
+    return ""

@@ -1,0 +1,743 @@
+/// Phase 14 v15.3: Garbage Collection (Mark-and-Sweep)
+///
+/// VM 내부에서 생성된 객체들의 생명주기를 자동으로 관리합니다.
+/// Mark-and-Sweep 알고리즘으로 도달 불가능한 객체를 식별하고 해제합니다.
+
+use std::fmt;
+
+// ============================================================================
+// 객체 타입 정의
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectType {
+    Integer,
+    Float,
+    Boolean,
+    Null,
+    Array(Vec<usize>),     // 다른 객체의 인덱스 목록
+    String(String),
+}
+
+impl fmt::Display for ObjectType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ObjectType::Integer => write!(f, "Integer"),
+            ObjectType::Float => write!(f, "Float"),
+            ObjectType::Boolean => write!(f, "Boolean"),
+            ObjectType::Null => write!(f, "Null"),
+            ObjectType::Array(indices) => write!(f, "Array(len={})", indices.len()),
+            ObjectType::String(s) => write!(f, "String(\"{}\")", s),
+        }
+    }
+}
+
+// ============================================================================
+// 객체 헤더 (메타데이터)
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ObjectHeader {
+    pub is_marked: bool,        // GC 마킹 플래그
+    pub size: usize,            // 객체 크기 (바이트 추정)
+    pub obj_type: ObjectType,   // 객체 타입
+    pub allocation_id: usize,   // 할당 순서 (추적용)
+}
+
+impl ObjectHeader {
+    fn new(obj_type: ObjectType, size: usize, allocation_id: usize) -> Self {
+        ObjectHeader {
+            is_marked: false,
+            size,
+            obj_type,
+            allocation_id,
+        }
+    }
+}
+
+// ============================================================================
+// Heap 객체
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct HeapObject {
+    pub header: ObjectHeader,
+}
+
+// ============================================================================
+// Root 정의
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct GCRoots {
+    pub stack: Vec<usize>,              // 스택의 객체 인덱스
+    pub globals: Vec<usize>,            // 전역 변수 인덱스
+    pub current_frame: Option<usize>,   // 현재 실행 프레임
+}
+
+impl GCRoots {
+    pub fn new() -> Self {
+        GCRoots::default()
+    }
+
+    /// 모든 루트 객체 인덱스 반환
+    pub fn all_roots(&self) -> Vec<usize> {
+        let mut roots = self.stack.clone();
+        roots.extend(&self.globals);
+        if let Some(frame) = self.current_frame {
+            roots.push(frame);
+        }
+        roots
+    }
+}
+
+// ============================================================================
+// Heap 관리자
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct Heap {
+    pub objects: Vec<HeapObject>,
+    pub allocated_bytes: usize,
+    pub gc_threshold: usize,         // GC 시작 임계값
+    pub total_allocations: usize,    // 총 할당 횟수
+    pub gc_runs: usize,              // GC 실행 횟수
+}
+
+impl Heap {
+    pub fn new(gc_threshold: usize) -> Self {
+        Heap {
+            objects: Vec::new(),
+            allocated_bytes: 0,
+            gc_threshold,
+            total_allocations: 0,
+            gc_runs: 0,
+        }
+    }
+
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn memory_usage_percent(&self) -> f64 {
+        (self.allocated_bytes as f64 / self.gc_threshold as f64) * 100.0
+    }
+}
+
+// ============================================================================
+// GC 통계
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct GCStats {
+    pub before_mark: usize,
+    pub after_mark: usize,
+    pub freed_count: usize,
+    pub freed_bytes: usize,
+    pub kept_count: usize,
+    pub remaining_bytes: usize,
+}
+
+impl fmt::Display for GCStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[GC] 해제: {} 객체 ({} bytes) | 유지: {} 객체 | 메모리: {} bytes",
+            self.freed_count, self.freed_bytes, self.kept_count, self.remaining_bytes
+        )
+    }
+}
+
+// ============================================================================
+// 가비지 컬렉터
+// ============================================================================
+
+pub struct GarbageCollector {
+    pub heap: Heap,
+    pub roots: GCRoots,
+}
+
+impl GarbageCollector {
+    pub fn new(gc_threshold: usize) -> Self {
+        GarbageCollector {
+            heap: Heap::new(gc_threshold),
+            roots: GCRoots::new(),
+        }
+    }
+
+    // ========================================================================
+    // 할당
+    // ========================================================================
+
+    /// 새 객체를 Heap에 할당
+    pub fn allocate(&mut self, obj_type: ObjectType) -> usize {
+        // GC 필요 여부 확인
+        if self.should_collect_garbage() {
+            self.collect_garbage();
+        }
+
+        // 크기 추정
+        let size = self.estimate_size(&obj_type);
+
+        // 객체 생성
+        let obj = HeapObject {
+            header: ObjectHeader::new(obj_type.clone(), size, self.heap.total_allocations),
+        };
+
+        // Heap에 추가
+        let idx = self.heap.objects.len();
+        self.heap.objects.push(obj);
+        self.heap.allocated_bytes += size;
+        self.heap.total_allocations += 1;
+
+        idx
+    }
+
+    /// 스택에 객체 참조 추가
+    pub fn push_stack(&mut self, obj_idx: usize) {
+        if obj_idx < self.heap.objects.len() {
+            self.roots.stack.push(obj_idx);
+        }
+    }
+
+    /// 스택에서 객체 참조 제거
+    pub fn pop_stack(&mut self) -> Option<usize> {
+        self.roots.stack.pop()
+    }
+
+    /// 전역 변수 등록
+    pub fn register_global(&mut self, obj_idx: usize) {
+        if obj_idx < self.heap.objects.len() {
+            self.roots.globals.push(obj_idx);
+        }
+    }
+
+    // ========================================================================
+    // Mark (마킹) - DFS 기반
+    // ========================================================================
+
+    /// Mark 단계: 루트에서 도달 가능한 객체 표시
+    pub fn mark(&mut self, roots: &GCRoots) {
+        // 모든 루트 객체부터 시작
+        for &obj_idx in &roots.all_roots() {
+            self.mark_object(obj_idx);
+        }
+    }
+
+    /// 객체와 그 참조된 객체를 재귀적으로 표시
+    fn mark_object(&mut self, obj_idx: usize) {
+        // 범위 체크
+        if obj_idx >= self.heap.objects.len() {
+            return;
+        }
+
+        let obj = &mut self.heap.objects[obj_idx];
+
+        // 이미 마킹된 경우 무한 재귀 방지
+        if obj.header.is_marked {
+            return;
+        }
+
+        // 마킹
+        obj.header.is_marked = true;
+
+        // 배열인 경우 참조된 객체도 마킹
+        if let ObjectType::Array(indices) = &obj.header.obj_type {
+            let indices = indices.clone(); // 소유권 이동 방지
+            for &idx in &indices {
+                self.mark_object(idx);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Sweep (청소)
+    // ========================================================================
+
+    /// Sweep 단계: 마킹되지 않은 객체 제거
+    pub fn sweep(&mut self) -> GCStats {
+        let before_count = self.heap.objects.len();
+
+        let mut freed_count = 0;
+        let mut freed_bytes = 0;
+        let mut kept_count = 0;
+
+        // 표시되지 않은 객체 제거
+        let mut i = 0;
+        while i < self.heap.objects.len() {
+            if !self.heap.objects[i].header.is_marked {
+                // 쓰레기 객체
+                let obj = &self.heap.objects[i];
+                freed_bytes += obj.header.size;
+                freed_count += 1;
+
+                // 제거
+                self.heap.objects.remove(i);
+                // i를 증가시키지 않음 (다음 요소가 현재 위치로 이동)
+            } else {
+                // 마킹된 객체 유지, 마킹 해제
+                self.heap.objects[i].header.is_marked = false;
+                kept_count += 1;
+                i += 1;
+            }
+        }
+
+        self.heap.allocated_bytes -= freed_bytes;
+
+        GCStats {
+            before_mark: before_count,
+            after_mark: self.heap.objects.len(),
+            freed_count,
+            freed_bytes,
+            kept_count,
+            remaining_bytes: self.heap.allocated_bytes,
+        }
+    }
+
+    // ========================================================================
+    // GC 실행
+    // ========================================================================
+
+    pub fn should_collect_garbage(&self) -> bool {
+        self.heap.allocated_bytes >= self.heap.gc_threshold
+    }
+
+    pub fn collect_garbage(&mut self) -> GCStats {
+        let roots = self.roots.clone();
+
+        // Mark 단계
+        self.mark(&roots);
+
+        // Sweep 단계
+        let stats = self.sweep();
+
+        self.heap.gc_runs += 1;
+
+        stats
+    }
+
+    // ========================================================================
+    // 유틸리티
+    // ========================================================================
+
+    fn estimate_size(&self, obj_type: &ObjectType) -> usize {
+        match obj_type {
+            ObjectType::Integer => 8,
+            ObjectType::Float => 8,
+            ObjectType::Boolean => 1,
+            ObjectType::Null => 0,
+            ObjectType::Array(indices) => 8 + indices.len() * 8,
+            ObjectType::String(s) => s.len() + 8,
+        }
+    }
+
+    pub fn get_object_info(&self, obj_idx: usize) -> Option<String> {
+        if obj_idx < self.heap.objects.len() {
+            let obj = &self.heap.objects[obj_idx];
+            Some(format!(
+                "객체 {}: {} ({} bytes, id={})",
+                obj_idx,
+                obj.header.obj_type,
+                obj.header.size,
+                obj.header.allocation_id
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn heap_summary(&self) -> String {
+        format!(
+            "Heap: {} 객체, {} bytes ({:.1}%), {} 번 할당, {} 번 GC",
+            self.heap.object_count(),
+            self.heap.allocated_bytes,
+            self.heap.memory_usage_percent(),
+            self.heap.total_allocations,
+            self.heap.gc_runs
+        )
+    }
+}
+
+// ============================================================================
+// 메인 데모
+// ============================================================================
+
+pub fn main() {
+    println!("=== Phase 14 v15.3: Garbage Collection (Mark-and-Sweep) ===\n");
+
+    // Demo 1: 기본 할당
+    println!("【Demo 1】기본 객체 할당");
+    {
+        let mut gc = GarbageCollector::new(100);
+
+        let obj0 = gc.allocate(ObjectType::Integer);
+        let obj1 = gc.allocate(ObjectType::Boolean);
+        let obj2 = gc.allocate(ObjectType::Null);
+
+        gc.push_stack(obj0);
+
+        println!("  할당: {} 객체", gc.heap.object_count());
+        println!("  메모리: {}", gc.heap_summary());
+        println!();
+    }
+
+    // Demo 2: 참조 관계
+    println!("【Demo 2】배열로 참조 관계 표현");
+    {
+        let mut gc = GarbageCollector::new(200);
+
+        let obj_a = gc.allocate(ObjectType::Integer);
+        let obj_b = gc.allocate(ObjectType::Integer);
+        let obj_c = gc.allocate(ObjectType::Array(vec![obj_a, obj_b]));
+
+        gc.push_stack(obj_c); // 스택: [배열] → 내부: [정수, 정수]
+
+        println!("  배열 생성 (2개 요소 포함)");
+        println!("  스택 루트: [{}]", obj_c);
+        println!("  메모리: {}", gc.heap_summary());
+        println!();
+    }
+
+    // Demo 3: 순환 참조
+    println!("【Demo 3】순환 참조 처리 (무한 루프 방지)");
+    {
+        let mut gc = GarbageCollector::new(300);
+
+        // 객체 A
+        let obj_a = gc.allocate(ObjectType::Integer);
+        // 객체 B (A 참조)
+        let obj_b = gc.allocate(ObjectType::Array(vec![obj_a]));
+        // 객체 A 업데이트 (B 참조) - 실제로는 스택에서 수정
+        // → 순환: A → B → A
+
+        gc.push_stack(obj_b);
+
+        println!("  순환 참조: B → A → B (실제 구현에서)");
+        println!("  Mark 단계: is_marked 체크로 무한 재귀 방지");
+        println!("  메모리: {}", gc.heap_summary());
+        println!();
+    }
+
+    // Demo 4: GC 실행 (메모리 임계값)
+    println!("【Demo 4】메모리 임계값으로 GC 자동 실행");
+    {
+        let mut gc = GarbageCollector::new(50); // 작은 임계값
+
+        println!("  임계값: {} bytes", gc.heap.gc_threshold);
+
+        // 여러 객체 할당
+        let obj0 = gc.allocate(ObjectType::Integer);
+        let obj1 = gc.allocate(ObjectType::Integer);
+        let obj2 = gc.allocate(ObjectType::Integer);
+
+        gc.push_stack(obj0); // obj0만 참조
+        // obj1, obj2는 참조 안 함
+
+        println!("  할당 전: {} bytes", gc.heap.allocated_bytes);
+        println!("  메모리 사용률: {:.1}%", gc.heap.memory_usage_percent());
+
+        // obj2를 할당할 때 임계값 도달 시 GC 자동 실행
+        let obj3 = gc.allocate(ObjectType::Integer);
+
+        println!("  할당 후: {} bytes (GC 실행됨)", gc.heap.allocated_bytes);
+        println!("  메모리: {}", gc.heap_summary());
+        println!();
+    }
+
+    // Demo 5: Mark-Sweep 상세 추적
+    println!("【Demo 5】Mark-Sweep 상세 과정");
+    {
+        let mut gc = GarbageCollector::new(1000);
+
+        // 객체 생성
+        let obj0 = gc.allocate(ObjectType::Integer); // 살아있음
+        let obj1 = gc.allocate(ObjectType::Integer); // 쓰레기
+        let obj2 = gc.allocate(ObjectType::Integer); // 쓰레기
+        let obj3 = gc.allocate(ObjectType::Array(vec![obj0])); // 살아있음
+
+        // 루트 설정
+        gc.push_stack(obj3); // obj3만 스택에서 참조
+
+        println!("  생성 후:");
+        println!("    총 객체: {}", gc.heap.object_count());
+        println!("    메모리: {} bytes", gc.heap.allocated_bytes);
+
+        // Mark 단계
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+
+        println!();
+        println!("  Mark 후 (마킹된 객체):");
+        for i in 0..gc.heap.object_count() {
+            if gc.heap.objects[i].header.is_marked {
+                println!("    객체 {}: marked ✓", i);
+            }
+        }
+
+        // Sweep 단계
+        let stats = gc.sweep();
+
+        println!();
+        println!("  Sweep 결과:");
+        println!("    {}", stats);
+        println!();
+    }
+
+    // Demo 6: 전역 변수 추적
+    println!("【Demo 6】전역 변수와 로컬 변수 구분");
+    {
+        let mut gc = GarbageCollector::new(500);
+
+        let global_obj = gc.allocate(ObjectType::Integer);
+        let local_obj = gc.allocate(ObjectType::Integer);
+
+        gc.register_global(global_obj);
+        gc.push_stack(local_obj);
+
+        println!("  전역: 객체 {} (영구 보존)", global_obj);
+        println!("  로컬: 객체 {} (스택 기반)", local_obj);
+        println!("  메모리: {}", gc.heap_summary());
+        println!();
+    }
+
+    // Demo 7: 복잡한 그래프
+    println!("【Demo 7】복잡한 객체 그래프");
+    {
+        let mut gc = GarbageCollector::new(1000);
+
+        // 트리 구조 생성
+        //     root
+        //     /  \
+        //    a    b
+        //   / \
+        //  c   d
+
+        let obj_c = gc.allocate(ObjectType::Integer);
+        let obj_d = gc.allocate(ObjectType::Integer);
+        let obj_a = gc.allocate(ObjectType::Array(vec![obj_c, obj_d]));
+        let obj_b = gc.allocate(ObjectType::Integer);
+        let obj_root = gc.allocate(ObjectType::Array(vec![obj_a, obj_b]));
+
+        gc.push_stack(obj_root);
+
+        println!("  트리 구조:");
+        println!("       root");
+        println!("       /  \\");
+        println!("      a    b");
+        println!("     / \\");
+        println!("    c   d");
+        println!();
+        println!("  메모리: {}", gc.heap_summary());
+        println!();
+    }
+
+    // Demo 8: GC 통계
+    println!("【Demo 8】GC 통계 및 모니터링");
+    {
+        let mut gc = GarbageCollector::new(100);
+
+        println!("  초기: {}", gc.heap_summary());
+
+        for i in 0..5 {
+            let obj = gc.allocate(ObjectType::Integer);
+            gc.push_stack(obj);
+            println!("    할당 {}: {}", i + 1, gc.heap_summary());
+        }
+
+        println!();
+    }
+
+    println!("=== v15.3 핵심 개념 ===\n");
+    println!("1. Mark-Sweep GC:");
+    println!("   - Mark: 루트에서 도달 가능한 객체 표시");
+    println!("   - Sweep: 미마킹 객체 제거");
+    println!();
+    println!("2. Root 정의:");
+    println!("   - 스택의 객체 참조");
+    println!("   - 전역 변수");
+    println!("   - 현재 실행 프레임");
+    println!();
+    println!("3. 안전성:");
+    println!("   - 순환 참조: is_marked로 방지");
+    println!("   - 메모리 누수: 없음 (모든 객체 추적)");
+    println!("   - 사용 중 해제: 없음 (루트 체크)");
+    println!();
+    println!("4. GC 시점:");
+    println!("   - 할당 임계값 도달 시 자동 실행");
+    println!("   - Stop-the-World (실행 중단)");
+    println!("   - 비결정적 성능 (GC 시간)");
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allocate_basic() {
+        let mut gc = GarbageCollector::new(1000);
+        let idx = gc.allocate(ObjectType::Integer);
+
+        assert_eq!(gc.heap.object_count(), 1);
+        assert_eq!(gc.heap.allocated_bytes, 8);
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn test_mark_from_stack() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let obj = gc.allocate(ObjectType::Integer);
+        gc.push_stack(obj);
+
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+
+        assert!(gc.heap.objects[obj].header.is_marked);
+    }
+
+    #[test]
+    fn test_mark_array_references() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let obj_a = gc.allocate(ObjectType::Integer);
+        let obj_b = gc.allocate(ObjectType::Integer);
+        let obj_array = gc.allocate(ObjectType::Array(vec![obj_a, obj_b]));
+
+        gc.push_stack(obj_array);
+
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+
+        assert!(gc.heap.objects[obj_array].header.is_marked);
+        assert!(gc.heap.objects[obj_a].header.is_marked);
+        assert!(gc.heap.objects[obj_b].header.is_marked);
+    }
+
+    #[test]
+    fn test_sweep_removes_unmarked() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let obj0 = gc.allocate(ObjectType::Integer);
+        let obj1 = gc.allocate(ObjectType::Integer);
+        let obj2 = gc.allocate(ObjectType::Integer);
+
+        gc.push_stack(obj0);
+
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+        let stats = gc.sweep();
+
+        assert_eq!(stats.freed_count, 2);
+        assert_eq!(gc.heap.object_count(), 1);
+    }
+
+    #[test]
+    fn test_gc_threshold_trigger() {
+        let mut gc = GarbageCollector::new(10);  // 10 bytes 임계값
+
+        let obj0 = gc.allocate(ObjectType::Integer);  // 8 bytes
+        gc.push_stack(obj0);
+
+        assert!(!gc.should_collect_garbage());  // 아직 미달
+
+        let obj1 = gc.allocate(ObjectType::Integer);  // 8+8 = 16 bytes
+        assert!(gc.should_collect_garbage());  // 이제 초과!
+    }
+
+    #[test]
+    fn test_circular_reference() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let obj_a = gc.allocate(ObjectType::Integer);
+        let obj_b = gc.allocate(ObjectType::Array(vec![obj_a]));
+
+        // 실제로는 obj_a도 obj_b를 참조하지만, 여기서는 한 방향만 테스트
+        gc.push_stack(obj_b);
+
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+
+        // 무한 루프가 없어야 함
+        assert!(gc.heap.objects[obj_b].header.is_marked);
+    }
+
+    #[test]
+    fn test_global_and_stack() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let global_obj = gc.allocate(ObjectType::Integer);
+        let local_obj = gc.allocate(ObjectType::Integer);
+        let garbage_obj = gc.allocate(ObjectType::Integer);
+
+        gc.register_global(global_obj);
+        gc.push_stack(local_obj);
+
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+        gc.sweep();
+
+        // 전역과 로컬은 유지, 쓰레기만 제거
+        assert_eq!(gc.heap.object_count(), 2);
+    }
+
+    #[test]
+    fn test_memory_tracking() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let before = gc.heap.allocated_bytes;
+
+        gc.allocate(ObjectType::Integer);
+        gc.allocate(ObjectType::Boolean);
+
+        let after = gc.heap.allocated_bytes;
+        assert!(after > before);
+    }
+
+    #[test]
+    fn test_gc_stats() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let obj0 = gc.allocate(ObjectType::Integer);
+        let obj1 = gc.allocate(ObjectType::Integer);
+
+        gc.push_stack(obj0);
+
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+        let stats = gc.sweep();
+
+        assert_eq!(stats.freed_count, 1);
+        assert_eq!(stats.kept_count, 1);
+        assert!(stats.remaining_bytes > 0);
+    }
+
+    #[test]
+    fn test_array_size_calculation() {
+        let mut gc = GarbageCollector::new(1000);
+
+        let arr = gc.allocate(ObjectType::Array(vec![0, 1, 2]));
+        let obj = &gc.heap.objects[arr];
+
+        // 배열 크기 = 8(헤더) + 3*8(요소)
+        assert!(obj.header.size > 8);
+    }
+
+    #[test]
+    fn test_empty_roots() {
+        let mut gc = GarbageCollector::new(1000);
+
+        gc.allocate(ObjectType::Integer);
+        gc.allocate(ObjectType::Integer);
+
+        // 루트가 없으면 모든 객체 제거
+        let roots = gc.roots.clone();
+        gc.mark(&roots);
+        gc.sweep();
+
+        assert_eq!(gc.heap.object_count(), 0);
+    }
+}

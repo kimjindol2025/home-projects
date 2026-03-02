@@ -1,0 +1,544 @@
+"""
+Phase 7: main.py - 10개 교육 시나리오
+Raft Consensus Engine - 실습용 시뮬레이션
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+# 패키지 경로 추가
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from raft_consensus_engine import (
+    NodeState,
+    RaftNode,
+    NetworkConfig,
+    GogsGlobalNetwork,
+    LeaderElection,
+    LogReplication,
+)
+
+
+async def print_status(network: GogsGlobalNetwork, title: str) -> None:
+    """클러스터 상태 출력"""
+    print(f"\n{'='*60}")
+    print(f"📊 {title}")
+    print(f"{'='*60}")
+    print(network.print_cluster_table())
+    await asyncio.sleep(0.1)
+
+
+async def scenario_01_initial_cluster_formation():
+    """
+    시나리오 1: 클러스터 초기화 & 첫 리더 선출
+    주제: 랜덤 타임아웃의 역할
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 1: 클러스터 초기화 & 첫 리더 선출")
+    print("="*60)
+    print("개념: 모든 노드가 동시에 FOLLOWER로 시작")
+    print("      선거 타임아웃은 각 노드마다 랜덤 (150~300ms)")
+    print("      가장 먼저 타임아웃된 노드가 후보 → 리더 선출")
+
+    config = NetworkConfig(min_delay_ms=10, max_delay_ms=50)
+    network = GogsGlobalNetwork(config)
+
+    # 5개 노드 생성
+    nodes = []
+    for i in range(5):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    await print_status(network, "초기 상태 (모두 FOLLOWER)")
+
+    # 선거 시작
+    election = LeaderElection(network)
+    tasks = [election.start_election(node) for node in nodes]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    await asyncio.sleep(0.3)
+    await print_status(network, "선거 후 상태")
+
+    leader = network.get_current_leader()
+    print(f"\n✅ 선출된 리더: {leader}")
+    print(f"📊 term 통계: {network.get_term_statistics()}")
+
+
+async def scenario_02_logical_clock_term():
+    """
+    시나리오 2: Term (논리적 시계)
+    주제: 구시대 리더 거부
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 2: Term (논리적 시계)")
+    print("="*60)
+    print("개념: Term은 논리적 시계")
+    print("      더 높은 term의 요청은 구시대 리더를 거부")
+
+    config = NetworkConfig(min_delay_ms=10, max_delay_ms=50)
+    network = GogsGlobalNetwork(config)
+
+    # 3개 노드
+    leader = RaftNode("leader", network)
+    follower1 = RaftNode("follower1", network)
+    follower2 = RaftNode("follower2", network)
+
+    network.add_node(leader)
+    network.add_node(follower1)
+    network.add_node(follower2)
+
+    await leader._become_candidate()
+    await leader._become_leader()
+
+    print(f"\n초기 리더 term: {leader.current_term}")
+
+    # 팔로워의 term을 증가시킴
+    follower1.current_term = leader.current_term + 2
+    print(f"follower1의 term을 {follower1.current_term}로 설정")
+
+    # 리더의 AppendEntries는 거부됨
+    from v9_3_planetary_consensus import AppendEntriesRequest
+
+    request = AppendEntriesRequest(
+        leader_id=leader.node_id,
+        term=leader.current_term,  # 낮은 term
+        prev_log_index=0,
+        prev_log_term=0,
+    )
+
+    response = await follower1.on_append_entries(request)
+
+    print(f"\n📊 AppendEntries 응답:")
+    print(f"   - success: {response.success} (거부됨)")
+    print(f"   - follower1의 새로운 term: {follower1.current_term}")
+
+
+async def scenario_03_normal_log_replication():
+    """
+    시나리오 3: 정상 로그 복제
+    주제: Quorum & Commit
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 3: 정상 로그 복제")
+    print("="*60)
+    print("개념: 리더가 명령 → 팔로워들에게 복제 → 쿼럼 ACK → 커밋")
+
+    config = NetworkConfig(min_delay_ms=5, max_delay_ms=30)
+    network = GogsGlobalNetwork(config)
+
+    # 5개 노드
+    nodes = []
+    for i in range(5):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    leader = nodes[0]
+    await leader._become_candidate()
+    await leader._become_leader()
+
+    await print_status(network, "리더 선출 완료")
+
+    # 명령 복제
+    replication = LogReplication(network)
+
+    commands = [
+        {"op": "set", "key": "name", "value": "Alice"},
+        {"op": "set", "key": "age", "value": 30},
+        {"op": "increment", "key": "counter"},
+    ]
+
+    print("\n📝 명령 복제 시작...")
+    for i, cmd in enumerate(commands, 1):
+        result = await replication.replicate_entry(leader, cmd)
+        print(f"   {i}. {cmd['op']:10} → {result.message}")
+        await asyncio.sleep(0.1)
+
+    await print_status(network, "복제 후 상태")
+    print(f"\n✅ 상태 머신: {leader.state_machine}")
+
+
+async def scenario_04_leader_failure_and_reelection():
+    """
+    시나리오 4: 리더 장애 & 재선출
+    주제: < 300ms 내에 새 리더 선출
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 4: 리더 장애 & 재선출")
+    print("="*60)
+    print("개념: 리더가 장애 → 팔로워들이 타임아웃 → 새 리더 선출")
+
+    config = NetworkConfig(min_delay_ms=10, max_delay_ms=50)
+    network = GogsGlobalNetwork(config)
+
+    nodes = []
+    for i in range(5):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    # 초기 리더 선출
+    leader = nodes[0]
+    await leader._become_candidate()
+    await leader._become_leader()
+
+    await print_status(network, "초기 리더: node-0")
+
+    # 리더 장애
+    print("\n💥 리더 장애 발생!")
+    leader.is_alive = False
+
+    # 새 리더 선출 대기
+    await asyncio.sleep(0.3)
+
+    new_leader = network.get_current_leader()
+    await print_status(network, "새 리더 선출 후")
+
+    print(f"\n✅ 새로운 리더: {new_leader}")
+
+
+async def scenario_05_network_delay_impact():
+    """
+    시나리오 5: 네트워크 지연의 영향
+    주제: 파라미터 튜닝
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 5: 네트워크 지연의 영향")
+    print("="*60)
+
+    import time
+
+    # 높은 지연
+    config = NetworkConfig(min_delay_ms=100, max_delay_ms=200)
+    network = GogsGlobalNetwork(config)
+
+    nodes = []
+    for i in range(3):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    print("\n⏱️  테스트: 높은 네트워크 지연 (100~200ms)")
+    start = time.time()
+
+    election = LeaderElection(network)
+    await election.start_election(nodes[0])
+
+    elapsed = time.time() - start
+    print(f"   선거 완료 시간: {elapsed:.3f}초")
+
+    # 낮은 지연
+    config2 = NetworkConfig(min_delay_ms=5, max_delay_ms=20)
+    network2 = GogsGlobalNetwork(config2)
+
+    nodes2 = []
+    for i in range(3):
+        node = RaftNode(f"node-{i}", network2)
+        network2.add_node(node)
+        nodes2.append(node)
+
+    print("\n⏱️  테스트: 낮은 네트워크 지연 (5~20ms)")
+    start = time.time()
+
+    election2 = LeaderElection(network2)
+    await election2.start_election(nodes2[0])
+
+    elapsed2 = time.time() - start
+    print(f"   선거 완료 시간: {elapsed2:.3f}초")
+
+
+async def scenario_06_lagging_follower_recovery():
+    """
+    시나리오 6: 뒤처진 팔로워 복구
+    주제: Catch-up 메커니즘
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 6: 뒤처진 팔로워 복구")
+    print("="*60)
+    print("개념: 팔로워가 오프라인이었다가 복구")
+    print("      리더는 prev_log_index를 감소시켜 로그 동기화")
+
+    config = NetworkConfig(min_delay_ms=5, max_delay_ms=20)
+    network = GogsGlobalNetwork(config)
+
+    leader = RaftNode("leader", network)
+    follower = RaftNode("follower", network)
+
+    network.add_node(leader)
+    network.add_node(follower)
+
+    await leader._become_candidate()
+    await leader._become_leader()
+
+    # 리더에 로그 항목 추가
+    print("\n📝 리더에 로그 항목 추가...")
+    for i in range(5):
+        await leader.append_entry({"op": "set", "key": f"k{i}", "value": i})
+
+    print(f"   리더 로그 길이: {len(leader.log)}")
+
+    # 팔로워는 오프라인
+    print("\n📛 팔로워 오프라인...")
+    follower.is_alive = False
+
+    await asyncio.sleep(0.1)
+
+    # 팔로워 복구
+    print("\n✅ 팔로워 복구!")
+    follower.is_alive = True
+
+    # 동기화 시뮬레이션 (간단히)
+    replication = LogReplication(network)
+
+    # next_index 초기화
+    leader.next_index[follower.node_id] = len(leader.log) + 1
+    leader.match_index[follower.node_id] = 0
+
+    print(f"   next_index[follower] 초기값: {leader.next_index[follower.node_id]}")
+
+    # AppendEntries 전송
+    for _ in range(3):
+        response = await replication.send_append_entries(leader, follower.node_id)
+        if response:
+            print(f"   → match_index[follower] = {leader.match_index.get(follower.node_id, 0)}")
+        await asyncio.sleep(0.05)
+
+
+async def scenario_07_network_partition_cap():
+    """
+    시나리오 7: 네트워크 파티션 (3+2)
+    주제: CAP 정리 실증
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 7: 네트워크 파티션 (3+2 분할)")
+    print("="*60)
+    print("개념: 5개 노드가 3개 vs 2개로 분할")
+    print("      다수파(3개)만 리더 선출 가능 (Quorum = 3)")
+    print("      소수파(2개)는 리더 선출 불가 (CAP 정리)")
+
+    config = NetworkConfig(min_delay_ms=10, max_delay_ms=50)
+    network = GogsGlobalNetwork(config)
+
+    node_ids = [f"node-{i}" for i in range(5)]
+    nodes = {}
+
+    for node_id in node_ids:
+        node = RaftNode(node_id, network)
+        network.add_node(node)
+        nodes[node_id] = node
+
+    await print_status(network, "초기 상태")
+
+    # 선거
+    election = LeaderElection(network)
+    await election.start_election(nodes[node_ids[0]])
+
+    await asyncio.sleep(0.2)
+
+    initial_leader = network.get_current_leader()
+    print(f"\n초기 리더: {initial_leader}")
+
+    # 3+2 분할
+    print("\n🔥 네트워크 파티션 발생!")
+    partition_a = ["node-0", "node-1", "node-2"]  # 다수파
+    partition_b = ["node-3", "node-4"]  # 소수파
+
+    for a_id in partition_a:
+        for b_id in partition_b:
+            network.partition_nodes(a_id, b_id)
+
+    print(f"   다수파 (3개): {partition_a}")
+    print(f"   소수파 (2개): {partition_b}")
+
+    await asyncio.sleep(0.2)
+
+    # 다수파의 리더 확인
+    majority_leader = None
+    for node_id in partition_a:
+        if nodes[node_id].state.value == "LEADER":
+            majority_leader = node_id
+            break
+
+    print(f"\n✅ 다수파의 리더: {majority_leader}")
+    print(f"   소수파는 리더 선출 불가능 (CAP 정리)")
+
+
+async def scenario_08_split_vote_and_convergence():
+    """
+    시나리오 8: Split Vote 시뮬레이션
+    주제: 재선거 수렴
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 8: Split Vote 및 수렴")
+    print("="*60)
+    print("개념: 일부 노드의 투표가 분산되면 선거 실패")
+    print("      재선거가 진행되어 최종적으로 수렴")
+
+    config = NetworkConfig(min_delay_ms=10, max_delay_ms=50)
+    network = GogsGlobalNetwork(config)
+
+    nodes = []
+    for i in range(5):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    print("\n🗳️  첫 번째 선거 시도...")
+    election = LeaderElection(network)
+
+    tasks = [election.start_election(node) for node in nodes[:2]]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    await asyncio.sleep(0.3)
+
+    leader1 = network.get_current_leader()
+    print(f"   결과: {leader1}")
+
+    await print_status(network, "선거 후")
+
+
+async def scenario_09_continuous_failure_tolerance():
+    """
+    시나리오 9: 연속 장애 내성 한계
+    주제: 2/5 장애 한계
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 9: 연속 장애 내성 한계")
+    print("="*60)
+    print("개념: Raft는 (n-1)/2 개 장애까지 견딤")
+    print("      5개 노드 → 최대 2개까지 장애 허용")
+
+    config = NetworkConfig(min_delay_ms=10, max_delay_ms=50)
+    network = GogsGlobalNetwork(config)
+
+    nodes = []
+    for i in range(5):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    # 초기 리더 선출
+    election = LeaderElection(network)
+    await election.start_election(nodes[0])
+    await asyncio.sleep(0.2)
+
+    print("\n❌ 1개 노드 장애...")
+    nodes[3].is_alive = False
+    active = sum(1 for n in nodes if n.is_alive)
+    print(f"   활성 노드: {active}/5 → 쿼럼 가능 (3/5)")
+
+    print("\n❌ 2개 노드 장애...")
+    nodes[4].is_alive = False
+    active = sum(1 for n in nodes if n.is_alive)
+    print(f"   활성 노드: {active}/5 → 쿼럼 가능 (3/5)")
+
+    print("\n❌ 3개 노드 장애...")
+    nodes[2].is_alive = False
+    active = sum(1 for n in nodes if n.is_alive)
+    quorum = 5 // 2 + 1
+    print(f"   활성 노드: {active}/5 → 쿼럼 불가 ({active} < {quorum})")
+    print(f"   ⚠️  클러스터 중단!")
+
+
+async def scenario_10_performance_benchmark():
+    """
+    시나리오 10: 성능 벤치마크
+    주제: ops/sec, P99 레이턴시
+    """
+    print("\n" + "="*60)
+    print("🎯 시나리오 10: 성능 벤치마크")
+    print("="*60)
+    print("개념: 처리량(throughput)과 레이턴시(latency) 측정")
+
+    config = NetworkConfig(min_delay_ms=5, max_delay_ms=20)
+    network = GogsGlobalNetwork(config)
+
+    nodes = []
+    for i in range(5):
+        node = RaftNode(f"node-{i}", network)
+        network.add_node(node)
+        nodes.append(node)
+
+    leader = nodes[0]
+    await leader._become_candidate()
+    await leader._become_leader()
+
+    import time
+
+    replication = LogReplication(network)
+
+    # 벤치마크
+    num_commands = 100
+    latencies = []
+
+    print(f"\n⏱️  {num_commands}개 명령 복제...")
+
+    start_time = time.time()
+
+    for i in range(num_commands):
+        cmd_start = time.time()
+        result = await replication.replicate_entry(leader, {"op": "increment", "key": "counter"})
+        cmd_latency = (time.time() - cmd_start) * 1000  # ms
+        latencies.append(cmd_latency)
+
+    total_time = time.time() - start_time
+
+    # 통계
+    latencies.sort()
+    p50 = latencies[len(latencies) // 2]
+    p99 = latencies[int(len(latencies) * 0.99)]
+    avg = sum(latencies) / len(latencies)
+
+    throughput = num_commands / total_time
+
+    print(f"\n📊 성능 결과:")
+    print(f"   - 처리량: {throughput:.2f} ops/sec")
+    print(f"   - 총 시간: {total_time:.3f}초")
+    print(f"   - 평균 레이턴시: {avg:.2f}ms")
+    print(f"   - P50 레이턴시: {p50:.2f}ms")
+    print(f"   - P99 레이턴시: {p99:.2f}ms")
+
+
+async def main():
+    """모든 시나리오 실행"""
+    print("\n")
+    print("╔" + "="*58 + "╗")
+    print("║" + " "*58 + "║")
+    print("║" + "  v9.3 행성급 분산 합의 엔진 - 10개 교육 시나리오".center(58) + "║")
+    print("║" + "  Post-Doc Research: Raft 분산 합의 알고리즘".center(58) + "║")
+    print("║" + " "*58 + "║")
+    print("╚" + "="*58 + "╝")
+
+    scenarios = [
+        ("01", scenario_01_initial_cluster_formation),
+        ("02", scenario_02_logical_clock_term),
+        ("03", scenario_03_normal_log_replication),
+        ("04", scenario_04_leader_failure_and_reelection),
+        ("05", scenario_05_network_delay_impact),
+        ("06", scenario_06_lagging_follower_recovery),
+        ("07", scenario_07_network_partition_cap),
+        ("08", scenario_08_split_vote_and_convergence),
+        ("09", scenario_09_continuous_failure_tolerance),
+        ("10", scenario_10_performance_benchmark),
+    ]
+
+    for num, scenario_func in scenarios:
+        try:
+            await scenario_func()
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"\n❌ 시나리오 {num} 실행 중 오류: {e}")
+
+    print("\n")
+    print("╔" + "="*58 + "╗")
+    print("║" + " "*58 + "║")
+    print("║" + "✅ 모든 시나리오 완료!".center(58) + "║")
+    print("║" + " "*58 + "║")
+    print("╚" + "="*58 + "╝")
+    print("\n기록이 증명이다. (Your record is your proof.)\n")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

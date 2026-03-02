@@ -1,0 +1,241 @@
+# Phase 5.5.3 — Parameter Type Inference
+
+## 컨텍스트
+
+**목표**: Phase 5.5.2 (Return Type Inference) 완료 후, Phase 5.5.3에서 파라미터 타입 어노테이션을 실제로 집행한다.
+
+**현재 GAP**:
+- `parser.ts` `parseParams()`: 타입 어노테이션(`fn add(a: num, b: num)`)을 파싱하지만 즉시 버림 → `string[]`만 반환
+- AST `fn` 노드: `params: string[]` — 타입 정보 없음
+- `type-checker.ts`: 모든 파라미터를 `UNKNOWN`으로만 등록 → 호출 시 타입 불일치 검출 불가
+- `type-system.ts`에 `parseType()` 함수가 이미 export되어 있음 → 재사용 가능
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 작업 |
+|------|------|
+| `src/ast.ts` | `Param` 타입 정의 + fn 노드 `params: Param[]`로 변경 |
+| `src/parser.ts` | `parseParams()` 타입 어노테이션 수집 + arrow fn 수정 |
+| `src/compiler.ts` | `params: Param[]` 시그니처 + `declareLocal(p.name)` |
+| `src/type-checker.ts` | `parseType()` 호출로 어노테이션 기반 타입 등록 |
+| `src/vm-param-types-test.ts` | 신규 15개 테스트 |
+
+---
+
+## Step 1: ast.ts — Param 타입 추가
+
+### 1-1: Param 타입 정의 삽입 (Line 2 뒤)
+
+```typescript
+// Phase 5.5.3: 파라미터 — 이름 + 선택적 타입 어노테이션
+export type Param = { name: string; typeAnnotation?: string };
+```
+
+### 1-2: Expr fn 노드 변경 (Line 17)
+
+```typescript
+// Before:
+| { kind: "fn"; name: string | null; params: string[]; body: Stmt[] }
+// After:
+| { kind: "fn"; name: string | null; params: Param[]; body: Stmt[] }
+```
+
+### 1-3: Stmt fn 노드 변경 (Line 48)
+
+```typescript
+// Before:
+| { kind: "fn"; name: string; params: string[]; body: Stmt[]; annotations?: CapabilityAnnotation[] }
+// After:
+| { kind: "fn"; name: string; params: Param[]; body: Stmt[]; annotations?: CapabilityAnnotation[] }
+```
+
+---
+
+## Step 2: parser.ts — 타입 어노테이션 수집
+
+### 2-1: Import에 Param 추가
+
+```typescript
+import { Expr, Stmt, Program, MatchArm, Param } from "./ast";
+```
+
+### 2-2: parseParams() 함수 변경 (Line 671-691)
+
+```typescript
+function parseParams(): Param[] {
+  const params: Param[] = [];
+  while (!at(T.RParen) && !at(T.EOF)) {
+    const paramName = expect(T.Ident, "Expected parameter name").value;
+    let typeAnnotation: string | undefined;
+    // Phase 5.5.3: 타입 어노테이션 수집 (버리지 않고 저장)
+    if (match(T.Colon)) {
+      const typeParts: string[] = [];
+      let depth = 0;
+      while (!at(T.Comma) && !at(T.RParen) && !at(T.EOF)) {
+        const tok = advance();
+        if (tok.type === T.LBracket) depth++;
+        if (tok.type === T.RBracket) depth--;
+        if (depth < 0) break;
+        typeParts.push(tok.value);
+      }
+      typeAnnotation = typeParts.join("").toLowerCase();
+    }
+    params.push({ name: paramName, typeAnnotation });
+    match(T.Comma);
+  }
+  return params;
+}
+```
+
+### 2-3: 단일 파라미터 arrow function 수정 (Line 559, 562)
+
+```typescript
+// Line 559:
+return { kind: "fn", name: null, params: [{ name: t.value }], body };
+// Line 562:
+return { kind: "fn", name: null, params: [{ name: t.value }], body: [{ kind: "return", value: expr }] };
+```
+
+### 2-4: 다중 파라미터 arrow function 수정 (Line 589, 593)
+
+```typescript
+const params: Param[] = [];
+// ...
+params.push({ name: advance().value });
+```
+
+### 2-5: parseArrowBody 시그니처 변경 (Line 622)
+
+```typescript
+function parseArrowBody(params: Param[]): Expr {
+```
+
+---
+
+## Step 3: compiler.ts — params.name 추출
+
+### 3-1: Import에 Param 추가
+
+```typescript
+import { Expr, Stmt, Program, MatchArm, Param } from "./ast";
+```
+
+### 3-2: compileFnBody 시그니처 변경 (Line 421)
+
+```typescript
+function compileFnBody(name: string, params: Param[], body: Stmt[], annotations: any[] = []) {
+```
+
+### 3-3: declareLocal 루프 수정 (Line 438)
+
+```typescript
+for (const p of params) declareLocal(p.name);  // Phase 5.5.3: .name 추출
+```
+
+---
+
+## Step 4: type-checker.ts — parseType() 기반 파라미터 타입 등록
+
+### 4-1: parseType import 추가
+
+```typescript
+import { ..., parseType } from "./type-system"
+```
+
+### 4-2: registerFunctionType() 수정 (Line 82-85)
+
+```typescript
+const paramTypes: Type[] = (fnStmt.params || []).map((p: any) =>
+  parseType(p.typeAnnotation ?? "unknown")
+)
+```
+
+### 4-3: checkStmt() case "fn" 파라미터 등록 수정 (Line 151-156)
+
+```typescript
+for (const param of fnStmt.params || []) {
+  this.env.set(param.name, parseType(param.typeAnnotation ?? "unknown"))
+}
+```
+
+### 4-4: checkExpr() case "fn" 파라미터 등록 수정 (Line 584-589)
+
+```typescript
+for (const param of fnExpr.params || []) {
+  this.env.set(param.name, parseType(param.typeAnnotation ?? "unknown"))
+}
+```
+
+### 4-5: checkExpr() case "fn" paramTypes 수정 (Line 599-602)
+
+```typescript
+const paramTypes: Type[] = (fnExpr.params || []).map((p: any) =>
+  parseType(p.typeAnnotation ?? "unknown")
+)
+```
+
+---
+
+## Step 5: vm-param-types-test.ts — 15개 통합 테스트
+
+```
+Suite A: 명시적 파라미터 타입 어노테이션 (5개)
+  1. fn add(a: num, b: num) → num 인자 통과
+  2. num 파라미터에 str 인자 전달 → TypeError 감지
+  3. str 파라미터에 str 인자 → 정상
+  4. bool 파라미터에 true 전달 → 정상
+  5. 어노테이션 파라미터 + 반환 타입 추론 연계
+
+Suite B: 후방 호환성 (5개)
+  6. 어노테이션 없는 파라미터 → UNKNOWN (기존 동작 유지)
+  7. 기존 fn add(a, b) 형식 → 정상 동작
+  8. 재귀 함수 파라미터 → UNKNOWN 허용
+  9. fn 표현식 (람다) 파라미터 → UNKNOWN 허용
+  10. 일부만 어노테이션 → 어노테이션 있는 것만 검증
+
+Suite C: 통합 (5개)
+  11. 기존 147개 테스트 호환성 유지 (기본 코드 실행)
+  12. 어노테이션 파라미터 + 다중 인자 검증
+  13. 중첩 함수 파라미터 타입 독립 관리
+  14. num 파라미터에 num 표현식 인자 → 정상
+  15. end-to-end: fn 선언 + 호출 + 반환 타입 추론 연계
+```
+
+---
+
+## 검증 순서
+
+```bash
+npm run build
+node dist/vm-param-types-test.js   # 신규 15개
+bash /tmp/run_all_tests.sh         # 전체 162개 (147 + 15)
+```
+
+목표: **162/162 전체 통과**
+
+---
+
+## 구현 순서
+
+```
+1. ast.ts          — Param 타입 정의 (가장 먼저, 모든 파일이 의존)
+2. parser.ts       — parseParams() 수정 + arrow fn 5곳 수정
+3. compiler.ts     — compileFnBody 시그니처 + declareLocal(p.name)
+4. type-checker.ts — parseType() 임포트 + 4곳 수정
+5. vm-param-types-test.ts — 15개 테스트 신규 작성
+6. npm run build → 전체 테스트
+```
+
+---
+
+## 리스크 통제
+
+| 리스크 | 대책 |
+|--------|------|
+| params: string[] → Param[] 변경으로 기존 코드 깨짐 | compiler.ts에서 `.name` 추출, TypeScript가 타입 오류로 즉시 안내 |
+| Arrow fn 단일 파라미터 `[t.value]` → `[{ name: t.value }]` 누락 | Line 559, 562 모두 수정 필수 |
+| type-checker에서 `param`(객체)을 `string`으로 사용 | `param.name`, `param.typeAnnotation`으로 명시적 접근 |
+| 어노테이션 없는 파라미터 회귀 | `parseType("unknown")` → UNKNOWN 반환 (기존 동작 동일) |
+| `parseType` export 여부 | type-system.ts Line 148: `export function parseType()` 이미 export됨 ✅ |

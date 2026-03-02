@@ -1,0 +1,196 @@
+# Phase 6.3 — Capability VM Runtime Enforcement
+
+## 컨텍스트
+
+Phase 6.2(완료): TypeChecker가 컴파일 타임에 capability를 정적 검증함.
+Phase 6.3(현재): capabilities를 실제 바이트코드에 기록하고, VM 실행 중에 강제 적용.
+
+**현재 GAP**:
+- `fn` Value에 capabilities 필드 없음 → 런타임에 권한 정보 없음
+- `Frame`에 capabilities 없음 → VM이 현재 컨텍스트 권한 파악 불가
+- builtin 이름 불일치: TypeChecker는 `file.read`, stdlib는 `file_read` (언더스코어)
+- builtin 호출 전 capability 집행 로직 없음
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 작업 |
+|------|------|
+| `src/compiler.ts` | Value.fn에 capabilities 추가, compileFnBody에 annotations 전달 |
+| `src/vm.ts` | Frame에 capabilities 추가, Op.Call에서 builtin 호출 전 검사 |
+| `src/type-checker.ts` | BUILTIN_REQUIRED_CAPABILITIES 키 이름 수정 |
+| `src/vm-runtime-cap-test.ts` | 신규 테스트 15개 |
+
+---
+
+## Step 1: compiler.ts — fn Value에 capabilities 저장
+
+### 1-1: Value 타입 수정 (줄 38)
+```typescript
+// 현재:
+| { tag: "fn"; name: string; arity: number; addr: number; freeVars: Value[] }
+
+// 변경:
+| { tag: "fn"; name: string; arity: number; addr: number; freeVars: Value[];
+    capabilities?: Array<{cap: string; arg?: string}> }
+```
+
+### 1-2: case "fn" stmt 수정 (줄 184-192)
+```typescript
+case "fn": {
+  if (scope().depth === 0) globals.add(s.name);
+  else declareLocal(s.name);
+  compileFnBody(s.name, s.params, s.body, s.annotations || []);  // annotations 전달
+  if (scope().depth === 0) {
+    emitArg(Op.StoreGlobal, addConst({ tag: "str", val: s.name }));
+  }
+  break;
+}
+```
+
+### 1-3: compileFnBody 시그니처 변경 및 capabilities 임베딩
+
+compileFnBody 내부에서 fn Value 생성 시 capabilities 포함:
+```typescript
+function compileFnBody(
+  name: string, params: string[], body: Stmt[],
+  annotations: any[] = []   // 추가
+) {
+  // ... 기존 로직 ...
+  const capabilities = annotations
+    .filter((a: any) => a.kind === "allow")
+    .map((a: any) => ({ cap: a.cap, arg: a.arg }))
+  // addConst 시 capabilities 포함
+}
+```
+
+---
+
+## Step 2: vm.ts — Frame에 capabilities + builtin 검사
+
+### 2-1: Frame 타입 수정
+```typescript
+type Frame = {
+  retAddr: number; baseSlot: number; fn: string; upvalues: Value[];
+  capabilities: Array<{cap: string; arg?: string}>  // ← 추가
+}
+```
+
+### 2-2: Op.Call에서 capabilities Frame에 전달
+```typescript
+case Op.Call: {
+  if (callee.tag === "fn") {
+    this.frames.push({
+      ...,
+      capabilities: callee.capabilities || []   // ← 추가
+    });
+  } else if (callee.tag === "builtin") {
+    this.checkBuiltinCapability(callee.name);   // ← 검사 후 실행
+    // ...builtin 실행 로직...
+  }
+}
+```
+
+### 2-3: BUILTIN_REQUIRED_CAPABILITIES + 검사 메서드
+
+```typescript
+// 클래스 필드
+private readonly BUILTIN_REQUIRED_CAPABILITIES = new Map([
+  ["file_read", "read_file"], ["file_write", "write_file"],
+  ["http_request", "network"], ["http_get", "network"],
+  ["process_spawn", "spawn_process"], ["eval", "execute_code"],
+])
+
+// 메서드
+private checkBuiltinCapability(name: string): void {
+  const required = this.BUILTIN_REQUIRED_CAPABILITIES.get(name)
+  if (!required) return  // print, len 등 안전 builtin은 통과
+  const caps = this.getCurrentCapabilities()
+  if (!caps.some(c => c.cap === required)) {
+    this.runtimeError(`[CapabilityError] '${name}' requires '${required}', not declared`)
+  }
+}
+
+private getCurrentCapabilities() {
+  return this.frames.length ? this.frames[this.frames.length - 1].capabilities : []
+}
+```
+
+---
+
+## Step 3: type-checker.ts — builtin 이름 통일
+
+```typescript
+// 현재 (점 표기법 - stdlib와 불일치):
+["file.read", "read_file"], ["file.write", "write_file"],
+["http.request", "network"], ["http.get", "network"],
+["process.spawn", "spawn_process"],
+
+// 수정 (언더스코어 - stdlib 실제 이름):
+["file_read", "read_file"], ["file_write", "write_file"],
+["http_request", "network"], ["http_get", "network"],
+["process_spawn", "spawn_process"],
+```
+
+---
+
+## Step 4: 테스트 (`src/vm-runtime-cap-test.ts`, 15개)
+
+실제 VM 실행을 통한 런타임 집행 테스트 (TypeChecker 단위 테스트와 별도).
+
+```
+Suite A — 컴파일러 capabilities 임베딩 (5개):
+  1. annotation 없는 fn → capabilities: []
+  2. allow(read_file("/tmp")) → fn Value에 올바르게 임베딩
+  3. allow(network("api.openai.com")) → 임베딩 확인
+  4. 다중 annotation → capabilities 배열 길이 확인
+  5. limit(cpu=5000) → capabilities에 미포함 (allow만)
+
+Suite B — VM 런타임 집행 (5개):
+  6. 권한 없이 file_read 호출 → CapabilityError
+  7. 권한 선언 후 file_read 호출 → 정상
+  8. 안전 builtin (print, len) → 권한 불필요
+  9. 중첩 함수 Frame 전파 → 각 프레임 독립 capabilities
+  10. 최상위 코드에서 file_read → CapabilityError (frames 비어있음)
+
+Suite C — 호환성 (5개):
+  11. 기존 annotation 없는 코드 → 정상
+  12. 기존 산술 연산 정상
+  13. 재귀 함수 capability 자기 참조
+  14. try/catch로 CapabilityError 처리 가능
+  15. 전체 117개 기존 테스트 호환성 유지
+```
+
+---
+
+## 검증 순서
+
+```bash
+npm run build
+node dist/vm-runtime-cap-test.js   # 신규 15개
+bash /tmp/run_all_tests.sh         # 전체 통과 확인
+```
+
+---
+
+## 구현 순서
+
+```
+1. compiler.ts — Value.fn 타입 + compileFnBody annotations 전달
+2. vm.ts       — Frame 타입 + Op.Call + BUILTIN_REQUIRED_CAPABILITIES + 검사 메서드 2개
+3. type-checker.ts — builtin 이름 통일 (점→언더스코어)
+4. vm-runtime-cap-test.ts — 15개 테스트
+5. npm run build → 전체 테스트
+```
+
+---
+
+## 리스크 통제
+
+| 리스크 | 대책 |
+|--------|------|
+| Value.fn 타입 변경으로 기존 코드 깨짐 | capabilities? 옵셔널 필드 |
+| Frame 초기화 누락 지점 존재 | 모든 frames.push() 찾아서 capabilities: [] 추가 |
+| stdlib 실제 builtin 이름 확인 필요 | stdlib.ts 정확히 읽기 |
+| 최상위 코드 엣지케이스 | getCurrentCapabilities() 빈 배열 반환으로 처리 |

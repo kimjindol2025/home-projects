@@ -1,0 +1,759 @@
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// ============================================================================
+// 섹션 1️⃣: Message Broker - 기본 구조
+// ============================================================================
+
+// Message 타입 정의
+type Message struct {
+	ID        string
+	Topic     string
+	Payload   interface{}
+	Timestamp time.Time
+	RetryCount int
+}
+
+// MessageBroker 인터페이스
+type MessageBroker interface {
+	Publish(topic string, message interface{}) error
+	Subscribe(topic string) <-chan *Message
+	Acknowledge(msg *Message) error
+}
+
+// SimpleMessageBroker 구현
+type SimpleMessageBroker struct {
+	topics    map[string][]chan *Message
+	messages  map[string][]*Message
+	mu        sync.RWMutex
+	msgID     int
+}
+
+// NewMessageBroker 생성
+func NewMessageBroker() *SimpleMessageBroker {
+	return &SimpleMessageBroker{
+		topics:   make(map[string][]chan *Message),
+		messages: make(map[string][]*Message),
+	}
+}
+
+// Publish: 메시지 발행
+func (mb *SimpleMessageBroker) Publish(topic string, payload interface{}) error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	mb.msgID++
+	msg := &Message{
+		ID:        fmt.Sprintf("msg-%d", mb.msgID),
+		Topic:     topic,
+		Payload:   payload,
+		Timestamp: time.Now(),
+	}
+
+	// 메시지 저장 (At-Least-Once)
+	mb.messages[topic] = append(mb.messages[topic], msg)
+
+	fmt.Printf("[Broker] ✓ 메시지 발행: %s (Topic: %s)\n", msg.ID, topic)
+
+	// 모든 구독자에게 전송
+	if consumers, exists := mb.topics[topic]; exists {
+		for _, ch := range consumers {
+			select {
+			case ch <- msg:
+			default:
+				fmt.Printf("[Broker] ⚠️ Consumer 채널 가득참: %s\n", topic)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Subscribe: 메시지 구독
+func (mb *SimpleMessageBroker) Subscribe(topic string) <-chan *Message {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	ch := make(chan *Message, 10)
+	mb.topics[topic] = append(mb.topics[topic], ch)
+
+	fmt.Printf("[Broker] ✓ 구독자 등록: Topic=%s\n", topic)
+	return ch
+}
+
+// Acknowledge: 메시지 처리 완료
+func (mb *SimpleMessageBroker) Acknowledge(msg *Message) error {
+	fmt.Printf("[Broker] ✓ ACK 수신: %s\n", msg.ID)
+	return nil
+}
+
+// ============================================================================
+// 섹션 2️⃣: Pub-Sub 패턴 - 느슨한 결합도
+// ============================================================================
+
+// Order 타입
+type Order struct {
+	ID     string
+	UserID string
+	Items  []string
+	Total  float64
+	Status string
+}
+
+// Publisher: 주문 생성
+func OrderPublisher(broker *SimpleMessageBroker) {
+	fmt.Println("\n[Publisher] 주문 생성 시작")
+
+	for i := 1; i <= 3; i++ {
+		order := Order{
+			ID:     fmt.Sprintf("order-%d", i),
+			UserID: fmt.Sprintf("user-%d", i),
+			Items:  []string{"item-1", "item-2"},
+			Total:  99.99,
+			Status: "PENDING",
+		}
+
+		broker.Publish("order-created", order)
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Subscriber 1: 이메일 서비스
+func EmailServiceSubscriber(broker *SimpleMessageBroker, done <-chan struct{}) {
+	messages := broker.Subscribe("order-created")
+
+	go func() {
+		for {
+			select {
+			case msg := <-messages:
+				order := msg.Payload.(Order)
+				fmt.Printf("  [EmailService] 📧 확인 이메일 발송: %s → %s\n", order.ID, order.UserID)
+				time.Sleep(100 * time.Millisecond)
+				broker.Acknowledge(msg)
+
+			case <-done:
+				fmt.Println("  [EmailService] ✓ 종료")
+				return
+			}
+		}
+	}()
+}
+
+// Subscriber 2: 결제 서비스
+func PaymentServiceSubscriber(broker *SimpleMessageBroker, done <-chan struct{}) {
+	messages := broker.Subscribe("order-created")
+
+	go func() {
+		for {
+			select {
+			case msg := <-messages:
+				order := msg.Payload.(Order)
+				fmt.Printf("  [PaymentService] 💳 결제 처리: %s ($%.2f)\n", order.ID, order.Total)
+				time.Sleep(150 * time.Millisecond)
+				broker.Acknowledge(msg)
+
+			case <-done:
+				fmt.Println("  [PaymentService] ✓ 종료")
+				return
+			}
+		}
+	}()
+}
+
+// Subscriber 3: 재고 서비스
+func InventoryServiceSubscriber(broker *SimpleMessageBroker, done <-chan struct{}) {
+	messages := broker.Subscribe("order-created")
+
+	go func() {
+		for {
+			select {
+			case msg := <-messages:
+				order := msg.Payload.(Order)
+				fmt.Printf("  [InventoryService] 📦 재고 감소: %s\n", order.ID)
+				time.Sleep(80 * time.Millisecond)
+				broker.Acknowledge(msg)
+
+			case <-done:
+				fmt.Println("  [InventoryService] ✓ 종료")
+				return
+			}
+		}
+	}()
+}
+
+// ============================================================================
+// 섹션 3️⃣: 전달 보증 (Delivery Guarantees)
+// ============================================================================
+
+// DeliveryGuaranteeDemo: 3가지 전달 보증 시연
+func DeliveryGuaranteeDemo() {
+	fmt.Println("\n[전달 보증] 3가지 패턴 시연")
+
+	// At-Most-Once: 손실 가능, 가장 빠름
+	fmt.Println("\n1️⃣ At-Most-Once (최대 1회, 손실 가능)")
+	fmt.Println("   - 로그 수집, 메트릭")
+	fmt.Println("   - 발행 후 저장 안 함")
+	fmt.Println("   - 특징: 빠름, 신뢰성 낮음\n")
+
+	// At-Least-Once: 중복 가능, 가장 일반적
+	fmt.Println("2️⃣ At-Least-Once (최소 1회, 중복 가능) ⭐ 가장 흔함")
+	fmt.Println("   - 주문, 결제, 중요한 비즈니스")
+	fmt.Println("   - 발행 후 저장 + ACK 기반 재시도")
+	fmt.Println("   - 특징: 중간, 신뢰성 높음\n")
+
+	// Exactly-Once: 정확히 1회, 매우 복잡
+	fmt.Println("3️⃣ Exactly-Once (정확히 1회, 중복 없음)")
+	fmt.Println("   - 금융 거래, 엄격한 규제")
+	fmt.Println("   - Idempotency 기반 구현")
+	fmt.Println("   - 특징: 느림, 신뢰성 매우 높음\n")
+
+	fmt.Println("추천: At-Least-Once + Idempotency 조합 사용")
+}
+
+// ============================================================================
+// 섹션 4️⃣: Idempotency - 중복 메시지 안전 처리
+// ============================================================================
+
+// ProcessedPayments: 처리된 결제 기록 (Idempotency 키)
+var ProcessedPayments = make(map[string]bool)
+var paymentMutex sync.Mutex
+
+// PaymentWithIdempotency: Idempotent 결제 처리
+func PaymentWithIdempotency(paymentID string, amount float64) error {
+	paymentMutex.Lock()
+	defer paymentMutex.Unlock()
+
+	// 이미 처리했는지 확인
+	if ProcessedPayments[paymentID] {
+		fmt.Printf("[Idempotency] ✓ 이미 처리된 결제: %s (재시도 무시)\n", paymentID)
+		return nil
+	}
+
+	// 결제 처리
+	fmt.Printf("[Idempotency] 💳 결제 처리: %s ($%.2f)\n", paymentID, amount)
+	time.Sleep(100 * time.Millisecond)
+
+	// 상태 기록
+	ProcessedPayments[paymentID] = true
+
+	return nil
+}
+
+// IdempotencyDemo: 중복 처리 시나리오
+func IdempotencyDemo() {
+	fmt.Println("\n[Idempotency] 중복 메시지 처리 시연")
+
+	// 시나리오: 결제 요청이 2번 들어옴 (Network Retry)
+	paymentID := "payment-123"
+
+	fmt.Println("\n시도 1: 첫 번째 결제 요청")
+	PaymentWithIdempotency(paymentID, 99.99)
+
+	fmt.Println("\nNetwork 재시도로 인한 중복 요청...")
+	PaymentWithIdempotency(paymentID, 99.99)
+
+	fmt.Println("\n또 다른 중복 요청...")
+	PaymentWithIdempotency(paymentID, 99.99)
+
+	fmt.Println("\n✓ 결과: $99.99만 1회 청구됨 (중복 없음)")
+}
+
+// ============================================================================
+// 섹션 5️⃣: Event Sourcing - 모든 변화를 이벤트로 기록
+// ============================================================================
+
+// Event 타입
+type Event struct {
+	ID        string
+	Type      string      // "WithdrawRequested", "DepositReceived", ...
+	UserID    string
+	Amount    float64
+	Timestamp time.Time
+}
+
+// EventStore: 모든 이벤트 기록
+type EventStore struct {
+	events []*Event
+	mu     sync.RWMutex
+}
+
+// NewEventStore 생성
+func NewEventStore() *EventStore {
+	return &EventStore{
+		events: make([]*Event, 0),
+	}
+}
+
+// Append: 이벤트 추가
+func (es *EventStore) Append(event *Event) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+
+	es.events = append(es.events, event)
+	fmt.Printf("[Event Sourcing] 📝 이벤트 기록: %s (%s)\n", event.Type, event.ID)
+}
+
+// GetHistory: 이벤트 히스토리 조회
+func (es *EventStore) GetHistory(userID string) []*Event {
+	es.mu.RLock()
+	defer es.mu.RUnlock()
+
+	var result []*Event
+	for _, e := range es.events {
+		if e.UserID == userID {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+// ComputeBalance: 현재 잔액 계산 (이벤트 재생)
+func (es *EventStore) ComputeBalance(userID string) float64 {
+	es.mu.RLock()
+	defer es.mu.RUnlock()
+
+	balance := 1000.0 // 초기값
+
+	for _, e := range es.events {
+		if e.UserID == userID {
+			switch e.Type {
+			case "Withdraw":
+				balance -= e.Amount
+			case "Deposit":
+				balance += e.Amount
+			}
+		}
+	}
+
+	return balance
+}
+
+// EventSourcingDemo: Event Sourcing 시연
+func EventSourcingDemo() {
+	fmt.Println("\n[Event Sourcing] 모든 상태 변화를 이벤트로 기록")
+
+	store := NewEventStore()
+
+	// 사건 1: 출금
+	store.Append(&Event{
+		ID:        "evt-1",
+		Type:      "Withdraw",
+		UserID:    "user-1",
+		Amount:    100,
+		Timestamp: time.Now(),
+	})
+
+	// 사건 2: 입금
+	store.Append(&Event{
+		ID:        "evt-2",
+		Type:      "Deposit",
+		UserID:    "user-1",
+		Amount:    500,
+		Timestamp: time.Now(),
+	})
+
+	// 사건 3: 출금
+	store.Append(&Event{
+		ID:        "evt-3",
+		Type:      "Withdraw",
+		UserID:    "user-1",
+		Amount:    200,
+		Timestamp: time.Now(),
+	})
+
+	// 현재 잔액 계산
+	balance := store.ComputeBalance("user-1")
+	fmt.Printf("\n[Event Sourcing] 💰 현재 잔액: $%.2f\n", balance)
+	fmt.Printf("   계산식: $1000 - $100 + $500 - $200 = $%.2f\n", balance)
+
+	// 감시 추적 (Audit Trail)
+	fmt.Println("\n[Event Sourcing] 📊 감시 추적 (Audit Trail)")
+	history := store.GetHistory("user-1")
+	for i, event := range history {
+		fmt.Printf("  %d. %s: $%.2f\n", i+1, event.Type, event.Amount)
+	}
+}
+
+// ============================================================================
+// 섹션 6️⃣: Circuit Breaker - 분산 시스템 장애 격리
+// ============================================================================
+
+// CircuitBreakerState 상태
+type CircuitBreakerState string
+
+const (
+	CLOSED     CircuitBreakerState = "CLOSED"
+	OPEN       CircuitBreakerState = "OPEN"
+	HALF_OPEN  CircuitBreakerState = "HALF_OPEN"
+)
+
+// CircuitBreaker 구현
+type CircuitBreaker struct {
+	state           CircuitBreakerState
+	failureCount    int
+	successCount    int
+	lastFailureTime time.Time
+	failureThreshold int
+	timeout         time.Duration
+	mu              sync.Mutex
+}
+
+// NewCircuitBreaker 생성
+func NewCircuitBreaker(failureThreshold int, timeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		state:            CLOSED,
+		failureThreshold: failureThreshold,
+		timeout:          timeout,
+	}
+}
+
+// Execute: Circuit Breaker로 보호된 실행
+func (cb *CircuitBreaker) Execute(fn func() error) error {
+	cb.mu.Lock()
+	state := cb.state
+	cb.mu.Unlock()
+
+	switch state {
+	case CLOSED:
+		err := fn()
+
+		cb.mu.Lock()
+		if err != nil {
+			cb.failureCount++
+			cb.lastFailureTime = time.Now()
+
+			fmt.Printf("[CB] ❌ 실패 #%d\n", cb.failureCount)
+
+			if cb.failureCount >= cb.failureThreshold {
+				cb.state = OPEN
+				fmt.Println("[CB] 🛑 Circuit Breaker OPEN (차단됨)")
+			}
+			cb.mu.Unlock()
+			return err
+		}
+
+		cb.failureCount = 0
+		cb.mu.Unlock()
+		return nil
+
+	case OPEN:
+		cb.mu.Lock()
+		if time.Since(cb.lastFailureTime) > cb.timeout {
+			cb.state = HALF_OPEN
+			cb.successCount = 0
+			cb.mu.Unlock()
+			fmt.Println("[CB] 🔄 Circuit Breaker HALF_OPEN (복구 시도)")
+			// 재귀 호출 대신 직접 실행
+			return cb.Execute(fn)
+		}
+		cb.mu.Unlock()
+
+		fmt.Println("[CB] ⛔ 요청 차단 (Circuit OPEN)")
+		return fmt.Errorf("circuit breaker is OPEN")
+
+	case HALF_OPEN:
+		err := fn()
+
+		cb.mu.Lock()
+		if err != nil {
+			cb.state = OPEN
+			fmt.Println("[CB] ❌ 복구 실패 → OPEN")
+			cb.mu.Unlock()
+			return err
+		}
+
+		cb.successCount++
+		if cb.successCount >= 2 {
+			cb.state = CLOSED
+			cb.failureCount = 0
+			fmt.Println("[CB] ✓ Circuit Breaker CLOSED (정상 복구)")
+		}
+		cb.mu.Unlock()
+		return nil
+	}
+
+	return fmt.Errorf("unknown state")
+}
+
+// CircuitBreakerDemo: 장애 격리 시연
+func CircuitBreakerDemo() {
+	fmt.Println("\n[Circuit Breaker] 분산 시스템 장애 격리")
+
+	cb := NewCircuitBreaker(2, 1*time.Second)
+
+	// 정상 요청
+	fmt.Println("\n1️⃣ 정상 요청들")
+	cb.Execute(func() error {
+		fmt.Println("[Service] ✓ 요청 성공")
+		return nil
+	})
+
+	// 실패 요청 시작
+	fmt.Println("\n2️⃣ 실패 요청들 (실패 임계값 = 2)")
+	for i := 0; i < 3; i++ {
+		cb.Execute(func() error {
+			return fmt.Errorf("service error")
+		})
+	}
+
+	// Circuit이 차단됨
+	fmt.Println("\n3️⃣ Circuit이 차단됨")
+	for i := 0; i < 2; i++ {
+		cb.Execute(func() error {
+			fmt.Println("[Service] 실제 요청은 하지 않음")
+			return nil
+		})
+	}
+
+	// 시간 경과 후 복구 시도
+	fmt.Println("\n4️⃣ 타임아웃 후 복구 시도 (HALF_OPEN)")
+	time.Sleep(1100 * time.Millisecond)
+
+	cb.Execute(func() error {
+		fmt.Println("[Service] 💪 테스트 요청 - 성공!")
+		return nil
+	})
+
+	// 정상 복구
+	fmt.Println("\n5️⃣ 서비스 정상 복구 (CLOSED)")
+	for i := 0; i < 2; i++ {
+		cb.Execute(func() error {
+			fmt.Println("[Service] ✓ 정상 작동")
+			return nil
+		})
+	}
+}
+
+// ============================================================================
+// 섹션 7️⃣: Dead Letter Queue (DLQ) - 실패한 메시지 처리
+// ============================================================================
+
+// DLQ 타입
+type DeadLetterQueue struct {
+	failedMessages []*Message
+	mu             sync.RWMutex
+}
+
+// NewDLQ 생성
+func NewDLQ() *DeadLetterQueue {
+	return &DeadLetterQueue{
+		failedMessages: make([]*Message, 0),
+	}
+}
+
+// Put: 실패한 메시지 저장
+func (dlq *DeadLetterQueue) Put(msg *Message, reason string) {
+	dlq.mu.Lock()
+	defer dlq.mu.Unlock()
+
+	fmt.Printf("[DLQ] ⚠️ 실패한 메시지 저장: %s (이유: %s)\n", msg.ID, reason)
+	dlq.failedMessages = append(dlq.failedMessages, msg)
+}
+
+// GetAll: 모든 실패 메시지 조회
+func (dlq *DeadLetterQueue) GetAll() []*Message {
+	dlq.mu.RLock()
+	defer dlq.mu.RUnlock()
+
+	result := make([]*Message, len(dlq.failedMessages))
+	copy(result, dlq.failedMessages)
+	return result
+}
+
+// DLQDemo: Dead Letter Queue 시연
+func DLQDemo() {
+	fmt.Println("\n[Dead Letter Queue] 실패한 메시지 처리")
+
+	dlq := NewDLQ()
+	maxRetries := 3
+
+	// 메시지 처리 시뮬레이션
+	messages := []*Message{
+		{ID: "msg-1", Topic: "orders", Payload: Order{ID: "order-1"}},
+		{ID: "msg-2", Topic: "orders", Payload: "invalid-data"}, // 처리 실패
+		{ID: "msg-3", Topic: "orders", Payload: Order{ID: "order-3"}},
+	}
+
+	fmt.Println("\n[처리] 메시지들을 순차 처리")
+
+	for _, msg := range messages {
+		msg.RetryCount = 0
+
+		for msg.RetryCount < maxRetries {
+			_, ok := msg.Payload.(Order)
+
+			if !ok && msg.RetryCount == 0 {
+				msg.RetryCount++
+				fmt.Printf("[처리] ⚠️ 오류 발생: %s (재시도 %d/%d)\n", msg.ID, msg.RetryCount, maxRetries)
+				continue
+			}
+
+			if !ok && msg.RetryCount >= maxRetries {
+				dlq.Put(msg, "Invalid data format")
+				break
+			}
+
+			fmt.Printf("[처리] ✓ 성공: %s\n", msg.ID)
+			break
+		}
+	}
+
+	// DLQ 모니터링
+	fmt.Println("\n[모니터링] DLQ에 저장된 메시지들")
+	failed := dlq.GetAll()
+	fmt.Printf("총 %d개의 실패한 메시지\n", len(failed))
+
+	for _, msg := range failed {
+		fmt.Printf("  - ID: %s, Topic: %s\n", msg.ID, msg.Topic)
+	}
+}
+
+// ============================================================================
+// 섹션 8️⃣: 할당 과제 3-2 - E-Commerce 통합 Demo
+// ============================================================================
+
+// Assignment3_2: E-Commerce 주문 처리 시스템
+func Assignment3_2() {
+	fmt.Println("\n" + repeatStr("=", 70))
+	fmt.Println("【 할당 과제 3-2: E-Commerce 마이크로서비스 아키텍처 】")
+	fmt.Println(repeatStr("=", 70))
+
+	broker := NewMessageBroker()
+	done := make(chan struct{})
+
+	// Subscribers 등록
+	fmt.Println("\n[과제 1] 마이크로서비스 등록")
+	fmt.Println(repeatStr("-", 68))
+	EmailServiceSubscriber(broker, done)
+	PaymentServiceSubscriber(broker, done)
+	InventoryServiceSubscriber(broker, done)
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Publisher에서 주문 생성
+	fmt.Println("\n[과제 2] 주문 생성 및 비동기 처리")
+	fmt.Println(repeatStr("-", 68))
+	OrderPublisher(broker)
+
+	// 모든 처리 완료 대기
+	time.Sleep(2000 * time.Millisecond)
+
+	close(done)
+	time.Sleep(500 * time.Millisecond)
+
+	// 성능 비교
+	fmt.Println("\n[과제 3] 성능 비교: 동기 vs 비동기")
+	fmt.Println(repeatStr("-", 68))
+
+	fmt.Println(`
+동기식 (RPC):
+  주문1: 이메일(100ms) → 결제(150ms) → 재고(80ms) = 330ms
+  주문2: 이메일(100ms) → 결제(150ms) → 재고(80ms) = 330ms
+  주문3: 이메일(100ms) → 결제(150ms) → 재고(80ms) = 330ms
+  총 소요 시간: 990ms
+
+비동기식 (Message Broker):
+  주문1~3 발행: 50ms
+  병렬 처리: max(100, 150, 80) = 150ms
+  총 소요 시간: 200ms
+
+시간 단축: 990ms → 200ms (약 5배 빠름!)
+	`)
+
+	// 아키텍처 설명
+	fmt.Println("[과제 4] 마이크로서비스 아키텍처 이점")
+	fmt.Println(repeatStr("-", 68))
+	fmt.Println(`
+1️⃣ 느슨한 결합도 (Loose Coupling)
+   - 서비스 간 직접 호출 없음
+   - 새 서비스 추가 시 기존 코드 수정 불필요
+
+2️⃣ 독립적 확장성
+   - 이메일 서비스 느리면? 추가 instance 배포
+   - 다른 서비스는 영향 없음
+
+3️⃣ 장애 격리
+   - 이메일 서비스 다운? 주문은 계속 생성됨
+   - Broker가 메시지 보관 (재시도)
+
+4️⃣ 비동기 처리
+   - 모든 처리가 병렬
+   - 전체 성능 극대화
+
+5️⃣ 모니터링 및 디버깅
+   - 각 서비스의 로그 독립적
+   - 메시지 추적 가능 (Event Sourcing)
+	`)
+
+	fmt.Println(repeatStr("=", 70))
+	fmt.Println("✓ 할당 과제 3-2 완료!")
+	fmt.Println(repeatStr("=", 70))
+}
+
+// ============================================================================
+// Helper 함수
+// ============================================================================
+
+func repeatStr(s string, count int) string {
+	result := ""
+	for i := 0; i < count; i++ {
+		result += s
+	}
+	return result
+}
+
+// ============================================================================
+// Main 함수
+// ============================================================================
+
+func main() {
+	fmt.Println("🎓 Go 301-3-2: 메시지 기반 분산 아키텍처\n")
+
+	// 섹션 1: Message Broker 기본
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 1️⃣: Message Broker 기본\n" + "]" + repeatStr("=", 70))
+	broker := NewMessageBroker()
+	broker.Publish("test-topic", "테스트 메시지")
+
+	// 섹션 2: Pub-Sub 패턴
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 2️⃣: Pub-Sub 패턴\n" + "]" + repeatStr("=", 70))
+	done := make(chan struct{})
+	EmailServiceSubscriber(broker, done)
+	PaymentServiceSubscriber(broker, done)
+	InventoryServiceSubscriber(broker, done)
+
+	time.Sleep(300 * time.Millisecond)
+
+	OrderPublisher(broker)
+	time.Sleep(1500 * time.Millisecond)
+	close(done)
+	time.Sleep(300 * time.Millisecond)
+
+	// 섹션 3: 전달 보증
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 3️⃣: 전달 보증\n" + "]" + repeatStr("=", 70))
+	DeliveryGuaranteeDemo()
+
+	// 섹션 4: Idempotency
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 4️⃣: Idempotency\n" + "]" + repeatStr("=", 70))
+	IdempotencyDemo()
+
+	// 섹션 5: Event Sourcing
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 5️⃣: Event Sourcing\n" + "]" + repeatStr("=", 70))
+	EventSourcingDemo()
+
+	// 섹션 6: Circuit Breaker
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 6️⃣: Circuit Breaker\n" + "]" + repeatStr("=", 70))
+	CircuitBreakerDemo()
+
+	// 섹션 7: Dead Letter Queue
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 7️⃣: Dead Letter Queue\n" + "]" + repeatStr("=", 70))
+	DLQDemo()
+
+	// 섹션 8: 할당 과제 3-2
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 8️⃣: 할당 과제 3-2\n" + "]" + repeatStr("=", 70))
+	Assignment3_2()
+}

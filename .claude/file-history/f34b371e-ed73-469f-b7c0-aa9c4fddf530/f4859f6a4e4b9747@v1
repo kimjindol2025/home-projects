@@ -1,0 +1,265 @@
+# v15.3 가비지 컬렉션(GC) - 구현 계획
+
+## Context
+
+v15.2에서 VM이 완성되었습니다. 그러나 `Value::Array(Vec<Value>)`, `Value::HashMap(...)` 구조는 복사 시마다 깊은 복사(Clone)가 발생합니다. 장기 실행 프로그램에서 메모리가 계속 증가하는 문제가 있습니다. v15.3에서는 **Mark-and-Sweep GC**를 도입하여 힙 객체를 `ObjectHeap`(arena)에서 중앙 관리하고, Value 스택에는 `GcRef(usize)` 인덱스만 저장하는 구조로 개선합니다.
+
+핵심 변화:
+- `Value::Array(Vec<Value>)` → `Value::Array(GcRef)` (Clone O(n) → O(1))
+- `Value::HashMap(...)` → `Value::HashMap(GcRef)` (Clone O(n) → O(1))
+- `VM`에 `ObjectHeap` 추가 (힙 관리자)
+
+---
+
+## 신규 프로젝트 경로
+
+```
+lang_design/v15_3_gc_basics/
+├── Cargo.toml
+├── src/
+│   ├── ast.rs           (v15.2 그대로 복사)
+│   ├── bytecode.rs      (v15.2 그대로 복사)
+│   ├── opcode.rs        (v15.2 그대로 복사)
+│   ├── disassembler.rs  (v15.2 그대로 복사)
+│   ├── compiler.rs      (v15.2 그대로 복사)
+│   ├── gc_object.rs     [신규] GcRef, GcObject, GcData, ObjectHeap
+│   ├── value.rs         [수정] Array/HashMap → GcRef 인덱스로 변경
+│   ├── vm.rs            [수정] ObjectHeap 통합, GC 트리거
+│   ├── lib.rs           [수정] gc_object 모듈 추가
+│   └── main.rs          [신규] 12개 교육 섹션
+└── ARCHITECTURE_V15_3_GC_BASICS.md
+```
+
+---
+
+## 구현 순서
+
+### Step 1~5: 복사 파일
+
+v15.2에서 5개 파일 그대로 복사 (변경 없음):
+- `opcode.rs`, `bytecode.rs`, `ast.rs`, `disassembler.rs`, `compiler.rs`
+
+### Step 6: `gc_object.rs` (신규 - 핵심)
+
+```rust
+use crate::value::Value;
+use std::collections::HashMap;
+
+/// GC 힙에서의 위치 (인덱스)
+pub type GcRef = usize;
+
+/// GC 힙에 저장되는 데이터 종류
+pub enum GcData {
+    Array(Vec<Value>),
+    HashMap(HashMap<String, Value>),
+    Str(String),
+}
+
+/// GC가 관리하는 힙 객체
+pub struct GcObject {
+    pub is_marked: bool,     // Mark 단계 플래그
+    pub data: GcData,
+}
+
+/// Arena 패턴 힙 - 모든 GC 객체를 소유
+pub struct ObjectHeap {
+    objects: Vec<Option<GcObject>>,  // None = 해제된 슬롯
+    total_allocated: usize,
+    gc_threshold: usize,
+    gc_count: usize,
+}
+
+/// GC 실행 통계 (교육용)
+pub struct GcStats {
+    pub objects_before: usize,
+    pub objects_after: usize,
+    pub objects_freed: usize,
+    pub gc_count: usize,
+}
+```
+
+**ObjectHeap 주요 메서드:**
+- `new() / with_threshold(n)`: 생성
+- `alloc(data) -> GcRef`: 빈 슬롯 재사용 or 새 슬롯 추가
+- `get(GcRef) -> Option<&GcObject>`: 불변 조회
+- `get_mut(GcRef) -> Option<&mut GcObject>`: 가변 조회
+- `live_count() -> usize`: 살아있는 객체 수
+- `should_collect() -> bool`: live_count >= gc_threshold
+- `mark(roots: &[Value])`: worklist DFS (재귀 아닌 loop)
+- `sweep() -> usize`: 해제 후 해제 수 반환
+- `collect_garbage(roots: &[Value]) -> GcStats`: mark + sweep 통합
+
+**Mark의 핵심: worklist DFS (Rust borrow checker 해결)**
+```rust
+pub fn mark(&mut self, roots: &[Value]) {
+    self.reset_marks();
+    let mut worklist: Vec<GcRef> = roots.iter()
+        .filter_map(|v| v.as_gc_ref())
+        .collect();
+
+    while let Some(gc_ref) = worklist.pop() {
+        let Some(Some(obj)) = self.objects.get_mut(gc_ref) else { continue };
+        if obj.is_marked { continue; }
+        obj.is_marked = true;
+        // 자식 GcRef 수집 후 worklist에 push
+        let children: Vec<GcRef> = match &obj.data {
+            GcData::Array(elems) => elems.iter().filter_map(|v| v.as_gc_ref()).collect(),
+            GcData::HashMap(map) => map.values().filter_map(|v| v.as_gc_ref()).collect(),
+            GcData::Str(_) => vec![],
+        };
+        worklist.extend(children);
+    }
+}
+```
+
+**Sweep의 핵심: is_marked=false → None 교체**
+```rust
+pub fn sweep(&mut self) -> usize {
+    let mut freed = 0;
+    for slot in self.objects.iter_mut() {
+        match slot {
+            Some(obj) if !obj.is_marked => { *slot = None; freed += 1; }
+            Some(obj) => { obj.is_marked = false; } // 다음 GC 준비
+            None => {}
+        }
+    }
+    freed
+}
+```
+
+### Step 7: `value.rs` (수정)
+
+```rust
+use crate::gc_object::{GcRef, ObjectHeap};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Bool(bool),
+    Null,
+    Array(GcRef),    // ← Vec<Value> 대신 인덱스
+    HashMap(GcRef),  // ← HashMap 대신 인덱스
+}
+
+impl Value {
+    pub fn as_gc_ref(&self) -> Option<GcRef> {
+        match self {
+            Value::Array(r) | Value::HashMap(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Value::Bool(b) => *b,
+            Value::Int(0) => false,
+            Value::Int(_) => true,
+            Value::Null => false,
+            Value::Array(_) | Value::HashMap(_) => true,
+        }
+    }
+
+    pub fn display_with_heap(&self, heap: &ObjectHeap) -> String { ... }
+}
+```
+
+### Step 8: `vm.rs` (수정)
+
+```rust
+pub struct VM {
+    bytecode: Bytecode,
+    stack: Vec<Value>,
+    ip: usize,
+    heap: ObjectHeap,  // 추가!
+}
+
+// OpArray 수정:
+OpCode::OpArray => {
+    let count = self.read_u16() as usize;
+    let mut arr = Vec::with_capacity(count);
+    for _ in 0..count { arr.push(self.stack_pop()?); }
+    arr.reverse();
+    if self.heap.should_collect() {
+        let stats = self.heap.collect_garbage(&self.stack);
+        eprintln!("[GC #{}: {} → {} ({} 해제)]",
+            stats.gc_count, stats.objects_before,
+            stats.objects_after, stats.objects_freed);
+    }
+    let gc_ref = self.heap.alloc(GcData::Array(arr));
+    self.stack.push(Value::Array(gc_ref));
+}
+
+// OpHash 수정 (유사):
+// OpIndex 수정:
+OpCode::OpIndex => {
+    let idx = self.stack_pop()?;
+    let container = self.stack_pop()?;
+    match container {
+        Value::Array(gc_ref) => {
+            let arr_data = self.heap.get(gc_ref)
+                .ok_or_else(|| "Dangling GcRef".to_string())?;
+            // 인덱싱 로직
+        }
+        Value::HashMap(gc_ref) => { ... }
+        _ => return Err("Invalid indexing".to_string()),
+    }
+}
+```
+
+### Step 9: `lib.rs` (수정)
+
+`gc_object` 모듈 공개, `compile_and_run` 유지.
+
+### Step 10: `Cargo.toml`
+
+```toml
+[package]
+name = "v15_3_gc_basics"
+version = "0.1.0"
+edition = "2021"
+```
+
+### Step 11: `main.rs` (12개 교육 섹션)
+
+| # | 섹션 | 내용 |
+|---|------|------|
+| 1 | GC의 필요성 | Clone O(n) 문제 시각화 |
+| 2 | Arena 패턴 | ObjectHeap 구조 설명 |
+| 3 | GcRef 개념 | 인덱스로 참조하는 방식 |
+| 4 | 할당과 조회 | alloc/get 실습 |
+| 5 | Mark 단계 | is_marked 변화 시각화 |
+| 6 | Sweep 단계 | None 교체 과정 시각화 |
+| 7 | collect_garbage | GcStats 출력 |
+| 8 | GC 임계값 | threshold 조절 효과 |
+| 9 | VM + GC 통합 | 실제 VM에서 배열 생성 + GC 발생 |
+| 10 | GC 스트레스 테스트 | 많은 배열 생성 → GC 반복 |
+| 11 | 중첩 배열 마킹 | 전이적 도달성 (배열 안의 배열) |
+| 12 | 아키텍처 요약 | v15.2 → v15.3 비교, 다음 단계 소개 |
+
+---
+
+## 테스트 목표: 25개
+
+| 파일 | 수 | 내용 |
+|------|---|------|
+| gc_object.rs | 10개 | alloc, live_count, mark, sweep, collect_garbage |
+| value.rs | 5개 | as_gc_ref, is_truthy, display_with_heap |
+| vm.rs | 10개 | VM+GC 통합 5개 + v15.2 기능 유지 5개 |
+
+**핵심 테스트 케이스:**
+- `mark_from_stack_root`: 스택에 있는 GcRef는 마킹됨
+- `sweep_frees_unreachable`: 스택에 없는 GcRef는 해제됨
+- `collect_garbage_stats`: stats.objects_freed 검증
+- `mark_nested_array`: 배열 안의 배열도 마킹됨
+- `vm_gc_does_not_free_stack_objects`: GC 후 스택 객체 여전히 유효
+
+---
+
+## 검증 방법
+
+```bash
+cd lang_design/v15_3_gc_basics
+cargo build   # 경고 없이 통과
+cargo test    # 25개 이상 통과
+cargo run     # 12개 섹션 + [GC #n: ... 해제] 출력 확인
+```

@@ -1,0 +1,467 @@
+"""
+v7.2 gRPC 인터셉터 (Interceptors)
+
+요청/응답 처리 시 공통 로직을 처리합니다.
+"""
+
+import time
+import json
+from typing import Dict, List, Callable, Any
+from datetime import datetime
+from enum import Enum
+
+
+class InterceptorType(Enum):
+    """인터셉터 타입"""
+    LOGGING = "LOGGING"
+    AUTHENTICATION = "AUTHENTICATION"
+    PERFORMANCE = "PERFORMANCE"
+    RATE_LIMITING = "RATE_LIMITING"
+
+
+# ============================================================================
+# 로깅 인터셉터
+# ============================================================================
+
+
+class LoggingInterceptor:
+    """
+    모든 gRPC 호출을 로깅합니다.
+
+    추적:
+    - 요청 시간
+    - 메소드 이름
+    - 입력/출력 크기
+    - 상태 코드
+    """
+
+    def __init__(self):
+        """로깅 인터셉터 초기화"""
+        self.call_count = 0
+        self.call_log: List[Dict] = []
+        self.max_log_size = 1000  # 최대 로그 수
+
+    def log_call(
+        self,
+        method: str,
+        request_size: int,
+        response_size: int,
+        status_code: int,
+        duration_ms: float,
+    ) -> None:
+        """
+        호출 로깅
+
+        Args:
+            method: 메소드 이름
+            request_size: 요청 크기 (바이트)
+            response_size: 응답 크기 (바이트)
+            status_code: 상태 코드
+            duration_ms: 처리 시간 (밀리초)
+        """
+        self.call_count += 1
+
+        log_entry = {
+            "call_id": self.call_count,
+            "timestamp": datetime.utcnow().isoformat(),
+            "method": method,
+            "request_size_bytes": request_size,
+            "response_size_bytes": response_size,
+            "status_code": status_code,
+            "duration_ms": round(duration_ms, 2),
+        }
+
+        self.call_log.append(log_entry)
+
+        # 로그 크기 제한
+        if len(self.call_log) > self.max_log_size:
+            self.call_log.pop(0)
+
+    def get_logs(self) -> List[Dict]:
+        """로그 조회"""
+        return self.call_log.copy()
+
+    def get_stats(self) -> Dict:
+        """로깅 통계"""
+        if not self.call_log:
+            return {
+                "total_calls": 0,
+                "avg_request_size": 0,
+                "avg_response_size": 0,
+                "avg_duration_ms": 0.0,
+                "success_rate": 0.0,
+            }
+
+        total_calls = len(self.call_log)
+        avg_request_size = sum(
+            log["request_size_bytes"] for log in self.call_log
+        ) / total_calls
+        avg_response_size = sum(
+            log["response_size_bytes"] for log in self.call_log
+        ) / total_calls
+        avg_duration_ms = sum(log["duration_ms"] for log in self.call_log) / total_calls
+        success_count = sum(1 for log in self.call_log if log["status_code"] == 0)
+        success_rate = (success_count / total_calls * 100) if total_calls > 0 else 0
+
+        return {
+            "total_calls": total_calls,
+            "avg_request_size_bytes": round(avg_request_size, 2),
+            "avg_response_size_bytes": round(avg_response_size, 2),
+            "avg_duration_ms": round(avg_duration_ms, 2),
+            "success_rate_percent": round(success_rate, 2),
+        }
+
+
+# ============================================================================
+# 인증 인터셉터
+# ============================================================================
+
+
+class AuthInterceptor:
+    """
+    API 키 기반 인증을 수행합니다.
+
+    유효한 키:
+    - gogs-key-2026
+    - gogs-key-admin
+    - gogs-key-demo
+    """
+
+    # 유효한 API 키
+    VALID_KEYS = {
+        "gogs-key-2026",
+        "gogs-key-admin",
+        "gogs-key-demo",
+    }
+
+    def __init__(self):
+        """인증 인터셉터 초기화"""
+        self.auth_count = 0
+        self.auth_log: List[Dict] = []
+
+    def validate_api_key(self, api_key: str) -> Dict:
+        """
+        API 키 검증
+
+        Args:
+            api_key: API 키
+
+        Returns:
+            {success: bool, message: str}
+        """
+        self.auth_count += 1
+
+        is_valid = api_key in self.VALID_KEYS
+
+        log_entry = {
+            "auth_id": self.auth_count,
+            "timestamp": datetime.utcnow().isoformat(),
+            "api_key": api_key[:10] + "***" if api_key else "NONE",
+            "valid": is_valid,
+        }
+
+        self.auth_log.append(log_entry)
+
+        if is_valid:
+            return {
+                "success": True,
+                "message": f"API 키 인증 성공",
+            }
+        else:
+            return {
+                "success": False,
+                "message": f"유효하지 않은 API 키",
+            }
+
+    def get_auth_stats(self) -> Dict:
+        """인증 통계"""
+        if not self.auth_log:
+            return {
+                "total_attempts": 0,
+                "successful": 0,
+                "failed": 0,
+                "success_rate": 0.0,
+            }
+
+        total = len(self.auth_log)
+        successful = sum(1 for log in self.auth_log if log["valid"])
+        failed = total - successful
+
+        return {
+            "total_attempts": total,
+            "successful": successful,
+            "failed": failed,
+            "success_rate_percent": round((successful / total * 100), 2),
+        }
+
+
+# ============================================================================
+# 성능 인터셉터
+# ============================================================================
+
+
+class PerformanceInterceptor:
+    """
+    요청 처리 시간을 측정하고 성능 메트릭을 수집합니다.
+
+    측정:
+    - 메소드별 응답 시간
+    - 최대/최소/평균 응답 시간
+    - 처리량 (요청/초)
+    """
+
+    def __init__(self):
+        """성능 인터셉터 초기화"""
+        self.measurements: Dict[str, List[float]] = {}
+        self.method_counts: Dict[str, int] = {}
+        self.start_time = time.time()
+
+    def measure(
+        self,
+        method: str,
+        duration_ms: float,
+    ) -> None:
+        """
+        성능 측정
+
+        Args:
+            method: 메소드 이름
+            duration_ms: 처리 시간 (밀리초)
+        """
+        if method not in self.measurements:
+            self.measurements[method] = []
+            self.method_counts[method] = 0
+
+        self.measurements[method].append(duration_ms)
+        self.method_counts[method] += 1
+
+    def get_stats(self) -> Dict:
+        """성능 통계"""
+        if not self.measurements:
+            return {
+                "methods": {},
+                "total_requests": 0,
+                "uptime_seconds": round(time.time() - self.start_time, 2),
+                "throughput_rps": 0.0,
+            }
+
+        stats = {}
+        total_requests = 0
+
+        for method, durations in self.measurements.items():
+            total_requests += len(durations)
+            stats[method] = {
+                "call_count": len(durations),
+                "min_ms": round(min(durations), 2),
+                "max_ms": round(max(durations), 2),
+                "avg_ms": round(sum(durations) / len(durations), 2),
+                "p99_ms": round(
+                    sorted(durations)[int(len(durations) * 0.99)], 2
+                ) if len(durations) > 0 else 0,
+            }
+
+        uptime_seconds = time.time() - self.start_time
+        throughput_rps = total_requests / uptime_seconds if uptime_seconds > 0 else 0
+
+        return {
+            "methods": stats,
+            "total_requests": total_requests,
+            "uptime_seconds": round(uptime_seconds, 2),
+            "throughput_rps": round(throughput_rps, 2),
+        }
+
+
+# ============================================================================
+# 비율 제한 인터셉터
+# ============================================================================
+
+
+class RateLimitingInterceptor:
+    """
+    초당 요청 수(RPS)를 제한합니다.
+
+    설정:
+    - 기본값: 100 요청/초
+    - 메소드별 커스텀 제한 가능
+    """
+
+    def __init__(self, default_rps_limit: int = 100):
+        """
+        비율 제한 인터셉터 초기화
+
+        Args:
+            default_rps_limit: 기본 초당 요청 제한
+        """
+        self.default_limit = default_rps_limit
+        self.method_limits: Dict[str, int] = {}
+        self.request_times: Dict[str, List[float]] = {}
+        self.blocked_count = 0
+
+    def set_method_limit(self, method: str, rps_limit: int) -> None:
+        """메소드별 비율 제한 설정"""
+        self.method_limits[method] = rps_limit
+
+    def check_rate_limit(self, method: str) -> Dict:
+        """
+        비율 제한 확인
+
+        Args:
+            method: 메소드 이름
+
+        Returns:
+            {allowed: bool, message: str}
+        """
+        current_time = time.time()
+        limit = self.method_limits.get(method, self.default_limit)
+
+        if method not in self.request_times:
+            self.request_times[method] = []
+
+        # 1초 이상 된 요청 제거
+        self.request_times[method] = [
+            t for t in self.request_times[method]
+            if current_time - t < 1.0
+        ]
+
+        # 제한 확인
+        if len(self.request_times[method]) >= limit:
+            self.blocked_count += 1
+            return {
+                "allowed": False,
+                "message": f"비율 제한 초과: {limit} 요청/초",
+            }
+
+        # 현재 요청 기록
+        self.request_times[method].append(current_time)
+
+        return {
+            "allowed": True,
+            "message": f"요청 허용: {len(self.request_times[method])}/{limit}",
+        }
+
+    def get_stats(self) -> Dict:
+        """비율 제한 통계"""
+        current_time = time.time()
+
+        stats = {}
+        for method, times in self.request_times.items():
+            # 1초 이내 요청 수
+            recent_count = sum(1 for t in times if current_time - t < 1.0)
+            stats[method] = {
+                "current_rps": recent_count,
+                "limit_rps": self.method_limits.get(method, self.default_limit),
+            }
+
+        return {
+            "methods": stats,
+            "total_blocked": self.blocked_count,
+        }
+
+
+# ============================================================================
+# 인터셉터 체인 (파이프라인)
+# ============================================================================
+
+
+class InterceptorChain:
+    """
+    여러 인터셉터를 순차적으로 실행합니다.
+
+    실행 순서:
+    1. Authentication (인증)
+    2. RateLimiting (비율 제한)
+    3. Logging (로깅)
+    4. Performance (성능 측정)
+    """
+
+    def __init__(self):
+        """인터셉터 체인 초기화"""
+        self.logging = LoggingInterceptor()
+        self.auth = AuthInterceptor()
+        self.performance = PerformanceInterceptor()
+        self.rate_limiting = RateLimitingInterceptor()
+
+    def execute_request(
+        self,
+        method: str,
+        request_size: int,
+        api_key: str,
+    ) -> Dict:
+        """
+        요청 인터셉터 체인 실행
+
+        Args:
+            method: 메소드 이름
+            request_size: 요청 크기
+            api_key: API 키
+
+        Returns:
+            {success: bool, message: str, ...}
+        """
+        start_time = time.time()
+
+        # 1. 인증
+        auth_result = self.auth.validate_api_key(api_key)
+        if not auth_result["success"]:
+            return {
+                "success": False,
+                "stage": "authentication",
+                "message": auth_result["message"],
+            }
+
+        # 2. 비율 제한
+        rate_limit_result = self.rate_limiting.check_rate_limit(method)
+        if not rate_limit_result["allowed"]:
+            return {
+                "success": False,
+                "stage": "rate_limiting",
+                "message": rate_limit_result["message"],
+            }
+
+        # 3. 성능 측정 (응답 처리 후 지연 계산)
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        return {
+            "success": True,
+            "stage": "all_checks_passed",
+            "method": method,
+            "request_size_bytes": request_size,
+            "interceptor_time_ms": round(elapsed_ms, 2),
+        }
+
+    def record_response(
+        self,
+        method: str,
+        request_size: int,
+        response_size: int,
+        status_code: int,
+        duration_ms: float,
+    ) -> None:
+        """
+        응답 기록
+
+        Args:
+            method: 메소드 이름
+            request_size: 요청 크기
+            response_size: 응답 크기
+            status_code: 상태 코드
+            duration_ms: 처리 시간
+        """
+        self.logging.log_call(
+            method=method,
+            request_size=request_size,
+            response_size=response_size,
+            status_code=status_code,
+            duration_ms=duration_ms,
+        )
+
+        self.performance.measure(method=method, duration_ms=duration_ms)
+
+    def get_all_stats(self) -> Dict:
+        """모든 인터셉터 통계 수집"""
+        return {
+            "logging": self.logging.get_stats(),
+            "authentication": self.auth.get_auth_stats(),
+            "performance": self.performance.get_stats(),
+            "rate_limiting": self.rate_limiting.get_stats(),
+        }

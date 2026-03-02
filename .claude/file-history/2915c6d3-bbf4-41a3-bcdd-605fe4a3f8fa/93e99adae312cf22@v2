@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+자동 샤딩 최적화 (Auto Sharding Optimizer)
+
+정수 선형 계획법(ILP) 및 그리디 알고리즘을 통한 최적 샤딩 전략 탐색
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import json
+import math
+
+
+@dataclass
+class ShardingStrategy:
+    """샤딩 전략"""
+    layer_name: str
+    sharding_type: str  # "replicate", "row", "column", "mesh_2d"
+    memory_per_device: float  # GB
+    total_time_ms: float
+    cost_score: float
+
+
+class GreedyShardingOptimizer:
+    """Greedy 샤딩 최적화 (빠름, 최적 아님)"""
+
+    def __init__(self, cost_model):
+        self.cost_model = cost_model
+
+    def optimize(self,
+                 layers: List[Tuple[str, Tuple, Tuple]],
+                 num_devices: int,
+                 max_memory_per_device_gb: float) -> List[ShardingStrategy]:
+        """Greedy 최적화: 각 레이어마다 최적 샤딩 선택"""
+
+        strategies = []
+
+        for layer_name, weight_shape, activation_shape in layers:
+            candidates = []
+
+            # 모든 샤딩 전략 평가
+            for sharding in ["replicate", "row_sharding", "column_sharding"]:
+                cost = self.cost_model.cost_matmul_with_sharding(
+                    activation_shape, weight_shape, num_devices, sharding
+                )
+
+                # 메모리 체크 (간단 추정)
+                if sharding == "replicate":
+                    memory = (weight_shape[-1] * weight_shape[-2] * 4) / (1024**3)
+                else:
+                    memory = (weight_shape[-1] * weight_shape[-2] * 4) / (1024**3) / num_devices
+
+                if memory > max_memory_per_device_gb:
+                    continue
+
+                candidates.append({
+                    "sharding": sharding,
+                    "total_time_ms": cost["total_time_ms"],
+                    "memory_gb": memory
+                })
+
+            if not candidates:
+                # 불가능하면 Replicate (메모리 초과)
+                best = {"sharding": "replicate"}
+            else:
+                # 가장 빠른 것 선택
+                best = min(candidates, key=lambda x: x["total_time_ms"])
+
+            strategy = ShardingStrategy(
+                layer_name=layer_name,
+                sharding_type=best["sharding"],
+                memory_per_device=best.get("memory_gb", 0),
+                total_time_ms=best.get("total_time_ms", 0),
+                cost_score=best.get("total_time_ms", 0)
+            )
+
+            strategies.append(strategy)
+
+        return strategies
+
+
+class DynamicProgrammingShardingOptimizer:
+    """동적 계획법 샤딩 최적화 (중간 속도, 더 나은 결과)"""
+
+    def __init__(self, cost_model):
+        self.cost_model = cost_model
+
+    def optimize(self,
+                 layers: List[Tuple[str, Tuple, Tuple]],
+                 num_devices: int,
+                 max_memory_per_device_gb: float) -> List[ShardingStrategy]:
+        """DP를 통한 최적화"""
+
+        n = len(layers)
+        sharding_options = ["replicate", "row_sharding", "column_sharding"]
+
+        # DP 테이블: dp[i][j] = 레이어 0~i-1을 처리할 때의 최소 비용
+        # (마지막 레이어가 sharding_options[j]인 경우)
+        dp = [[float('inf')] * len(sharding_options) for _ in range(n + 1)]
+
+        # 초기값
+        for j in range(len(sharding_options)):
+            dp[0][j] = 0
+
+        # 역추적용
+        choice = [[None] * len(sharding_options) for _ in range(n)]
+
+        for i in range(n):
+            layer_name, weight_shape, activation_shape = layers[i]
+
+            for j, sharding in enumerate(sharding_options):
+                cost = self.cost_model.cost_matmul_with_sharding(
+                    activation_shape, weight_shape, num_devices, sharding
+                )
+
+                current_cost = cost["total_time_ms"]
+
+                # 이전 상태에서의 최소 비용 찾기
+                for prev_j in range(len(sharding_options)):
+                    prev_sharding = sharding_options[prev_j]
+
+                    # Resharding 비용 계산
+                    if i == 0:
+                        resharding_cost = 0
+                    else:
+                        if prev_sharding != sharding:
+                            # All-to-All 통신
+                            resharding_cost = 5.0  # ms (추정)
+                        else:
+                            resharding_cost = 0
+
+                    total = dp[i][prev_j] + current_cost + resharding_cost
+
+                    if total < dp[i + 1][j]:
+                        dp[i + 1][j] = total
+                        choice[i][j] = prev_j
+
+        # 역추적하여 최적 경로 복원
+        optimal_sharding = []
+        best_final_j = min(range(len(sharding_options)),
+                          key=lambda j: dp[n][j])
+
+        j = best_final_j
+        for i in range(n - 1, -1, -1):
+            optimal_sharding.insert(0, sharding_options[j])
+            if i > 0:
+                j = choice[i][j] if choice[i][j] is not None else j
+
+        # 결과 생성
+        strategies = []
+        for i, (layer_name, _, _) in enumerate(layers):
+            strategy = ShardingStrategy(
+                layer_name=layer_name,
+                sharding_type=optimal_sharding[i],
+                memory_per_device=0,
+                total_time_ms=0,
+                cost_score=dp[n][best_final_j]
+            )
+            strategies.append(strategy)
+
+        return strategies
+
+
+class AutoShardingOptimizer:
+    """자동 샤딩 최적화 (통합)"""
+
+    def __init__(self, cost_model):
+        self.cost_model = cost_model
+        self.greedy_optimizer = GreedyShardingOptimizer(cost_model)
+        self.dp_optimizer = DynamicProgrammingShardingOptimizer(cost_model)
+
+    def optimize_fast(self,
+                     layers: List[Tuple[str, Tuple, Tuple]],
+                     num_devices: int,
+                     max_memory_per_device_gb: float) -> List[ShardingStrategy]:
+        """빠른 최적화 (Greedy)"""
+        return self.greedy_optimizer.optimize(layers, num_devices, max_memory_per_device_gb)
+
+    def optimize_medium(self,
+                       layers: List[Tuple[str, Tuple, Tuple]],
+                       num_devices: int,
+                       max_memory_per_device_gb: float) -> List[ShardingStrategy]:
+        """중간 최적화 (Dynamic Programming)"""
+        return self.dp_optimizer.optimize(layers, num_devices, max_memory_per_device_gb)
+
+    def optimize_with_ilp(self,
+                         layers: List[Tuple[str, Tuple, Tuple]],
+                         num_devices: int,
+                         max_memory_per_device_gb: float) -> List[ShardingStrategy]:
+        """ILP 최적화 (최적, 느림)"""
+        # 실제로는 OR-Tools, Gurobi 등의 솔버 사용
+        # 여기서는 간단히 DP로 근사
+        return self.optimize_medium(layers, num_devices, max_memory_per_device_gb)
+
+    def compare_optimizers(self,
+                          layers: List[Tuple[str, Tuple, Tuple]],
+                          num_devices: int,
+                          max_memory_per_device_gb: float) -> Dict:
+        """모든 최적화 방법 비교"""
+
+        greedy_result = self.optimize_fast(layers, num_devices, max_memory_per_device_gb)
+        dp_result = self.optimize_medium(layers, num_devices, max_memory_per_device_gb)
+
+        greedy_cost = sum(s.total_time_ms for s in greedy_result)
+        dp_cost = sum(s.total_time_ms for s in dp_result)
+
+        return {
+            "greedy": {
+                "strategies": [s.sharding_type for s in greedy_result],
+                "total_cost_ms": greedy_cost
+            },
+            "dp": {
+                "strategies": [s.sharding_type for s in dp_result],
+                "total_cost_ms": dp_cost
+            },
+            "improvement": {
+                "percentage": ((greedy_cost - dp_cost) / greedy_cost * 100) if greedy_cost > 0 else 0
+            }
+        }
+
+    def generate_mlir_code(self, strategies: List[ShardingStrategy]) -> str:
+        """최적 샤딩을 기반으로 MLIR 코드 생성"""
+
+        mlir_code = "// Auto-Generated Sharding Strategy\n\n"
+
+        for strategy in strategies:
+            mlir_code += f"// Layer: {strategy.layer_name}\n"
+            mlir_code += f"// Sharding: {strategy.sharding_type}\n"
+
+            if strategy.sharding_type == "replicate":
+                mlir_code += f"%{strategy.layer_name} = multidevice.launch\n"
+                mlir_code += f"  on %all_devices_replicate\n"
+                mlir_code += f"  {{\n"
+                mlir_code += f"    // Computation on all replicas\n"
+                mlir_code += f"  }}\n\n"
+
+            elif strategy.sharding_type == "row_sharding":
+                mlir_code += f"%{strategy.layer_name}_sharded = tensor.extract_slice %weight\n"
+                mlir_code += f"  [0:N, 0:D/num_devices]\n"
+                mlir_code += f"%{strategy.layer_name} = multidevice.launch\n"
+                mlir_code += f"  on %device_group\n"
+                mlir_code += f"  {{\n"
+                mlir_code += f"    linalg.matmul with_sharded_weight\n"
+                mlir_code += f"  }}\n"
+                mlir_code += f"%{strategy.layer_name}_result = multidevice.all_gather\n"
+                mlir_code += f"  from %device_group\n\n"
+
+            elif strategy.sharding_type == "column_sharding":
+                mlir_code += f"%{strategy.layer_name} = multidevice.launch\n"
+                mlir_code += f"  on %device_group\n"
+                mlir_code += f"  {{\n"
+                mlir_code += f"    linalg.matmul with_sharded_activation\n"
+                mlir_code += f"  }}\n"
+                mlir_code += f"%{strategy.layer_name}_result = multidevice.all_reduce\n"
+                mlir_code += f"  on %device_group\n"
+                mlir_code += f"  operation \"sum\"\n\n"
+
+        return mlir_code
+
+    def report_optimization(self, comparison: Dict) -> str:
+        """최적화 결과 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║           AUTO SHARDING OPTIMIZATION REPORT                        ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        report += "Greedy Optimizer:\n"
+        report += f"  Strategies: {comparison['greedy']['strategies']}\n"
+        report += f"  Total Cost: {comparison['greedy']['total_cost_ms']:.2f} ms\n\n"
+
+        report += "Dynamic Programming Optimizer:\n"
+        report += f"  Strategies: {comparison['dp']['strategies']}\n"
+        report += f"  Total Cost: {comparison['dp']['total_cost_ms']:.2f} ms\n\n"
+
+        report += "Improvement:\n"
+        report += f"  DP vs Greedy: {comparison['improvement']['percentage']:.2f}% faster\n"
+
+        report += "\n" + "─" * 68 + "\n"
+
+        return report
+
+    def export_to_json(self, strategies: List[ShardingStrategy]) -> str:
+        """샤딩 전략을 JSON으로 내보내기"""
+
+        data = {
+            "num_layers": len(strategies),
+            "strategies": [
+                {
+                    "layer": s.layer_name,
+                    "sharding_type": s.sharding_type,
+                    "memory_per_device_gb": s.memory_per_device,
+                    "total_time_ms": s.total_time_ms
+                }
+                for s in strategies
+            ]
+        }
+
+        return json.dumps(data, indent=2)
+

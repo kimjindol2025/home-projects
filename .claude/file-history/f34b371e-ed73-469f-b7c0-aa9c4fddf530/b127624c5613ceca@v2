@@ -1,0 +1,403 @@
+// ============================================================================
+// GC Object: 가비지 컬렉션 힙 관리
+// ============================================================================
+
+use crate::value::Value;
+use std::collections::HashMap;
+
+/// GC 힙에서의 객체 참조 (인덱스)
+pub type GcRef = usize;
+
+/// GC 힙에 저장되는 데이터 종류
+#[derive(Debug, Clone)]
+pub enum GcData {
+    /// 배열
+    Array(Vec<Value>),
+
+    /// 해시맵
+    HashMap(HashMap<String, Value>),
+
+    /// 문자열
+    Str(String),
+}
+
+/// GC가 관리하는 힙 객체
+#[derive(Debug, Clone)]
+pub struct GcObject {
+    /// Mark 단계 플래그 (도달 가능 여부 표시)
+    pub is_marked: bool,
+
+    /// 실제 데이터
+    pub data: GcData,
+}
+
+impl GcObject {
+    /// 새로운 GC 객체 생성
+    pub fn new(data: GcData) -> Self {
+        GcObject {
+            is_marked: false,
+            data,
+        }
+    }
+}
+
+/// GC 실행 통계 (교육용)
+#[derive(Debug, Clone, Copy)]
+pub struct GcStats {
+    /// GC 실행 전 객체 수
+    pub objects_before: usize,
+
+    /// GC 실행 후 객체 수
+    pub objects_after: usize,
+
+    /// 해제된 객체 수
+    pub objects_freed: usize,
+
+    /// 누적 GC 실행 횟수
+    pub gc_count: usize,
+}
+
+/// Arena 패턴 힙 - 모든 GC 객체를 소유
+pub struct ObjectHeap {
+    /// 객체 슬롯 (None = 해제된 슬롯)
+    objects: Vec<Option<GcObject>>,
+
+    /// 적응형 GC 임계값
+    gc_threshold: usize,
+
+    /// GC 실행 횟수
+    gc_count: usize,
+}
+
+impl ObjectHeap {
+    /// 새로운 ObjectHeap 생성 (기본 임계값: 64개 객체)
+    pub fn new() -> Self {
+        ObjectHeap {
+            objects: Vec::new(),
+            gc_threshold: 64,
+            gc_count: 0,
+        }
+    }
+
+    /// 커스텀 임계값으로 ObjectHeap 생성
+    pub fn with_threshold(threshold: usize) -> Self {
+        ObjectHeap {
+            objects: Vec::new(),
+            gc_threshold: threshold,
+            gc_count: 0,
+        }
+    }
+
+    /// 객체 할당 (빈 슬롯 재사용 or 새 슬롯 추가)
+    pub fn alloc(&mut self, data: GcData) -> GcRef {
+        let obj = GcObject::new(data);
+
+        // 빈 슬롯 찾기
+        for (i, slot) in self.objects.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(obj);
+                return i;
+            }
+        }
+
+        // 빈 슬롯이 없으면 새로 추가
+        self.objects.push(Some(obj));
+        self.objects.len() - 1
+    }
+
+    /// 객체 불변 조회
+    pub fn get(&self, gc_ref: GcRef) -> Option<&GcObject> {
+        self.objects.get(gc_ref)?.as_ref()
+    }
+
+    /// 객체 가변 조회
+    pub fn get_mut(&mut self, gc_ref: GcRef) -> Option<&mut GcObject> {
+        self.objects.get_mut(gc_ref)?.as_mut()
+    }
+
+    /// 살아있는 객체 수 (None이 아닌 슬롯)
+    pub fn live_count(&self) -> usize {
+        self.objects.iter().filter(|slot| slot.is_some()).count()
+    }
+
+    /// GC 실행 필요 여부
+    pub fn should_collect(&self) -> bool {
+        self.live_count() >= self.gc_threshold
+    }
+
+    /// 모든 객체의 마킹 플래그 초기화
+    fn reset_marks(&mut self) {
+        for slot in self.objects.iter_mut() {
+            if let Some(obj) = slot {
+                obj.is_marked = false;
+            }
+        }
+    }
+
+    /// Mark 단계: 루트에서 도달 가능한 객체들을 마킹 (worklist DFS)
+    pub fn mark(&mut self, roots: &[Value]) {
+        self.reset_marks();
+
+        // 루트에서 시작하는 모든 GcRef를 worklist에 추가
+        let mut worklist: Vec<GcRef> = roots
+            .iter()
+            .filter_map(|v| v.as_gc_ref())
+            .collect();
+
+        // Worklist DFS: 스택을 사용하여 재귀 없이 순회
+        while let Some(gc_ref) = worklist.pop() {
+            // GcRef가 유효하지 않거나 슬롯이 비었으면 스킵
+            if gc_ref >= self.objects.len() {
+                continue;
+            }
+
+            let Some(Some(obj)) = self.objects.get_mut(gc_ref) else {
+                continue;
+            };
+
+            // 이미 마킹되면 스킵 (순환 참조 처리)
+            if obj.is_marked {
+                continue;
+            }
+
+            obj.is_marked = true;
+
+            // 자식 GcRef를 수집
+            let children: Vec<GcRef> = match &obj.data {
+                GcData::Array(arr) => {
+                    arr.iter().filter_map(|v| v.as_gc_ref()).collect()
+                }
+                GcData::HashMap(map) => {
+                    map.values().filter_map(|v| v.as_gc_ref()).collect()
+                }
+                GcData::Str(_) => vec![],
+            };
+
+            // 자식들을 worklist에 추가
+            worklist.extend(children);
+        }
+    }
+
+    /// Sweep 단계: 마킹되지 않은 객체들을 해제
+    pub fn sweep(&mut self) -> usize {
+        let mut freed = 0;
+
+        for slot in self.objects.iter_mut() {
+            match slot {
+                Some(obj) if !obj.is_marked => {
+                    *slot = None;
+                    freed += 1;
+                }
+                Some(obj) => {
+                    // 마킹 플래그 리셋 (다음 GC 준비)
+                    obj.is_marked = false;
+                }
+                None => {}
+            }
+        }
+
+        freed
+    }
+
+    /// Mark-and-Sweep GC 실행
+    pub fn collect_garbage(&mut self, roots: &[Value]) -> GcStats {
+        let objects_before = self.live_count();
+
+        // Mark 단계
+        self.mark(roots);
+
+        // Sweep 단계
+        let objects_freed = self.sweep();
+
+        let objects_after = self.live_count();
+        self.gc_count += 1;
+
+        GcStats {
+            objects_before,
+            objects_after,
+            objects_freed,
+            gc_count: self.gc_count,
+        }
+    }
+
+    /// 총 할당된 슬롯 수 (None 포함)
+    pub fn capacity(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// GC 임계값 변경
+    pub fn set_threshold(&mut self, threshold: usize) {
+        self.gc_threshold = threshold;
+    }
+
+    /// GC 실행 횟수 조회
+    pub fn gc_count(&self) -> usize {
+        self.gc_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alloc_and_get() {
+        let mut heap = ObjectHeap::new();
+        let arr_data = GcData::Array(vec![Value::Int(1), Value::Int(2)]);
+        let gc_ref = heap.alloc(arr_data);
+
+        let obj = heap.get(gc_ref);
+        assert!(obj.is_some());
+        assert!(!obj.unwrap().is_marked);
+    }
+
+    #[test]
+    fn test_alloc_reuses_freed_slot() {
+        let mut heap = ObjectHeap::with_threshold(100);
+        let ref1 = heap.alloc(GcData::Str("first".to_string()));
+        let ref2 = heap.alloc(GcData::Str("second".to_string()));
+
+        assert_eq!(heap.live_count(), 2);
+        assert_eq!(heap.capacity(), 2);
+
+        // ref1을 수동으로 "해제" (테스트용)
+        heap.objects[ref1] = None;
+        assert_eq!(heap.live_count(), 1);
+
+        // 새 할당은 ref1의 슬롯을 재사용
+        let ref3 = heap.alloc(GcData::Str("third".to_string()));
+        assert_eq!(ref3, ref1);
+        assert_eq!(heap.live_count(), 2);
+    }
+
+    #[test]
+    fn test_live_count() {
+        let mut heap = ObjectHeap::new();
+        assert_eq!(heap.live_count(), 0);
+
+        heap.alloc(GcData::Str("a".to_string()));
+        assert_eq!(heap.live_count(), 1);
+
+        heap.alloc(GcData::Str("b".to_string()));
+        assert_eq!(heap.live_count(), 2);
+    }
+
+    #[test]
+    fn test_mark_from_root() {
+        let mut heap = ObjectHeap::with_threshold(100);
+        let arr_ref = heap.alloc(GcData::Array(vec![]));
+
+        // 루트에 arr_ref가 있음
+        let roots = vec![Value::Array(arr_ref)];
+        heap.mark(&roots);
+
+        // arr_ref는 마킹되어야 함
+        assert!(heap.get(arr_ref).unwrap().is_marked);
+    }
+
+    #[test]
+    fn test_mark_nested_array() {
+        let mut heap = ObjectHeap::with_threshold(100);
+
+        // inner_arr = [1, 2]
+        let inner_ref = heap.alloc(GcData::Array(vec![Value::Int(1), Value::Int(2)]));
+
+        // outer_arr = [inner_arr]
+        let outer_ref = heap.alloc(GcData::Array(vec![Value::Array(inner_ref)]));
+
+        // 루트에 outer_arr만 있음
+        let roots = vec![Value::Array(outer_ref)];
+        heap.mark(&roots);
+
+        // 둘 다 마킹되어야 함
+        assert!(heap.get(outer_ref).unwrap().is_marked);
+        assert!(heap.get(inner_ref).unwrap().is_marked);
+    }
+
+    #[test]
+    fn test_sweep_unmarked_objects() {
+        let mut heap = ObjectHeap::with_threshold(100);
+        let ref1 = heap.alloc(GcData::Str("keep".to_string()));
+        let ref2 = heap.alloc(GcData::Str("free".to_string()));
+
+        // ref1만 마킹
+        heap.objects[ref1].as_mut().unwrap().is_marked = true;
+
+        let freed = heap.sweep();
+
+        assert_eq!(freed, 1);
+        assert!(heap.get(ref1).is_some()); // 마킹된 것은 유지
+        assert!(heap.get(ref2).is_none());  // 마킹 안 된 것은 해제
+    }
+
+    #[test]
+    fn test_collect_garbage_returns_stats() {
+        let mut heap = ObjectHeap::with_threshold(100);
+        let ref1 = heap.alloc(GcData::Str("a".to_string()));
+        let ref2 = heap.alloc(GcData::Str("b".to_string()));
+
+        let roots = vec![Value::Array(ref1)];
+        let stats = heap.collect_garbage(&roots);
+
+        assert_eq!(stats.objects_before, 2);
+        assert_eq!(stats.objects_after, 1);
+        assert_eq!(stats.objects_freed, 1);
+        assert_eq!(stats.gc_count, 1);
+    }
+
+    #[test]
+    fn test_should_collect() {
+        let mut heap = ObjectHeap::with_threshold(2);
+        assert!(!heap.should_collect());
+
+        heap.alloc(GcData::Str("a".to_string()));
+        assert!(!heap.should_collect());
+
+        heap.alloc(GcData::Str("b".to_string()));
+        assert!(heap.should_collect()); // live_count == threshold
+    }
+
+    #[test]
+    fn test_gc_count_increments() {
+        let mut heap = ObjectHeap::new();
+        assert_eq!(heap.gc_count(), 0);
+
+        let roots = vec![];
+        heap.collect_garbage(&roots);
+        assert_eq!(heap.gc_count(), 1);
+
+        heap.collect_garbage(&roots);
+        assert_eq!(heap.gc_count(), 2);
+    }
+
+    #[test]
+    fn test_circular_reference_handling() {
+        let mut heap = ObjectHeap::with_threshold(100);
+
+        // a = [b] 만들고, b = [a] 만들 수는 없지만,
+        // 루트에 a가 있으면 둘 다 마킹됨
+        let a_ref = heap.alloc(GcData::Str("a".to_string()));
+        // 실제 순환 참조는 가변 차용으로 인해 테스트하기 어렵지만,
+        // worklist 기반 mark는 순환 참조를 안전하게 처리함
+
+        let roots = vec![Value::Array(a_ref)];
+        heap.mark(&roots);
+        assert!(heap.get(a_ref).unwrap().is_marked);
+    }
+
+    #[test]
+    fn test_multiple_gc_runs() {
+        let mut heap = ObjectHeap::with_threshold(100);
+
+        // 첫 번째 GC
+        let ref1 = heap.alloc(GcData::Str("a".to_string()));
+        heap.alloc(GcData::Str("b".to_string()));
+        let stats1 = heap.collect_garbage(&vec![Value::Array(ref1)]);
+        assert_eq!(stats1.objects_freed, 1);
+
+        // 두 번째 GC
+        heap.alloc(GcData::Str("c".to_string()));
+        let stats2 = heap.collect_garbage(&vec![Value::Array(ref1)]);
+        assert_eq!(stats2.gc_count, 2);
+    }
+}

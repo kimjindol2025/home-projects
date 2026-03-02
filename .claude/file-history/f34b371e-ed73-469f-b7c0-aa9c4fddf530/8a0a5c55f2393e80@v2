@@ -1,0 +1,381 @@
+"""
+v5.5 Database Layer
+v5.2의 SQLite 구현을 기반으로 한 데이터 계층
+"""
+
+import sqlite3
+import json
+from datetime import datetime
+from typing import List, Dict, Optional, Tuple, Any
+from contextlib import contextmanager
+
+
+class GogsDatabase:
+    """Gogs 연구 기록 데이터베이스"""
+
+    def __init__(self, db_file: str = 'gogs_research.db'):
+        self.db_file = db_file
+        self._init_db()
+
+    def _init_db(self):
+        """데이터베이스 초기화 (테이블 생성)"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+
+        # 【 테이블 1: 연구자 】
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS researchers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                role TEXT DEFAULT 'researcher',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 【 테이블 2: 실험 】
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                researcher_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                description TEXT,
+                result REAL,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (researcher_id) REFERENCES researchers(id)
+            )
+        ''')
+
+        # 【 테이블 3: 실험 로그 】
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS experiment_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_id INTEGER NOT NULL,
+                log_text TEXT,
+                log_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (experiment_id) REFERENCES experiments(id)
+            )
+        ''')
+
+        # 【 테이블 4: 인증 토큰 】
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                researcher_id INTEGER NOT NULL,
+                token TEXT NOT NULL UNIQUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME,
+                is_active INTEGER DEFAULT 1,
+                FOREIGN KEY (researcher_id) REFERENCES researchers(id)
+            )
+        ''')
+
+        # 【 인덱스 생성 (성능 최적화) 】
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_researchers_email ON researchers(email)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_experiments_researcher ON experiments(researcher_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_experiments_status ON experiments(status)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_logs_experiment ON experiment_logs(experiment_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tokens_token ON auth_tokens(token)')
+
+        conn.commit()
+        conn.close()
+
+    @contextmanager
+    def get_connection(self):
+        """연결 컨텍스트 매니저 (자동 커밋/롤백)"""
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+    # 【 Researchers CRUD 】
+    def create_researcher(self, name: str, email: str, role: str = 'researcher') -> Dict:
+        """연구자 생성"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO researchers (name, email, role)
+                VALUES (?, ?, ?)
+            ''', (name, email, role))
+
+            researcher_id = cursor.lastrowid
+            cursor.execute('SELECT * FROM researchers WHERE id = ?', (researcher_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_researcher(self, researcher_id: int) -> Optional[Dict]:
+        """연구자 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM researchers WHERE id = ?', (researcher_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_researcher_by_email(self, email: str) -> Optional[Dict]:
+        """이메일로 연구자 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM researchers WHERE email = ?', (email,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_all_researchers(self) -> List[Dict]:
+        """모든 연구자 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM researchers ORDER BY id')
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_researcher(self, researcher_id: int, **kwargs) -> Dict:
+        """연구자 정보 수정"""
+        allowed_fields = {'name', 'email', 'role'}
+        fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+
+        if not fields:
+            return self.get_researcher(researcher_id)
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            set_clause = ', '.join([f'{k} = ?' for k in fields.keys()])
+            values = list(fields.values()) + [researcher_id]
+            cursor.execute(f'UPDATE researchers SET {set_clause} WHERE id = ?', values)
+            # 같은 연결 내에서 업데이트된 데이터 조회
+            cursor.execute('SELECT * FROM researchers WHERE id = ?', (researcher_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_researcher(self, researcher_id: int) -> bool:
+        """연구자 삭제"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM researchers WHERE id = ?', (researcher_id,))
+            return cursor.rowcount > 0
+
+    # 【 Experiments CRUD 】
+    def create_experiment(self, researcher_id: int, subject: str,
+                         description: str = '', status: str = 'pending') -> Dict:
+        """실험 생성"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO experiments (researcher_id, subject, description, status)
+                VALUES (?, ?, ?, ?)
+            ''', (researcher_id, subject, description, status))
+
+            experiment_id = cursor.lastrowid
+            cursor.execute('SELECT * FROM experiments WHERE id = ?', (experiment_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_experiment(self, experiment_id: int) -> Optional[Dict]:
+        """실험 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT * FROM experiments WHERE id = ?', (experiment_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_researcher_experiments(self, researcher_id: int) -> List[Dict]:
+        """연구자의 실험 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM experiments
+                WHERE researcher_id = ?
+                ORDER BY created_at DESC
+            ''', (researcher_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_experiments(self, status: Optional[str] = None) -> List[Dict]:
+        """모든 실험 조회 (선택적 상태 필터)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if status:
+                cursor.execute('''
+                    SELECT * FROM experiments
+                    WHERE status = ?
+                    ORDER BY created_at DESC
+                ''', (status,))
+            else:
+                cursor.execute('SELECT * FROM experiments ORDER BY created_at DESC')
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_experiment(self, experiment_id: int, **kwargs) -> Dict:
+        """실험 정보 수정"""
+        allowed_fields = {'subject', 'description', 'result', 'status'}
+        fields = {k: v for k, v in kwargs.items() if k in allowed_fields}
+
+        if not fields:
+            return self.get_experiment(experiment_id)
+
+        fields['updated_at'] = datetime.now().isoformat()
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            set_clause = ', '.join([f'{k} = ?' for k in fields.keys()])
+            values = list(fields.values()) + [experiment_id]
+            cursor.execute(f'UPDATE experiments SET {set_clause} WHERE id = ?', values)
+            # 같은 연결 내에서 업데이트된 데이터 조회
+            cursor.execute('SELECT * FROM experiments WHERE id = ?', (experiment_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_experiment(self, experiment_id: int) -> bool:
+        """실험 삭제 (로그 포함)"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM experiment_logs WHERE experiment_id = ?',
+                          (experiment_id,))
+            cursor.execute('DELETE FROM experiments WHERE id = ?', (experiment_id,))
+            return cursor.rowcount > 0
+
+    # 【 Experiment Logs 】
+    def add_experiment_log(self, experiment_id: int, log_text: str) -> Dict:
+        """실험 로그 추가"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO experiment_logs (experiment_id, log_text)
+                VALUES (?, ?)
+            ''', (experiment_id, log_text))
+
+            log_id = cursor.lastrowid
+            cursor.execute('SELECT * FROM experiment_logs WHERE id = ?', (log_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_experiment_logs(self, experiment_id: int) -> List[Dict]:
+        """실험 로그 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM experiment_logs
+                WHERE experiment_id = ?
+                ORDER BY log_time ASC
+            ''', (experiment_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    # 【 Statistics 】
+    def get_statistics(self) -> Dict:
+        """통계 정보 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            # 전체 연구자 수
+            cursor.execute('SELECT COUNT(*) as count FROM researchers')
+            researcher_count = cursor.fetchone()['count']
+
+            # 전체 실험 수
+            cursor.execute('SELECT COUNT(*) as count FROM experiments')
+            experiment_count = cursor.fetchone()['count']
+
+            # 상태별 실험 수
+            cursor.execute('''
+                SELECT status, COUNT(*) as count
+                FROM experiments
+                GROUP BY status
+            ''')
+            status_counts = {row['status']: row['count'] for row in cursor.fetchall()}
+
+            # 평균 결과
+            cursor.execute('''
+                SELECT AVG(result) as avg_result
+                FROM experiments
+                WHERE result IS NOT NULL
+            ''')
+            avg_result = cursor.fetchone()['avg_result']
+
+            # 연구자별 실험 수
+            cursor.execute('''
+                SELECT r.id, r.name, COUNT(e.id) as experiment_count
+                FROM researchers r
+                LEFT JOIN experiments e ON r.id = e.researcher_id
+                GROUP BY r.id
+                ORDER BY experiment_count DESC
+            ''')
+            researcher_stats = [dict(row) for row in cursor.fetchall()]
+
+            return {
+                'researcher_count': researcher_count,
+                'experiment_count': experiment_count,
+                'status_counts': status_counts,
+                'avg_result': avg_result,
+                'researcher_stats': researcher_stats,
+            }
+
+    def get_top_experiments(self, limit: int = 5) -> List[Dict]:
+        """상위 실험 조회"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT e.*, r.name as researcher_name
+                FROM experiments e
+                LEFT JOIN researchers r ON e.researcher_id = r.id
+                WHERE e.result IS NOT NULL
+                ORDER BY e.result DESC
+                LIMIT ?
+            ''', (limit,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    # 【 Authentication Tokens 】
+    def create_token(self, researcher_id: int, token: str, expires_at: Optional[str] = None) -> Dict:
+        """인증 토큰 생성"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO auth_tokens (researcher_id, token, expires_at)
+                VALUES (?, ?, ?)
+            ''', (researcher_id, token, expires_at))
+
+            token_id = cursor.lastrowid
+            cursor.execute('SELECT * FROM auth_tokens WHERE id = ?', (token_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def verify_token(self, token: str) -> Optional[Dict]:
+        """토큰 검증"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT * FROM auth_tokens
+                WHERE token = ? AND is_active = 1
+            ''', (token,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def revoke_token(self, token: str) -> bool:
+        """토큰 폐기"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('UPDATE auth_tokens SET is_active = 0 WHERE token = ?', (token,))
+            return cursor.rowcount > 0
+
+    # 【 Export 】
+    def export_to_json(self) -> str:
+        """데이터 JSON 내보내기"""
+        data = {
+            'researchers': self.get_all_researchers(),
+            'experiments': self.get_all_experiments(),
+            'statistics': self.get_statistics(),
+            'export_time': datetime.now().isoformat(),
+        }
+        return json.dumps(data, indent=2, ensure_ascii=False, default=str)
+
+    def get_database_info(self) -> Dict:
+        """데이터베이스 정보"""
+        stats = self.get_statistics()
+        return {
+            'database_file': self.db_file,
+            'researchers': stats['researcher_count'],
+            'experiments': stats['experiment_count'],
+            'status_distribution': stats['status_counts'],
+            'avg_result': stats['avg_result'],
+        }

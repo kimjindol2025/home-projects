@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+"""
+SMT Encoder: MLIR IR를 Z3 SMT 식으로 인코딩
+
+MLIR 연산들을 수학적 명제(Predicate)로 치환하여
+형식 검증이 가능하도록 변환
+
+예:
+  arith.addi %x, %y : i32
+  → ((x + y) % 2^32)
+
+  arith.select %cond, %true_val, %false_val
+  → If(cond, true_val, false_val)
+"""
+
+import z3
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import json
+
+
+class IRType(Enum):
+    """MLIR 타입"""
+    I8 = ("i8", 8, True)
+    I16 = ("i16", 16, True)
+    I32 = ("i32", 32, True)
+    I64 = ("i64", 64, True)
+    F32 = ("f32", 32, False)
+    F64 = ("f64", 64, False)
+    INDEX = ("index", 64, False)
+
+    def __init__(self, name: str, bit_width: int, is_signed: bool):
+        self.type_name = name
+        self.bit_width = bit_width
+        self.is_signed = is_signed
+
+    @classmethod
+    def from_string(cls, s: str):
+        """문자열에서 타입 파싱"""
+        for member in cls:
+            if member.type_name == s:
+                return member
+        raise ValueError(f"Unknown type: {s}")
+
+
+@dataclass
+class Variable:
+    """Z3 변수"""
+    name: str
+    ir_type: IRType
+    z3_var: z3.ExprRef
+
+
+@dataclass
+class SMTEncodingResult:
+    """SMT 인코딩 결과"""
+    expression: z3.ExprRef
+    variables: Dict[str, Variable]
+    constants: Dict[str, z3.ExprRef]
+
+
+class TypeConversionError(Exception):
+    """타입 변환 오류"""
+    pass
+
+
+class SMTEncoder:
+    """MLIR IR → Z3 SMT 인코더"""
+
+    def __init__(self, ctx: Optional[z3.Context] = None):
+        """
+        초기화
+
+        Args:
+            ctx: Z3 Context (기본값: 새로 생성)
+        """
+        self.ctx = ctx or z3.Context()
+        self.variables: Dict[str, Variable] = {}
+        self.constants: Dict[str, z3.ExprRef] = {}
+        self.operations: Dict[str, z3.ExprRef] = {}
+
+    def encode_constant(
+        self,
+        value: int,
+        ir_type: IRType
+    ) -> z3.ExprRef:
+        """
+        상수 인코딩
+
+        Args:
+            value: 상수 값
+            ir_type: MLIR 타입
+
+        Returns:
+            Z3 식
+        """
+        if ir_type in [IRType.F32, IRType.F64]:
+            # 부동 소수점
+            return z3.RealVal(value, self.ctx)
+        else:
+            # 정수
+            return z3.IntVal(value, self.ctx)
+
+    def encode_variable(
+        self,
+        name: str,
+        ir_type: IRType
+    ) -> z3.ExprRef:
+        """
+        변수 인코딩
+
+        Args:
+            name: 변수명
+            ir_type: MLIR 타입
+
+        Returns:
+            Z3 변수
+        """
+        if name in self.variables:
+            return self.variables[name].z3_var
+
+        # 새 변수 생성
+        if ir_type in [IRType.F32, IRType.F64]:
+            z3_var = z3.Real(name, self.ctx)
+        else:
+            z3_var = z3.Int(name, self.ctx)
+
+        var = Variable(name=name, ir_type=ir_type, z3_var=z3_var)
+        self.variables[name] = var
+
+        return z3_var
+
+    def encode_addi(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        정수 덧셈 인코딩
+
+        arith.addi %x, %y : i32
+        → ((x + y) % 2^32)
+
+        Args:
+            lhs: 좌항
+            rhs: 우항
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 덧셈
+        """
+        result = lhs + rhs
+
+        if result_type.is_signed:
+            # 부호 있는 정수: 오버플로우 처리
+            # 범위: [-2^(n-1), 2^(n-1) - 1]
+            max_val = 2 ** (result_type.bit_width - 1) - 1
+            min_val = -(2 ** (result_type.bit_width - 1))
+
+            # (x + y) mod 2^n으로 변환
+            mod_val = 2 ** result_type.bit_width
+            result = result - (result // mod_val) * mod_val
+        else:
+            # 부호 없는 정수: 0 이상만
+            mod_val = 2 ** result_type.bit_width
+            result = result % mod_val
+
+        return result
+
+    def encode_muli(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        정수 곱셈 인코딩
+
+        arith.muli %x, %y : i32
+        → ((x * y) % 2^32)
+
+        Args:
+            lhs: 좌항
+            rhs: 우항
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 곱셈
+        """
+        result = lhs * rhs
+
+        if result_type.is_signed:
+            # 부호 있는 정수: 오버플로우 처리
+            mod_val = 2 ** result_type.bit_width
+            result = result - (result // mod_val) * mod_val
+        else:
+            # 부호 없는 정수
+            mod_val = 2 ** result_type.bit_width
+            result = result % mod_val
+
+        return result
+
+    def encode_divsi(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        부호 있는 정수 나눗셈 인코딩
+
+        arith.divsi %x, %y : i32
+        → x // y (y != 0)
+
+        Args:
+            lhs: 좌항 (피제수)
+            rhs: 우항 (제수)
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 나눗셈
+        """
+        # Z3에서는 / 연산자가 정수 나눗셈
+        return lhs / rhs
+
+    def encode_divui(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        부호 없는 정수 나눗셈 인코딩
+
+        arith.divui %x, %y : i32
+
+        Args:
+            lhs: 좌항
+            rhs: 우항
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 나눗셈
+        """
+        # Z3에서도 / 연산자 (음수 아니므로 결과 같음)
+        return lhs / rhs
+
+    def encode_addf(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        부동 소수점 덧셈 인코딩
+
+        arith.addf %x, %y : f32
+        → x + y (IEEE 754 준수)
+
+        Args:
+            lhs: 좌항
+            rhs: 우항
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 덧셈
+        """
+        return lhs + rhs
+
+    def encode_mulf(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        부동 소수점 곱셈 인코딩
+
+        arith.mulf %x, %y : f32
+        → x * y
+
+        Args:
+            lhs: 좌항
+            rhs: 우항
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 곱셈
+        """
+        return lhs * rhs
+
+    def encode_divf(
+        self,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef,
+        result_type: IRType
+    ) -> z3.ExprRef:
+        """
+        부동 소수점 나눗셈 인코딩
+
+        arith.divf %x, %y : f32
+        → x / y
+
+        Args:
+            lhs: 좌항
+            rhs: 우항
+            result_type: 결과 타입
+
+        Returns:
+            인코딩된 나눗셈
+        """
+        return lhs / rhs
+
+    def encode_select(
+        self,
+        condition: z3.ExprRef,
+        true_val: z3.ExprRef,
+        false_val: z3.ExprRef
+    ) -> z3.ExprRef:
+        """
+        선택 연산 (if-then-else) 인코딩
+
+        arith.select %cond, %true_val, %false_val
+        → If(cond, true_val, false_val)
+
+        Args:
+            condition: 조건식
+            true_val: 참일 때 값
+            false_val: 거짓일 때 값
+
+        Returns:
+            Z3 If 식
+        """
+        return z3.If(condition, true_val, false_val, self.ctx)
+
+    def encode_cmpi(
+        self,
+        predicate: str,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef
+    ) -> z3.ExprRef:
+        """
+        정수 비교 인코딩
+
+        arith.cmpi <predicate> %x, %y
+        → x <predicate> y
+
+        Args:
+            predicate: 비교 연산자
+              - "eq": ==
+              - "ne": !=
+              - "slt": < (부호 있음)
+              - "sle": <=
+              - "sgt": >
+              - "sge": >=
+              - "ult": < (부호 없음)
+              - "ule": <=
+              - "ugt": >
+              - "uge": >=
+
+            lhs: 좌항
+            rhs: 우항
+
+        Returns:
+            Z3 비교식
+        """
+        predicate_map = {
+            "eq": lambda l, r: l == r,
+            "ne": lambda l, r: l != r,
+            "slt": lambda l, r: l < r,
+            "sle": lambda l, r: l <= r,
+            "sgt": lambda l, r: l > r,
+            "sge": lambda l, r: l >= r,
+            "ult": lambda l, r: l < r,
+            "ule": lambda l, r: l <= r,
+            "ugt": lambda l, r: l > r,
+            "uge": lambda l, r: l >= r,
+        }
+
+        if predicate not in predicate_map:
+            raise ValueError(f"Unknown predicate: {predicate}")
+
+        return predicate_map[predicate](lhs, rhs)
+
+    def encode_cmpf(
+        self,
+        predicate: str,
+        lhs: z3.ExprRef,
+        rhs: z3.ExprRef
+    ) -> z3.ExprRef:
+        """
+        부동 소수점 비교 인코딩
+
+        Args:
+            predicate: "oeq", "one", "olt", "ole", "ogt", "oge"
+                      (또는 "ueq", "une" 등 unordered 변형)
+            lhs: 좌항
+            rhs: 우항
+
+        Returns:
+            Z3 비교식
+        """
+        # 간단하게: ordered와 unordered 모두 같게 처리
+        # (NaN 처리는 Z3에 맡김)
+        predicate_map = {
+            "oeq": lambda l, r: l == r,
+            "one": lambda l, r: l != r,
+            "olt": lambda l, r: l < r,
+            "ole": lambda l, r: l <= r,
+            "ogt": lambda l, r: l > r,
+            "oge": lambda l, r: l >= r,
+            "ueq": lambda l, r: l == r,
+            "une": lambda l, r: l != r,
+        }
+
+        if predicate not in predicate_map:
+            raise ValueError(f"Unknown float predicate: {predicate}")
+
+        return predicate_map[predicate](lhs, rhs)
+
+    def encode_operation(
+        self,
+        op_name: str,
+        operands: Dict[str, z3.ExprRef],
+        result_type: IRType,
+        **kwargs
+    ) -> z3.ExprRef:
+        """
+        일반적인 연산 인코딩
+
+        Args:
+            op_name: 연산 이름 (예: "arith.addi")
+            operands: 피연산자 (이름 → Z3 식)
+            result_type: 결과 타입
+            **kwargs: 추가 인자
+
+        Returns:
+            인코딩된 연산
+        """
+        if op_name == "arith.addi":
+            return self.encode_addi(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.subi":
+            # 뺄셈 (덧셈처럼 오버플로우 처리)
+            result = operands["lhs"] - operands["rhs"]
+            if result_type.is_signed:
+                mod_val = 2 ** result_type.bit_width
+                result = result - (result // mod_val) * mod_val
+            else:
+                result = result % (2 ** result_type.bit_width)
+            return result
+
+        elif op_name == "arith.muli":
+            return self.encode_muli(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.divsi":
+            return self.encode_divsi(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.divui":
+            return self.encode_divui(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.addf":
+            return self.encode_addf(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.mulf":
+            return self.encode_mulf(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.divf":
+            return self.encode_divf(operands["lhs"], operands["rhs"], result_type)
+
+        elif op_name == "arith.select":
+            return self.encode_select(
+                operands["condition"],
+                operands["true_val"],
+                operands["false_val"]
+            )
+
+        elif op_name == "arith.cmpi":
+            return self.encode_cmpi(
+                kwargs["predicate"],
+                operands["lhs"],
+                operands["rhs"]
+            )
+
+        elif op_name == "arith.cmpf":
+            return self.encode_cmpf(
+                kwargs["predicate"],
+                operands["lhs"],
+                operands["rhs"]
+            )
+
+        else:
+            raise ValueError(f"Unsupported operation: {op_name}")
+
+    def simplify_expression(self, expr: z3.ExprRef) -> z3.ExprRef:
+        """
+        Z3 식 단순화
+
+        Args:
+            expr: Z3 식
+
+        Returns:
+            단순화된 식
+        """
+        return z3.simplify(expr, ctx=self.ctx)
+
+    def get_variables(self) -> Dict[str, Variable]:
+        """변수 목록 반환"""
+        return self.variables
+
+    def get_result(self) -> SMTEncodingResult:
+        """전체 인코딩 결과 반환"""
+        # 마지막 연산이 최종 식
+        last_expr = list(self.operations.values())[-1] if self.operations else None
+
+        return SMTEncodingResult(
+            expression=last_expr,
+            variables=self.variables,
+            constants=self.constants
+        )
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("SMT Encoder Demo: MLIR IR to Z3")
+    print("="*70)
+
+    # 1. 예제 1: 단순 덧셈
+    print("\n[Example 1] Simple Addition: (x + y)")
+    print("-"*70)
+
+    encoder1 = SMTEncoder()
+    x = encoder1.encode_variable("x", IRType.I32)
+    y = encoder1.encode_variable("y", IRType.I32)
+    add_result = encoder1.encode_addi(x, y, IRType.I32)
+
+    print(f"x: {x}")
+    print(f"y: {y}")
+    print(f"(x + y): {add_result}")
+
+    # 2. 예제 2: 문제가 되는 최적화 (x * 2) / 2 vs x
+    print("\n[Example 2] Problematic Optimization: (x * 2) / 2 vs x")
+    print("-"*70)
+
+    encoder2 = SMTEncoder()
+    x2 = encoder2.encode_variable("x", IRType.I32)
+
+    # 좌측: (x * 2) / 2
+    c2 = encoder2.encode_constant(2, IRType.I32)
+    mul_result = encoder2.encode_muli(x2, c2, IRType.I32)
+    div_result = encoder2.encode_divsi(mul_result, c2, IRType.I32)
+
+    print(f"LHS = (x * 2) / 2:")
+    print(f"  x = {x2}")
+    print(f"  x * 2 = {mul_result}")
+    print(f"  (x * 2) / 2 = {div_result}")
+
+    # 우측: x
+    print(f"\nRHS = x:")
+    print(f"  x = {x2}")
+
+    print(f"\n확인: (x * 2) / 2 == x 인가?")
+    print(f"  형식: {z3.simplify(div_result - x2)}")
+
+    # 3. 예제 3: 부동 소수점 (안전한 경우)
+    print("\n[Example 3] Safe Optimization (Float): (x * 2.0) / 2.0 vs x")
+    print("-"*70)
+
+    encoder3 = SMTEncoder()
+    xf = encoder3.encode_variable("x", IRType.F32)
+
+    # 좌측: (x * 2.0) / 2.0
+    c2f = encoder3.encode_constant(2, IRType.F32)
+    mul_f = encoder3.encode_mulf(xf, c2f, IRType.F32)
+    div_f = encoder3.encode_divf(mul_f, c2f, IRType.F32)
+
+    print(f"LHS = (x * 2.0) / 2.0:")
+    print(f"  (x * 2.0) / 2.0 = {div_f}")
+
+    print(f"\nRHS = x:")
+    print(f"  x = {xf}")
+
+    print(f"\n확인: (x * 2.0) / 2.0 == x 인가?")
+    simplified = z3.simplify(div_f - xf, ctx=encoder3.ctx)
+    print(f"  형식: {simplified}")
+
+    # 4. 예제 4: 조건 선택
+    print("\n[Example 4] Conditional: select(cond, a, b)")
+    print("-"*70)
+
+    encoder4 = SMTEncoder()
+    cond = encoder4.encode_variable("cond", IRType.I32)
+    a = encoder4.encode_variable("a", IRType.I32)
+    b = encoder4.encode_variable("b", IRType.I32)
+
+    # Z3에서 조건은 bool이어야 함
+    cond_bool = cond != 0
+    select_result = encoder4.encode_select(cond_bool, a, b)
+
+    print(f"select(cond != 0, a, b) = {select_result}")
+
+    print("\n" + "="*70)
+    print("SMT Encoding Complete")
+    print("="*70)

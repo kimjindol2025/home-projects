@@ -1,0 +1,421 @@
+// ============================================================================
+// Bootstrap: 셀프 호스팅 검증 엔진
+// ============================================================================
+
+use crate::ast::{Expression, Program, Statement};
+use crate::bytecode::Bytecode;
+use crate::compiler::Compiler;
+use crate::value::Value;
+use crate::vm::VM;
+use std::time::Instant;
+
+/// 컴파일 1단계 결과
+#[derive(Debug, Clone)]
+pub struct Stage {
+    /// 스테이지 번호 (0, 1, 2)
+    pub number: usize,
+    /// 생성된 바이트코드
+    pub bytecode: Bytecode,
+    /// 실행 결과
+    pub result: Option<Value>,
+    /// 컴파일 시간 (나노초)
+    pub compile_time_ns: u64,
+    /// 바이트코드의 FNV-1a 해시
+    pub bytecode_hash: u64,
+}
+
+impl Stage {
+    /// 주어진 프로그램을 컴파일하여 Stage 생성
+    pub fn compile(number: usize, program: &Program) -> Result<Self, String> {
+        let start = Instant::now();
+
+        let mut compiler = Compiler::new();
+        compiler.compile(program)?;
+        let bytecode = compiler.bytecode();
+
+        let compile_time = start.elapsed().as_nanos() as u64;
+        let bytecode_hash = Self::hash_bytecode(&bytecode);
+
+        Ok(Stage {
+            number,
+            bytecode,
+            result: None,
+            compile_time_ns: compile_time,
+            bytecode_hash,
+        })
+    }
+
+    /// Stage의 바이트코드를 실행
+    pub fn run(&mut self) -> Result<Value, String> {
+        let start = Instant::now();
+
+        let mut vm = VM::new(self.bytecode.clone());
+        let result = vm.run()?;
+
+        let _run_time = start.elapsed().as_nanos() as u64;
+        self.result = Some(result.clone());
+
+        Ok(result)
+    }
+
+    /// 바이트코드의 FNV-1a 해시 계산 (외부 크레이트 없음)
+    fn hash_bytecode(bytecode: &Bytecode) -> u64 {
+        const FNV_PRIME: u64 = 1099511628211;
+        const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+
+        let mut hash = FNV_OFFSET_BASIS;
+
+        // 명령어들을 해시
+        for &byte in &bytecode.instructions {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+
+        // 상수들을 해시
+        for &constant in &bytecode.constants {
+            let bytes = constant.to_le_bytes();
+            for &byte in &bytes {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+
+        hash
+    }
+}
+
+/// 바이너리 동일성 검사 결과
+#[derive(Debug, Clone)]
+pub struct BinaryIdentityCheck {
+    /// 해시가 동일한가
+    pub hashes_equal: bool,
+    /// 명령어들이 동일한가
+    pub instructions_equal: bool,
+    /// 상수들이 동일한가
+    pub constants_equal: bool,
+    /// Stage1의 바이트코드 해시
+    pub stage1_hash: u64,
+    /// Stage2의 바이트코드 해시
+    pub stage2_hash: u64,
+    /// 명령어 길이
+    pub instructions_len: usize,
+    /// 상수 개수
+    pub constants_count: usize,
+}
+
+impl BinaryIdentityCheck {
+    /// 바이너리가 동일한가 (모든 조건 만족)
+    pub fn is_identical(&self) -> bool {
+        self.hashes_equal && self.instructions_equal && self.constants_equal
+    }
+
+    /// 진단 메시지 생성
+    pub fn diagnostic(&self) -> String {
+        if self.is_identical() {
+            format!(
+                "PASS: Stage1 == Stage2 (hash: {:#018x}, {} instructions, {} constants)",
+                self.stage1_hash, self.instructions_len, self.constants_count
+            )
+        } else {
+            let mut details = Vec::new();
+            if !self.hashes_equal {
+                details.push(format!("Hash mismatch: {:#018x} vs {:#018x}", self.stage1_hash, self.stage2_hash));
+            }
+            if !self.instructions_equal {
+                details.push("Instructions differ".to_string());
+            }
+            if !self.constants_equal {
+                details.push("Constants differ".to_string());
+            }
+            format!("FAIL: {}", details.join(", "))
+        }
+    }
+}
+
+/// 3단계 부트스트래핑 실행기
+pub struct Bootstrap {
+    source_program: Program,
+}
+
+impl Bootstrap {
+    /// 새로운 Bootstrap 실행기 생성
+    pub fn new(source_program: Program) -> Self {
+        Bootstrap { source_program }
+    }
+
+    /// 3단계 부트스트래핑 실행
+    pub fn run(&self) -> Result<BootstrapResult, String> {
+        // Stage0: 원본 소스 컴파일 및 실행
+        let mut stage0 = Stage::compile(0, &self.source_program)?;
+        stage0.run()?;
+
+        // Stage1: 동일한 소스 컴파일
+        let mut stage1 = Stage::compile(1, &self.source_program)?;
+        stage1.run()?;
+
+        // Stage2: 동일한 소스 컴파일
+        let mut stage2 = Stage::compile(2, &self.source_program)?;
+        stage2.run()?;
+
+        // 바이너리 동일성 검증 (Stage1 vs Stage2)
+        let binary_identity = self.verify_binary_identity(&stage1, &stage2);
+
+        Ok(BootstrapResult {
+            stage0,
+            stage1,
+            stage2,
+            binary_identity,
+        })
+    }
+
+    /// Stage1과 Stage2의 바이너리 동일성 검증
+    pub fn verify_binary_identity(&self, s1: &Stage, s2: &Stage) -> BinaryIdentityCheck {
+        let hashes_equal = s1.bytecode_hash == s2.bytecode_hash;
+        let instructions_equal = s1.bytecode.instructions == s2.bytecode.instructions;
+        let constants_equal = s1.bytecode.constants == s2.bytecode.constants;
+
+        BinaryIdentityCheck {
+            hashes_equal,
+            instructions_equal,
+            constants_equal,
+            stage1_hash: s1.bytecode_hash,
+            stage2_hash: s2.bytecode_hash,
+            instructions_len: s1.bytecode.instructions.len(),
+            constants_count: s1.bytecode.constants.len(),
+        }
+    }
+}
+
+/// 부트스트래핑 결과
+#[derive(Debug, Clone)]
+pub struct BootstrapResult {
+    pub stage0: Stage,
+    pub stage1: Stage,
+    pub stage2: Stage,
+    pub binary_identity: BinaryIdentityCheck,
+}
+
+/// compiler.gogs 프로그램 생성
+///
+/// Gogs-Lang 소스 코드:
+/// ```gogs
+/// let version = 16;
+/// let major = 1;
+/// let minor = 0;
+/// let version_code = version * 100 + major * 10 + minor;  // → 1610
+/// let is_stable = if version_code >= 1600 { true } else { false };
+/// let opcodes = [0, 1, 2, 3, 4, 5];
+/// version_code
+/// ```
+/// 예상 결과: Value::Int(1610)
+pub fn make_compiler_gogs_program() -> Program {
+    Program::new(vec![
+        // let version = 16;
+        Statement::Let {
+            name: "version".to_string(),
+            value: Expression::Integer(16),
+        },
+        // let major = 1;
+        Statement::Let {
+            name: "major".to_string(),
+            value: Expression::Integer(1),
+        },
+        // let minor = 0;
+        Statement::Let {
+            name: "minor".to_string(),
+            value: Expression::Integer(0),
+        },
+        // let version_code = version * 100 + major * 10 + minor;
+        Statement::Let {
+            name: "version_code".to_string(),
+            value: Expression::Infix(
+                "+".to_string(),
+                Box::new(Expression::Infix(
+                    "+".to_string(),
+                    Box::new(Expression::Infix(
+                        "*".to_string(),
+                        Box::new(Expression::Identifier("version".to_string())),
+                        Box::new(Expression::Integer(100)),
+                    )),
+                    Box::new(Expression::Infix(
+                        "*".to_string(),
+                        Box::new(Expression::Identifier("major".to_string())),
+                        Box::new(Expression::Integer(10)),
+                    )),
+                )),
+                Box::new(Expression::Identifier("minor".to_string())),
+            ),
+        },
+        // let is_stable = if version_code >= 1600 { true } else { false };
+        Statement::Let {
+            name: "is_stable".to_string(),
+            value: Expression::If {
+                condition: Box::new(Expression::Infix(
+                    ">=".to_string(),
+                    Box::new(Expression::Identifier("version_code".to_string())),
+                    Box::new(Expression::Integer(1600)),
+                )),
+                consequence: vec![Statement::Expression(Expression::Boolean(true))],
+                alternative: Some(vec![Statement::Expression(Expression::Boolean(false))]),
+            },
+        },
+        // let opcodes = [0, 1, 2, 3, 4, 5];
+        Statement::Let {
+            name: "opcodes".to_string(),
+            value: Expression::Array(vec![
+                Expression::Integer(0),
+                Expression::Integer(1),
+                Expression::Integer(2),
+                Expression::Integer(3),
+                Expression::Integer(4),
+                Expression::Integer(5),
+            ]),
+        },
+        // version_code (반환값)
+        Statement::Expression(Expression::Identifier("version_code".to_string())),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stage_compile() {
+        let program = Program::new(vec![Statement::Expression(Expression::Integer(42))]);
+        let stage = Stage::compile(0, &program).unwrap();
+
+        assert_eq!(stage.number, 0);
+        assert!(!stage.bytecode.instructions.is_empty());
+        assert_eq!(stage.bytecode.constants.len(), 1);
+    }
+
+    #[test]
+    fn test_stage_run() {
+        let program = Program::new(vec![Statement::Expression(Expression::Integer(42))]);
+        let mut stage = Stage::compile(0, &program).unwrap();
+        let result = stage.run().unwrap();
+
+        assert_eq!(result, Value::Int(42));
+        assert_eq!(stage.result, Some(Value::Int(42)));
+    }
+
+    #[test]
+    fn test_hash_bytecode_deterministic() {
+        let program = Program::new(vec![Statement::Expression(Expression::Integer(42))]);
+
+        let stage1 = Stage::compile(0, &program).unwrap();
+        let stage2 = Stage::compile(1, &program).unwrap();
+
+        // 동일한 프로그램은 동일한 해시를 가져야 함
+        assert_eq!(stage1.bytecode_hash, stage2.bytecode_hash);
+    }
+
+    #[test]
+    fn test_binary_identity_check_identical() {
+        let program = Program::new(vec![Statement::Expression(Expression::Integer(42))]);
+
+        let stage1 = Stage::compile(0, &program).unwrap();
+        let stage2 = Stage::compile(1, &program).unwrap();
+
+        let check = BinaryIdentityCheck {
+            hashes_equal: stage1.bytecode_hash == stage2.bytecode_hash,
+            instructions_equal: stage1.bytecode.instructions == stage2.bytecode.instructions,
+            constants_equal: stage1.bytecode.constants == stage2.bytecode.constants,
+            stage1_hash: stage1.bytecode_hash,
+            stage2_hash: stage2.bytecode_hash,
+            instructions_len: stage1.bytecode.instructions.len(),
+            constants_count: stage1.bytecode.constants.len(),
+        };
+
+        assert!(check.is_identical());
+    }
+
+    #[test]
+    fn test_binary_identity_diagnostic() {
+        let check = BinaryIdentityCheck {
+            hashes_equal: true,
+            instructions_equal: true,
+            constants_equal: true,
+            stage1_hash: 0x123456789abcdef0,
+            stage2_hash: 0x123456789abcdef0,
+            instructions_len: 10,
+            constants_count: 2,
+        };
+
+        let diag = check.diagnostic();
+        assert!(diag.contains("PASS"));
+        assert!(diag.contains("10 instructions"));
+        assert!(diag.contains("2 constants"));
+    }
+
+    #[test]
+    fn test_make_compiler_gogs_program() {
+        let program = make_compiler_gogs_program();
+
+        // 프로그램에 7개의 statement가 있어야 함 (6개의 let + 1개의 expression)
+        assert_eq!(program.statements.len(), 7);
+    }
+
+    #[test]
+    fn test_compiler_gogs_program_result() {
+        let program = make_compiler_gogs_program();
+        let mut compiler = Compiler::new();
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        // 기대값: 16*100 + 1*10 + 0 = 1610
+        assert_eq!(result, Value::Int(1610));
+    }
+
+    #[test]
+    fn test_bootstrap_run() {
+        let program = make_compiler_gogs_program();
+        let bootstrap = Bootstrap::new(program);
+        let result = bootstrap.run().unwrap();
+
+        // 모든 스테이지가 동일한 결과를 가져야 함
+        assert_eq!(result.stage0.result, Some(Value::Int(1610)));
+        assert_eq!(result.stage1.result, Some(Value::Int(1610)));
+        assert_eq!(result.stage2.result, Some(Value::Int(1610)));
+
+        // Stage1과 Stage2의 바이너리가 동일해야 함
+        assert!(result.binary_identity.is_identical());
+    }
+
+    #[test]
+    fn test_stage1_hash_equals_stage2() {
+        let program = make_compiler_gogs_program();
+        let bootstrap = Bootstrap::new(program);
+        let result = bootstrap.run().unwrap();
+
+        assert_eq!(result.stage1.bytecode_hash, result.stage2.bytecode_hash);
+    }
+
+    #[test]
+    fn test_compiler_gogs_is_stable() {
+        let program = make_compiler_gogs_program();
+        let mut compiler = Compiler::new();
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        // version_code = 1610, is_stable = true (1610 >= 1600)
+        assert_eq!(result, Value::Int(1610));
+    }
+
+    #[test]
+    fn test_compiler_gogs_with_array() {
+        let program = make_compiler_gogs_program();
+        let mut compiler = Compiler::new();
+        compiler.compile(&program).unwrap();
+
+        // 프로그램에는 opcodes 배열 선언이 포함되어 있음
+        assert!(compiler.local_count() >= 6); // version, major, minor, version_code, is_stable, opcodes
+    }
+}

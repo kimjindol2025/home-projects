@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+🏛️ v7.2: 마이크로서비스 아키텍처 (MSA) + gRPC
+3개 독립 서비스의 통신과 자동 장애 격리
+
+석사 과정: 서비스 간 빠른 통신과 장애 복원력
+"""
+
+import asyncio
+import time
+import uuid
+import json
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, asdict
+from enum import Enum
+import random
+
+# ============= 상수 정의 =============
+
+REGISTRY_HEARTBEAT_TTL = 10  # 10초
+CIRCUIT_BREAKER_FAILURE_THRESHOLD = 3
+CIRCUIT_BREAKER_SUCCESS_THRESHOLD = 2
+CIRCUIT_BREAKER_TIMEOUT = 30
+
+# ============= 데이터 타입 =============
+
+class CircuitState(Enum):
+    """Circuit Breaker 상태"""
+    CLOSED = "정상"      # 모든 요청 통과
+    OPEN = "개방"        # 모든 요청 거절
+    HALF_OPEN = "반개방"  # 테스트 요청만 통과
+
+@dataclass
+class ServiceInstance:
+    """서비스 인스턴스"""
+    service_name: str
+    instance_id: str
+    host: str
+    port: int
+    metadata: Dict[str, Any]
+    registered_at: str
+    last_heartbeat: str
+
+    def to_dict(self):
+        return asdict(self)
+
+@dataclass
+class CircuitBreakerMetrics:
+    """Circuit Breaker 메트릭"""
+    state: CircuitState
+    failure_count: int
+    success_count: int
+    last_failure_time: Optional[str]
+    total_requests: int
+    total_failures: int
+
+# ============= 서비스 레지스트리 =============
+
+class ServiceRegistry:
+    """
+    분산 마이크로서비스 환경에서 서비스 발견 (Service Discovery)
+
+    역할:
+    1. 서비스 인스턴스 등록
+    2. 장애 감지 (Heartbeat)
+    3. 서비스 주소 제공
+    """
+
+    def __init__(self):
+        self.instances: Dict[str, List[ServiceInstance]] = {}
+        self.metrics: Dict[str, Dict[str, CircuitBreakerMetrics]] = {}
+
+    async def register(self, service_name: str, host: str, port: int, metadata: Dict = None) -> str:
+        """서비스 등록"""
+        instance_id = str(uuid.uuid4())[:8]
+        instance = ServiceInstance(
+            service_name=service_name,
+            instance_id=instance_id,
+            host=host,
+            port=port,
+            metadata=metadata or {},
+            registered_at=datetime.now().isoformat(),
+            last_heartbeat=datetime.now().isoformat()
+        )
+
+        if service_name not in self.instances:
+            self.instances[service_name] = []
+
+        self.instances[service_name].append(instance)
+        print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] {service_name} 등록됨 (ID: {instance_id})")
+
+        return instance_id
+
+    async def heartbeat(self, service_name: str, instance_id: str) -> bool:
+        """서비스 생존 신호"""
+        if service_name in self.instances:
+            for instance in self.instances[service_name]:
+                if instance.instance_id == instance_id:
+                    instance.last_heartbeat = datetime.now().isoformat()
+                    return True
+        return False
+
+    async def deregister(self, service_name: str, instance_id: str) -> bool:
+        """서비스 등록 해제"""
+        if service_name in self.instances:
+            self.instances[service_name] = [
+                inst for inst in self.instances[service_name]
+                if inst.instance_id != instance_id
+            ]
+            print(f"❌ [{datetime.now().strftime('%H:%M:%S')}] {service_name} 등록 해제됨 (ID: {instance_id})")
+            return True
+        return False
+
+    async def discover(self, service_name: str) -> Optional[ServiceInstance]:
+        """서비스 발견 (라운드 로빈)"""
+        if service_name not in self.instances:
+            return None
+
+        # 생존 확인 (Heartbeat 확인)
+        alive_instances = []
+        for instance in self.instances[service_name]:
+            last_beat = datetime.fromisoformat(instance.last_heartbeat)
+            if (datetime.now() - last_beat).seconds < REGISTRY_HEARTBEAT_TTL:
+                alive_instances.append(instance)
+
+        if not alive_instances:
+            return None
+
+        # 라운드 로빈 선택
+        return random.choice(alive_instances)
+
+    async def get_status(self) -> Dict[str, Any]:
+        """시스템 상태"""
+        status = {}
+        for service_name, instances in self.instances.items():
+            alive_count = sum(
+                1 for inst in instances
+                if (datetime.now() - datetime.fromisoformat(inst.last_heartbeat)).seconds < REGISTRY_HEARTBEAT_TTL
+            )
+            status[service_name] = {
+                'total': len(instances),
+                'alive': alive_count,
+                'instances': [inst.to_dict() for inst in instances]
+            }
+        return status
+
+# ============= Circuit Breaker =============
+
+class CircuitBreaker:
+    """
+    자동 장애 격리 (Automatic Fault Isolation)
+
+    상태 전이:
+    CLOSED → OPEN (실패 3회)
+      ↑         ↓
+      ├─ HALF_OPEN (30초 후)
+      │   └─ 성공 2회 → CLOSED
+    """
+
+    def __init__(self, service_name: str, instance_id: str):
+        self.service_name = service_name
+        self.instance_id = instance_id
+        self.state = CircuitState.CLOSED
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.total_requests = 0
+        self.total_failures = 0
+
+    async def call(self, func, *args, **kwargs):
+        """
+        Circuit Breaker를 통한 안전한 호출
+        """
+        self.total_requests += 1
+
+        # OPEN 상태: 요청 거절
+        if self.state == CircuitState.OPEN:
+            if self._should_attempt_reset():
+                self.state = CircuitState.HALF_OPEN
+                self.success_count = 0
+                print(f"🔄 [{datetime.now().strftime('%H:%M:%S')}] {self.service_name}:{self.instance_id} HALF_OPEN → 테스트 중")
+            else:
+                self.total_failures += 1
+                raise Exception(f"🚫 Circuit Open: {self.service_name}:{self.instance_id}")
+
+        # 실제 호출
+        try:
+            result = await func(*args, **kwargs)
+            await self._on_success()
+            return result
+        except Exception as e:
+            await self._on_failure()
+            raise e
+
+    async def _on_success(self):
+        """성공 처리"""
+        self.failure_count = 0
+
+        if self.state == CircuitState.HALF_OPEN:
+            self.success_count += 1
+            if self.success_count >= CIRCUIT_BREAKER_SUCCESS_THRESHOLD:
+                self.state = CircuitState.CLOSED
+                print(f"✅ [{datetime.now().strftime('%H:%M:%S')}] {self.service_name}:{self.instance_id} CLOSED → 정상화")
+
+    async def _on_failure(self):
+        """실패 처리"""
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+        self.total_failures += 1
+
+        if self.state == CircuitState.HALF_OPEN:
+            self.state = CircuitState.OPEN
+            print(f"🔴 [{datetime.now().strftime('%H:%M:%S')}] {self.service_name}:{self.instance_id} OPEN → 요청 거절")
+        elif self.failure_count >= CIRCUIT_BREAKER_FAILURE_THRESHOLD:
+            self.state = CircuitState.OPEN
+            print(f"🔴 [{datetime.now().strftime('%H:%M:%S')}] {self.service_name}:{self.instance_id} OPEN (실패 {self.failure_count}회)")
+
+    def _should_attempt_reset(self) -> bool:
+        """재시도 가능 여부"""
+        if self.last_failure_time is None:
+            return True
+        return (datetime.now() - self.last_failure_time).seconds >= CIRCUIT_BREAKER_TIMEOUT
+
+    async def get_metrics(self) -> CircuitBreakerMetrics:
+        """메트릭 조회"""
+        return CircuitBreakerMetrics(
+            state=self.state,
+            failure_count=self.failure_count,
+            success_count=self.success_count,
+            last_failure_time=self.last_failure_time.isoformat() if self.last_failure_time else None,
+            total_requests=self.total_requests,
+            total_failures=self.total_failures
+        )
+
+# ============= 마이크로서비스 =============
+
+class UserService:
+    """사용자 서비스"""
+
+    def __init__(self, registry: ServiceRegistry, instance_id: str = None):
+        self.registry = registry
+        self.instance_id = instance_id or str(uuid.uuid4())[:8]
+        self.users: Dict[str, Dict] = {}
+        self.circuit_breaker = CircuitBreaker("UserService", self.instance_id)
+
+    async def start(self):
+        """서비스 시작"""
+        await self.registry.register("UserService", "127.0.0.1", 50051, {"version": "1.0"})
+
+    async def get_user(self, user_id: str) -> Dict:
+        """사용자 조회"""
+        if user_id not in self.users:
+            raise Exception(f"❌ 사용자 없음: {user_id}")
+        return self.users[user_id]
+
+    async def create_user(self, name: str, email: str) -> Dict:
+        """사용자 생성"""
+        user_id = str(uuid.uuid4())[:8]
+        user = {
+            'id': user_id,
+            'name': name,
+            'email': email,
+            'status': 'active',
+            'created_at': datetime.now().isoformat()
+        }
+        self.users[user_id] = user
+        print(f"👤 [{datetime.now().strftime('%H:%M:%S')}] UserService: 사용자 생성 {user_id}")
+        return user
+
+class ProductService:
+    """상품 서비스"""
+
+    def __init__(self, registry: ServiceRegistry, instance_id: str = None):
+        self.registry = registry
+        self.instance_id = instance_id or str(uuid.uuid4())[:8]
+        self.products: Dict[str, Dict] = {}
+        self.circuit_breaker = CircuitBreaker("ProductService", self.instance_id)
+
+    async def start(self):
+        """서비스 시작"""
+        await self.registry.register("ProductService", "127.0.0.1", 50052, {"version": "1.0"})
+
+    async def get_product(self, product_id: str) -> Dict:
+        """상품 조회"""
+        if product_id not in self.products:
+            raise Exception(f"❌ 상품 없음: {product_id}")
+        return self.products[product_id]
+
+    async def create_product(self, name: str, price: float, stock: int) -> Dict:
+        """상품 생성"""
+        product_id = str(uuid.uuid4())[:8]
+        product = {
+            'id': product_id,
+            'name': name,
+            'price': price,
+            'stock': stock,
+            'status': 'available',
+            'created_at': datetime.now().isoformat()
+        }
+        self.products[product_id] = product
+        print(f"📦 [{datetime.now().strftime('%H:%M:%S')}] ProductService: 상품 생성 {product_id}")
+        return product
+
+class OrderService:
+    """주문 서비스 (다른 서비스 호출)"""
+
+    def __init__(self, registry: ServiceRegistry, user_service: UserService, product_service: ProductService):
+        self.registry = registry
+        self.user_service = user_service
+        self.product_service = product_service
+        self.instance_id = str(uuid.uuid4())[:8]
+        self.orders: Dict[str, Dict] = {}
+        self.circuit_breaker = CircuitBreaker("OrderService", self.instance_id)
+
+    async def start(self):
+        """서비스 시작"""
+        await self.registry.register("OrderService", "127.0.0.1", 50053, {"version": "1.0"})
+
+    async def create_order(self, user_id: str, product_id: str, quantity: int) -> Dict:
+        """주문 생성 (다른 서비스 호출)"""
+        order_id = str(uuid.uuid4())[:8]
+
+        try:
+            # UserService 호출 (Circuit Breaker 사용)
+            user = await self.user_service.circuit_breaker.call(
+                self.user_service.get_user,
+                user_id
+            )
+
+            # ProductService 호출 (Circuit Breaker 사용)
+            product = await self.product_service.circuit_breaker.call(
+                self.product_service.get_product,
+                product_id
+            )
+
+            # 재고 확인
+            if product['stock'] < quantity:
+                raise Exception(f"❌ 재고 부족: {product_id}")
+
+            # 주문 생성
+            order = {
+                'id': order_id,
+                'user_id': user_id,
+                'product_id': product_id,
+                'quantity': quantity,
+                'total_price': product['price'] * quantity,
+                'status': 'completed',
+                'created_at': datetime.now().isoformat()
+            }
+            self.orders[order_id] = order
+
+            # 재고 감소
+            product['stock'] -= quantity
+
+            print(f"📋 [{datetime.now().strftime('%H:%M:%S')}] OrderService: 주문 완료 {order_id}")
+            return order
+
+        except Exception as e:
+            print(f"❌ [{datetime.now().strftime('%H:%M:%S')}] OrderService 오류: {e}")
+            raise
+
+# ============= 시뮬레이션 =============
+
+async def run_microservices_simulation():
+    """마이크로서비스 시뮬레이션"""
+
+    print("\n" + "="*80)
+    print("🏛️ v7.2: 마이크로서비스 아키텍처 + gRPC 시뮬레이션")
+    print("="*80 + "\n")
+
+    # 1. 서비스 레지스트리 생성
+    registry = ServiceRegistry()
+    print("✅ 서비스 레지스트리 시작\n")
+
+    # 2. 마이크로서비스 생성
+    user_service = UserService(registry)
+    product_service = ProductService(registry)
+    order_service = OrderService(registry, user_service, product_service)
+
+    await user_service.start()
+    await product_service.start()
+    await order_service.start()
+    print()
+
+    # 3. 테스트 데이터
+    print("【 테스트 데이터 준비 】\n")
+
+    user1 = await user_service.create_user("김철수", "kim@example.com")
+    user2 = await user_service.create_user("이영희", "lee@example.com")
+
+    product1 = await product_service.create_product("노트북", 1000000, 5)
+    product2 = await product_service.create_product("마우스", 50000, 20)
+    print()
+
+    # 4. 정상 주문
+    print("【 정상 주문 시나리오 】\n")
+    order1 = await order_service.create_order(user1['id'], product1['id'], 1)
+    print(f"  결과: {order1['id']} - {order1['status']}\n")
+
+    # 5. Circuit Breaker 테스트
+    print("【 Circuit Breaker 테스트 (서비스 장애 시뮬레이션) 】\n")
+
+    # 의도적으로 실패 유도
+    for i in range(3):
+        try:
+            await order_service.create_order(user2['id'], "invalid_product", 1)
+        except Exception:
+            pass
+
+    # Circuit Breaker 상태 확인
+    metrics = await order_service.circuit_breaker.get_metrics()
+    print(f"  상태: {metrics.state.value}")
+    print(f"  실패 횟수: {metrics.total_failures}\n")
+
+    # 6. 서비스 상태 모니터링
+    print("【 서비스 레지스트리 상태 】\n")
+    status = await registry.get_status()
+    for service_name, info in status.items():
+        print(f"  {service_name}: {info['alive']}/{info['total']} 정상")
+    print()
+
+    print("="*80)
+    print("【 시뮬레이션 완료 】")
+    print("="*80 + "\n")
+
+    print("✨ v7.2 마이크로서비스 시뮬레이션 성공!")
+    print("기록이 증명이다 gogs 🎓\n")
+
+# ============= 메인 실행 =============
+
+if __name__ == "__main__":
+    asyncio.run(run_microservices_simulation())

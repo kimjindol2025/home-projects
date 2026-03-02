@@ -1,0 +1,345 @@
+/**
+ * IoT 에지 컴퓨팅 시스템
+ * 센서 데이터 수집, 필터링, 집계
+ */
+
+// 센서 유형
+export enum SensorType {
+  TEMPERATURE = 'temperature', // 온도 (°C)
+  HUMIDITY = 'humidity', // 습도 (%)
+  PRESSURE = 'pressure', // 기압 (hPa)
+  LIGHT = 'light', // 조도 (lux)
+  MOTION = 'motion', // 움직임 (0/1)
+  CO2 = 'co2', // CO2 농도 (ppm)
+  ACCELEROMETER = 'accelerometer', // 가속도
+}
+
+// 센서 읽기
+export interface SensorReading {
+  id: string;
+  deviceId: string;
+  sensorType: SensorType;
+  value: number;
+  unit: string;
+  timestamp: string;
+  quality: number; // 0-100%
+}
+
+// 디바이스
+export interface Device {
+  id: string;
+  name: string;
+  location: string;
+  sensors: SensorType[];
+  lastSeen: string;
+  battery: number; // 0-100%
+  online: boolean;
+  readings: SensorReading[];
+}
+
+// 집계된 통계
+export interface AggregatedData {
+  deviceId: string;
+  sensorType: SensorType;
+  average: number;
+  min: number;
+  max: number;
+  stdDev: number;
+  count: number;
+  period: 'hour' | 'day' | 'week';
+  timestamp: string;
+}
+
+// 경고
+export interface Alert {
+  id: string;
+  deviceId: string;
+  sensorType: SensorType;
+  condition: string;
+  value: number;
+  threshold: number;
+  severity: 'info' | 'warning' | 'critical';
+  acknowledged: boolean;
+  timestamp: string;
+}
+
+// IoT 엔진
+export class IoTEngine {
+  private devices: Map<string, Device> = new Map();
+  private readings: Map<string, SensorReading[]> = new Map();
+  private aggregatedData: Map<string, AggregatedData[]> = new Map();
+  private alerts: Map<string, Alert[]> = new Map();
+  private readingIdCounter = 1;
+  private alertIdCounter = 1;
+  private thresholds: Map<string, { min: number; max: number }> = new Map(
+    Object.entries({
+      temperature: { min: -10, max: 50 },
+      humidity: { min: 10, max: 95 },
+      pressure: { min: 900, max: 1050 },
+      light: { min: 0, max: 100000 },
+      co2: { min: 0, max: 2000 },
+    })
+  );
+
+  // 디바이스 등록
+  registerDevice(
+    deviceId: string,
+    name: string,
+    location: string,
+    sensors: SensorType[]
+  ): Device {
+    const device: Device = {
+      id: deviceId,
+      name,
+      location,
+      sensors,
+      lastSeen: new Date().toISOString(),
+      battery: 100,
+      online: true,
+      readings: [],
+    };
+
+    this.devices.set(deviceId, device);
+    this.readings.set(deviceId, []);
+    this.alerts.set(deviceId, []);
+
+    return device;
+  }
+
+  // 센서 데이터 수집
+  recordReading(
+    deviceId: string,
+    sensorType: SensorType,
+    value: number
+  ): SensorReading | null {
+    const device = this.devices.get(deviceId);
+    if (!device) return null;
+
+    // 데이터 유효성 검사
+    const threshold = this.thresholds.get(sensorType);
+    const quality =
+      threshold && value >= threshold.min && value <= threshold.max
+        ? 100
+        : 50; // 범위 밖이면 품질 저하
+
+    const reading: SensorReading = {
+      id: `read_${this.readingIdCounter++}`,
+      deviceId,
+      sensorType,
+      value,
+      unit: this.getUnit(sensorType),
+      timestamp: new Date().toISOString(),
+      quality,
+    };
+
+    this.readings.get(deviceId)!.push(reading);
+    device.lastSeen = reading.timestamp;
+    device.readings.push(reading);
+
+    // 최근 1000개만 유지
+    if (device.readings.length > 1000) {
+      device.readings.shift();
+    }
+
+    // 경고 검사
+    this.checkAlerts(deviceId, sensorType, value);
+
+    return reading;
+  }
+
+  // 경고 검사
+  private checkAlerts(deviceId: string, sensorType: SensorType, value: number): void {
+    const threshold = this.thresholds.get(sensorType);
+    if (!threshold) return;
+
+    let severity: 'info' | 'warning' | 'critical' = 'info';
+    let condition = '';
+
+    if (value < threshold.min) {
+      severity = value < threshold.min * 0.8 ? 'critical' : 'warning';
+      condition = `below_min (${threshold.min})`;
+    } else if (value > threshold.max) {
+      severity = value > threshold.max * 1.2 ? 'critical' : 'warning';
+      condition = `above_max (${threshold.max})`;
+    }
+
+    if (severity !== 'info') {
+      const alert: Alert = {
+        id: `alert_${this.alertIdCounter++}`,
+        deviceId,
+        sensorType,
+        condition,
+        value,
+        threshold: threshold.max,
+        severity,
+        acknowledged: false,
+        timestamp: new Date().toISOString(),
+      };
+
+      this.alerts.get(deviceId)!.push(alert);
+    }
+  }
+
+  // 데이터 집계 (시간별)
+  aggregateData(
+    deviceId: string,
+    sensorType: SensorType,
+    period: 'hour' | 'day' = 'hour'
+  ): AggregatedData {
+    const readings = this.readings
+      .get(deviceId)!
+      .filter(
+        (r) => r.sensorType === sensorType
+      );
+
+    if (readings.length === 0) {
+      return {
+        deviceId,
+        sensorType,
+        average: 0,
+        min: 0,
+        max: 0,
+        stdDev: 0,
+        count: 0,
+        period,
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    const values = readings.map((r) => r.value);
+    const average = values.reduce((a, b) => a + b, 0) / values.length;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+
+    // 표준편차 계산
+    const variance =
+      values.reduce((sum, v) => sum + Math.pow(v - average, 2), 0) /
+      values.length;
+    const stdDev = Math.sqrt(variance);
+
+    const aggregated: AggregatedData = {
+      deviceId,
+      sensorType,
+      average,
+      min,
+      max,
+      stdDev,
+      count: values.length,
+      period,
+      timestamp: new Date().toISOString(),
+    };
+
+    if (!this.aggregatedData.has(deviceId)) {
+      this.aggregatedData.set(deviceId, []);
+    }
+    this.aggregatedData.get(deviceId)!.push(aggregated);
+
+    return aggregated;
+  }
+
+  // 배터리 저하
+  updateBattery(deviceId: string, percentage: number): void {
+    const device = this.devices.get(deviceId);
+    if (device) {
+      device.battery = Math.max(0, Math.min(100, percentage));
+      if (percentage < 20) {
+        // 배터리 경고
+        this.alerts.get(deviceId)!.push({
+          id: `alert_${this.alertIdCounter++}`,
+          deviceId,
+          sensorType: SensorType.TEMPERATURE,
+          condition: 'low_battery',
+          value: percentage,
+          threshold: 20,
+          severity: 'warning',
+          acknowledged: false,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+  }
+
+  // 디바이스 상태
+  getDeviceStatus(deviceId: string) {
+    const device = this.devices.get(deviceId);
+    if (!device) return null;
+
+    const readings = this.readings.get(deviceId)!;
+    const latestReading = readings[readings.length - 1];
+
+    return {
+      deviceId,
+      name: device.name,
+      location: device.location,
+      online: device.online,
+      battery: device.battery,
+      lastSeen: device.lastSeen,
+      sensors: device.sensors,
+      latestReading,
+      activeAlerts: this.alerts.get(deviceId)!.filter((a) => !a.acknowledged)
+        .length,
+    };
+  }
+
+  // 활성 경고
+  getActiveAlerts(deviceId: string): Alert[] {
+    return this.alerts.get(deviceId)!.filter((a) => !a.acknowledged);
+  }
+
+  // 경고 확인
+  acknowledgeAlert(deviceId: string, alertId: string): void {
+    const alerts = this.alerts.get(deviceId);
+    if (alerts) {
+      const alert = alerts.find((a) => a.id === alertId);
+      if (alert) {
+        alert.acknowledged = true;
+      }
+    }
+  }
+
+  // 통계
+  getMetrics() {
+    const totalDevices = this.devices.size;
+    const onlineDevices = Array.from(this.devices.values()).filter(
+      (d) => d.online
+    ).length;
+    const totalReadings = Array.from(this.readings.values()).reduce(
+      (sum, arr) => sum + arr.length,
+      0
+    );
+    const totalAlerts = Array.from(this.alerts.values()).reduce(
+      (sum, arr) => sum + arr.length,
+      0
+    );
+    const activeAlerts = Array.from(this.alerts.values()).reduce(
+      (sum, arr) => sum + arr.filter((a) => !a.acknowledged).length,
+      0
+    );
+
+    return {
+      totalDevices,
+      onlineDevices,
+      offlineDevices: totalDevices - onlineDevices,
+      totalReadings,
+      totalAlerts,
+      activeAlerts,
+      averageSignalQuality: totalReadings > 0 ? 95 : 0,
+    };
+  }
+
+  // 유닛 반환
+  private getUnit(sensorType: SensorType): string {
+    const units: { [key in SensorType]: string } = {
+      temperature: '°C',
+      humidity: '%',
+      pressure: 'hPa',
+      light: 'lux',
+      motion: 'bool',
+      co2: 'ppm',
+      accelerometer: 'm/s²',
+    };
+    return units[sensorType];
+  }
+}
+
+export const iotEngine = new IoTEngine();

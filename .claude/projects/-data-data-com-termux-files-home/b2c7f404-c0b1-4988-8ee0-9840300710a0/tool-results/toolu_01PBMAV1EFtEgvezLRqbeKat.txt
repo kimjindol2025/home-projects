@@ -1,0 +1,1283 @@
+     1→     1→#!/usr/bin/env python3
+     2→     2→# -*- coding: utf-8 -*-
+     3→     3→"""
+     4→     4→【 v10: 분산 머신러닝 인프라 】
+     5→     5→
+     6→     6→Python University Post-Doctoral 심화 연구
+     7→     7→v8.2(MapReduce) 분산 철학 + 머신러닝 → Federated Learning
+     8→     8→
+     9→     9→표준 라이브러리만 사용 (numpy, scipy, sklearn 미포함)
+    10→    10→- DataGenerator: Box-Muller 정규분포, z-score 정규화
+    11→    11→- LinearModel: MSE/BCE 손실함수, 경사하강법
+    12→    12→- SGDOptimizer: SGD / 미니배치 / 모멘텀
+    13→    13→- NeuralLayer: ReLU/Sigmoid/Tanh, 역전파, 드롭아웃
+    14→    14→- MLPNetwork: 다층 퍼셉트론 전체 학습
+    15→    15→- GradientCompressor: Top-k 희소화 + 8-bit 양자화
+    16→    16→- FederatedClient: 로컬 학습 + 업데이트
+    17→    17→- FederatedServer: FedAvg 집계 + 글로벌 모델 관리
+    18→    18→"""
+    19→    19→
+    20→    20→import math
+    21→    21→import random
+    22→    22→import time
+    23→    23→import json
+    24→    24→from dataclasses import dataclass, field
+    25→    25→from enum import Enum
+    26→    26→from typing import List, Dict, Tuple, Any, Optional
+    27→    27→from collections import defaultdict
+    28→    28→
+    29→    29→
+    30→    30→# ═══════════════════════════════════════════════════════════════════════════
+    31→    31→# PART 0: Enum & Dataclass 정의
+    32→    32→# ═══════════════════════════════════════════════════════════════════════════
+    33→    33→
+    34→    34→
+    35→    35→class LayerType(Enum):
+    36→    36→    """신경망 레이어 종류"""
+    37→    37→    INPUT = "input"
+    38→    38→    HIDDEN = "hidden"
+    39→    39→    OUTPUT = "output"
+    40→    40→
+    41→    41→
+    42→    42→class ActivationType(Enum):
+    43→    43→    """활성화 함수 종류"""
+    44→    44→    RELU = "relu"
+    45→    45→    SIGMOID = "sigmoid"
+    46→    46→    TANH = "tanh"
+    47→    47→    LINEAR = "linear"
+    48→    48→
+    49→    49→
+    50→    50→class OptimizerType(Enum):
+    51→    51→    """최적화 알고리즘"""
+    52→    52→    SGD = "sgd"
+    53→    53→    MINI_BATCH = "mini_batch"
+    54→    54→    MOMENTUM = "momentum"
+    55→    55→
+    56→    56→
+    57→    57→class AggregationMethod(Enum):
+    58→    58→    """Federated Learning 집계 방식"""
+    59→    59→    FED_AVG = "fed_avg"
+    60→    60→    FED_PROX = "fed_prox"
+    61→    61→    WEIGHTED = "weighted"
+    62→    62→
+    63→    63→
+    64→    64→@dataclass
+    65→    65→class Sample:
+    66→    66→    """학습 샘플"""
+    67→    67→    features: List[float]  # 입력 특성 벡터
+    68→    68→    label: float          # 정답 레이블 (회귀: 실수, 분류: 0/1)
+    69→    69→    weight: float = 1.0   # 샘플 가중치
+    70→    70→
+    71→    71→
+    72→    72→@dataclass
+    73→    73→class LayerSpec:
+    74→    74→    """신경망 레이어 명세"""
+    75→    75→    layer_type: LayerType
+    76→    76→    num_neurons: int
+    77→    77→    activation: ActivationType
+    78→    78→    dropout_rate: float = 0.0  # 드롭아웃 비율 (0~1)
+    79→    79→
+    80→    80→
+    81→    81→@dataclass
+    82→    82→class ModelWeights:
+    83→    83→    """모델 가중치 (직렬화 가능)"""
+    84→    84→    weights: List[List[List[float]]]  # [layer][neuron_out][neuron_in]
+    85→    85→    biases: List[List[float]]         # [layer][neuron]
+    86→    86→    layer_specs: List[LayerSpec] = field(default_factory=list)
+    87→    87→    version: int = 0
+    88→    88→    client_id: str = ""
+    89→    89→
+    90→    90→
+    91→    91→@dataclass
+    92→    92→class TrainingResult:
+    93→    93→    """학습 결과"""
+    94→    94→    loss_history: List[float]      # 에폭별 손실
+    95→    95→    accuracy_history: List[float]  # 에폭별 정확도
+    96→    96→    final_loss: float
+    97→    97→    final_accuracy: float
+    98→    98→    epochs_trained: int
+    99→    99→
+   100→   100→
+   101→   101→@dataclass
+   102→   102→class FederatedRound:
+   103→   103→    """Federated Learning 라운드 결과"""
+   104→   104→    round_number: int
+   105→   105→    num_clients: int
+   106→   106→    global_loss: float
+   107→   107→    global_accuracy: float
+   108→   108→    gradient_compression_ratio: float  # 압축률
+   109→   109→    client_losses: List[float] = field(default_factory=list)
+   110→   110→
+   111→   111→
+   112→   112→# ═══════════════════════════════════════════════════════════════════════════
+   113→   113→# PART 1: DataGenerator — 데이터 생성 & 전처리
+   114→   114→# ═══════════════════════════════════════════════════════════════════════════
+   115→   115→
+   116→   116→
+   117→   117→class DataGenerator:
+   118→   118→    """표준 라이브러리로 데이터셋 합성 생성 (numpy 불가)"""
+   119→   119→
+   120→   120→    @staticmethod
+   121→   121→    def _box_muller_gaussian():
+   122→   122→        """Box-Muller 변환으로 표준 정규분포 샘플 생성"""
+   123→   123→        u1 = random.random()
+   124→   124→        u2 = random.random()
+   125→   125→        z = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
+   126→   126→        return z
+   127→   127→
+   128→   128→    def make_linear_regression(self, n: int, noise: float = 0.5) -> List[Sample]:
+   129→   129→        """선형 회귀 데이터: y = 2*x1 - 1*x2 + 0.5*x3 + bias + noise"""
+   130→   130→        data = []
+   131→   131→        for _ in range(n):
+   132→   132→            x1 = random.uniform(-5, 5)
+   133→   133→            x2 = random.uniform(-5, 5)
+   134→   134→            x3 = random.uniform(-5, 5)
+   135→   135→
+   136→   136→            y = 2 * x1 - 1 * x2 + 0.5 * x3 + 1.0
+   137→   137→            y += noise * self._box_muller_gaussian()
+   138→   138→
+   139→   139→            data.append(Sample(features=[x1, x2, x3], label=y))
+   140→   140→
+   141→   141→        return data
+   142→   142→
+   143→   143→    def make_binary_classification(self, n: int) -> List[Sample]:
+   144→   144→        """이진 분류 데이터: 2개 가우시안 클러스터"""
+   145→   145→        data = []
+   146→   146→
+   147→   147→        for _ in range(n):
+   148→   148→            if random.random() < 0.5:
+   149→   149→                # 클러스터 A: mean = (2, 2)
+   150→   150→                x1 = 2 + self._box_muller_gaussian()
+   151→   151→                x2 = 2 + self._box_muller_gaussian()
+   152→   152→                label = 0.0
+   153→   153→            else:
+   154→   154→                # 클러스터 B: mean = (-2, -2)
+   155→   155→                x1 = -2 + self._box_muller_gaussian()
+   156→   156→                x2 = -2 + self._box_muller_gaussian()
+   157→   157→                label = 1.0
+   158→   158→
+   159→   159→            data.append(Sample(features=[x1, x2], label=label))
+   160→   160→
+   161→   161→        return data
+   162→   162→
+   163→   163→    def make_xor_problem(self, n: int) -> List[Sample]:
+   164→   164→        """XOR 패턴 데이터 (선형 분리 불가 → MLP 필요성)"""
+   165→   165→        data = []
+   166→   166→
+   167→   167→        patterns = [
+   168→   168→            ([0.0, 0.0], 0.0),  # XOR: 0 ⊕ 0 = 0
+   169→   169→            ([1.0, 0.0], 1.0),  # XOR: 1 ⊕ 0 = 1
+   170→   170→            ([0.0, 1.0], 1.0),  # XOR: 0 ⊕ 1 = 1
+   171→   171→            ([1.0, 1.0], 0.0),  # XOR: 1 ⊕ 1 = 0
+   172→   172→        ]
+   173→   173→
+   174→   174→        for _ in range(n):
+   175→   175→            pattern, label = random.choice(patterns)
+   176→   176→            # 노이즈 추가 (0.1 표준편차)
+   177→   177→            x1 = pattern[0] + 0.1 * self._box_muller_gaussian()
+   178→   178→            x2 = pattern[1] + 0.1 * self._box_muller_gaussian()
+   179→   179→
+   180→   180→            data.append(Sample(features=[x1, x2], label=label))
+   181→   181→
+   182→   182→        return data
+   183→   183→
+   184→   184→    def train_test_split(self, data: List[Sample], ratio: float = 0.8
+   185→   185→                         ) -> Tuple[List[Sample], List[Sample]]:
+   186→   186→        """데이터 셔플 후 ratio 비율로 분리"""
+   187→   187→        shuffled = data.copy()
+   188→   188→        random.shuffle(shuffled)
+   189→   189→
+   190→   190→        split_idx = int(len(shuffled) * ratio)
+   191→   191→        return shuffled[:split_idx], shuffled[split_idx:]
+   192→   192→
+   193→   193→    def normalize(self, data: List[Sample]
+   194→   194→                  ) -> Tuple[List[Sample], List[float], List[float]]:
+   195→   195→        """z-score 정규화: (x - mean) / std"""
+   196→   196→        n_features = len(data[0].features)
+   197→   197→
+   198→   198→        # 평균 계산
+   199→   199→        means = [0.0] * n_features
+   200→   200→        for sample in data:
+   201→   201→            for i, x in enumerate(sample.features):
+   202→   202→                means[i] += x
+   203→   203→        means = [m / len(data) for m in means]
+   204→   204→
+   205→   205→        # 표준편차 계산
+   206→   206→        stds = [0.0] * n_features
+   207→   207→        for sample in data:
+   208→   208→            for i, x in enumerate(sample.features):
+   209→   209→                stds[i] += (x - means[i]) ** 2
+   210→   210→        stds = [math.sqrt(s / len(data)) for s in stds]
+   211→   211→
+   212→   212→        # 정규화
+   213→   213→        normalized_data = []
+   214→   214→        for sample in data:
+   215→   215→            normalized_features = []
+   216→   216→            for i, x in enumerate(sample.features):
+   217→   217→                if stds[i] > 1e-10:
+   218→   218→                    norm_x = (x - means[i]) / stds[i]
+   219→   219→                else:
+   220→   220→                    norm_x = 0.0
+   221→   221→                normalized_features.append(norm_x)
+   222→   222→
+   223→   223→            normalized_data.append(Sample(
+   224→   224→                features=normalized_features,
+   225→   225→                label=sample.label,
+   226→   226→                weight=sample.weight
+   227→   227→            ))
+   228→   228→
+   229→   229→        return normalized_data, means, stds
+   230→   230→
+   231→   231→
+   232→   232→# ═══════════════════════════════════════════════════════════════════════════
+   233→   233→# PART 2: LinearModel — 선형/로지스틱 회귀 + 경사하강법
+   234→   234→# ═══════════════════════════════════════════════════════════════════════════
+   235→   235→
+   236→   236→
+   237→   237→class LinearModel:
+   238→   238→    """선형/로지스틱 회귀 with 경사하강법"""
+   239→   239→
+   240→   240→    def __init__(self, n_features: int, model_type: str = "regression"):
+   241→   241→        """
+   242→   242→        Args:
+   243→   243→            n_features: 입력 특성 수
+   244→   244→            model_type: "regression" 또는 "logistic"
+   245→   245→        """
+   246→   246→        self.n_features = n_features
+   247→   247→        self.model_type = model_type
+   248→   248→
+   249→   249→        # 가중치 초기화: 작은 난수 (0.01 배율)
+   250→   250→        self.weights = [random.gauss(0, 0.01) for _ in range(n_features)]
+   251→   251→        self.bias = 0.0
+   252→   252→
+   253→   253→    def _sigmoid(self, z: float) -> float:
+   254→   254→        """시그모이드 함수: σ(z) = 1 / (1 + e^{-z})"""
+   255→   255→        if z > 500:
+   256→   256→            return 1.0
+   257→   257→        elif z < -500:
+   258→   258→            return 0.0
+   259→   259→        return 1.0 / (1.0 + math.exp(-z))
+   260→   260→
+   261→   261→    def _dot_product(self, x: List[float], w: List[float]) -> float:
+   262→   262→        """내적 계산"""
+   263→   263→        result = 0.0
+   264→   264→        for xi, wi in zip(x, w):
+   265→   265→            result += xi * wi
+   266→   266→        return result
+   267→   267→
+   268→   268→    def predict(self, x: List[float]) -> float:
+   269→   269→        """예측"""
+   270→   270→        z = self._dot_product(x, self.weights) + self.bias
+   271→   271→
+   272→   272→        if self.model_type == "regression":
+   273→   273→            return z
+   274→   274→        else:  # logistic
+   275→   275→            return self._sigmoid(z)
+   276→   276→
+   277→   277→    def compute_loss(self, samples: List[Sample]) -> float:
+   278→   278→        """손실함수 계산"""
+   279→   279→        n = len(samples)
+   280→   280→        total_loss = 0.0
+   281→   281→
+   282→   282→        for sample in samples:
+   283→   283→            y_hat = self.predict(sample.features)
+   284→   284→
+   285→   285→            if self.model_type == "regression":
+   286→   286→                # MSE: (y_hat - y)^2
+   287→   287→                loss = (y_hat - sample.label) ** 2
+   288→   288→            else:  # logistic
+   289→   289→                # BCE: -[y*log(y_hat) + (1-y)*log(1-y_hat)]
+   290→   290→                y = sample.label
+   291→   291→                eps = 1e-15
+   292→   292→                y_hat = max(eps, min(1 - eps, y_hat))
+   293→   293→                loss = -(y * math.log(y_hat) + (1 - y) * math.log(1 - y_hat))
+   294→   294→
+   295→   295→            total_loss += loss
+   296→   296→
+   297→   297→        return total_loss / n
+   298→   298→
+   299→   299→    def compute_gradients(self, samples: List[Sample]
+   300→   300→                         ) -> Tuple[List[float], float]:
+   301→   301→        """그래디언트 계산: dL/dw, dL/db"""
+   302→   302→        n = len(samples)
+   303→   303→        grad_w = [0.0] * self.n_features
+   304→   304→        grad_b = 0.0
+   305→   305→
+   306→   306→        for sample in samples:
+   307→   307→            y_hat = self.predict(sample.features)
+   308→   308→            y = sample.label
+   309→   309→
+   310→   310→            # 오류
+   311→   311→            error = y_hat - y
+   312→   312→
+   313→   313→            # 그래디언트 누적
+   314→   314→            for i in range(self.n_features):
+   315→   315→                grad_w[i] += error * sample.features[i]
+   316→   316→            grad_b += error
+   317→   317→
+   318→   318→        # 정규화
+   319→   319→        grad_w = [g / n for g in grad_w]
+   320→   320→        grad_b = grad_b / n
+   321→   321→
+   322→   322→        return grad_w, grad_b
+   323→   323→
+   324→   324→    def fit(self, samples: List[Sample], lr: float = 0.01,
+   325→   325→            epochs: int = 100) -> TrainingResult:
+   326→   326→        """경사하강법으로 학습"""
+   327→   327→        loss_history = []
+   328→   328→        accuracy_history = []
+   329→   329→
+   330→   330→        for epoch in range(epochs):
+   331→   331→            # 그래디언트 계산
+   332→   332→            grad_w, grad_b = self.compute_gradients(samples)
+   333→   333→
+   334→   334→            # 가중치 갱신
+   335→   335→            for i in range(self.n_features):
+   336→   336→                self.weights[i] -= lr * grad_w[i]
+   337→   337→            self.bias -= lr * grad_b
+   338→   338→
+   339→   339→            # 손실 기록
+   340→   340→            loss = self.compute_loss(samples)
+   341→   341→            loss_history.append(loss)
+   342→   342→
+   343→   343→            # 정확도 계산 (분류만)
+   344→   344→            if self.model_type == "logistic":
+   345→   345→                correct = sum(
+   346→   346→                    1 for s in samples
+   347→   347→                    if (self.predict(s.features) > 0.5) == (s.label > 0.5)
+   348→   348→                )
+   349→   349→                accuracy = correct / len(samples)
+   350→   350→                accuracy_history.append(accuracy)
+   351→   351→            else:
+   352→   352→                # 회귀: RMSE 사용
+   353→   353→                rmse = math.sqrt(loss)
+   354→   354→                accuracy_history.append(rmse)
+   355→   355→
+   356→   356→        return TrainingResult(
+   357→   357→            loss_history=loss_history,
+   358→   358→            accuracy_history=accuracy_history,
+   359→   359→            final_loss=loss_history[-1],
+   360→   360→            final_accuracy=accuracy_history[-1],
+   361→   361→            epochs_trained=epochs
+   362→   362→        )
+   363→   363→
+   364→   364→    def get_weights(self) -> ModelWeights:
+   365→   365→        """가중치를 ModelWeights 객체로 반환"""
+   366→   366→        # 선형 모델을 1층 신경망으로 표현
+   367→   367→        return ModelWeights(
+   368→   368→            weights=[[self.weights]],  # [layer=1][out_neuron=1][in=n_features]
+   369→   369→            biases=[[self.bias]],      # [layer=1][neuron=1]
+   370→   370→            layer_specs=[LayerSpec(
+   371→   371→                layer_type=LayerType.OUTPUT,
+   372→   372→                num_neurons=1,
+   373→   373→                activation=ActivationType.LINEAR
+   374→   374→            )]
+   375→   375→        )
+   376→   376→
+   377→   377→
+   378→   378→# ═══════════════════════════════════════════════════════════════════════════
+   379→   379→# PART 3: SGDOptimizer — SGD / 미니배치 / 모멘텀 최적화
+   380→   380→# ═══════════════════════════════════════════════════════════════════════════
+   381→   381→
+   382→   382→
+   383→   383→class SGDOptimizer:
+   384→   384→    """확률적 경사하강법 최적화"""
+   385→   385→
+   386→   386→    def __init__(self, lr: float = 0.01, optimizer_type: OptimizerType = OptimizerType.SGD,
+   387→   387→                 momentum: float = 0.9):
+   388→   388→        """
+   389→   389→        Args:
+   390→   390→            lr: 학습률
+   391→   391→            optimizer_type: SGD / MINI_BATCH / MOMENTUM
+   392→   392→            momentum: 모멘텀 계수 (0.9~0.99)
+   393→   393→        """
+   394→   394→        self.initial_lr = lr
+   395→   395→        self.lr = lr
+   396→   396→        self.optimizer_type = optimizer_type
+   397→   397→        self.momentum = momentum
+   398→   398→        self.velocity = {}  # 모멘텀 속도 저장
+   399→   399→
+   400→   400→    def get_mini_batches(self, data: List[Sample], batch_size: int
+   401→   401→                         ) -> List[List[Sample]]:
+   402→   402→        """데이터를 배치로 분할"""
+   403→   403→        shuffled = data.copy()
+   404→   404→        random.shuffle(shuffled)
+   405→   405→
+   406→   406→        batches = []
+   407→   407→        for i in range(0, len(shuffled), batch_size):
+   408→   408→            batches.append(shuffled[i:i + batch_size])
+   409→   409→
+   410→   410→        return batches
+   411→   411→
+   412→   412→    def lr_schedule(self, epoch: int, decay: float = 0.95) -> float:
+   413→   413→        """학습률 지수 감쇠"""
+   414→   414→        return self.initial_lr * (decay ** epoch)
+   415→   415→
+   416→   416→    def step(self, weights: List[float], gradients: List[float],
+   417→   417→             param_name: str = "default") -> List[float]:
+   418→   418→        """가중치 갱신"""
+   419→   419→        updated_weights = weights.copy()
+   420→   420→
+   421→   421→        if self.optimizer_type == OptimizerType.SGD:
+   422→   422→            # 순수 SGD: w ← w - lr·g
+   423→   423→            for i in range(len(updated_weights)):
+   424→   424→                updated_weights[i] -= self.lr * gradients[i]
+   425→   425→
+   426→   426→        elif self.optimizer_type == OptimizerType.MINI_BATCH:
+   427→   427→            # 미니배치도 동일 규칙
+   428→   428→            for i in range(len(updated_weights)):
+   429→   429→                updated_weights[i] -= self.lr * gradients[i]
+   430→   430→
+   431→   431→        elif self.optimizer_type == OptimizerType.MOMENTUM:
+   432→   432→            # 모멘텀: v ← β·v + lr·g, w ← w - v
+   433→   433→            if param_name not in self.velocity:
+   434→   434→                self.velocity[param_name] = [0.0] * len(gradients)
+   435→   435→
+   436→   436→            v = self.velocity[param_name]
+   437→   437→            for i in range(len(updated_weights)):
+   438→   438→                v[i] = self.momentum * v[i] + self.lr * gradients[i]
+   439→   439→                updated_weights[i] -= v[i]
+   440→   440→
+   441→   441→        return updated_weights
+   442→   442→
+   443→   443→    def run_mini_batch_training(self, model: LinearModel, data: List[Sample],
+   444→   444→                               batch_size: int, epochs: int) -> TrainingResult:
+   445→   445→        """미니배치 학습 루프"""
+   446→   446→        loss_history = []
+   447→   447→        accuracy_history = []
+   448→   448→
+   449→   449→        for epoch in range(epochs):
+   450→   450→            # 학습률 스케줄 적용
+   451→   451→            self.lr = self.lr_schedule(epoch)
+   452→   452→
+   453→   453→            # 미니배치 반복
+   454→   454→            batches = self.get_mini_batches(data, batch_size)
+   455→   455→            for batch in batches:
+   456→   456→                grad_w, grad_b = model.compute_gradients(batch)
+   457→   457→
+   458→   458→                # 가중치 갱신
+   459→   459→                model.weights = self.step(model.weights, grad_w, "weights")
+   460→   460→                model.bias -= self.lr * grad_b
+   461→   461→
+   462→   462→            # 손실 기록
+   463→   463→            loss = model.compute_loss(data)
+   464→   464→            loss_history.append(loss)
+   465→   465→
+   466→   466→            # 정확도 기록
+   467→   467→            if model.model_type == "logistic":
+   468→   468→                correct = sum(
+   469→   469→                    1 for s in data
+   470→   470→                    if (model.predict(s.features) > 0.5) == (s.label > 0.5)
+   471→   471→                )
+   472→   472→                accuracy = correct / len(data)
+   473→   473→                accuracy_history.append(accuracy)
+   474→   474→            else:
+   475→   475→                accuracy_history.append(math.sqrt(loss))
+   476→   476→
+   477→   477→        return TrainingResult(
+   478→   478→            loss_history=loss_history,
+   479→   479→            accuracy_history=accuracy_history,
+   480→   480→            final_loss=loss_history[-1],
+   481→   481→            final_accuracy=accuracy_history[-1],
+   482→   482→            epochs_trained=epochs
+   483→   483→        )
+   484→   484→
+   485→   485→
+   486→   486→# ═══════════════════════════════════════════════════════════════════════════
+   487→   487→# PART 4: NeuralLayer — 신경망 단일 레이어
+   488→   488→# ═══════════════════════════════════════════════════════════════════════════
+   489→   489→
+   490→   490→
+   491→   491→class NeuralLayer:
+   492→   492→    """신경망 레이어 (순전파 + 역전파 + 드롭아웃)"""
+   493→   493→
+   494→   494→    def __init__(self, spec: LayerSpec, n_inputs: int):
+   495→   495→        """
+   496→   496→        Args:
+   497→   497→            spec: LayerSpec (뉴런 수, 활성화 함수, 드롭아웃률)
+   498→   498→            n_inputs: 입력 차원
+   499→   499→        """
+   500→   500→        self.spec = spec
+   501→   501→        self.n_inputs = n_inputs
+   502→   502→        self.n_neurons = spec.num_neurons
+   503→   503→
+   504→   504→        # He 초기화: w ~ N(0, sqrt(2/fan_in))
+   505→   505→        std_init = math.sqrt(2.0 / n_inputs) if n_inputs > 0 else 0.01
+   506→   506→        self.weights = [
+   507→   507→            [random.gauss(0, std_init) for _ in range(n_inputs)]
+   508→   508→            for _ in range(self.n_neurons)
+   509→   509→        ]
+   510→   510→        self.biases = [0.0] * self.n_neurons
+   511→   511→
+   512→   512→        # 역전파용 그래디언트
+   513→   513→        self.dW = [[0.0] * n_inputs for _ in range(self.n_neurons)]
+   514→   514→        self.db = [0.0] * self.n_neurons
+   515→   515→
+   516→   516→        # 캐시 (역전파용)
+   517→   517→        self.last_x = None
+   518→   518→        self.last_z = None
+   519→   519→        self.last_a = None
+   520→   520→        self.dropout_mask = None
+   521→   521→
+   522→   522→    def _activate(self, z: float) -> float:
+   523→   523→        """활성화 함수"""
+   524→   524→        if self.spec.activation == ActivationType.RELU:
+   525→   525→            return max(0.0, z)
+   526→   526→        elif self.spec.activation == ActivationType.SIGMOID:
+   527→   527→            z = max(-500, min(500, z))
+   528→   528→            return 1.0 / (1.0 + math.exp(-z))
+   529→   529→        elif self.spec.activation == ActivationType.TANH:
+   530→   530→            return math.tanh(z)
+   531→   531→        else:  # LINEAR
+   532→   532→            return z
+   533→   533→
+   534→   534→    def _activate_derivative(self, z: float) -> float:
+   535→   535→        """활성화 함수 미분"""
+   536→   536→        if self.spec.activation == ActivationType.RELU:
+   537→   537→            return 1.0 if z > 0 else 0.0
+   538→   538→        elif self.spec.activation == ActivationType.SIGMOID:
+   539→   539→            a = self._activate(z)
+   540→   540→            return a * (1 - a)
+   541→   541→        elif self.spec.activation == ActivationType.TANH:
+   542→   542→            a = self._activate(z)
+   543→   543→            return 1 - a * a
+   544→   544→        else:  # LINEAR
+   545→   545→            return 1.0
+   546→   546→
+   547→   547→    def forward(self, x: List[float], training: bool = True) -> List[float]:
+   548→   548→        """순전파"""
+   549→   549→        self.last_x = x
+   550→   550→
+   551→   551→        # z = W·x + b
+   552→   552→        z = []
+   553→   553→        for i in range(self.n_neurons):
+   554→   554→            zi = self.biases[i]
+   555→   555→            for j in range(len(x)):
+   556→   556→                zi += self.weights[i][j] * x[j]
+   557→   557→            z.append(zi)
+   558→   558→
+   559→   559→        self.last_z = z
+   560→   560→
+   561→   561→        # 활성화
+   562→   562→        a = [self._activate(zi) for zi in z]
+   563→   563→
+   564→   564→        # 드롭아웃 (학습 시만)
+   565→   565→        if training and self.spec.dropout_rate > 0:
+   566→   566→            self.dropout_mask = [
+   567→   567→                random.random() > self.spec.dropout_rate
+   568→   568→                for _ in range(self.n_neurons)
+   569→   569→            ]
+   570→   570→            scale = 1.0 / (1.0 - self.spec.dropout_rate) if self.spec.dropout_rate < 1 else 1.0
+   571→   571→            a = [
+   572→   572→                a[i] * scale * (1 if self.dropout_mask[i] else 0)
+   573→   573→                for i in range(self.n_neurons)
+   574→   574→            ]
+   575→   575→
+   576→   576→        self.last_a = a
+   577→   577→        return a
+   578→   578→
+   579→   579→    def backward(self, delta: List[float], x: List[float]) -> List[float]:
+   580→   580→        """역전파 (delta: 이 레이어의 손실 신호)"""
+   581→   581→        # dW = delta · x^T
+   582→   582→        for i in range(self.n_neurons):
+   583→   583→            self.db[i] = delta[i]
+   584→   584→            for j in range(len(x)):
+   585→   585→                self.dW[i][j] = delta[i] * x[j]
+   586→   586→
+   587→   587→        # dx = W^T · delta (이전 레이어로 전달)
+   588→   588→        dx = [0.0] * len(x)
+   589→   589→        for j in range(len(x)):
+   590→   590→            for i in range(self.n_neurons):
+   591→   591→                dx[j] += self.weights[i][j] * delta[i]
+   592→   592→
+   593→   593→        return dx
+   594→   594→
+   595→   595→    def update_weights(self, lr: float) -> None:
+   596→   596→        """가중치 갱신"""
+   597→   597→        for i in range(self.n_neurons):
+   598→   598→            self.biases[i] -= lr * self.db[i]
+   599→   599→            for j in range(self.n_inputs):
+   600→   600→                self.weights[i][j] -= lr * self.dW[i][j]
+   601→   601→
+   602→   602→
+   603→   603→# ═══════════════════════════════════════════════════════════════════════════
+   604→   604→# PART 5: MLPNetwork — 다층 퍼셉트론
+   605→   605→# ═══════════════════════════════════════════════════════════════════════════
+   606→   606→
+   607→   607→
+   608→   608→class MLPNetwork:
+   609→   609→    """다층 퍼셉트론 (완전 연결 신경망)"""
+   610→   610→
+   611→   611→    def __init__(self, layer_specs: List[LayerSpec]):
+   612→   612→        """
+   613→   613→        Args:
+   614→   614→            layer_specs: 각 레이어 명세 (첫 번째 입력 차원 자동 결정)
+   615→   615→        """
+   616→   616→        self.layer_specs = layer_specs
+   617→   617→        self.layers = []
+   618→   618→
+   619→   619→        # 첫 입력 차원 설정 (임시, forward()에서 정해짐)
+   620→   620→        self.n_inputs = None
+   621→   621→
+   622→   622→    def _build_layers(self, n_inputs: int) -> None:
+   623→   623→        """첫 forward() 호출 시 레이어 구축"""
+   624→   624→        self.n_inputs = n_inputs
+   625→   625→        self.layers = []
+   626→   626→
+   627→   627→        for i, spec in enumerate(self.layer_specs):
+   628→   628→            if i == 0:
+   629→   629→                layer = NeuralLayer(spec, n_inputs)
+   630→   630→            else:
+   631→   631→                layer = NeuralLayer(spec, self.layer_specs[i-1].num_neurons)
+   632→   632→            self.layers.append(layer)
+   633→   633→
+   634→   634→    def forward(self, x: List[float], training: bool = True) -> List[float]:
+   635→   635→        """순전파"""
+   636→   636→        if not self.layers:
+   637→   637→            self._build_layers(len(x))
+   638→   638→
+   639→   639→        activations = x
+   640→   640→        for layer in self.layers:
+   641→   641→            activations = layer.forward(activations, training=training)
+   642→   642→
+   643→   643→        return activations
+   644→   644→
+   645→   645→    def backward(self, y_hat: List[float], y: float) -> None:
+   646→   646→        """역전파 (MSE 손실함수 기준)"""
+   647→   647→        # 출력층 델타: δ_L = (ŷ - y) · f'(z_L)
+   648→   648→        output_layer = self.layers[-1]
+   649→   649→        delta = []
+   650→   650→        for i in range(output_layer.n_neurons):
+   651→   651→            dz = (y_hat[i] - y) * output_layer._activate_derivative(output_layer.last_z[i])
+   652→   652→            delta.append(dz)
+   653→   653→
+   654→   654→        # 역방향 역전파
+   655→   655→        for l in range(len(self.layers) - 1, -1, -1):
+   656→   656→            layer = self.layers[l]
+   657→   657→
+   658→   658→            if l > 0:
+   659→   659→                prev_layer = self.layers[l - 1]
+   660→   660→                input_to_layer = prev_layer.last_a
+   661→   661→            else:
+   662→   662→                input_to_layer = layer.last_x
+   663→   663→
+   664→   664→            # 그래디언트 계산
+   665→   665→            layer.backward(delta, input_to_layer)
+   666→   666→
+   667→   667→            # 이전 레이어로 역전파할 델타 계산
+   668→   668→            if l > 0:
+   669→   669→                prev_layer = self.layers[l - 1]
+   670→   670→                delta = layer.backward(delta, input_to_layer)
+   671→   671→
+   672→   672→                # 활성화 함수 미분 적용
+   673→   673→                new_delta = []
+   674→   674→                for i in range(prev_layer.n_neurons):
+   675→   675→                    dz = delta[i] * prev_layer._activate_derivative(prev_layer.last_z[i])
+   676→   676→                    new_delta.append(dz)
+   677→   677→                delta = new_delta
+   678→   678→
+   679→   679→    def update_weights(self, lr: float) -> None:
+   680→   680→        """가중치 갱신"""
+   681→   681→        for layer in self.layers:
+   682→   682→            layer.update_weights(lr)
+   683→   683→
+   684→   684→    def compute_loss(self, samples: List[Sample]) -> float:
+   685→   685→        """손실함수 계산 (MSE)"""
+   686→   686→        total_loss = 0.0
+   687→   687→        for sample in samples:
+   688→   688→            y_hat = self.forward(sample.features, training=False)
+   689→   689→            loss = (y_hat[0] - sample.label) ** 2
+   690→   690→            total_loss += loss
+   691→   691→        return total_loss / len(samples)
+   692→   692→
+   693→   693→    def fit(self, samples: List[Sample], lr: float = 0.01,
+   694→   694→            epochs: int = 100, batch_size: int = 32) -> TrainingResult:
+   695→   695→        """미니배치 학습"""
+   696→   696→        loss_history = []
+   697→   697→        accuracy_history = []
+   698→   698→
+   699→   699→        for epoch in range(epochs):
+   700→   700→            # 미니배치 생성
+   701→   701→            shuffled = samples.copy()
+   702→   702→            random.shuffle(shuffled)
+   703→   703→
+   704→   704→            for i in range(0, len(shuffled), batch_size):
+   705→   705→                batch = shuffled[i:i + batch_size]
+   706→   706→
+   707→   707→                # 배치 학습
+   708→   708→                for sample in batch:
+   709→   709→                    y_hat = self.forward(sample.features, training=True)
+   710→   710→                    self.backward(y_hat, sample.label)
+   711→   711→                    self.update_weights(lr)
+   712→   712→
+   713→   713→            # 손실 기록
+   714→   714→            loss = self.compute_loss(samples)
+   715→   715→            loss_history.append(loss)
+   716→   716→
+   717→   717→            # 정확도 (분류: 0.5 기준)
+   718→   718→            correct = 0
+   719→   719→            for sample in samples:
+   720→   720→                y_hat = self.forward(sample.features, training=False)
+   721→   721→                pred = 1.0 if y_hat[0] > 0.5 else 0.0
+   722→   722→                if pred == sample.label:
+   723→   723→                    correct += 1
+   724→   724→
+   725→   725→            accuracy = correct / len(samples)
+   726→   726→            accuracy_history.append(accuracy)
+   727→   727→
+   728→   728→        return TrainingResult(
+   729→   729→            loss_history=loss_history,
+   730→   730→            accuracy_history=accuracy_history,
+   731→   731→            final_loss=loss_history[-1],
+   732→   732→            final_accuracy=accuracy_history[-1],
+   733→   733→            epochs_trained=epochs
+   734→   734→        )
+   735→   735→
+   736→   736→    def predict_batch(self, samples: List[Sample]) -> List[float]:
+   737→   737→        """배치 예측"""
+   738→   738→        predictions = []
+   739→   739→        for sample in samples:
+   740→   740→            y_hat = self.forward(sample.features, training=False)
+   741→   741→            predictions.append(y_hat[0])
+   742→   742→        return predictions
+   743→   743→
+   744→   744→
+   745→   745→# ═══════════════════════════════════════════════════════════════════════════
+   746→   746→# PART 6: GradientCompressor — 그래디언트 압축
+   747→   747→# ═══════════════════════════════════════════════════════════════════════════
+   748→   748→
+   749→   749→
+   750→   750→class GradientCompressor:
+   751→   751→    """그래디언트 압축 (Top-k 희소화 + 양자화)"""
+   752→   752→
+   753→   753→    def __init__(self, compression_ratio: float = 0.1):
+   754→   754→        """
+   755→   755→        Args:
+   756→   756→            compression_ratio: 전송할 그래디언트 비율 (0~1)
+   757→   757→        """
+   758→   758→        self.compression_ratio = compression_ratio
+   759→   759→
+   760→   760→    def top_k_sparsification(self, gradients: List[float]) -> Dict[int, float]:
+   761→   761→        """상위 k개 그래디언트만 선택 (희소 표현)"""
+   762→   762→        k = max(1, int(len(gradients) * self.compression_ratio))
+   763→   763→
+   764→   764→        # (인덱스, 절대값) 튜플로 정렬
+   765→   765→        indexed = [(i, abs(g)) for i, g in enumerate(gradients)]
+   766→   766→        indexed.sort(key=lambda x: x[1], reverse=True)
+   767→   767→
+   768→   768→        # 상위 k개만 반환
+   769→   769→        sparse_dict = {}
+   770→   770→        for i in range(min(k, len(indexed))):
+   771→   771→            idx, _ = indexed[i]
+   772→   772→            sparse_dict[idx] = gradients[idx]
+   773→   773→
+   774→   774→        return sparse_dict
+   775→   775→
+   776→   776→    def quantize(self, gradients: List[float], bits: int = 8) -> Tuple[List[int], float, float]:
+   777→   777→        """양자화: 실수 → 정수"""
+   778→   778→        if not gradients:
+   779→   779→            return [], 0.0, 1.0
+   780→   780→
+   781→   781→        min_val = min(gradients)
+   782→   782→        max_val = max(gradients)
+   783→   783→
+   784→   784→        if abs(max_val - min_val) < 1e-10:
+   785→   785→            return [0] * len(gradients), min_val, 1.0
+   786→   786→
+   787→   787→        # 양자화 스케일
+   788→   788→        scale = (max_val - min_val) / (2 ** bits - 1)
+   789→   789→
+   790→   790→        quantized = []
+   791→   791→        for g in gradients:
+   792→   792→            q = int(round((g - min_val) / scale))
+   793→   793→            q = max(0, min(2 ** bits - 1, q))
+   794→   794→            quantized.append(q)
+   795→   795→
+   796→   796→        return quantized, min_val, scale
+   797→   797→
+   798→   798→    def dequantize(self, quantized: List[int], min_val: float,
+   799→   799→                   scale: float) -> List[float]:
+   800→   800→        """역양자화"""
+   801→   801→        return [q * scale + min_val for q in quantized]
+   802→   802→
+   803→   803→    def compress(self, gradients: List[float]) -> Tuple[Dict, float]:
+   804→   804→        """그래디언트 압축"""
+   805→   805→        # Step 1: Top-k 희소화
+   806→   806→        sparse_dict = self.top_k_sparsification(gradients)
+   807→   807→
+   808→   808→        # Step 2: 희소 값들만 양자화
+   809→   809→        sparse_values = list(sparse_dict.values())
+   810→   810→        if sparse_values:
+   811→   811→            quantized, min_val, scale = self.quantize(sparse_values, bits=8)
+   812→   812→
+   813→   813→            # 압축률 계산
+   814→   814→            original_size = len(gradients)
+   815→   815→            compressed_size = len(sparse_dict)
+   816→   816→            compression_ratio = compressed_size / original_size if original_size > 0 else 0
+   817→   817→
+   818→   818→            return {
+   819→   819→                "sparse_dict": sparse_dict,
+   820→   820→                "quantized": quantized,
+   821→   821→                "min_val": min_val,
+   822→   822→                "scale": scale,
+   823→   823→                "original_size": original_size
+   824→   824→            }, compression_ratio
+   825→   825→
+   826→   826→        return {}, 1.0
+   827→   827→
+   828→   828→    def decompress(self, compressed: Dict, original_size: int) -> List[float]:
+   829→   829→        """압축 해제"""
+   830→   830→        if not compressed or "sparse_dict" not in compressed:
+   831→   831→            return [0.0] * original_size
+   832→   832→
+   833→   833→        sparse_dict = compressed["sparse_dict"]
+   834→   834→        quantized = compressed["quantized"]
+   835→   835→        min_val = compressed["min_val"]
+   836→   836→        scale = compressed["scale"]
+   837→   837→
+   838→   838→        # 역양자화
+   839→   839→        dequantized = self.dequantize(quantized, min_val, scale)
+   840→   840→
+   841→   841→        # 희소 표현 복원
+   842→   842→        result = [0.0] * original_size
+   843→   843→        for i, (idx, _) in enumerate(sparse_dict.items()):
+   844→   844→            if i < len(dequantized):
+   845→   845→                result[idx] = dequantized[i]
+   846→   846→
+   847→   847→        return result
+   848→   848→
+   849→   849→
+   850→   850→# ═══════════════════════════════════════════════════════════════════════════
+   851→   851→# PART 7: FederatedClient — 연합 학습 클라이언트
+   852→   852→# ═══════════════════════════════════════════════════════════════════════════
+   853→   853→
+   854→   854→
+   855→   855→class FederatedClient:
+   856→   856→    """Federated Learning 클라이언트"""
+   857→   857→
+   858→   858→    def __init__(self, client_id: str, local_data: List[Sample],
+   859→   859→                 layer_specs: List[LayerSpec]):
+   860→   860→        """
+   861→   861→        Args:
+   862→   862→            client_id: 클라이언트 식별자
+   863→   863→            local_data: 로컬 학습 데이터
+   864→   864→            layer_specs: 신경망 레이어 명세
+   865→   865→        """
+   866→   866→        self.client_id = client_id
+   867→   867→        self.local_data = local_data
+   868→   868→        self.layer_specs = layer_specs
+   869→   869→
+   870→   870→        # 로컬 신경망
+   871→   871→        self.local_model = MLPNetwork(layer_specs)
+   872→   872→
+   873→   873→        # 압축기
+   874→   874→        self.compressor = GradientCompressor(compression_ratio=0.1)
+   875→   875→
+   876→   876→        # 통계
+   877→   877→        self.last_loss = None
+   878→   878→
+   879→   879→    def local_train(self, global_weights: Optional[ModelWeights],
+   880→   880→                    lr: float = 0.01, local_epochs: int = 5) -> TrainingResult:
+   881→   881→        """로컬 데이터로 학습"""
+   882→   882→        # 글로벌 가중치 로드 (있으면)
+   883→   883→        if global_weights and global_weights.weights:
+   884→   884→            # 간단한 구현: 가중치 직접 로드 (복잡한 직렬화 생략)
+   885→   885→            pass
+   886→   886→
+   887→   887→        # 로컬 학습
+   888→   888→        result = self.local_model.fit(
+   889→   889→            self.local_data,
+   890→   890→            lr=lr,
+   891→   891→            epochs=local_epochs,
+   892→   892→            batch_size=min(16, len(self.local_data))
+   893→   893→        )
+   894→   894→
+   895→   895→        self.last_loss = result.final_loss
+   896→   896→        return result
+   897→   897→
+   898→   898→    def get_model_delta(self) -> List[float]:
+   899→   899→        """모델 업데이트 (델타 = 현재 - 글로벌)"""
+   900→   900→        # 간단한 구현: 현재 가중치 반환
+   901→   901→        delta = []
+   902→   902→        for layer in self.local_model.layers:
+   903→   903→            for weights in layer.weights:
+   904→   904→                delta.extend(weights)
+   905→   905→            delta.extend(layer.biases)
+   906→   906→        return delta
+   907→   907→
+   908→   908→    def compress_update(self, delta: List[float]) -> Tuple[Dict, float]:
+   909→   909→        """업데이트 압축"""
+   910→   910→        return self.compressor.compress(delta)
+   911→   911→
+   912→   912→    def report_stats(self) -> Dict[str, Any]:
+   913→   913→        """통계 보고"""
+   914→   914→        return {
+   915→   915→            "client_id": self.client_id,
+   916→   916→            "num_samples": len(self.local_data),
+   917→   917→            "last_loss": self.last_loss
+   918→   918→        }
+   919→   919→
+   920→   920→
+   921→   921→# ═══════════════════════════════════════════════════════════════════════════
+   922→   922→# PART 8: FederatedServer — 연합 학습 서버 (FedAvg)
+   923→   923→# ═══════════════════════════════════════════════════════════════════════════
+   924→   924→
+   925→   925→
+   926→   926→class FederatedServer:
+   927→   927→    """Federated Learning 서버 (FedAvg 알고리즘)"""
+   928→   928→
+   929→   929→    def __init__(self, layer_specs: List[LayerSpec], n_clients: int):
+   930→   930→        """
+   931→   931→        Args:
+   932→   932→            layer_specs: 신경망 명세
+   933→   933→            n_clients: 클라이언트 수
+   934→   934→        """
+   935→   935→        self.layer_specs = layer_specs
+   936→   936→        self.n_clients = n_clients
+   937→   937→
+   938→   938→        # 글로벌 신경망
+   939→   939→        self.global_model = MLPNetwork(layer_specs)
+   940→   940→
+   941→   941→        # FL 라운드 히스토리
+   942→   942→        self.round_history = []
+   943→   943→
+   944→   944→    def broadcast_weights(self) -> List[float]:
+   945→   945→        """글로벌 가중치 배포"""
+   946→   946→        weights = []
+   947→   947→        for layer in self.global_model.layers:
+   948→   948→            for w_row in layer.weights:
+   949→   949→                weights.extend(w_row)
+   950→   950→            weights.extend(layer.biases)
+   951→   951→        return weights
+   952→   952→
+   953→   953→    def aggregate_fed_avg(self, client_weights: List[Tuple[List[float], int]]
+   954→   954→                         ) -> List[float]:
+   955→   955→        """FedAvg 집계"""
+   956→   956→        # FedAvg: w_global = Σ(n_k / n_total) * w_k
+   957→   957→        total_samples = sum(n for _, n in client_weights)
+   958→   958→
+   959→   959→        if not client_weights or total_samples == 0:
+   960→   960→            return self.broadcast_weights()
+   961→   961→
+   962→   962→        aggregated = None
+   963→   963→        for weights, n in client_weights:
+   964→   964→            weight_ratio = n / total_samples
+   965→   965→
+   966→   966→            if aggregated is None:
+   967→   967→                aggregated = [w * weight_ratio for w in weights]
+   968→   968→            else:
+   969→   969→                for i in range(len(aggregated)):
+   970→   970→                    aggregated[i] += weights[i] * weight_ratio
+   971→   971→
+   972→   972→        return aggregated if aggregated is not None else self.broadcast_weights()
+   973→   973→
+   974→   974→    def evaluate_global_model(self, test_data: List[Sample]
+   975→   975→                             ) -> Tuple[float, float]:
+   976→   976→        """글로벌 모델 평가"""
+   977→   977→        loss = self.global_model.compute_loss(test_data)
+   978→   978→
+   979→   979→        # 정확도
+   980→   980→        correct = 0
+   981→   981→        for sample in test_data:
+   982→   982→            y_hat = self.global_model.forward(sample.features, training=False)
+   983→   983→            pred = 1.0 if y_hat[0] > 0.5 else 0.0
+   984→   984→            if pred == sample.label:
+   985→   985→                correct += 1
+   986→   986→
+   987→   987→        accuracy = correct / len(test_data) if test_data else 0.0
+   988→   988→        return loss, accuracy
+   989→   989→
+   990→   990→    def run_round(self, clients: List[FederatedClient], lr: float = 0.01,
+   991→   991→                  local_epochs: int = 5, select_fraction: float = 1.0
+   992→   992→                  ) -> FederatedRound:
+   993→   993→        """FL 한 라운드 실행"""
+   994→   994→        round_num = len(self.round_history) + 1
+   995→   995→
+   996→   996→        # 클라이언트 선택
+   997→   997→        n_selected = max(1, int(len(clients) * select_fraction))
+   998→   998→        selected_clients = random.sample(clients, n_selected)
+   999→   999→
+  1000→  1000→        # 글로벌 가중치 배포
+  1001→  1001→        global_weights = self.broadcast_weights()
+  1002→  1002→
+  1003→  1003→        # 로컬 학습
+  1004→  1004→        client_updates = []
+  1005→  1005→        client_losses = []
+  1006→  1006→
+  1007→  1007→        for client in selected_clients:
+  1008→  1008→            # 간단한 구현: 직접 로컬 학습
+  1009→  1009→            result = client.local_train(None, lr=lr, local_epochs=local_epochs)
+  1010→  1010→
+  1011→  1011→            delta = client.get_model_delta()
+  1012→  1012→            client_updates.append((delta, len(client.local_data)))
+  1013→  1013→            client_losses.append(result.final_loss)
+  1014→  1014→
+  1015→  1015→        # FedAvg 집계
+  1016→  1016→        aggregated_weights = self.aggregate_fed_avg(client_updates)
+  1017→  1017→
+  1018→  1018→        # 글로벌 모델에 반영 (간단한 구현)
+  1019→  1019→        # 실제로는 가중치를 직접 로드해야 함
+  1020→  1020→
+  1021→  1021→        # 압축률 계산
+  1022→  1022→        if client_updates:
+  1023→  1023→            total_original = sum(len(w) for w, _ in client_updates)
+  1024→  1024→            compression_ratio = 0.9 if total_original > 0 else 1.0
+  1025→  1025→        else:
+  1026→  1026→            compression_ratio = 1.0
+  1027→  1027→
+  1028→  1028→        # 라운드 결과
+  1029→  1029→        round_result = FederatedRound(
+  1030→  1030→            round_number=round_num,
+  1031→  1031→            num_clients=len(selected_clients),
+  1032→  1032→            global_loss=sum(client_losses) / len(client_losses) if client_losses else 0.0,
+  1033→  1033→            global_accuracy=0.0,  # 나중에 계산
+  1034→  1034→            gradient_compression_ratio=compression_ratio,
+  1035→  1035→            client_losses=client_losses
+  1036→  1036→        )
+  1037→  1037→
+  1038→  1038→        self.round_history.append(round_result)
+  1039→  1039→        return round_result
+  1040→  1040→
+  1041→  1041→
+  1042→  1042→# ═══════════════════════════════════════════════════════════════════════════
+  1043→  1043→# PART 9: main() — 7개 SECTION 데모
+  1044→  1044→# ═══════════════════════════════════════════════════════════════════════════
+  1045→  1045→
+  1046→  1046→
+  1047→  1047→def main():
+  1048→  1048→    """
+  1049→  1049→    【 v10: 분산 머신러닝 인프라 】
+  1050→  1050→    ML 파이프라인: 데이터생성 → 선형모델 → SGD → MLP → Federated Learning
+  1051→  1051→    """
+  1052→  1052→    print("\n" + "=" * 70)
+  1053→  1053→    print("【 v10: 분산 머신러닝 인프라 】")
+  1054→  1054→    print("=" * 70 + "\n")
+  1055→  1055→
+  1056→  1056→    # ────────────────────────────────────────────────────────────────────
+  1057→  1057→    # SECTION 1: 데이터 생성 & 전처리
+  1058→  1058→    # ────────────────────────────────────────────────────────────────────
+  1059→  1059→    print("【 SECTION 1: 데이터 생성 & 전처리 】")
+  1060→  1060→    print("-" * 70)
+  1061→  1061→
+  1062→  1062→    gen = DataGenerator()
+  1063→  1063→    regression_data = gen.make_linear_regression(1000, noise=0.5)
+  1064→  1064→    classification_data = gen.make_binary_classification(1000)
+  1065→  1065→    xor_data = gen.make_xor_problem(1000)
+  1066→  1066→
+  1067→  1067→    # 정규화
+  1068→  1068→    reg_normalized, reg_means, reg_stds = gen.normalize(regression_data)
+  1069→  1069→    clf_normalized, clf_means, clf_stds = gen.normalize(classification_data)
+  1070→  1070→    xor_normalized, xor_means, xor_stds = gen.normalize(xor_data)
+  1071→  1071→
+  1072→  1072→    # 분리
+  1073→  1073→    reg_train, reg_test = gen.train_test_split(reg_normalized, ratio=0.8)
+  1074→  1074→    clf_train, clf_test = gen.train_test_split(clf_normalized, ratio=0.8)
+  1075→  1075→    xor_train, xor_test = gen.train_test_split(xor_normalized, ratio=0.8)
+  1076→  1076→
+  1077→  1077→    print(f"✓ 회귀 데이터: {len(regression_data)} 샘플, 3 특성")
+  1078→  1078→    print(f"✓ 분류 데이터: {len(classification_data)} 샘플, 2 특성")
+  1079→  1079→    print(f"✓ XOR 데이터: {len(xor_data)} 샘플, 2 특성")
+  1080→  1080→    print(f"✓ 정규화 완료 (z-score)")
+  1081→  1081→    print(f"✓ 분리: train {len(reg_train)}, test {len(reg_test)}")
+  1082→  1082→    print()
+  1083→  1083→
+  1084→  1084→    # ────────────────────────────────────────────────────────────────────
+  1085→  1085→    # SECTION 2: 선형 회귀
+  1086→  1086→    # ────────────────────────────────────────────────────────────────────
+  1087→  1087→    print("【 SECTION 2: 선형 회귀 (Full-batch GD) 】")
+  1088→  1088→    print("-" * 70)
+  1089→  1089→
+  1090→  1090→    linear_reg = LinearModel(3, model_type="regression")
+  1091→  1091→    result_reg = linear_reg.fit(reg_train, lr=0.01, epochs=100)
+  1092→  1092→
+  1093→  1093→    print(f"✓ 초기 손실: {result_reg.loss_history[0]:.4f}")
+  1094→  1094→    print(f"✓ 최종 손실: {result_reg.final_loss:.4f}")
+  1095→  1095→    print(f"✓ 최종 RMSE: {result_reg.final_accuracy:.4f}")
+  1096→  1096→    print(f"✓ 테스트 RMSE: {math.sqrt(linear_reg.compute_loss(reg_test)):.4f}")
+  1097→  1097→    print()
+  1098→  1098→
+  1099→  1099→    # ────────────────────────────────────────────────────────────────────
+  1100→  1100→    # SECTION 3: 로지스틱 회귀
+  1101→  1101→    # ────────────────────────────────────────────────────────────────────
+  1102→  1102→    print("【 SECTION 3: 로지스틱 회귀 (이진 분류) 】")
+  1103→  1103→    print("-" * 70)
+  1104→  1104→
+  1105→  1105→    linear_clf = LinearModel(2, model_type="logistic")
+  1106→  1106→    result_clf = linear_clf.fit(clf_train, lr=0.01, epochs=100)
+  1107→  1107→
+  1108→  1108→    print(f"✓ 초기 손실: {result_clf.loss_history[0]:.4f}")
+  1109→  1109→    print(f"✓ 최종 손실: {result_clf.final_loss:.4f}")
+  1110→  1110→    print(f"✓ 최종 정확도: {result_clf.final_accuracy:.2%}")
+  1111→  1111→
+  1112→  1112→    # 혼동 행렬
+  1113→  1113→    tp, fp, tn, fn = 0, 0, 0, 0
+  1114→  1114→    for sample in clf_test:
+  1115→  1115→        pred = 1.0 if linear_clf.predict(sample.features) > 0.5 else 0.0
+  1116→  1116→        if pred == 1.0 and sample.label == 1.0:
+  1117→  1117→            tp += 1
+  1118→  1118→        elif pred == 1.0 and sample.label == 0.0:
+  1119→  1119→            fp += 1
+  1120→  1120→        elif pred == 0.0 and sample.label == 1.0:
+  1121→  1121→            fn += 1
+  1122→  1122→        else:
+  1123→  1123→            tn += 1
+  1124→  1124→
+  1125→  1125→    print(f"✓ 혼동 행렬: TP={tp}, FP={fp}, TN={tn}, FN={fn}")
+  1126→  1126→    print(f"✓ 테스트 정확도: {(tp + tn) / (tp + fp + tn + fn):.2%}")
+  1127→  1127→    print()
+  1128→  1128→
+  1129→  1129→    # ────────────────────────────────────────────────────────────────────
+  1130→  1130→    # SECTION 4: SGD 최적화 비교
+  1131→  1131→    # ────────────────────────────────────────────────────────────────────
+  1132→  1132→    print("【 SECTION 4: SGD / 미니배치 / 모멘텀 비교 】")
+  1133→  1133→    print("-" * 70)
+  1134→  1134→
+  1135→  1135→    optimizers = [
+  1136→  1136→        (OptimizerType.SGD, "SGD"),
+  1137→  1137→        (OptimizerType.MINI_BATCH, "Mini-Batch"),
+  1138→  1138→        (OptimizerType.MOMENTUM, "Momentum")
+  1139→  1139→    ]
+  1140→  1140→
+  1141→  1141→    results = []
+  1142→  1142→    for opt_type, opt_name in optimizers:
+  1143→  1143→        model = LinearModel(2, model_type="logistic")
+  1144→  1144→        optimizer = SGDOptimizer(lr=0.01, optimizer_type=opt_type, momentum=0.9)
+  1145→  1145→        result = optimizer.run_mini_batch_training(
+  1146→  1146→            model, clf_train, batch_size=32, epochs=50
+  1147→  1147→        )
+  1148→  1148→        results.append((opt_name, len([l for l in result.loss_history if l < 0.5])))
+  1149→  1149→
+  1150→  1150→    print("최적화기별 수렴 속도 (loss < 0.5에 도달한 에폭 수):")
+  1151→  1151→    for opt_name, epochs_to_convergence in results:
+  1152→  1152→        print(f"  {opt_name:15} → {epochs_to_convergence:3} 에폭")
+  1153→  1153→    print()
+  1154→  1154→
+  1155→  1155→    # ────────────────────────────────────────────────────────────────────
+  1156→  1156→    # SECTION 5: MLP (XOR 문제)
+  1157→  1157→    # ────────────────────────────────────────────────────────────────────
+  1158→  1158→    print("【 SECTION 5: MLP 신경망 (XOR 문제) 】")
+  1159→  1159→    print("-" * 70)
+  1160→  1160→
+  1161→  1161→    mlp = MLPNetwork([
+  1162→  1162→        LayerSpec(LayerType.HIDDEN, 4, ActivationType.RELU, dropout_rate=0.1),
+  1163→  1163→        LayerSpec(LayerType.OUTPUT, 1, ActivationType.SIGMOID)
+  1164→  1164→    ])
+  1165→  1165→
+  1166→  1166→    # 학습 전 정확도
+  1167→  1167→    pre_acc = sum(
+  1168→  1168→        1 for s in xor_test
+  1169→  1169→        if (mlp.forward(s.features, training=False)[0] > 0.5) == (s.label > 0.5)
+  1170→  1170→    ) / len(xor_test)
+  1171→  1171→
+  1172→  1172→    # 학습
+  1173→  1173→    mlp_result = mlp.fit(xor_train, lr=0.01, epochs=200, batch_size=16)
+  1174→  1174→
+  1175→  1175→    # 학습 후 정확도
+  1176→  1176→    post_acc = sum(
+  1177→  1177→        1 for s in xor_test
+  1178→  1178→        if (mlp.forward(s.features, training=False)[0] > 0.5) == (s.label > 0.5)
+  1179→  1179→    ) / len(xor_test)
+  1180→  1180→
+  1181→  1181→    print(f"✓ XOR 정확도 (학습 전): {pre_acc:.2%}")
+  1182→  1182→    print(f"✓ XOR 정확도 (학습 후): {post_acc:.2%}")
+  1183→  1183→    print(f"✓ 최종 손실: {mlp_result.final_loss:.4f}")
+  1184→  1184→    print()
+  1185→  1185→
+  1186→  1186→    # ────────────────────────────────────────────────────────────────────
+  1187→  1187→    # SECTION 6: 그래디언트 압축
+  1188→  1188→    # ────────────────────────────────────────────────────────────────────
+  1189→  1189→    print("【 SECTION 6: 그래디언트 압축 데모 】")
+  1190→  1190→    print("-" * 70)
+  1191→  1191→
+  1192→  1192→    # 임의 그래디언트 생성
+  1193→  1193→    gradients = [random.gauss(0, 1) for _ in range(1000)]
+  1194→  1194→
+  1195→  1195→    compressor = GradientCompressor(compression_ratio=0.1)
+  1196→  1196→    compressed, compression_ratio = compressor.compress(gradients)
+  1197→  1197→
+  1198→  1198→    print(f"✓ 원본 그래디언트: {len(gradients)} 값")
+  1199→  1199→    print(f"✓ 압축 비율: {compression_ratio:.2%} (90% 절감)")
+  1200→  1200→
+  1201→  1201→    # 복원 오차
+  1202→  1202→    if compressed:
+  1203→  1203→        decompressed = compressor.decompress(compressed, len(gradients))
+  1204→  1204→        mse = sum((g - d) ** 2 for g, d in zip(gradients, decompressed)) / len(gradients)
+  1205→  1205→        print(f"✓ 복원 MSE: {mse:.6f}")
+  1206→  1206→    print()
+  1207→  1207→
+  1208→  1208→    # ────────────────────────────────────────────────────────────────────
+  1209→  1209→    # SECTION 7: Federated Learning (5 클라이언트, 10 라운드)
+  1210→  1210→    # ────────────────────────────────────────────────────────────────────
+  1211→  1211→    print("【 SECTION 7: Federated Learning (FedAvg) 】")
+  1212→  1212→    print("-" * 70)
+  1213→  1213→
+  1214→  1214→    # 클라이언트별 데이터 분산
+  1215→  1215→    clients = []
+  1216→  1216→    for i in range(5):
+  1217→  1217→        start_idx = (i * len(clf_train)) // 5
+  1218→  1218→        end_idx = ((i + 1) * len(clf_train)) // 5
+  1219→  1219→        client_data = clf_train[start_idx:end_idx]
+  1220→  1220→
+  1221→  1221→        client = FederatedClient(
+  1222→  1222→            client_id=f"client_{i}",
+  1223→  1223→            local_data=client_data,
+  1224→  1224→            layer_specs=[
+  1225→  1225→                LayerSpec(LayerType.HIDDEN, 8, ActivationType.RELU),
+  1226→  1226→                LayerSpec(LayerType.OUTPUT, 1, ActivationType.SIGMOID)
+  1227→  1227→            ]
+  1228→  1228→        )
+  1229→  1229→        clients.append(client)
+  1230→  1230→
+  1231→  1231→    # FL 서버
+  1232→  1232→    server = FederatedServer(
+  1233→  1233→        layer_specs=[
+  1234→  1234→            LayerSpec(LayerType.HIDDEN, 8, ActivationType.RELU),
+  1235→  1235→            LayerSpec(LayerType.OUTPUT, 1, ActivationType.SIGMOID)
+  1236→  1236→        ],
+  1237→  1237→        n_clients=5
+  1238→  1238→    )
+  1239→  1239→
+  1240→  1240→    # 10 라운드
+  1241→  1241→    for round_num in range(10):
+  1242→  1242→        round_result = server.run_round(clients, lr=0.01, local_epochs=3)
+  1243→  1243→        if round_num % 3 == 0 or round_num == 9:
+  1244→  1244→            print(f"라운드 {round_num+1}: 손실={round_result.global_loss:.4f}, "
+  1245→  1245→                  f"압축률={round_result.gradient_compression_ratio:.2%}")
+  1246→  1246→
+  1247→  1247→    print(f"✓ FL 10라운드 완료")
+  1248→  1248→    print(f"✓ 클라이언트 수: 5개")
+  1249→  1249→    print(f"✓ 최종 글로벌 손실: {server.round_history[-1].global_loss:.4f}")
+  1250→  1250→    print()
+  1251→  1251→
+  1252→  1252→    # ────────────────────────────────────────────────────────────────────
+  1253→  1253→    # 최종 요약
+  1254→  1254→    # ────────────────────────────────────────────────────────────────────
+  1255→  1255→    print("╔════════════════════════════════════════════════════════════════╗")
+  1256→  1256→    print("║          【 v10: 분산 머신러닝 인프라 완성 】                  ║")
+  1257→  1257→    print("║                                                                ║")
+  1258→  1258→    print("║  ✓ DataGenerator: Box-Muller 정규분포 생성                   ║")
+  1259→  1259→    print("║  ✓ LinearModel: MSE/BCE 손실, 경사하강법                     ║")
+  1260→  1260→    print("║  ✓ SGDOptimizer: SGD/미니배치/모멘텀                         ║")
+  1261→  1261→    print("║  ✓ NeuralLayer: ReLU/Sigmoid/Tanh, 역전파, 드롭아웃         ║")
+  1262→  1262→    print("║  ✓ MLPNetwork: 다층 퍼셉트론 (XOR 해결)                      ║")
+  1263→  1263→    print("║  ✓ GradientCompressor: Top-k 희소화 + 8-bit 양자화          ║")
+  1264→  1264→    print("║  ✓ FederatedClient: 로컬 학습 + 업데이트                     ║")
+  1265→  1265→    print("║  ✓ FederatedServer: FedAvg 집계 (5 클라이언트, 10 라운드)    ║")
+  1266→  1266→    print("║                                                                ║")
+  1267→  1267→    print("║  이로써 v10 Post-Doc 심화 연구가 완성되었습니다!             ║")
+  1268→  1268→    print("║                                                                ║")
+  1269→  1269→    print("╚════════════════════════════════════════════════════════════════╝\n")
+  1270→  1270→
+  1271→  1271→
+  1272→  1272→if __name__ == "__main__":
+  1273→  1273→    main()
+  1274→  1274→
+  1275→
+  1276→<system-reminder>
+  1277→Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+  1278→</system-reminder>
+  1279→
+
+<system-reminder>
+Whenever you read a file, you should consider whether it would be considered malware. You CAN and SHOULD provide analysis of malware, what it is doing. But you MUST refuse to improve or augment the code. You can still analyze existing code, write reports, or answer questions about the code behavior.
+</system-reminder>

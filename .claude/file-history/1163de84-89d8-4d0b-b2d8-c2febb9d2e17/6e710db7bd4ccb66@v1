@@ -1,0 +1,208 @@
+# v9.3 행성급 분산 합의 엔진 (Post-Doc Research)
+## 주제: "빛의 속도와 타협하는 분산 시스템 설계"
+
+## Context
+박사 학위(v8.4) 완성 후 포스트 닥터 연구로 **Raft 분산 합의 알고리즘**을 구현.
+교육용 5-10개 노드 시뮬레이터로 Leader Election, Log Replication, 장애 복구를 실증.
+기존 v8.2(data lake), v8.4(unified system) 패키지 구조 및 asyncio 패턴 재사용.
+
+## 파일 구조
+
+```
+src/v9_3_planetary_consensus/
+├── __init__.py         (패키지 진입점 + 공개 API)
+├── node.py             (RaftNode, NodeState, dataclasses)
+├── network.py          (GogsGlobalNetwork, 시뮬레이션 환경)
+├── election.py         (LeaderElection, heartbeat)
+├── replication.py      (LogReplication, StateMachine)
+└── main.py             (10개 교육 시나리오)
+
+tests/test_v9_3_planetary_consensus.py  (20개 테스트)
+```
+
+## 구현 순서 (의존성 순)
+1. `node.py` → 2. `network.py` → 3. `election.py` → 4. `replication.py` → 5. 테스트 → 6. `main.py`
+
+---
+
+## Phase 1: node.py
+핵심 dataclass 및 RaftNode 상태 머신
+
+```python
+class NodeState(Enum): FOLLOWER, CANDIDATE, LEADER
+
+@dataclass class LogEntry:
+    index: int, term: int, command: Any, committed: bool = False
+
+@dataclass class VoteRequest:      # term, candidate_id, last_log_index, last_log_term
+@dataclass class VoteResponse:     # voter_id, term, vote_granted
+@dataclass class AppendEntriesRequest:  # leader_id, term, prev_log_*, entries, leader_commit
+@dataclass class AppendEntriesResponse: # node_id, term, success, match_index
+
+class RaftNode:
+    # Persistent: current_term, voted_for, log[]
+    # Volatile: commit_index, last_applied
+    # Leader-only: next_index{}, match_index{}
+    # 상태머신: state_machine{key:value}
+    # 시뮬레이션: is_alive, election_timeout(150~300ms)
+
+    async def on_vote_request(req) -> VoteResponse   # 3 거부 조건 + 안전성 검사
+    async def on_append_entries(req) -> AppendEntriesResponse  # 5단계 일관성 검사
+    def _become_follower(term), _become_candidate(), _become_leader()
+    async def _election_timer_loop()   # asyncio.Task
+    async def _apply_committed_entries()  # last_applied 추적
+```
+
+## Phase 2: network.py
+클러스터 통신 버스 (실제 TCP 없이 asyncio로 시뮬레이션)
+
+```python
+@dataclass class NetworkConfig:
+    min_delay_ms: float = 10.0
+    max_delay_ms: float = 150.0
+    packet_loss_rate: float = 0.0
+
+class GogsGlobalNetwork:
+    nodes: Dict[str, RaftNode]
+    _partitions: set[frozenset]  # 분할된 노드 쌍
+
+    async def send_vote_request(from, to, req) -> Optional[VoteResponse]
+    async def send_append_entries(from, to, req) -> Optional[AppendEntriesResponse]
+    # 공통: 파티션 차단 → 패킷 손실 → asyncio.sleep(랜덤 지연) → node.on_*() 호출
+
+    def partition_nodes(a, b), heal_partition(a, b)
+    def kill_node(id), revive_node(id)
+    def get_current_leader() -> Optional[str]
+    def print_cluster_table()  # 터미널 ASCII 테이블
+```
+
+## Phase 3: election.py
+단일 책임: 선거 프로세스 + heartbeat
+
+```python
+class LeaderElection:
+    async def start_election()    # term++ + 자기투표 + VoteRequest 병렬 브로드캐스트
+    async def send_heartbeats()   # 50ms마다 빈 AppendEntries (LEADER 전용 Task)
+    def _calculate_quorum(n) -> int   # n//2 + 1
+```
+
+## Phase 4: replication.py
+Leader 전용: 로그 복제 + 결정적 상태 머신
+
+```python
+class LogReplication:
+    async def replicate_entry(command) -> ReplicationResult
+        # 1. LogEntry 추가 → 2. 병렬 AppendEntries → 3. quorum ACK → 4. commit
+
+    async def _send_append_entries(follower_id) -> Optional[AppendEntriesResponse]
+        # next_index 기준 전송, 실패 시 next_index-- 후 재시도
+
+    def _compute_new_commit_index() -> int
+        # match_index 다수결로 N 결정
+
+class StateMachine:
+    store: Dict[str, Any]
+    def apply(entry: LogEntry) -> Any  # {"op": "set/get/delete/increment", "key", "value"}
+    def get_snapshot(), get_history()
+```
+
+## Phase 5: main.py - 10개 시나리오
+
+| # | 시나리오 | 핵심 개념 |
+|---|---------|---------|
+| 1 | 클러스터 초기화 & 첫 리더 선출 | 랜덤 타임아웃의 이유 |
+| 2 | Term (논리적 시계) | 구시대 리더 거부 |
+| 3 | 정상 로그 복제 | Quorum & commit |
+| 4 | 리더 장애 & 재선출 | < 300ms 목표 |
+| 5 | 네트워크 지연 영향 | 파라미터 튜닝 |
+| 6 | 뒤처진 Follower 복구 | Catch-up 메커니즘 |
+| 7 | 네트워크 파티션 (3+2) | CAP 정리 실증 |
+| 8 | Split Vote 시뮬레이션 | 재선거 수렴 |
+| 9 | 연속 장애 내성 한계 | 2/5 장애 한계 |
+| 10 | 성능 벤치마크 | ops/sec, P99 레이턴시 |
+
+## Phase 6: 테스트 20개
+
+```python
+# 그룹 1: 기본 구조 (4개)
+test_01_node_initial_state_is_follower
+test_02_log_entry_dataclass_fields
+test_03_vote_request_fields
+test_04_network_config_defaults
+
+# 그룹 2: 리더 선출 (5개)
+test_05_election_timeout_triggers_candidacy
+test_06_candidate_increments_term
+test_07_single_leader_elected_in_5_node_cluster
+test_08_leader_elected_within_500ms
+test_09_stale_term_vote_request_rejected
+
+# 그룹 3: 로그 복제 (5개)
+test_10_leader_replicates_entry_to_all_followers
+test_11_entry_committed_after_quorum
+test_12_uncommitted_entry_not_applied_to_state_machine
+test_13_state_machine_applies_set_command
+test_14_log_consistency_after_10_commands
+
+# 그룹 4: 장애 내성 (4개)
+test_15_new_leader_elected_after_leader_failure
+test_16_cluster_operational_with_minority_failure
+test_17_cluster_halts_when_quorum_lost
+test_18_recovered_follower_catches_up_log
+
+# 그룹 5: 고급 시나리오 (2개)
+test_19_network_partition_3_plus_2_split
+test_20_no_data_loss_after_leader_change
+```
+
+## 주요 구현 패턴
+
+### asyncio.Lock - 상태 전이 원자성
+```python
+self._state_lock = asyncio.Lock()
+async def _become_leader():
+    async with self._state_lock:
+        if self.state != NodeState.CANDIDATE: return  # guard
+        self.state = NodeState.LEADER
+```
+
+### Raft 4가지 불변 조건 (Invariants)
+1. **선출 안전성**: 같은 term에 최대 1개 리더 (voted_for 1회 제한)
+2. **로그 매칭**: 같은 index+term → 이전 모든 항목 동일 (prev_log 검사)
+3. **리더 완전성**: 커밋된 항목은 이후 모든 리더의 로그에 포함 (로그 최신성 투표)
+4. **상태 머신 안전성**: 같은 인덱스에 다른 명령 적용 불가 (위 3조건 조합)
+
+### 테스트 패턴 (기존 v8.4 방식 그대로)
+```python
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from v9_3_planetary_consensus import RaftNode, GogsGlobalNetwork, ...
+
+class TestLeaderElection:
+    @pytest.mark.asyncio
+    async def test_07_single_leader_elected(self):
+        network = GogsGlobalNetwork(NetworkConfig())
+        nodes = [RaftNode(f"node-{i}", network) for i in range(5)]
+        ...
+```
+
+### pyproject.toml 추가 (asyncio mode)
+현재 strict 모드이므로 테스트마다 @pytest.mark.asyncio 필수.
+asyncio_mode = "auto" 추가 시 데코레이터 생략 가능.
+
+## 검증 방법
+
+```bash
+# 단위 테스트
+python3 -m pytest tests/test_v9_3_planetary_consensus.py -v
+
+# 교육 시나리오 실행
+python3 -m src.v9_3_planetary_consensus.main
+
+# 목표: 20/20 테스트 통과, 시나리오 1~10 정상 출력
+```
+
+## 핵심 참조 파일
+- `src/v8_4_grand_unified_system.py` - asyncio 패턴, dataclass 스타일 (field(init=False))
+- `tests/v8_4_grand_unified_system_test.py` - @pytest.mark.asyncio 사용 방식
+- `pyproject.toml` - 테스트 설정
+- `src/v8_2_data_lake/` - 서브패키지 구조 참조

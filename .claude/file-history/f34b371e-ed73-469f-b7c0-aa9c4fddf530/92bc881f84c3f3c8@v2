@@ -1,0 +1,204 @@
+"""
+v5.5 Authentication & Authorization
+v5.3의 토큰 기반 인증 + 역할 기반 권한 제어
+"""
+
+import hashlib
+import secrets
+import json
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+from enum import Enum
+
+
+class Role(Enum):
+    """사용자 역할"""
+    ADMIN = 'admin'
+    RESEARCHER = 'researcher'
+    VIEWER = 'viewer'
+
+
+class AuthManager:
+    """인증 및 권한 관리"""
+
+    def __init__(self, db_layer):
+        """
+        Args:
+            db_layer: GogsDatabase 인스턴스
+        """
+        self.db = db_layer
+        self.token_expiry_hours = 24
+
+    # 【 Token Management 】
+    def generate_token(self) -> str:
+        """안전한 토큰 생성 (256비트 무작위)"""
+        return secrets.token_urlsafe(32)
+
+    def hash_password(self, password: str) -> str:
+        """비밀번호 해시 (SHA256)"""
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def authenticate(self, email: str, password: str) -> Optional[str]:
+        """
+        이메일과 비밀번호로 인증, 토큰 발급
+
+        Args:
+            email: 연구자 이메일
+            password: 비밀번호
+
+        Returns:
+            토큰 문자열 또는 None
+        """
+        researcher = self.db.get_researcher_by_email(email)
+        if not researcher:
+            return None
+
+        # 주의: 실제 환경에서는 비밀번호를 DB에 저장하고 검증해야 함
+        # 이는 데모용이므로 이메일 자체를 비밀번호로 취급
+        password_hash = self.hash_password(password)
+        if password_hash != self.hash_password(email):
+            return None
+
+        # 토큰 생성
+        token = self.generate_token()
+        expires_at = (datetime.now() + timedelta(hours=self.token_expiry_hours)).isoformat()
+        self.db.create_token(researcher['id'], token, expires_at)
+
+        return token
+
+    def verify_token(self, token: str) -> Optional[Dict]:
+        """
+        토큰 검증
+
+        Returns:
+            토큰 정보 (researcher_id, token, is_active)
+        """
+        token_data = self.db.verify_token(token)
+        if not token_data:
+            return None
+
+        # 만료 시간 확인
+        if token_data.get('expires_at'):
+            try:
+                expires_at = datetime.fromisoformat(token_data['expires_at'])
+                if datetime.now() > expires_at:
+                    self.db.revoke_token(token)
+                    return None
+            except (ValueError, TypeError):
+                pass
+
+        return token_data
+
+    def logout(self, token: str) -> bool:
+        """로그아웃 (토큰 폐기)"""
+        return self.db.revoke_token(token)
+
+    # 【 Authorization 】
+    def get_researcher_role(self, researcher_id: int) -> Role:
+        """연구자 역할 조회"""
+        researcher = self.db.get_researcher(researcher_id)
+        if not researcher:
+            return Role.VIEWER
+
+        role_str = researcher.get('role', 'researcher')
+        try:
+            return Role[role_str.upper()]
+        except KeyError:
+            return Role.RESEARCHER
+
+    def has_permission(self, token: str, required_role: Role) -> bool:
+        """
+        토큰이 특정 역할 권한을 가지는지 확인
+
+        Args:
+            token: 인증 토큰
+            required_role: 필요한 최소 역할
+
+        Returns:
+            권한 보유 여부
+        """
+        token_data = self.verify_token(token)
+        if not token_data:
+            return False
+
+        researcher_id = token_data.get('researcher_id')
+        researcher_role = self.get_researcher_role(researcher_id)
+
+        # 역할 계층: ADMIN > RESEARCHER > VIEWER
+        role_hierarchy = {Role.ADMIN: 3, Role.RESEARCHER: 2, Role.VIEWER: 1}
+        return role_hierarchy.get(researcher_role, 0) >= role_hierarchy.get(required_role, 0)
+
+    def can_view_experiment(self, token: str, experiment_id: int) -> bool:
+        """실험 조회 권한 확인"""
+        token_data = self.verify_token(token)
+        if not token_data:
+            return False
+
+        researcher_id = token_data.get('researcher_id')
+        experiment = self.db.get_experiment(experiment_id)
+
+        if not experiment:
+            return False
+
+        # ADMIN은 모든 실험 조회 가능, 다른 사용자는 본인 실험만 조회 가능
+        researcher_role = self.get_researcher_role(researcher_id)
+        if researcher_role == Role.ADMIN:
+            return True
+
+        return experiment.get('researcher_id') == researcher_id
+
+    def can_modify_experiment(self, token: str, experiment_id: int) -> bool:
+        """실험 수정 권한 확인"""
+        token_data = self.verify_token(token)
+        if not token_data:
+            return False
+
+        researcher_id = token_data.get('researcher_id')
+        experiment = self.db.get_experiment(experiment_id)
+
+        if not experiment:
+            return False
+
+        researcher_role = self.get_researcher_role(researcher_id)
+        if researcher_role == Role.ADMIN:
+            return True
+
+        return experiment.get('researcher_id') == researcher_id
+
+    def can_manage_researchers(self, token: str) -> bool:
+        """연구자 관리 권한 확인 (ADMIN만)"""
+        return self.has_permission(token, Role.ADMIN)
+
+
+class AuthMiddleware:
+    """인증 미들웨어"""
+
+    def __init__(self, auth_manager: AuthManager):
+        self.auth = auth_manager
+
+    def require_authentication(self, token: Optional[str]) -> Optional[Dict]:
+        """인증 필수"""
+        if not token:
+            return None
+        return self.auth.verify_token(token)
+
+    def require_role(self, token: Optional[str], required_role: Role) -> bool:
+        """특정 역할 필수"""
+        if not token:
+            return False
+        return self.auth.has_permission(token, required_role)
+
+    def extract_token_from_header(self, auth_header: Optional[str]) -> Optional[str]:
+        """
+        Authorization 헤더에서 토큰 추출
+
+        Format: "Bearer <token>"
+        """
+        if not auth_header:
+            return None
+
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return None
+
+        return parts[1]

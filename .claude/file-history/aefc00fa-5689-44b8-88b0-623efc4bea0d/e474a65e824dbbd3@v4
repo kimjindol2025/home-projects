@@ -1,0 +1,127 @@
+# GRIE Kernel Build System
+# Supports: native, aarch64-linux-android, x86_64-linux-gnu, aarch64-linux-gnu
+#
+# Prerequisites:
+#   - Zig 0.14.0 or newer (https://ziglang.org/download/)
+#
+# Usage:
+#   make build-native           # Build for current platform
+#   make build-android          # Cross-compile for ARM64 Android
+#   make build-linux-x86        # Cross-compile for x86_64 Linux
+#   make build-linux-arm        # Cross-compile for ARM64 Linux
+#   make build-all              # Build all targets
+#   make test                   # Run unit tests
+#   make clean                  # Clean build artifacts
+#   make help                   # Show this help
+
+.PHONY: help build-native build-android build-linux-x86 build-linux-arm build-all test clean
+
+# Zig compiler
+ZIG := zig
+
+# Build directory
+BUILD_DIR := ../../..
+
+# Output directories by target
+OUT_NATIVE := $(BUILD_DIR)/bin/native
+OUT_ANDROID := $(BUILD_DIR)/bin/android/aarch64
+OUT_LINUX_X86 := $(BUILD_DIR)/bin/linux/x86_64
+OUT_LINUX_ARM := $(BUILD_DIR)/bin/linux/aarch64
+
+# Default optimization level
+OPT := ReleaseFast
+
+help:
+	@echo "GRIE Kernel Build System"
+	@echo ""
+	@echo "Available targets:"
+	@echo "  make build-native         Build for current platform"
+	@echo "  make build-android        Cross-compile for ARM64 Android"
+	@echo "  make build-linux-x86      Cross-compile for x86_64 Linux"
+	@echo "  make build-linux-arm      Cross-compile for ARM64 Linux"
+	@echo "  make build-all            Build all targets"
+	@echo "  make test                 Run unit tests"
+	@echo "  make clean                Clean build artifacts"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make build-native OPT=Debug"
+	@echo "  make build-android OPT=ReleaseSafe"
+	@echo "  make build-all OPT=ReleaseSmall"
+
+# Create output directories
+$(OUT_NATIVE) $(OUT_ANDROID) $(OUT_LINUX_X86) $(OUT_LINUX_ARM):
+	@mkdir -p $@
+
+# Build for native platform
+build-native: $(OUT_NATIVE)
+	@echo "🔨 Building for native platform ($(OPT))..."
+	@mkdir -p $(OUT_NATIVE)
+	@$(ZIG) build-lib src/main.zig -Doptimize=$(OPT) 2>&1 | tee $(OUT_NATIVE)/build.log
+	@mv -f libmain.a $(OUT_NATIVE)/libgrie_kernel.a 2>/dev/null || true
+	@echo "✅ Native build complete: $(OUT_NATIVE)"
+
+# Cross-compile for ARM64 Android
+build-android: $(OUT_ANDROID)
+	@echo "🔨 Cross-compiling for ARM64 Android ($(OPT))..."
+	@mkdir -p $(OUT_ANDROID)
+	@$(ZIG) build-lib src/main.zig -target aarch64-linux-android -Doptimize=$(OPT) 2>&1 | tee $(OUT_ANDROID)/build.log
+	@mv -f libmain.a $(OUT_ANDROID)/libgrie_kernel.a 2>/dev/null || true
+	@echo "✅ Android build complete: $(OUT_ANDROID)"
+
+# Cross-compile for x86_64 Linux
+build-linux-x86: $(OUT_LINUX_X86)
+	@echo "🔨 Cross-compiling for x86_64 Linux ($(OPT))..."
+	@mkdir -p $(OUT_LINUX_X86)
+	@$(ZIG) build-lib src/main.zig -target x86_64-linux-gnu -Doptimize=$(OPT) 2>&1 | tee $(OUT_LINUX_X86)/build.log
+	@mv -f libmain.a $(OUT_LINUX_X86)/libgrie_kernel.a 2>/dev/null || true
+	@echo "✅ x86_64 Linux build complete: $(OUT_LINUX_X86)"
+
+# Cross-compile for ARM64 Linux
+build-linux-arm: $(OUT_LINUX_ARM)
+	@echo "🔨 Cross-compiling for ARM64 Linux ($(OPT))..."
+	@mkdir -p $(OUT_LINUX_ARM)
+	@$(ZIG) build-lib src/main.zig -target aarch64-linux-gnu -Doptimize=$(OPT) 2>&1 | tee $(OUT_LINUX_ARM)/build.log
+	@mv -f libmain.a $(OUT_LINUX_ARM)/libgrie_kernel.a 2>/dev/null || true
+	@echo "✅ ARM64 Linux build complete: $(OUT_LINUX_ARM)"
+
+# Build all targets
+build-all: clean build-native build-android build-linux-x86 build-linux-arm
+	@echo ""
+	@echo "📊 Build Summary:"
+	@echo "  ✓ Native:        $(OUT_NATIVE)/lib"
+	@echo "  ✓ Android ARM64: $(OUT_ANDROID)/lib"
+	@echo "  ✓ Linux x86_64:  $(OUT_LINUX_X86)/lib"
+	@echo "  ✓ Linux ARM64:   $(OUT_LINUX_ARM)/lib"
+
+# Run unit tests (native only)
+test:
+	@echo "🧪 Running unit tests..."
+	@$(ZIG) build test -Doptimize=$(OPT)
+	@echo "✅ Tests passed"
+
+# Clean build artifacts
+clean:
+	@echo "🧹 Cleaning build artifacts..."
+	@rm -rf $(BUILD_DIR)/bin
+	@rm -rf .zig-cache
+	@echo "✅ Clean complete"
+
+# Verify Zig installation
+verify-zig:
+	@echo "Checking Zig installation..."
+	@$(ZIG) version
+	@$(ZIG) build --help | head -5
+	@echo "✅ Zig is properly installed"
+
+# Show build information
+info:
+	@echo "GRIE Kernel Build Information"
+	@echo ""
+	@echo "Compiler: $(shell $(ZIG) version)"
+	@echo "Optimization: $(OPT)"
+	@echo ""
+	@echo "Supported targets:"
+	@echo "  - aarch64-linux-android  (ARM64 Android)"
+	@echo "  - x86_64-linux-gnu       (x86_64 Linux)"
+	@echo "  - aarch64-linux-gnu      (ARM64 Linux)"
+	@echo "  - [native]               (Current platform)"

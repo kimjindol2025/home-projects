@@ -1,0 +1,495 @@
+"""
+v6.1 Design Patterns Advanced - Domain-Driven Design (DDD)
+============================================================
+
+도메인 주도 설계의 핵심 개념들:
+1. Entity      — 정체성으로 식별되는 객체 (ID가 있음)
+2. Value Object — 값으로 비교되는 불변 객체
+3. Aggregate   — 일관성 경계의 객체 그룹
+4. Domain Event — 비즈니스에서 일어난 중요한 일
+
+철학: "프로그래밍 모델 = 도메인 모델"
+       코드가 비즈니스 언어와 일치해야 함
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from enum import Enum
+
+
+# =============================================================================
+# Value Objects — 값으로 비교, 불변
+# =============================================================================
+
+@dataclass(frozen=True)
+class Email:
+    """
+    이메일 Value Object
+    - 불변(frozen=True): 생성 후 변경 불가
+    - 유효성 검사: 생성 시점에 검증
+    - 값으로 비교: 두 이메일 객체는 값이 같으면 동등
+    """
+    value: str
+
+    def __post_init__(self):
+        """생성 후 유효성 검사"""
+        if not isinstance(self.value, str) or "@" not in self.value:
+            raise ValueError(f"유효하지 않은 이메일: {self.value}")
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class ExperimentScore:
+    """
+    실험 점수 Value Object
+    - 범위 검증: 0~100
+    - 소수점 2자리
+    """
+    value: float
+
+    def __post_init__(self):
+        """유효성 검사"""
+        if not (0.0 <= self.value <= 100.0):
+            raise ValueError(f"점수는 0~100 범위: {self.value}")
+
+    def is_passing_score(self, threshold: float = 70.0) -> bool:
+        """합격 여부"""
+        return self.value >= threshold
+
+    def __str__(self) -> str:
+        return f"{self.value:.2f}"
+
+
+@dataclass(frozen=True)
+class ExperimentStatus:
+    """실험 상태 Value Object"""
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+    @staticmethod
+    def is_valid(status: str) -> bool:
+        return status in [
+            ExperimentStatus.PENDING,
+            ExperimentStatus.IN_PROGRESS,
+            ExperimentStatus.COMPLETED,
+            ExperimentStatus.FAILED,
+        ]
+
+
+# =============================================================================
+# Entities — 정체성으로 식별되는 객체
+# =============================================================================
+
+class Researcher:
+    """
+    연구자 Entity
+    - 정체성: ID로 식별 (같은 ID = 같은 사람, 속성이 바뀌어도)
+    - 가변: 속성은 변할 수 있음 (이름, 역할 등)
+    - 수명주기: 생성 → 수정 → 삭제
+    """
+
+    def __init__(self, id: int, name: str, email: Email, role: str):
+        self.id = id
+        self.name = name
+        self.email = email
+        self.role = role
+        self.created_at = datetime.now()
+
+    def update(self, name: str, role: str) -> None:
+        """정보 수정 (불변식 검사 후)"""
+        if not name or len(name.strip()) == 0:
+            raise ValueError("이름은 비어있을 수 없습니다")
+        self.name = name
+        self.role = role
+
+    def __eq__(self, other) -> bool:
+        """정체성으로 비교 (값이 아닌 ID로!)"""
+        if not isinstance(other, Researcher):
+            return False
+        return self.id == other.id
+
+    def __hash__(self) -> int:
+        """세트/딕셔너리에서 사용 가능"""
+        return hash(self.id)
+
+    def __repr__(self) -> str:
+        return f"Researcher(id={self.id}, name={self.name}, email={self.email})"
+
+
+class ExperimentLog:
+    """
+    실험 로그 Entity
+    - 정체성: ID
+    - 로그는 불변 (추가만 가능, 수정 불가)
+    """
+
+    def __init__(self, id: int, experiment_id: int, message: str):
+        self.id = id
+        self.experiment_id = experiment_id
+        self.message = message
+        self.created_at = datetime.now()
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, ExperimentLog) and self.id == other.id
+
+    def __repr__(self) -> str:
+        return f"ExperimentLog(id={self.id}, msg='{self.message[:30]}...')"
+
+
+# =============================================================================
+# Aggregate Root — 일관성 경계의 진입점
+# =============================================================================
+
+class ExperimentAggregate:
+    """
+    실험 Aggregate
+
+    Aggregate 패턴:
+    - 여러 Entity/VO를 묶음
+    - 진입점은 Root (ExperimentAggregate)
+    - 외부는 Root를 통해서만 접근
+    - Root가 일관성(invariant) 보장
+    - 도메인 규칙을 메서드로 명시
+
+    Invariant (불변식):
+    1. 완료된 실험에는 로그 추가 불가
+    2. 완료/실패 시 점수 필수
+    3. 로그는 순차적으로만 추가
+    """
+
+    def __init__(self, id: int, researcher: Researcher, subject: str):
+        self._id = id
+        self._researcher = researcher
+        self._subject = subject
+        self._status = ExperimentStatus.PENDING
+        self._logs: List[ExperimentLog] = []
+        self._score: Optional[ExperimentScore] = None
+        self._events: List[Dict] = []
+        self._next_log_id = 1
+
+    @property
+    def id(self) -> int:
+        return self._id
+
+    @property
+    def subject(self) -> str:
+        return self._subject
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    @property
+    def score(self) -> Optional[ExperimentScore]:
+        return self._score
+
+    @property
+    def logs(self) -> List[ExperimentLog]:
+        """읽기 전용 복사본 반환 (외부 수정 방지)"""
+        return list(self._logs)
+
+    def add_log(self, message: str) -> ExperimentLog:
+        """
+        로그 추가 — 불변식 검사
+
+        불변식:
+        - 완료/실패 상태에서는 로그 추가 불가
+        - 메시지는 공백이 아니어야 함
+        """
+        # 불변식 1: 완료된 실험에는 로그 추가 불가
+        if self._status in [ExperimentStatus.COMPLETED, ExperimentStatus.FAILED]:
+            raise ValueError(
+                f"완료된 실험({self._status})에는 로그를 추가할 수 없습니다"
+            )
+
+        # 불변식 2: 메시지 검증
+        if not message or len(message.strip()) == 0:
+            raise ValueError("로그 메시지는 비어있을 수 없습니다")
+
+        # 로그 생성 및 추가
+        log = ExperimentLog(self._next_log_id, self._id, message)
+        self._next_log_id += 1
+        self._logs.append(log)
+
+        # 도메인 이벤트 발생
+        self._events.append({
+            'type': 'LogAdded',
+            'experiment_id': self._id,
+            'log_id': log.id,
+            'message': message,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        return log
+
+    def start(self) -> None:
+        """
+        실험 시작
+        상태 전이: pending → in_progress
+        """
+        if self._status != ExperimentStatus.PENDING:
+            raise ValueError(
+                f"pending 상태에서만 시작 가능 (현재: {self._status})"
+            )
+
+        self._status = ExperimentStatus.IN_PROGRESS
+        self._events.append({
+            'type': 'ExperimentStarted',
+            'experiment_id': self._id,
+            'timestamp': datetime.now().isoformat()
+        })
+
+    def complete(self, score: ExperimentScore) -> None:
+        """
+        실험 완료
+        불변식: 점수 필수
+        """
+        # 불변식: in_progress에서만 완료 가능
+        if self._status != ExperimentStatus.IN_PROGRESS:
+            raise ValueError(
+                f"in_progress 상태에서만 완료 가능 (현재: {self._status})"
+            )
+
+        # 불변식: 점수 필수
+        if not isinstance(score, ExperimentScore):
+            raise ValueError("점수는 ExperimentScore 객체여야 합니다")
+
+        self._status = ExperimentStatus.COMPLETED
+        self._score = score
+
+        self._events.append({
+            'type': 'ExperimentCompleted',
+            'experiment_id': self._id,
+            'score': float(score.value),
+            'timestamp': datetime.now().isoformat()
+        })
+
+    def fail(self) -> None:
+        """실험 실패 — 실패 이유 기록은 마지막 로그로"""
+        if self._status not in [ExperimentStatus.PENDING, ExperimentStatus.IN_PROGRESS]:
+            raise ValueError(f"실패 불가 상태: {self._status}")
+
+        self._status = ExperimentStatus.FAILED
+        self._events.append({
+            'type': 'ExperimentFailed',
+            'experiment_id': self._id,
+            'timestamp': datetime.now().isoformat()
+        })
+
+    def get_events(self) -> List[Dict]:
+        """도메인 이벤트 반환 및 초기화"""
+        events = self._events
+        self._events = []
+        return events
+
+    def to_dict(self) -> Dict[str, Any]:
+        """DTO 변환 (DB 저장용)"""
+        return {
+            'id': self._id,
+            'researcher_id': self._researcher.id,
+            'subject': self._subject,
+            'status': self._status,
+            'score': float(self._score.value) if self._score else None,
+            'logs_count': len(self._logs)
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"Experiment(id={self._id}, subject='{self._subject}', "
+            f"status={self._status}, score={self._score})"
+        )
+
+
+# =============================================================================
+# Domain Event — 비즈니스에서 일어난 중요한 일
+# =============================================================================
+
+@dataclass
+class DomainEvent:
+    """도메인 이벤트 기본 클래스"""
+    event_type: str
+    timestamp: datetime
+    aggregate_id: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'event_type': self.event_type,
+            'timestamp': self.timestamp.isoformat(),
+            'aggregate_id': self.aggregate_id
+        }
+
+
+@dataclass
+class ExperimentStartedEvent(DomainEvent):
+    """실험이 시작됨"""
+    researcher_id: int = None
+
+
+@dataclass
+class ExperimentCompletedEvent(DomainEvent):
+    """실험이 완료됨"""
+    researcher_id: int = None
+    final_score: float = None
+
+
+@dataclass
+class ExperimentFailedEvent(DomainEvent):
+    """실험이 실패함"""
+    researcher_id: int = None
+
+
+# =============================================================================
+# Demonstration
+# =============================================================================
+
+def demonstrate_value_objects():
+    """Value Object 시연"""
+    print("\n" + "="*70)
+    print("1️⃣  Value Object 시연")
+    print("="*70)
+
+    # Email Value Object
+    email1 = Email("alice@gogs.io")
+    email2 = Email("alice@gogs.io")
+    print(f"✅ Email 생성: {email1}")
+    print(f"✅ Email 동등성 (값 비교): {email1 == email2}")
+
+    # 유효하지 않은 이메일 → 즉시 예외
+    try:
+        invalid_email = Email("invalid-email")
+    except ValueError as e:
+        print(f"❌ 유효성 검사: {e}")
+
+    # ExperimentScore
+    score1 = ExperimentScore(95.5)
+    score2 = ExperimentScore(95.5)
+    print(f"\n✅ Score 생성: {score1}")
+    print(f"✅ Score 동등성: {score1 == score2}")
+    print(f"✅ 합격 여부 (70 이상): {score1.is_passing_score()}")
+
+    # 범위 초과 → 즉시 예외
+    try:
+        invalid_score = ExperimentScore(150.0)
+    except ValueError as e:
+        print(f"❌ 유효성 검사: {e}")
+
+    print("\n💡 핵심: Value Object는 생성 시 유효성을 보장!")
+    print("   - 유효하지 않은 데이터는 생성 단계에서 차단")
+    print("   - 나중에 검증할 필요 없음")
+
+
+def demonstrate_entities():
+    """Entity 시연"""
+    print("\n" + "="*70)
+    print("2️⃣  Entity 시연")
+    print("="*70)
+
+    # 연구자 생성
+    email = Email("bob@gogs.io")
+    researcher = Researcher(1, "Bob", email, "RESEARCHER")
+    print(f"✅ Entity 생성: {researcher}")
+
+    # 정체성 비교 (같은 ID = 같은 사람, 속성이 달라도)
+    researcher2 = Researcher(1, "Bob (Modified)", email, "ADMIN")
+    print(f"\n✅ 정체성 비교:")
+    print(f"   researcher == researcher2: {researcher == researcher2}")
+    print(f"   이유: 같은 ID (1) → 같은 사람!")
+    print(f"   (값이 다르더라도 상관없음)")
+
+    # 속성 수정
+    researcher.update("Bob Updated", "ADMIN")
+    print(f"\n✅ 속성 수정 가능: {researcher.name}")
+
+    print("\n💡 핵심: Entity는 정체성(ID)으로 식별!")
+    print("   - 같은 ID면 다른 시점의 같은 객체")
+    print("   - 속성은 변할 수 있음 (가변)")
+
+
+def demonstrate_aggregate():
+    """Aggregate 패턴 시연"""
+    print("\n" + "="*70)
+    print("3️⃣  Aggregate Root 시연")
+    print("="*70)
+
+    # 집계 생성
+    researcher = Researcher(1, "Alice", Email("alice@gogs.io"), "ADMIN")
+    experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+    print(f"✅ Aggregate 생성: {experiment}")
+    print(f"   상태: {experiment.status}")
+
+    # 실험 시작
+    experiment.start()
+    print(f"\n✅ 실험 시작됨")
+    print(f"   상태: {experiment.status}")
+
+    # 로그 추가
+    log1 = experiment.add_log("첫 시도 완료")
+    print(f"\n✅ 로그 추가: {log1.message}")
+
+    log2 = experiment.add_log("분석 진행 중")
+    print(f"✅ 로그 추가: {log2.message}")
+
+    # 불변식 검사: 완료된 실험에는 로그 추가 불가
+    score = ExperimentScore(92.5)
+    experiment.complete(score)
+    print(f"\n✅ 실험 완료: 점수 {experiment.score}")
+
+    try:
+        experiment.add_log("나중에 추가된 로그")
+    except ValueError as e:
+        print(f"❌ 불변식 위반 감지: {e}")
+
+    # 도메인 이벤트 확인
+    events = experiment.get_events()
+    print(f"\n✅ 발생한 도메인 이벤트: {len(events)}개")
+    for event in events:
+        print(f"   - {event['type']}")
+
+    print("\n💡 핵심: Aggregate가 불변식(business rules)을 보장!")
+    print("   - 완료된 실험 → 로그 추가 불가")
+    print("   - 점수 범위 검증")
+    print("   - 상태 전이 규칙 강제")
+
+
+def demonstrate_domain_events():
+    """Domain Event 시연"""
+    print("\n" + "="*70)
+    print("4️⃣  Domain Event 시연")
+    print("="*70)
+
+    researcher = Researcher(1, "Charlie", Email("charlie@gogs.io"), "RESEARCHER")
+    experiment = ExperimentAggregate(2, researcher, "심화 연구")
+
+    # 여러 상태 전이 발생
+    experiment.start()
+    experiment.add_log("테스트 1 통과")
+    experiment.add_log("테스트 2 통과")
+    experiment.complete(ExperimentScore(98.0))
+
+    # 이벤트 수집
+    events = experiment.get_events()
+    print(f"✅ 발생한 이벤트 흐름:")
+    for i, event in enumerate(events, 1):
+        print(f"   {i}. {event['type']}")
+
+    print("\n💡 핵심: Event를 통해 비즈니스 프로세스 추적!")
+    print("   - 감사(audit trail)")
+    print("   - 보상 트랜잭션(saga)")
+    print("   - 이벤트 기반 통합")
+
+
+if __name__ == '__main__':
+    demonstrate_value_objects()
+    demonstrate_entities()
+    demonstrate_aggregate()
+    demonstrate_domain_events()
+    print("\n" + "="*70)
+    print("✅ DDD Patterns 시연 완료!")
+    print("="*70)

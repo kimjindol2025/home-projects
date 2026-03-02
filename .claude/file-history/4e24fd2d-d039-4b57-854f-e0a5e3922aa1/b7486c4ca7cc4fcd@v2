@@ -1,0 +1,897 @@
+// File: v2_1_concurrency/02_channel_fan_out_fan_in.go
+// 🎓 Go 201-2-2: 병렬 데이터 파이프라인 - Fan-out/Fan-in 패턴
+// 저자: Claude Haiku 4.5
+// 수준: 대학원 고급 (시스템 아키텍트 수준)
+// 주제: 버퍼된 채널, 팬아웃/팬인, 워커 풀, 채널 종료, Select 우선순위, 파이프라인
+//
+// 실행 명령: CGO_ENABLED=0 go run 02_channel_fan_out_fan_in.go
+
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+// ============================================================
+// 섹션 1: Buffered vs Unbuffered 채널 비교
+// ============================================================
+
+func section1_bufferedVsUnbuffered() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 1: Buffered vs Unbuffered 채널 비교")
+	fmt.Println("============================================================")
+
+	// 1-1: Unbuffered 채널 (동기 방식)
+	fmt.Println("\n[1-1] Unbuffered 채널 (동기 방식)")
+	start := time.Now()
+	unbufferedCh := make(chan int)
+
+	go func() {
+		for i := 1; i <= 5; i++ {
+			fmt.Printf("송신: %d\n", i)
+			unbufferedCh <- i // 수신자를 기다림
+		}
+		close(unbufferedCh)
+	}()
+
+	count := 0
+	for val := range unbufferedCh {
+		fmt.Printf("수신: %d\n", val)
+		time.Sleep(100 * time.Millisecond) // 느린 수신자
+		count++
+	}
+	fmt.Printf("시간: %.3fs, 처리: %d개\n", time.Since(start).Seconds(), count)
+
+	// 1-2: Buffered 채널 (비동기 방식)
+	fmt.Println("\n[1-2] Buffered 채널 (버퍼 크기 5, 비동기 방식)")
+	start = time.Now()
+	bufferedCh := make(chan int, 5)
+
+	go func() {
+		for i := 1; i <= 5; i++ {
+			fmt.Printf("송신: %d (버퍼 담김)\n", i)
+			bufferedCh <- i // 버퍼에 넣고 계속 진행
+		}
+		close(bufferedCh)
+	}()
+
+	count = 0
+	for val := range bufferedCh {
+		fmt.Printf("수신: %d\n", val)
+		time.Sleep(100 * time.Millisecond) // 느린 수신자
+		count++
+	}
+	fmt.Printf("시간: %.3fs, 처리: %d개\n", time.Since(start).Seconds(), count)
+
+	// 1-3: 처리량 벤치마크
+	fmt.Println("\n[1-3] 처리량(Throughput) 벤치마크")
+
+	// Unbuffered 벤치마크
+	fmt.Println("Unbuffered 채널: 1000개 전송")
+	start = time.Now()
+	ch := make(chan int)
+	go func() {
+		for i := 0; i < 1000; i++ {
+			ch <- i
+		}
+		close(ch)
+	}()
+	for range ch {
+	}
+	unbufferedTime := time.Since(start)
+	fmt.Printf("소요시간: %v\n", unbufferedTime)
+
+	// Buffered 벤치마크
+	fmt.Println("Buffered 채널: 1000개 전송 (버퍼 크기 100)")
+	start = time.Now()
+	ch = make(chan int, 100)
+	go func() {
+		for i := 0; i < 1000; i++ {
+			ch <- i
+		}
+		close(ch)
+	}()
+	for range ch {
+	}
+	bufferedTime := time.Since(start)
+	fmt.Printf("소요시간: %v\n", bufferedTime)
+	fmt.Printf("개선 효과: %.2fx\n", float64(unbufferedTime.Nanoseconds())/float64(bufferedTime.Nanoseconds()))
+}
+
+// ============================================================
+// 섹션 2: Fan-out 패턴 (1:N 데이터 분산)
+// ============================================================
+
+func section2_fanOut() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 2: Fan-out 패턴 (1:N 데이터 분산)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[2-1] 기본 Fan-out: 생산자 → 여러 워커")
+
+	// 생산자: 작업 생성
+	jobs := make(chan int, 10)
+
+	// 워커 3개 시작
+	numWorkers := 3
+	done := make(chan bool, numWorkers)
+
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			fmt.Printf("워커 %d: 시작\n", workerID)
+			for job := range jobs {
+				fmt.Printf("워커 %d: 작업 %d 처리 중\n", workerID, job)
+				time.Sleep(100 * time.Millisecond)
+				fmt.Printf("워커 %d: 작업 %d 완료\n", workerID, job)
+			}
+			fmt.Printf("워커 %d: 종료\n", workerID)
+			done <- true
+		}(w)
+	}
+
+	// 작업 배포 (fan-out)
+	fmt.Println("생산자: 작업 5개 배포")
+	for j := 1; j <= 5; j++ {
+		jobs <- j
+		fmt.Printf("생산자: 작업 %d 배포\n", j)
+	}
+	close(jobs) // 작업 배포 완료 신호
+
+	// 모든 워커 대기
+	for i := 0; i < numWorkers; i++ {
+		<-done
+	}
+	fmt.Println("모든 작업 완료!")
+
+	// [2-2] 동시 처리 비율 측정
+	fmt.Println("\n[2-2] 동시 처리 능력 비교")
+
+	testFanOut := func(numWorkers int, totalJobs int) time.Duration {
+		jobs := make(chan int, 10)
+		done := make(chan bool, numWorkers)
+		start := time.Now()
+
+		for w := 0; w < numWorkers; w++ {
+			go func() {
+				for range jobs {
+					time.Sleep(10 * time.Millisecond)
+				}
+				done <- true
+			}()
+		}
+
+		go func() {
+			for j := 0; j < totalJobs; j++ {
+				jobs <- j
+			}
+			close(jobs)
+		}()
+
+		for i := 0; i < numWorkers; i++ {
+			<-done
+		}
+		return time.Since(start)
+	}
+
+	time1 := testFanOut(1, 20)
+	fmt.Printf("워커 1개: %v\n", time1)
+
+	time3 := testFanOut(3, 20)
+	fmt.Printf("워커 3개: %v\n", time3)
+
+	time6 := testFanOut(6, 20)
+	fmt.Printf("워커 6개: %v\n", time6)
+
+	fmt.Printf("성능 개선 (1→6): %.2fx\n", float64(time1.Nanoseconds())/float64(time6.Nanoseconds()))
+}
+
+// ============================================================
+// 섹션 3: Fan-in 패턴 (N:1 결과 수집)
+// ============================================================
+
+func section3_fanIn() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 3: Fan-in 패턴 (N:1 결과 수집)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[3-1] 기본 Fan-in: 여러 워커 → 결과 수집")
+
+	// 결과 채널
+	results := make(chan string, 10)
+
+	// 워커 4개 시작
+	for w := 1; w <= 4; w++ {
+		go func(workerID int) {
+			for i := 1; i <= 3; i++ {
+				result := fmt.Sprintf("워커%d-결과%d", workerID, i)
+				results <- result
+				fmt.Printf("워커 %d: %s 전송\n", workerID, result)
+				time.Sleep(50 * time.Millisecond)
+			}
+		}(w)
+	}
+
+	// 결과 수집 (fan-in)
+	fmt.Println("소비자: 결과 수집 중...")
+	totalResults := 4 * 3 // 4개 워커 × 3개 결과
+	for i := 0; i < totalResults; i++ {
+		result := <-results
+		fmt.Printf("소비자 수신: %s\n", result)
+	}
+	fmt.Println("모든 결과 수집 완료!")
+
+	// [3-2] Select를 이용한 다중 채널 Fan-in
+	fmt.Println("\n[3-2] Select를 이용한 다중 채널 Fan-in")
+
+	result1 := make(chan string, 5)
+	result2 := make(chan string, 5)
+	result3 := make(chan string, 5)
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			result1 <- fmt.Sprintf("source1-%d", i)
+			time.Sleep(30 * time.Millisecond)
+		}
+		close(result1)
+	}()
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			result2 <- fmt.Sprintf("source2-%d", i)
+			time.Sleep(25 * time.Millisecond)
+		}
+		close(result2)
+	}()
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			result3 <- fmt.Sprintf("source3-%d", i)
+			time.Sleep(35 * time.Millisecond)
+		}
+		close(result3)
+	}()
+
+	// 3개 소스의 결과를 하나의 채널에서 수집
+	count := 0
+	totalExpected := 9
+
+	for count < totalExpected {
+		select {
+		case r, ok := <-result1:
+			if ok {
+				fmt.Printf("[source1] %s\n", r)
+				count++
+			}
+		case r, ok := <-result2:
+			if ok {
+				fmt.Printf("[source2] %s\n", r)
+				count++
+			}
+		case r, ok := <-result3:
+			if ok {
+				fmt.Printf("[source3] %s\n", r)
+				count++
+			}
+		}
+	}
+	fmt.Printf("모든 소스 수집 완료 (%d개)\n", count)
+}
+
+// ============================================================
+// 섹션 4: Worker Pool 완전 구현
+// ============================================================
+
+type WorkerPool struct {
+	jobs    chan int
+	results chan string
+	workers int
+}
+
+func section4_workerPool() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 4: Worker Pool 완전 구현")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[4-1] 워커 풀 생성 및 작업 배포")
+
+	pool := &WorkerPool{
+		jobs:    make(chan int, 20),
+		results: make(chan string, 20),
+		workers: 4,
+	}
+
+	// 워커 풀 시작
+	var wg sync.WaitGroup
+	wg.Add(pool.workers)
+
+	for w := 0; w < pool.workers; w++ {
+		go func(workerID int) {
+			defer wg.Done()
+			for job := range pool.jobs {
+				fmt.Printf("워커 %d: 작업 %d 처리\n", workerID, job)
+				time.Sleep(50 * time.Millisecond)
+				result := fmt.Sprintf("결과[%d] = %d^2 = %d", job, job, job*job)
+				pool.results <- result
+			}
+			fmt.Printf("워커 %d: 종료\n", workerID)
+		}(w)
+	}
+
+	// 작업 배포 (goroutine에서 동시 실행)
+	go func() {
+		fmt.Println("작업 배포 시작: 10개")
+		for j := 1; j <= 10; j++ {
+			pool.jobs <- j
+		}
+		close(pool.jobs)
+	}()
+
+	// 결과 수집 (별도 goroutine)
+	resultsDone := make(chan bool)
+	go func() {
+		for i := 0; i < 10; i++ {
+			result := <-pool.results
+			fmt.Printf("결과: %s\n", result)
+		}
+		resultsDone <- true
+	}()
+
+	// 대기
+	wg.Wait()
+	<-resultsDone
+	fmt.Println("워커 풀 작업 완료!")
+
+	// [4-2] 워커 풀 벤치마크
+	fmt.Println("\n[4-2] 워커 풀 크기에 따른 성능")
+
+	benchmarkWorkerPool := func(numWorkers int, numJobs int) time.Duration {
+		jobs := make(chan int, numWorkers)
+		done := make(chan bool, numWorkers)
+		start := time.Now()
+
+		// 워커 시작
+		for w := 0; w < numWorkers; w++ {
+			go func() {
+				for range jobs {
+					time.Sleep(10 * time.Millisecond)
+				}
+				done <- true
+			}()
+		}
+
+		// 작업 배포
+		go func() {
+			for j := 0; j < numJobs; j++ {
+				jobs <- j
+			}
+			close(jobs)
+		}()
+
+		// 워커 대기
+		for i := 0; i < numWorkers; i++ {
+			<-done
+		}
+
+		return time.Since(start)
+	}
+
+	elapsed1 := benchmarkWorkerPool(1, 50)
+	fmt.Printf("워커 1개: %v\n", elapsed1)
+
+	elapsed4 := benchmarkWorkerPool(4, 50)
+	fmt.Printf("워커 4개: %v\n", elapsed4)
+
+	elapsed8 := benchmarkWorkerPool(8, 50)
+	fmt.Printf("워커 8개: %v\n", elapsed8)
+
+	fmt.Printf("성능 개선 (1→8): %.2fx\n", float64(elapsed1.Nanoseconds())/float64(elapsed8.Nanoseconds()))
+}
+
+// ============================================================
+// 섹션 5: 채널 Close 패턴 및 상태 관리
+// ============================================================
+
+func section5_channelClose() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 5: 채널 Close 패턴 및 상태 관리")
+	fmt.Println("============================================================")
+
+	// [5-1] 채널 종료 신호
+	fmt.Println("\n[5-1] 채널 종료 신호 처리")
+
+	jobs := make(chan int, 5)
+	done := make(chan bool)
+
+	go func() {
+		count := 0
+		for job := range jobs {
+			fmt.Printf("작업 %d 처리\n", job)
+			count++
+		}
+		fmt.Printf("채널 종료 감지! 총 %d개 작업 처리\n", count)
+		done <- true
+	}()
+
+	// 작업 전송
+	for i := 1; i <= 5; i++ {
+		jobs <- i
+	}
+	close(jobs) // 송신 완료 신호
+	fmt.Println("채널 종료 신호 전송")
+
+	<-done
+	fmt.Println("워커 종료 완료")
+
+	// [5-2] ok 값을 이용한 채널 상태 확인
+	fmt.Println("\n[5-2] ok 값을 이용한 채널 상태 확인")
+
+	ch := make(chan string, 3)
+	ch <- "첫번째"
+	ch <- "두번째"
+	close(ch)
+
+	// 채널에서 값 읽기
+	val, ok := <-ch
+	fmt.Printf("값: %s, ok: %v\n", val, ok)
+
+	val, ok = <-ch
+	fmt.Printf("값: %s, ok: %v\n", val, ok)
+
+	val, ok = <-ch
+	fmt.Printf("값: %s, ok: %v (채널 닫혀있음)\n", val, ok)
+
+	val, ok = <-ch
+	fmt.Printf("값: %s, ok: %v (빈 채널에서 읽음)\n", val, ok)
+
+	// [5-3] WaitGroup을 이용한 안전한 종료
+	fmt.Println("\n[5-3] WaitGroup을 이용한 안전한 종료")
+
+	var wg sync.WaitGroup
+	jobs = make(chan int, 10)
+	numWorkers := 3
+
+	// 워커 시작
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for job := range jobs {
+				fmt.Printf("워커 %d: 작업 %d\n", id, job)
+				time.Sleep(20 * time.Millisecond)
+			}
+		}(w)
+	}
+
+	// 작업 배포
+	for j := 1; j <= 9; j++ {
+		jobs <- j
+	}
+	close(jobs)
+
+	wg.Wait()
+	fmt.Println("모든 워커 종료!")
+}
+
+// ============================================================
+// 섹션 6: Select 우선순위 처리
+// ============================================================
+
+func section6_selectPriority() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 6: Select 우선순위 처리")
+	fmt.Println("============================================================")
+
+	// [6-1] 기본 select
+	fmt.Println("\n[6-1] 기본 Select (순서 무관)")
+
+	important := make(chan string, 5)
+	normal := make(chan string, 5)
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			important <- fmt.Sprintf("중요-%d", i)
+			time.Sleep(30 * time.Millisecond)
+		}
+		close(important)
+	}()
+
+	go func() {
+		for i := 0; i < 3; i++ {
+			normal <- fmt.Sprintf("일반-%d", i)
+			time.Sleep(25 * time.Millisecond)
+		}
+		close(normal)
+	}()
+
+	count := 0
+	totalExpected := 6
+
+	for count < totalExpected {
+		select {
+		case msg, ok := <-important:
+			if ok {
+				fmt.Printf("[우선] %s\n", msg)
+			} else {
+				important = nil // 채널 비활성화
+			}
+			count++
+		case msg, ok := <-normal:
+			if ok {
+				fmt.Printf("[일반] %s\n", msg)
+			} else {
+				normal = nil
+			}
+			count++
+		}
+	}
+
+	// [6-2] 우선순위 처리 (for-select 루프 내 중첩)
+	fmt.Println("\n[6-2] 우선순위 처리 (important 먼저 소진)")
+
+	time.Sleep(200 * time.Millisecond) // [6-1] 완료 대기
+
+	important2 := make(chan string, 5)
+	normal2 := make(chan string, 5)
+
+	go func() {
+		for i := 0; i < 5; i++ {
+			important2 <- fmt.Sprintf("important-%d", i)
+		}
+		close(important2)
+	}()
+
+	go func() {
+		for i := 0; i < 5; i++ {
+			normal2 <- fmt.Sprintf("normal-%d", i)
+		}
+		close(normal2)
+	}()
+
+	// 우선순위 처리: important가 있으면 먼저 처리
+	time.Sleep(50 * time.Millisecond)
+	count = 0
+	processed := 0
+
+	for count < 10 {
+		// 먼저 important2 채널 확인
+		if important2 != nil {
+			select {
+			case msg, ok := <-important2:
+				if ok {
+					fmt.Printf("[우선] %s\n", msg)
+					processed++
+				} else {
+					important2 = nil
+				}
+				count++
+				continue
+			default: // important2가 준비되지 않았으면 normal2 시도
+			}
+		}
+
+		// important2가 없으면 normal2 처리
+		if normal2 != nil {
+			select {
+			case msg, ok := <-normal2:
+				if ok {
+					fmt.Printf("[일반] %s\n", msg)
+					processed++
+				} else {
+					normal2 = nil
+				}
+				count++
+			default:
+				if important2 == nil && normal2 == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		} else {
+			break
+		}
+	}
+
+	fmt.Printf("처리 완료: %d개\n", processed)
+}
+
+// ============================================================
+// 섹션 7: 파이프라인 아키텍처 (Generator → Filter → Square)
+// ============================================================
+
+func section7_pipeline() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 7: 파이프라인 아키텍처")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[7-1] 3단계 파이프라인: 생성 → 필터 → 변환")
+
+	// Stage 1: Generator (1-10 생성)
+	generator := func() <-chan int {
+		ch := make(chan int, 5)
+		go func() {
+			for i := 1; i <= 10; i++ {
+				fmt.Printf("[생성기] %d\n", i)
+				ch <- i
+			}
+			close(ch)
+		}()
+		return ch
+	}
+
+	// Stage 2: Filter (짝수만 필터)
+	filter := func(in <-chan int) <-chan int {
+		ch := make(chan int, 5)
+		go func() {
+			for val := range in {
+				if val%2 == 0 {
+					fmt.Printf("[필터] %d 통과\n", val)
+					ch <- val
+				} else {
+					fmt.Printf("[필터] %d 제외\n", val)
+				}
+			}
+			close(ch)
+		}()
+		return ch
+	}
+
+	// Stage 3: Square (제곱 계산)
+	square := func(in <-chan int) <-chan int {
+		ch := make(chan int, 5)
+		go func() {
+			for val := range in {
+				result := val * val
+				fmt.Printf("[변환] %d^2 = %d\n", val, result)
+				ch <- result
+			}
+			close(ch)
+		}()
+		return ch
+	}
+
+	// 파이프라인 구성
+	fmt.Println("파이프라인 시작: 1-10 → 짝수만 → 제곱")
+	results := square(filter(generator()))
+
+	fmt.Println("\n최종 결과:")
+	for result := range results {
+		fmt.Printf("결과: %d\n", result)
+	}
+
+	// [7-2] 멀티 스테이지 파이프라인 벤치마크
+	fmt.Println("\n[7-2] 파이프라인 성능 벤치마크")
+
+	// 직렬 처리
+	start := time.Now()
+	for i := 1; i <= 1000; i++ {
+		if i%2 == 0 {
+			_ = i * i
+		}
+	}
+	directTime := time.Since(start)
+	fmt.Printf("직렬 처리: %v\n", directTime)
+
+	// 파이프라인 처리
+	start = time.Now()
+	genCh := make(chan int, 100)
+	go func() {
+		for i := 1; i <= 1000; i++ {
+			genCh <- i
+		}
+		close(genCh)
+	}()
+
+	filterCh := make(chan int, 100)
+	go func() {
+		for i := range genCh {
+			if i%2 == 0 {
+				filterCh <- i
+			}
+		}
+		close(filterCh)
+	}()
+
+	count := 0
+	for range filterCh {
+		count++
+	}
+	pipelineTime := time.Since(start)
+	fmt.Printf("파이프라인 처리: %v\n", pipelineTime)
+	fmt.Printf("처리량: %d개\n", count)
+}
+
+// ============================================================
+// 섹션 8: Assignment 2-2 구현
+// ============================================================
+
+func section8_assignment2_2() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 8: Assignment 2-2 - 실전 벤치마킹")
+	fmt.Println("============================================================")
+
+	// Assignment 1: 데이터 필터링 파이프라인
+	fmt.Println("\n[8-1] Assignment 2-2-1: 데이터 필터링 파이프라인")
+	fmt.Println("요구사항: 1-100 생성 → 짝수 필터 → 제곱 변환 → 결과 수집")
+
+	// 파이프라인 구성
+	gen := make(chan int, 10)
+	go func() {
+		for i := 1; i <= 100; i++ {
+			gen <- i
+		}
+		close(gen)
+	}()
+
+	even := make(chan int, 10)
+	go func() {
+		for i := range gen {
+			if i%2 == 0 {
+				even <- i
+			}
+		}
+		close(even)
+	}()
+
+	squared := make(chan int, 10)
+	go func() {
+		for i := range even {
+			squared <- i * i
+		}
+		close(squared)
+	}()
+
+	count := 0
+	sumSquares := 0
+	for s := range squared {
+		count++
+		sumSquares += s
+	}
+
+	fmt.Printf("결과: %d개 짝수의 제곱, 합계: %d\n", count, sumSquares)
+	fmt.Println("예상: 50개 짝수의 제곱")
+
+	// Assignment 2: Select 우선순위 처리
+	fmt.Println("\n[8-2] Assignment 2-2-2: Select 우선순위 처리")
+	fmt.Println("요구사항: important 채널 우선 처리, 그 후 normal 채널")
+
+	important := make(chan string, 100)
+	normal := make(chan string, 100)
+
+	// important 데이터 배포
+	go func() {
+		for i := 0; i < 50; i++ {
+			important <- fmt.Sprintf("IMP-%d", i)
+		}
+		close(important)
+	}()
+
+	// normal 데이터 배포
+	go func() {
+		for i := 0; i < 50; i++ {
+			normal <- fmt.Sprintf("NOR-%d", i)
+		}
+		close(normal)
+	}()
+
+	importantCount := 0
+	normalCount := 0
+
+	for importantCount < 50 || normalCount < 50 {
+		// 우선순위 처리: important 먼저
+		if important != nil {
+			select {
+			case _, ok := <-important:
+				if ok {
+					importantCount++
+				} else {
+					important = nil
+				}
+			default:
+				if normal != nil {
+					select {
+					case _, ok := <-normal:
+						if ok {
+							normalCount++
+						} else {
+							normal = nil
+						}
+					default:
+					}
+				}
+			}
+		} else if normal != nil {
+			select {
+			case _, ok := <-normal:
+				if ok {
+					normalCount++
+				} else {
+					normal = nil
+				}
+			default:
+			}
+		}
+	}
+
+	fmt.Printf("처리 결과: important=%d, normal=%d\n", importantCount, normalCount)
+
+	// Assignment 3: 성능 벤치마크 (순차 vs 병렬)
+	fmt.Println("\n[8-3] Assignment 2-2-3: 성능 벤치마크")
+	fmt.Println("요구사항: 1워커 vs 8워커 처리량 비교")
+
+	benchmarkWorkerCount := func(numWorkers int, totalJobs int) time.Duration {
+		jobs := make(chan int, 50)
+		done := make(chan bool, numWorkers)
+
+		start := time.Now()
+
+		// 워커 시작
+		for w := 0; w < numWorkers; w++ {
+			go func() {
+				for range jobs {
+					time.Sleep(1 * time.Millisecond)
+				}
+				done <- true
+			}()
+		}
+
+		// 작업 배포
+		go func() {
+			for j := 0; j < totalJobs; j++ {
+				jobs <- j
+			}
+			close(jobs)
+		}()
+
+		// 워커 대기
+		for i := 0; i < numWorkers; i++ {
+			<-done
+		}
+
+		return time.Since(start)
+	}
+
+	const totalJobs = 200
+
+	fmt.Printf("\n벤치마크 시작: %d개 작업 (각 1ms)\n", totalJobs)
+
+	duration1 := benchmarkWorkerCount(1, totalJobs)
+	fmt.Printf("워커 1개: %v (처리량: %.0f ops/s)\n", duration1, float64(totalJobs)/duration1.Seconds())
+
+	duration8 := benchmarkWorkerCount(8, totalJobs)
+	fmt.Printf("워커 8개: %v (처리량: %.0f ops/s)\n", duration8, float64(totalJobs)/duration8.Seconds())
+
+	improvement := float64(duration1.Nanoseconds()) / float64(duration8.Nanoseconds())
+	fmt.Printf("\n성능 개선 (1→8): %.2fx\n", improvement)
+	fmt.Printf("예상 개선도: ~8배, 실제: %.2fx\n", improvement)
+
+	// Summary
+	fmt.Println("\n[Assignment 2-2 완료]")
+	fmt.Println("✓ 데이터 필터링 파이프라인: 1-100 → 짝수 → 제곱")
+	fmt.Println("✓ Select 우선순위 처리: important 먼저 소진")
+	fmt.Println("✓ 성능 벤치마크: 병렬 처리 성능 검증")
+}
+
+// ============================================================
+// Main: 전체 실행
+// ============================================================
+
+func main() {
+	fmt.Println("\n============================================================")
+	fmt.Println("🎓 Go 201-2-2: 병렬 데이터 파이프라인 - Fan-out/Fan-in")
+	fmt.Println("============================================================")
+
+	section1_bufferedVsUnbuffered()
+	section2_fanOut()
+	section3_fanIn()
+	section4_workerPool()
+	section5_channelClose()
+	section6_selectPriority()
+	section7_pipeline()
+	section8_assignment2_2()
+
+	fmt.Println("\n============================================================")
+	fmt.Println("모든 섹션 완료!")
+	fmt.Println("============================================================")
+}

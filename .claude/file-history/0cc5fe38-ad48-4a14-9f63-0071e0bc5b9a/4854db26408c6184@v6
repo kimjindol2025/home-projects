@@ -1,0 +1,178 @@
+# 🦀 Rust Language Development - 학습 프로젝트
+
+---
+
+## 🎓 **[공식 프로젝트]** gogs_project - 1학년 과정 진행
+
+```
+저장소:      https://gogs.dclub.kr/kim/gogs_project ✅
+위치:        ~/kim/projects/gogs_project
+최신 커밋:   0d17ecc (Phase 3 - 소유권)
+총 커밋:     3개 (3 Phases)
+파일:        8개 (코드) + 4개 (문서)
+총 LOC:      ~1,500+ (누적)
+날짜:        2026-02-22
+상태:        ✅ Phase 3 진행 중 (60% 완료)
+난이도:      ⭐⭐⭐⭐⭐ (최고)
+```
+
+### 📍 3개 커밋 진행 상황
+```
+6b889e8: Phase 1 - 변수와 불변성 (726 LOC)
+e34a04f: Phase 2 - 제어 흐름 (619 LOC 추가)
+0d17ecc: Phase 3 - 소유권 (659 LOC 추가) ✨
+```
+
+### 📦 구조
+```
+gogs_project/
+├── Cargo.toml
+├── README.md                    (프로젝트 전체 개요)
+├── src/main.rs                  (실습 코드 + study_hours 과제)
+└── docs/
+    ├── CODING_STANDARDS.md      (Gogs 코딩 표준)
+    └── LECTURE_NOTES.md         (선생님의 강의 노트)
+```
+
+### 🎯 Phase 1: 변수와 불변성 ✅
+- ✅ `let` - 불변 변수
+- ✅ `let mut` - 가변 변수
+- ✅ `const` - 상수
+- ✅ 강타입 시스템
+- ✅ study_hours: u32 과제 완료
+
+### 🔥 Gogs 코딩 표준
+```
+✅ Strict Typing:     let count: i32 = 0;
+✅ Naming:            snake_case & SCREAMING_SNAKE_CASE
+✅ Documentation:     /// 주석으로 문서화
+```
+
+### 📊 통계
+```
+총 LOC:       ~726 LOC
+함수:         1개 (main)
+문서:         3개 (README + 2 가이드)
+테스트:       (향후 추가)
+```
+
+---
+
+# 🦀 Rust Language Development - 학습 프로젝트
+
+## 📍 프로젝트 정보
+```
+이름:        rust-language-dev
+위치:        ~/kim/projects/rust-language-dev
+저장소:      https://gogs.dclub.kr/kim/rust-language-dev ✅ 푸시 완료
+상태:        ✅ Phase 1 완료
+커밋:        6c5e7b1 (마스터 브랜치)
+날짜:        2026-02-22
+```
+
+---
+
+## 📦 프로젝트 구조
+```
+rust-language-dev/
+├── Cargo.toml          # 프로젝트 설정 및 의존성
+├── src/
+│   ├── main.rs         # 실행 엔트리포인트 (80 LOC)
+│   ├── core.rs         # 핵심 로직 - 7의 배수 추출 (70 LOC)
+│   └── utils.rs        # 향후 추가 예정
+└── docs/
+    └── milestone.md    # 학습 일지 및 설계 문서
+```
+
+---
+
+## ✅ Phase 1: 기초 다지기 (완료)
+
+### 구현된 내용
+
+**src/core.rs** - `extract_multiples_of_seven()`
+```rust
+pub fn extract_multiples_of_seven() -> (Vec<i32>, i32)
+```
+- **목적**: 1~100 중 7의 배수 추출 및 합계 계산
+- **return**: (Vec<i32>, i32) 튜플
+- **구현**: for...in 루프 + match 패턴 매칭
+- **테스트**: 1개 assert (14개 배수, 합계 735)
+
+**src/main.rs** - 제어 흐름 기초
+```rust
+loop {
+    match step_count {
+        1..6 => { println!("..."); }
+        10 => { break "SUCCESS"; }
+        _ => {}
+    }
+}
+```
+
+### 코딩 원칙 (ClaudeCode 전용)
+```
+✅ Immutability First:   let multiples: Vec<i32>
+✅ Explicit Types:       let sum: i32 = 0
+✅ No Dead Code:         사용하지 않는 코드 즉시 제거
+```
+
+---
+
+## 📊 통계
+```
+총 LOC:        ~150 LOC
+함수:          3개 (extract_multiples_of_seven, print_statistics, main)
+테스트:        1개 유닛 테스트
+문서화:        100% (모든 공개 함수에 /// 주석)
+```
+
+---
+
+## 🎯 향후 계획
+
+### Phase 2: 소유권 & 참조
+- [ ] 구조체 (struct) 기초
+- [ ] impl 블록
+- [ ] 참조 vs 차용
+- [ ] 생명주기 (Lifetime)
+
+### Phase 3: 에러 처리
+- [ ] Result<T, E> 패턴
+- [ ] ? 연산자
+- [ ] 커스텀 에러 타입
+
+### Phase 4: 언어 인터프리터
+- [ ] Lexer (토큰화)
+- [ ] Parser (구문 분석)
+- [ ] Interpreter (실행 엔진)
+
+---
+
+## 📝 학습 노트
+
+### 이번 Phase에서 배운 것
+1. Cargo 프로젝트 구조 및 설정
+2. mod 시스템으로 파일 분리
+3. Vec 기본 사용법 (Vec::new, push)
+4. 튜플 반환 (복수 반환값)
+5. for...in 범위 반복 (1..=100)
+6. match 패턴 매칭 (나머지 판별)
+7. 유닛 테스트 작성 (#[test])
+
+---
+
+## 🔗 Gogs 푸시 예정
+
+```bash
+# 저장소 생성 후 실행:
+cd ~/kim/projects/rust-language-dev
+git remote add origin https://gogs.dclub.kr/kim/rust-language-dev.git
+git push -u origin master
+```
+
+---
+
+## 💬 마지막 메모
+
+> "기록이 증명이다" - 매 Phase마다 이 파일을 업데이트하여 학습 과정 기록

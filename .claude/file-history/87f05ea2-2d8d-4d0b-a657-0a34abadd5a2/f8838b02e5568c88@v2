@@ -1,0 +1,247 @@
+#include "kbody.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define _GNU_SOURCE
+
+static int kbody_parse_json(const char *body, size_t len, kbody_t *result);
+static int kbody_parse_form(const char *body, size_t len, kbody_t *result);
+
+int kbody_parse(const char *content_type, const char *body, size_t len, kbody_t *result) {
+    if (!content_type || !body || !result) return -1;
+    
+    memset(result, 0, sizeof(*result));
+    result->raw_body = (char *)body;
+    result->raw_len = len;
+
+    if (strstr(content_type, "application/json")) {
+        result->type = KBODY_JSON;
+        return kbody_parse_json(body, len, result);
+    } else if (strstr(content_type, "application/x-www-form-urlencoded")) {
+        result->type = KBODY_FORM;
+        return kbody_parse_form(body, len, result);
+    }
+
+    snprintf(result->error_msg, sizeof(result->error_msg), "Unsupported content type");
+    return -1;
+}
+
+static int hex_to_int(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void url_decode(char *str) {
+    char *p = str, *q = str;
+    while (*p) {
+        if (*p == '%' && p[1] && p[2]) {
+            int h1 = hex_to_int(p[1]);
+            int h2 = hex_to_int(p[2]);
+            if (h1 >= 0 && h2 >= 0) {
+                *q++ = (h1 << 4) | h2;
+                p += 3;
+            } else {
+                *q++ = *p++;
+            }
+        } else if (*p == '+') {
+            *q++ = ' ';
+            p++;
+        } else {
+            *q++ = *p++;
+        }
+    }
+    *q = '\0';
+}
+
+static int kbody_parse_form(const char *body, size_t len, kbody_t *result) {
+    if (len >= KBODY_MAX_BODY_SIZE) {
+        snprintf(result->error_msg, sizeof(result->error_msg), "Body too large");
+        return -1;
+    }
+
+    char *buffer = (char *)malloc(len + 1);
+    if (!buffer) {
+        snprintf(result->error_msg, sizeof(result->error_msg), "Memory allocation failed");
+        return -1;
+    }
+    memcpy(buffer, body, len);
+    buffer[len] = '\0';
+
+    char *saveptr = NULL;
+    char *pair = strtok_r(buffer, "&", &saveptr);
+
+    while (pair && result->field_count < KBODY_MAX_FIELDS) {
+        char pair_copy[KBODY_MAX_VALUE_LEN];
+        if (strlen(pair) >= sizeof(pair_copy)) break;
+        strcpy(pair_copy, pair);
+
+        char *eq = strchr(pair_copy, '=');
+        char *key_str, *val_str;
+
+        if (eq) {
+            *eq = '\0';
+            key_str = pair_copy;
+            val_str = eq + 1;
+        } else {
+            key_str = pair_copy;
+            val_str = "";
+        }
+
+        url_decode(key_str);
+        url_decode(val_str);
+
+        if (strlen(key_str) < KBODY_MAX_KEY_LEN && strlen(val_str) < KBODY_MAX_VALUE_LEN) {
+            strcpy(result->fields[result->field_count].key, key_str);
+            strcpy(result->fields[result->field_count].value, val_str);
+            result->fields[result->field_count].is_string = 1;
+            result->field_count++;
+        }
+
+        pair = strtok_r(NULL, "&", &saveptr);
+    }
+
+    free(buffer);
+    result->is_valid = 1;
+    return 0;
+}
+
+static int kbody_parse_json(const char *body, size_t len, kbody_t *result) {
+    // Simple JSON parser for basic key-value objects
+    if (len >= KBODY_MAX_BODY_SIZE) {
+        snprintf(result->error_msg, sizeof(result->error_msg), "Body too large");
+        return -1;
+    }
+
+    char *buffer = (char *)malloc(len + 1);
+    if (!buffer) {
+        snprintf(result->error_msg, sizeof(result->error_msg), "Memory allocation failed");
+        return -1;
+    }
+    memcpy(buffer, body, len);
+    buffer[len] = '\0';
+
+    const char *p = buffer;
+    int in_string = 0;
+    char key[KBODY_MAX_KEY_LEN];
+    char value[KBODY_MAX_VALUE_LEN];
+    int parsing_key = 0;
+    int key_pos = 0, val_pos = 0;
+
+    while (*p && result->field_count < KBODY_MAX_FIELDS) {
+        if (*p == '{') {
+            // Entering object
+        } else if (*p == '}') {
+            // Exiting object
+            if (parsing_key == 2 && key_pos > 0 && val_pos > 0) {
+                key[key_pos] = '\0';
+                value[val_pos] = '\0';
+                strcpy(result->fields[result->field_count].key, key);
+                strcpy(result->fields[result->field_count].value, value);
+                result->field_count++;
+            }
+        } else if (*p == '"') {
+            in_string = !in_string;
+            if (in_string && parsing_key == 0) {
+                parsing_key = 1;
+                key_pos = 0;
+            } else if (!in_string && parsing_key == 1) {
+                parsing_key = 2;
+            } else if (in_string && parsing_key == 2) {
+                val_pos = 0;
+            } else if (!in_string && parsing_key == 3) {
+                parsing_key = 4;
+                if (key_pos > 0 && val_pos > 0) {
+                    key[key_pos] = '\0';
+                    value[val_pos] = '\0';
+                    strcpy(result->fields[result->field_count].key, key);
+                    strcpy(result->fields[result->field_count].value, value);
+                    result->fields[result->field_count].is_string = 1;
+                    result->field_count++;
+                    parsing_key = 0;
+                }
+            }
+        } else if (in_string) {
+            if (parsing_key == 1 && key_pos < KBODY_MAX_KEY_LEN - 1) {
+                key[key_pos++] = *p;
+            } else if (parsing_key == 3 && val_pos < KBODY_MAX_VALUE_LEN - 1) {
+                value[val_pos++] = *p;
+            }
+        } else if (*p == ':' && parsing_key == 2) {
+            parsing_key = 3;
+        } else if (*p == ',' && parsing_key == 4) {
+            parsing_key = 0;
+        }
+
+        p++;
+    }
+
+    free(buffer);
+    result->is_valid = 1;
+    return 0;
+}
+
+const char* kbody_get(const kbody_t *body, const char *key) {
+    if (!body || !key) return NULL;
+
+    for (int i = 0; i < body->field_count; i++) {
+        if (strcmp(body->fields[i].key, key) == 0) {
+            return body->fields[i].value;
+        }
+    }
+
+    return NULL;
+}
+
+bool kbody_has(const kbody_t *body, const char *key) {
+    return kbody_get(body, key) != NULL;
+}
+
+int kbody_get_int(const kbody_t *body, const char *key, int default_val) {
+    const char *val = kbody_get(body, key);
+    return val ? atoi(val) : default_val;
+}
+
+bool kbody_get_bool(const kbody_t *body, const char *key, bool default_val) {
+    const char *val = kbody_get(body, key);
+    if (!val) return default_val;
+    return strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcmp(val, "yes") == 0;
+}
+
+double kbody_get_double(const kbody_t *body, const char *key, double default_val) {
+    const char *val = kbody_get(body, key);
+    return val ? atof(val) : default_val;
+}
+
+int kbody_count(const kbody_t *body) {
+    return body ? body->field_count : 0;
+}
+
+bool kbody_is_valid_json(const char *json) {
+    if (!json) return false;
+    while (isspace(*json)) json++;
+    return *json == '{' || *json == '[';
+}
+
+bool kbody_is_valid_form(const char *form) {
+    if (!form) return false;
+    return strlen(form) > 0;
+}
+
+const char* kbody_error(const kbody_t *body) {
+    return body && body->error_msg[0] ? body->error_msg : NULL;
+}
+
+void kbody_clear(kbody_t *body) {
+    if (body) memset(body, 0, sizeof(*body));
+}
+
+void kbody_foreach(const kbody_t *body, kbody_iterator_t cb, void *userdata) {
+    if (!body || !cb) return;
+    for (int i = 0; i < body->field_count; i++) {
+        cb(body->fields[i].key, body->fields[i].value, userdata);
+    }
+}

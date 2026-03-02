@@ -1,0 +1,252 @@
+# v16.0 Self-Hosting 구현 계획
+
+## Context
+
+v15.3까지 GC가 통합된 바이트코드 VM이 완성되었습니다.
+그러나 `Expression::Identifier`(변수 참조)가 컴파일러에서 **미구현** 상태입니다
+(`Statement::Let { name: _, value }` — name이 무시됨).
+
+v16.0에서는 두 가지를 달성합니다:
+1. **변수 지원 완성**: OpGetLocal/OpSetLocal을 컴파일러에 연결
+2. **셀프 호스팅 검증**: 동일 소스를 두 번 컴파일하면 바이트 단위로 같다는 것을 증명
+   → Stage1 bytecode == Stage2 bytecode → 언어의 결정론적 독립 선언
+
+---
+
+## 신규 프로젝트 경로
+
+```
+lang_design/v16_0_self_hosting/
+├── Cargo.toml
+├── compiler.gogs          [신규] 문서화용 Gogs-Lang 소스 파일
+└── src/
+    ├── ast.rs             (v15.3 복사, 변경 없음)
+    ├── bytecode.rs        (v15.3 복사, 변경 없음)
+    ├── opcode.rs          (v15.3 복사, 변경 없음)
+    ├── disassembler.rs    (v15.3 복사, 변경 없음)
+    ├── gc_object.rs       (v15.3 복사, 변경 없음)
+    ├── value.rs           (v15.3 복사, 변경 없음)
+    ├── compiler.rs        [수정] Identifier/Let 완성 + emit_with_byte_operand
+    ├── vm.rs              [수정] OpGetLocal/OpSetLocal + locals Vec<Value>
+    ├── bootstrap.rs       [신규] Stage0/1/2 + BinaryIdentityCheck
+    ├── lib.rs             [수정] bootstrap 모듈 추가
+    └── main.rs            [신규] 12개 교육 섹션
+```
+
+---
+
+## 구현 순서
+
+### Step 1~6: 복사 파일 (v15.3 → v16.0, 변경 없음)
+
+`ast.rs`, `bytecode.rs`, `opcode.rs`, `disassembler.rs`, `gc_object.rs`, `value.rs`
+
+---
+
+### Step 7: `compiler.rs` 수정 — Identifier/Let 완성
+
+**구조체 변경:**
+```rust
+use std::collections::HashMap;
+pub struct Compiler {
+    bytecode: Bytecode,
+    pub debug_mode: bool,
+    locals: HashMap<String, usize>,  // [NEW] 변수명 → 슬롯 인덱스
+    next_local: usize,               // [NEW] 다음 슬롯 번호 (0부터 시작)
+}
+```
+
+**Statement::Let 수정:**
+```rust
+Statement::Let { name, value } => {
+    self.compile_expression(value)?;           // 스택에 값 푸시
+    let idx = self.next_local;
+    self.locals.insert(name.clone(), idx);
+    self.next_local += 1;
+    self.emit_with_byte_operand(OpCode::OpSetLocal, idx as u8); // 팝→로컬 저장
+}
+```
+
+**Expression::Identifier 수정 (`"not yet implemented"` 제거):**
+```rust
+Expression::Identifier(name) => {
+    match self.locals.get(name) {
+        Some(&idx) => self.emit_with_byte_operand(OpCode::OpGetLocal, idx as u8),
+        None => return Err(format!("Undefined variable: '{}'", name)),
+    }
+}
+```
+
+**신규 메서드:**
+```rust
+fn emit_with_byte_operand(&mut self, op: OpCode, operand: u8) {
+    self.emit(op);
+    self.bytecode.add_instruction(operand);  // 1바이트 (opcode.rs: width=1)
+}
+pub fn local_count(&self) -> usize { self.next_local }
+pub fn get_local_index(&self, name: &str) -> Option<usize> { self.locals.get(name).copied() }
+```
+
+> **근거**: `opcode.rs`에서 `OpGetLocal.operand_width() = 1` → u8 사용, 최대 256 변수
+
+---
+
+### Step 8: `vm.rs` 수정 — 로컬 변수 실행
+
+**구조체 변경:**
+```rust
+pub struct VM {
+    bytecode: Bytecode,
+    stack: Vec<Value>,
+    ip: usize,
+    heap: ObjectHeap,
+    locals: Vec<Value>,  // [NEW] 256 슬롯 (사전 초기화)
+}
+// VM::new()에서: locals: vec![Value::Null; 256]
+```
+
+**신규 OpCode 처리 (`_ => return Err` 대신):**
+```rust
+OpCode::OpSetLocal => {
+    let idx = self.read_u8() as usize;
+    let val = self.stack_pop()?;   // 팝 후 저장 (Statement 의미론)
+    self.locals[idx] = val;
+}
+OpCode::OpGetLocal => {
+    let idx = self.read_u8() as usize;
+    self.stack.push(self.locals[idx].clone());
+}
+fn read_u8(&mut self) -> u8 {
+    let b = self.bytecode.instructions[self.ip]; self.ip += 1; b
+}
+```
+
+---
+
+### Step 9: `bootstrap.rs` 신규 — 핵심 셀프 호스팅 엔진
+
+```rust
+/// 컴파일 1단계 결과물
+pub struct Stage {
+    pub number: usize,
+    pub bytecode: Bytecode,
+    pub result: Option<Value>,
+    pub compile_time_ns: u64,
+    pub bytecode_hash: u64,   // FNV-1a (외부 크레이트 없음)
+}
+impl Stage {
+    pub fn compile(number: usize, program: &Program) -> Result<Self, String>
+    pub fn run(&mut self) -> Result<Value, String>
+    fn hash_bytecode(bc: &Bytecode) -> u64  // FNV-1a over instructions+constants
+}
+
+/// 바이너리 동일성 검사 결과
+pub struct BinaryIdentityCheck {
+    pub hashes_equal: bool,
+    pub instructions_equal: bool,
+    pub constants_equal: bool,
+    pub stage1_hash: u64, pub stage2_hash: u64,
+    pub instructions_len: usize, pub constants_count: usize,
+}
+impl BinaryIdentityCheck {
+    pub fn is_identical(&self) -> bool           // hashes && instructions && constants
+    pub fn diagnostic(&self) -> String           // "PASS: ..." or "FAIL: ..."
+}
+
+/// 3단계 부트스트래핑 실행기
+pub struct Bootstrap { source_program: Program }
+impl Bootstrap {
+    pub fn new(source_program: Program) -> Self
+    pub fn run(&self) -> Result<BootstrapResult, String>
+        // Stage0: compile(source) + run
+        // Stage1: compile(source) + run  (동일 소스)
+        // Stage2: compile(source) + run  (동일 소스)
+        // verify: verify_binary_identity(stage1, stage2)
+    pub fn verify_binary_identity(&self, s1: &Stage, s2: &Stage) -> BinaryIdentityCheck
+}
+pub struct BootstrapResult {
+    pub stage0: Stage, pub stage1: Stage, pub stage2: Stage,
+    pub binary_identity: BinaryIdentityCheck,
+}
+
+/// compiler.gogs에 해당하는 AST 구성 (변수 + 산술 + 조건 + 배열)
+/// 예상 실행 결과: Int(1610)  (16*100 + 1*10 + 0)
+pub fn make_compiler_gogs_program() -> Program
+```
+
+---
+
+### Step 10: `lib.rs` 수정
+
+```rust
+pub mod bootstrap;   // [NEW]
+pub use bootstrap::{Bootstrap, BootstrapResult, Stage, BinaryIdentityCheck};
+pub use bootstrap::make_compiler_gogs_program;  // [NEW]
+// 나머지 pub use 유지
+```
+
+---
+
+### Step 11: `compiler.gogs` (문서화 + 의사코드)
+
+```
+// compiler.gogs - Gogs-Lang 소스 파일 v16.0 셀프 호스팅 데모
+// 변수, 산술, 조건, 배열 사용
+let version = 16;
+let major = 1;
+let minor = 0;
+let version_code = version * 100 + major * 10 + minor;  // → 1610
+let is_stable = if version_code >= 1600 { true } else { false };
+let opcodes = [0, 1, 2, 3, 4, 5];
+version_code
+```
+
+---
+
+### Step 12: `main.rs` — 12개 교육 섹션
+
+| # | 섹션 제목 | 핵심 내용 |
+|---|---------|---------|
+| 1 | 셀프 호스팅의 정의 | 역사(GCC/Rust/Go), v16.0의 의미 |
+| 2 | v15.3의 한계 시각화 | Identifier 에러 재현 후 해결 선언 |
+| 3 | 로컬 변수 설계 | locals HashMap, 1바이트 operand 이유 |
+| 4 | 컴파일러 동작 실증 | `let x = 42; x` → GetLocal 방출 확인 |
+| 5 | VM 실행 실증 | `let x=10; let y=20; x+y` → 30 확인 |
+| 6 | compiler.gogs AST | 트리 구조 + 변수 의존 관계 시각화 |
+| 7 | Stage0 컴파일 | 컴파일 + 실행 → `Int(1610)` 확인 |
+| 8 | 결정론적 컴파일 | 10회 반복 컴파일, 해시 항상 동일 |
+| 9 | 3단계 부트스트래핑 | Stage0 → Stage1 → Stage2 실행 |
+| 10 | 바이너리 동일성 검증 | `Stage1 hash == Stage2 hash` 출력 |
+| 11 | 바이트코드 역어셈블 | GetLocal/SetLocal 동작 시각화 |
+| 12 | 아키텍처 요약 | v15.3→v16.0 변화, 언어 독립 선언 |
+
+---
+
+## 테스트 목표: 25개
+
+| 파일 | 수 | 핵심 내용 |
+|-----|---|---------|
+| compiler.rs | 5개 | let→SetLocal 방출, identifier→GetLocal 방출, 인덱스 순서, 미정의 변수 에러 |
+| vm.rs | 5개 | let+get 기본, 두 변수 독립, 변수 산술, if 조건 변수, 배열+변수 |
+| bootstrap.rs | 10개 | Stage 생성, FNV 해시 결정론, Stage1==Stage2, is_identical, diagnostic |
+| 통합 | 5개 | compiler_gogs 결과=1610, is_stable=true, opcodes 길이, 전체 파이프라인, Bootstrap 검증 통과 |
+
+**핵심 테스트 (반드시 통과):**
+```rust
+test_stage1_hash_equals_stage2    // stage1.bytecode_hash == stage2.bytecode_hash
+test_binary_identity_is_identical // BinaryIdentityCheck::is_identical() == true
+test_compiler_gogs_result         // compile_and_run(&make_compiler_gogs_program()) == Ok(Int(1610))
+test_identifier_compiles_get_local // GetLocal 방출 검증
+test_undefined_variable_error     // Err("Undefined variable: 'x'")
+```
+
+---
+
+## 검증 방법
+
+```bash
+cd lang_design/v16_0_self_hosting
+cargo build   # 경고 0개
+cargo test    # 25개 이상 통과
+cargo run     # 12개 섹션 + "PASS: Stage1 == Stage2" 출력 확인
+```

@@ -1,0 +1,200 @@
+# v15.2 조건부 분기 & 백필링 VM - 구현 계획
+
+## Context
+
+v15.1에서 AST → 바이트코드 컴파일러를 완성했습니다. v15.2는 그 바이트코드를 **실제로 실행하는 Virtual Machine**을 구현하는 단계입니다. 핵심은 세 가지입니다:
+1. `emit_placeholder()` 버그 수정 (4바이트 → 3바이트)
+2. `change_operand()`로 백필링 메커니즘 완성
+3. VM 실행 루프 구현 (OpJump + OpJumpNotTruthy)
+
+---
+
+## 신규 프로젝트 경로
+
+```
+lang_design/v15_2_vm_conditionals/
+├── Cargo.toml
+├── src/
+│   ├── opcode.rs        (v15.1 복사, 무변경)
+│   ├── bytecode.rs      (v15.1 복사, 무변경)
+│   ├── ast.rs           (While { condition, body } 추가)
+│   ├── value.rs         (NEW: Value 열거형)
+│   ├── compiler.rs      (버그 수정 + change_operand + While + else)
+│   ├── vm.rs            (NEW: Virtual Machine 실행 엔진)
+│   ├── disassembler.rs  (전방/후방 점프 시각화 추가)
+│   ├── lib.rs
+│   └── main.rs          (12개 교육 섹션)
+├── ARCHITECTURE_V15_2_VM_CONDITIONALS.md
+└── README_V15_2_VM_CONDITIONALS.md
+```
+
+---
+
+## 구현 순서 (의존성 순)
+
+### Step 1~2: opcode.rs, bytecode.rs
+v15.1 그대로 복사. 변경 없음.
+
+### Step 3: ast.rs - While 추가
+```rust
+While {
+    condition: Box<Expression>,
+    body: Vec<Statement>,
+},
+```
+
+### Step 4: value.rs (NEW)
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Bool(bool),
+    Null,
+    Array(Vec<Value>),
+}
+
+impl Value {
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Value::Bool(b) => *b,
+            Value::Int(0) => false,
+            Value::Int(_) => true,
+            Value::Null => false,
+            Value::Array(_) => true,
+        }
+    }
+}
+```
+
+### Step 5: compiler.rs - 핵심 수정 3가지
+
+**① emit_placeholder 버그 수정 (4바이트 → 3바이트)**
+```rust
+fn emit_placeholder(&mut self, op: OpCode) -> usize {
+    let pos = self.bytecode.len();
+    self.bytecode.add_instruction(op.as_byte());
+    self.bytecode.add_instruction(0x00); // high
+    self.bytecode.add_instruction(0x00); // low
+    pos  // 정확히 3바이트
+}
+```
+
+**② change_operand 신규 추가 (백필링 핵심)**
+```rust
+fn change_operand(&mut self, pos: usize, operand: u16) {
+    let bytes = operand.to_be_bytes();
+    self.bytecode.instructions[pos + 1] = bytes[0];
+    self.bytecode.instructions[pos + 2] = bytes[1];
+}
+// fix_jump는 change_operand에 위임
+fn fix_jump(&mut self, pos: usize) {
+    let target = self.bytecode.len() as u16;
+    self.change_operand(pos, target);
+}
+```
+
+**③ If-Else 완성 (else 없을 때 무조건 점프 추가)**
+```rust
+if let Some(alt) = alternative {
+    let jump_pos = self.emit_placeholder(OpCode::OpJump); // else 건너뛰기
+    self.fix_jump(jump_not_truthy_pos);  // else 시작 위치로 백필
+    for stmt in alt { self.compile_statement(stmt)?; }
+    self.fix_jump(jump_pos);            // else 끝 위치로 백필
+} else {
+    self.fix_jump(jump_not_truthy_pos); // if 이후 위치로 백필
+}
+```
+
+**④ While 루프 추가 (후방 점프 - 백필링 불필요)**
+```rust
+Expression::While { condition, body } => {
+    let loop_start = self.bytecode.len() as u16;
+    self.compile_expression(condition)?;
+    let jump_not_truthy_pos = self.emit_placeholder(OpCode::OpJumpNotTruthy);
+    for stmt in body { self.compile_statement(stmt)?; }
+    self.emit_with_operand(OpCode::OpJump, loop_start); // 주소 이미 알고 있음!
+    self.fix_jump(jump_not_truthy_pos);
+}
+```
+
+**⑤ debug_mode 필드 추가**
+```rust
+pub struct Compiler { bytecode: Bytecode, pub debug_mode: bool }
+// fix_jump 호출 시 debug_mode이면 백필링 과정 출력
+```
+
+### Step 6: vm.rs (NEW)
+
+```rust
+pub struct VM {
+    bytecode: Bytecode,
+    stack: Vec<Value>,
+    ip: usize,
+}
+
+// run() 핵심 루프:
+// 1. op = instructions[ip], ip += 1
+// 2. match op { ... }
+// OpJump: target = read_u16(), ip = target (덮어씀!)
+// OpJumpNotTruthy: target = read_u16(); if !stack_pop().is_truthy() { ip = target }
+// OpArray: count = read_u16(), pop count개, reverse, push Array
+// OpIndex: idx = pop, arr = pop, push arr[idx] or Null
+
+fn read_u16(&mut self) -> u16 {
+    let h = instructions[ip] as u16;
+    let l = instructions[ip+1] as u16;
+    ip += 2;
+    (h << 8) | l
+}
+```
+
+### Step 7: disassembler.rs
+점프 명령어에 `↑ 후방` / `↓ 전방` 방향 표시 추가.
+
+### Step 8: lib.rs
+`value`, `vm` 모듈 추가. `compile_and_run()` 편의 함수 추가.
+
+### Step 9: Cargo.toml
+```toml
+[package]
+name = "v15_2_vm_conditionals"
+version = "0.1.0"
+edition = "2021"
+```
+
+### Step 10: main.rs - 12개 교육 섹션
+
+| # | 섹션 | 내용 |
+|---|------|------|
+| 1 | VM 기본 구조 | IP, Stack, 실행 루프 소개 |
+| 2 | 정수 연산 실행 | `5 + 3 = 8` 컴파일 → 실행 |
+| 3 | 불리언 연산 | `!true = false` 실행 |
+| 4 | 비교 연산 | `5 == 5 = true` 실행 |
+| 5 | 전위/산술 | `-5`, `2 * 3 + 4` 실행 |
+| 6 | If 참 분기 | `if true { 10 }` = 10 |
+| 7 | If-Else 백필링 | `if false { 10 } else { 20 }` 시연 + [BACKFILL] 출력 |
+| 8 | 중첩 If | `if 5 > 3 { if true { 1 } else { 2 } }` |
+| 9 | While 루프 | 카운터 증가 루프 실행 |
+| 10 | 배열 + 인덱싱 | `[1,2,3][1] = 2` 실행 |
+| 11 | 복합 표현식 | `2*3 + 10 - 5 = 11` 실행 |
+| 12 | 아키텍처 요약 | 백필링 원리 + 절대 vs 상대 주소 비교 |
+
+---
+
+## 테스트 목표: 25개 통과
+
+- value.rs: 5개 (is_truthy 각 타입)
+- compiler.rs: 5개 (emit_placeholder 3바이트 검증 포함)
+- vm.rs: 10개 (산술, 조건, 루프, 배열)
+- lib.rs 통합: 5개
+
+---
+
+## 검증 방법
+
+```bash
+cd lang_design/v15_2_vm_conditionals
+cargo build   # 경고 없이 통과
+cargo test    # 25개 이상 통과
+cargo run     # 12개 섹션 + 실제 실행 결과 출력
+```

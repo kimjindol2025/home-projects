@@ -1,0 +1,219 @@
+/**
+ * 쿼리 플래너
+ *
+ * - 쿼리 파싱
+ * - 비용 추정
+ * - 최적 실행 계획 생성
+ */
+
+import type { QueryPlan, Operation } from '../types/performance.types';
+
+export class QueryPlanner {
+  private _db: any;
+  private _indexManager: any;
+  private _cache = new Map<string, QueryPlan>();
+
+  constructor(db: any, indexManager?: any) {
+    this._db = db;
+    this._indexManager = indexManager;
+  }
+
+  /**
+   * 쿼리 분석 및 실행 계획 생성
+   */
+  analyze(sql: string): QueryPlan {
+    // 캐시 확인
+    if (this._cache.has(sql)) {
+      return this._cache.get(sql)!;
+    }
+
+    const plan: QueryPlan = {
+      sql,
+      cost: 0,
+      rows: 0,
+      indexes: [],
+      operations: [],
+      explanation: ''
+    };
+
+    // 1. 쿼리 타입 분석
+    const type = this._getQueryType(sql);
+
+    // 2. 테이블 및 조건 추출
+    const { table, columns, conditions } = this._parseQuery(sql);
+
+    // 3. 적용 가능한 인덱스 찾기
+    const applicableIndexes = this._findApplicableIndexes(table, columns, conditions);
+
+    // 4. 비용 추정
+    plan.cost = this._estimateCost(table, applicableIndexes, conditions);
+    plan.rows = this._estimateRows(table, conditions);
+    plan.indexes = applicableIndexes;
+
+    // 5. 실행 계획 작성
+    plan.operations = this._generateOperations(table, applicableIndexes, conditions, type);
+
+    // 6. 설명 생성
+    plan.explanation = this._generateExplanation(plan);
+
+    // 캐시 저장
+    this._cache.set(sql, plan);
+
+    return plan;
+  }
+
+  /**
+   * 쿼리 타입 식별
+   */
+  private _getQueryType(sql: string): string {
+    if (sql.match(/SELECT/i)) return 'SELECT';
+    if (sql.match(/INSERT/i)) return 'INSERT';
+    if (sql.match(/UPDATE/i)) return 'UPDATE';
+    if (sql.match(/DELETE/i)) return 'DELETE';
+    return 'UNKNOWN';
+  }
+
+  /**
+   * 쿼리 파싱
+   */
+  private _parseQuery(sql: string): { table: string; columns: string[]; conditions: string[] } {
+    const table = (sql.match(/FROM\s+(\w+)/i)?.[1] || 'unknown').toLowerCase();
+    const columns = (sql.match(/SELECT\s+(.+?)\s+FROM/i)?.[1] || '*').split(',').map(c => c.trim());
+    const where = sql.match(/WHERE\s+(.+?)(?:ORDER|GROUP|LIMIT|$)/i)?.[1] || '';
+    const conditions = where ? where.split(/\s+AND\s+/i) : [];
+
+    return { table, columns, conditions };
+  }
+
+  /**
+   * 적용 가능한 인덱스 찾기
+   */
+  private _findApplicableIndexes(table: string, columns: string[], conditions: string[]): string[] {
+    if (!this._indexManager) return [];
+
+    const indexes: string[] = [];
+    const allIndexes = this._indexManager.listAllIndexes() || [];
+
+    for (const index of allIndexes) {
+      // 같은 테이블의 인덱스만 고려
+      if (index.table !== table) continue;
+
+      // WHERE 절 컬럼과 매칭
+      for (const condition of conditions) {
+        const columnMatch = condition.match(/(\w+)\s*[=<>]/);
+        if (columnMatch && index.columns.includes(columnMatch[1])) {
+          indexes.push(index.name);
+          break;
+        }
+      }
+    }
+
+    return indexes;
+  }
+
+  /**
+   * 비용 추정 (0-100 스케일)
+   */
+  private _estimateCost(table: string, indexes: string[], conditions: string[]): number {
+    let cost = 100; // 기본 비용
+
+    // 인덱스 사용 시 비용 감소
+    if (indexes.length > 0) {
+      cost = Math.max(10, cost - (indexes.length * 30));
+    }
+
+    // 조건이 많을수록 비용 증가
+    cost += conditions.length * 5;
+
+    return cost;
+  }
+
+  /**
+   * 행 개수 추정
+   */
+  private _estimateRows(table: string, conditions: string[]): number {
+    try {
+      const totalRows = (this._db.query as any)(
+        `SELECT COUNT(*) as count FROM ${table}`
+      )?.count || 0;
+
+      // 조건이 있으면 선택성 계산 (단순화된 추정)
+      const selectivity = Math.pow(0.5, Math.min(conditions.length, 3));
+      return Math.ceil(totalRows * selectivity);
+    } catch {
+      return 1000; // 기본 추정값
+    }
+  }
+
+  /**
+   * 실행 계획 작성
+   */
+  private _generateOperations(
+    table: string,
+    indexes: string[],
+    conditions: string[],
+    type: string
+  ): Operation[] {
+    const ops: Operation[] = [];
+
+    if (type === 'SELECT') {
+      if (indexes.length > 0) {
+        ops.push({
+          type: 'SEEK',
+          index: indexes[0],
+          cost: 10
+        });
+      } else {
+        ops.push({
+          type: 'SCAN',
+          table,
+          cost: 50
+        });
+      }
+
+      if (conditions.length > 0) {
+        ops.push({
+          type: 'FILTER',
+          cost: 5
+        });
+      }
+    }
+
+    return ops;
+  }
+
+  /**
+   * 설명 생성
+   */
+  private _generateExplanation(plan: QueryPlan): string {
+    const parts: string[] = [];
+
+    for (const op of plan.operations) {
+      if (op.type === 'SEEK') {
+        parts.push(`Using index ${op.index}`);
+      } else if (op.type === 'SCAN') {
+        parts.push(`Full table scan on ${op.table}`);
+      } else if (op.type === 'FILTER') {
+        parts.push(`Filter rows`);
+      }
+    }
+
+    return parts.join(' → ');
+  }
+
+  /**
+   * 캐시 초기화
+   */
+  clearCache(): void {
+    this._cache.clear();
+  }
+
+  /**
+   * 캐시 크기
+   */
+  getCacheSize(): number {
+    return this._cache.size;
+  }
+}
+
+export default QueryPlanner;

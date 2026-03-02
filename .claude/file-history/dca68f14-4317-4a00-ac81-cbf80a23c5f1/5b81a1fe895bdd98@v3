@@ -1,0 +1,175 @@
+# Phase 5.4: 컴파일러 통합 계획
+
+## 컨텍스트
+
+Phase 5.2/5.3 (TypeInference + TypeConstraints) 완성 — 117/117 테스트 통과.
+이제 Phase 5.4: TypeChecker를 VM 컴파일 파이프라인에 통합하여:
+1. **런타임 타입 안전성 강화**: 실행 전 타입 오류 조기 감지
+2. **상수 폴딩(Constant Folding)**: `2 + 3` → 컴파일 타임에 `5`로 계산
+3. **상수 중복 제거**: `addConst()` 결과 캐시 (같은 값 재사용)
+
+---
+
+## 재사용할 기존 코드
+
+| 항목 | 파일 | 역할 |
+|------|------|------|
+| `TypeChecker` 클래스 | src/type-checker.ts | 타입 검증 |
+| `TypeCheckResult` | src/type-checker.ts | check() 반환값 |
+| `compile()` 함수 | src/compiler.ts:55 | 컴파일 진입점 |
+| `addConst()` 함수 | src/compiler.ts:64 | 상수 풀 추가 |
+| `compileExpr "binary"` | src/compiler.ts:437 | 이진 연산 컴파일 |
+| `run()` 함수 | src/index.ts:31 | 실행 파이프라인 |
+
+---
+
+## 구현 1: src/index.ts - TypeChecker 파이프라인 주입
+
+```typescript
+// 현재 파이프라인 (src/index.ts:31-41):
+export function run(source: string, basePath?: string): string[] {
+  const tokens = lex(source);
+  const ast = parse(tokens);
+  // ★ 여기에 TypeChecker 주입 ★
+  if (!hasImports && !hasExports) {
+    const chunk = compile(ast);
+    const vm = new VM(chunk);
+    return vm.run().output;
+  }
+  ...
+}
+
+// 변경 후:
+import { TypeChecker } from "./type-checker"
+
+// Fast path 분기 전에 타입 검사 (선택적):
+const checker = new TypeChecker()
+const typeResult = checker.check(ast)
+if (!typeResult.success) {
+  // 오류를 출력으로 반환 (런타임 크래시 방지)
+  return typeResult.errors.map(e => `[TypeError] ${e.message}`)
+}
+```
+
+**주의**: 기존 테스트 호환성 유지 필수. 오류는 throw가 아닌 출력으로 반환.
+
+---
+
+## 구현 2: src/compiler.ts - 상수 중복 제거
+
+```typescript
+// 현재 (src/compiler.ts:64-67): 항상 새 슬롯
+function addConst(val: Value): number {
+  chunk.constants.push(val);
+  return chunk.constants.length - 1;
+}
+
+// 변경 후: 캐시 조회 먼저
+function addConst(val: Value): number {
+  const key = JSON.stringify(val)
+  const existing = constCache.get(key)
+  if (existing !== undefined) return existing
+  const idx = chunk.constants.length
+  chunk.constants.push(val)
+  constCache.set(key, idx)
+  return idx
+}
+// constCache: Map<string, number> - compile() 함수 상단에 선언
+```
+
+---
+
+## 구현 3: src/compiler.ts - 상수 폴딩
+
+```typescript
+// 현재 (src/compiler.ts:437-447): 모든 이진 연산 → 3개 옵코드 생성
+case "binary": {
+  compileExpr(e.left);
+  compileExpr(e.right);
+  emit(ops[e.op]);
+  break;
+}
+
+// 변경 후: num+num이면 컴파일 타임 계산
+case "binary": {
+  if (e.left.kind === "number" && e.right.kind === "number") {
+    const l = e.left.value, r = e.right.value
+    let result: Value | null = null
+    if (e.op === "+") result = { tag: "num", val: l + r }
+    else if (e.op === "-") result = { tag: "num", val: l - r }
+    else if (e.op === "*") result = { tag: "num", val: l * r }
+    else if (e.op === "/" && r !== 0) result = { tag: "num", val: l / r }
+    else if (e.op === "%") result = { tag: "num", val: l % r }
+    else if (e.op === "==") result = { tag: "bool", val: l === r }
+    else if (e.op === "!=") result = { tag: "bool", val: l !== r }
+    else if (e.op === "<")  result = { tag: "bool", val: l < r }
+    else if (e.op === ">")  result = { tag: "bool", val: l > r }
+    else if (e.op === "<=") result = { tag: "bool", val: l <= r }
+    else if (e.op === ">=") result = { tag: "bool", val: l >= r }
+    if (result) { emitArg(Op.Const, addConst(result)); break; }
+  }
+  // 문자열 + 문자열 폴딩
+  if (e.left.kind === "string" && e.right.kind === "string" && e.op === "+") {
+    emitArg(Op.Const, addConst({ tag: "str", val: e.left.value + e.right.value }))
+    break
+  }
+  // 폴딩 불가 → 기존 방식
+  compileExpr(e.left);
+  compileExpr(e.right);
+  emit(ops[e.op]);
+  break;
+}
+```
+
+---
+
+## 구현 4: src/vm-optimizer-test.ts (테스트, 20개)
+
+```
+Suite A - 상수 폴딩 (8개):
+  1. 숫자 덧셈 폴딩: 2+3 → Const(5) [옵코드 1개]
+  2. 숫자 뺄셈 폴딩: 10-4 → Const(6)
+  3. 숫자 곱셈 폴딩: 3*4 → Const(12)
+  4. 숫자 나눗셈 폴딩: 8/2 → Const(4)
+  5. 비교 연산 폴딩: 3>2 → Const(true)
+  6. 문자열 연결 폴딩: "a"+"b" → Const("ab")
+  7. 중첩 폴딩: (2+3)*4 → Const(20)
+  8. 0으로 나눗셈: 8/0 → 폴딩 안 됨 (런타임 처리)
+
+Suite B - 상수 중복 제거 (7개):
+  9. 같은 숫자 중복: addConst(1), addConst(1) → 같은 인덱스
+  10. 같은 문자열 중복: "hello" × 2 → 1개 슬롯
+  11. 다른 숫자 → 다른 인덱스
+  12. null 중복 제거
+  13. bool 중복 제거
+  14. 상수 풀 크기 검증
+  15. 캐시 히트율 확인
+
+Suite C - TypeChecker 통합 (5개):
+  16. 유효한 프로그램 → 오류 없음
+  17. 타입 오류 → 출력에 [TypeError] 포함
+  18. 미정의 변수 → [TypeError] 감지
+  19. 함수 인자 개수 불일치 → [TypeError] 감지
+  20. 기존 117개 테스트 호환성 유지
+```
+
+---
+
+## 수정 대상 파일
+
+- **수정**: `src/index.ts` (TypeChecker 주입, fast path + import path 양쪽)
+- **수정**: `src/compiler.ts` (상수 중복 제거 + 상수 폴딩)
+- **신규**: `src/vm-optimizer-test.ts` (20개 테스트)
+
+---
+
+## 검증
+
+```bash
+npm run build
+node dist/vm-optimizer-test.js     # 신규 20개 테스트
+node dist/vm-inference-test.js     # Phase 5.2/5.3 호환성 (20개)
+node dist/vm-types-test.js         # Phase 5 호환성 (20개)
+node dist/vm-compatibility-test.js # Phase 2-4 호환성 (77개)
+# 목표: 137개 테스트 전체 통과
+```

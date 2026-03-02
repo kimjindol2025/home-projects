@@ -1,0 +1,376 @@
+# ============================================================================
+# caching/cache.fl - 메모리 캐싱 시스템
+# ============================================================================
+# Phase 1B 구현
+# 작성: 2026-03-02
+# 책임: 캐시 관리, TTL, 무효화
+
+# ─────────────────────────────────────────────────────────────────────────
+# 캐시 구조
+# ─────────────────────────────────────────────────────────────────────────
+
+struct CacheEntry<T>
+  key: string
+  value: T
+  createdAt: number       # 밀리초 타임스탐프
+  expiresAt: number       # 밀리초 타임스탐프
+  accessCount: number
+  lastAccessedAt: number
+
+struct Cache<T>
+  data: map<string, CacheEntry<T>>
+  maxSize: number
+  currentSize: number
+  hits: number
+  misses: number
+  evictions: number
+
+fn newCache
+  input: maxSize: number
+  output: Cache<string>
+  intent: "새 캐시 생성"
+  do
+    return {
+      data: {},
+      maxSize: maxSize,
+      currentSize: 0,
+      hits: 0,
+      misses: 0,
+      evictions: 0
+    }
+
+# ─────────────────────────────────────────────────────────────────────────
+# 기본 작업: GET, PUT, DELETE
+# ─────────────────────────────────────────────────────────────────────────
+
+fn cacheGet
+  input: (cache: Cache, key: string)
+  output: Option<string>
+  intent: "캐시에서 값 조회"
+  do
+    match cache.data.get(key)
+      None => {
+        cache.misses = cache.misses + 1
+        return None
+      }
+      Some(entry) => {
+        # TTL 확인
+        let now = getCurrentTimeMs()
+        if now > entry.expiresAt
+          # 만료됨
+          cache.data.remove(key)
+          cache.currentSize = cache.currentSize - 1
+          cache.misses = cache.misses + 1
+          return None
+
+        # 캐시 히트
+        let updatedEntry = entry
+        updatedEntry.accessCount = entry.accessCount + 1
+        updatedEntry.lastAccessedAt = now
+        cache.data[key] = updatedEntry
+
+        cache.hits = cache.hits + 1
+        return Some(entry.value)
+      }
+
+fn cachePut
+  input: (cache: Cache, key: string, value: string, ttlSeconds: number)
+  output: Result<void, string>
+  intent: "캐시에 값 저장"
+  do
+    let now = getCurrentTimeMs()
+    let expiresAt = now + (ttlSeconds * 1000)
+
+    # 크기 제한 확인
+    if cache.currentSize >= cache.maxSize
+      # LRU 제거
+      match evictLRU(cache)
+        Err(e) => return Err(e)
+        Ok(_) => {}
+
+    let entry = {
+      key: key,
+      value: value,
+      createdAt: now,
+      expiresAt: expiresAt,
+      accessCount: 1,
+      lastAccessedAt: now
+    }
+
+    match cache.data.get(key)
+      Some(_) => {
+        # 기존 키 업데이트
+        cache.data[key] = entry
+      }
+      None => {
+        # 새 키 추가
+        cache.data[key] = entry
+        cache.currentSize = cache.currentSize + 1
+      }
+
+    return Ok(void)
+
+fn cacheDelete
+  input: (cache: Cache, key: string)
+  output: bool
+  intent: "캐시에서 키 삭제"
+  do
+    match cache.data.get(key)
+      Some(_) => {
+        cache.data.remove(key)
+        cache.currentSize = cache.currentSize - 1
+        return true
+      }
+      None => return false
+
+fn cacheClear
+  input: cache: Cache
+  output: void
+  intent: "캐시 전체 초기화"
+  do
+    cache.data = {}
+    cache.currentSize = 0
+    cache.hits = 0
+    cache.misses = 0
+    cache.evictions = 0
+
+# ─────────────────────────────────────────────────────────────────────────
+# 무효화 전략
+# ─────────────────────────────────────────────────────────────────────────
+
+fn invalidatePattern
+  input: (cache: Cache, pattern: string)
+  output: number
+  intent: "패턴과 일치하는 모든 캐시 무효화"
+  do
+    let invalidatedCount = 0
+    let keysToDelete = []
+
+    for key in cache.data.keys()
+      if matchesPattern(key, pattern)
+        keysToDelete = arrayPush(keysToDelete, key)
+
+    for key in keysToDelete
+      if cacheDelete(cache, key)
+        invalidatedCount = invalidatedCount + 1
+
+    return invalidatedCount
+
+fn invalidateTodoCache
+  input: cache: Cache
+  output: void
+  intent: "Todo 관련 캐시 무효화"
+  do
+    # 패턴 기반 무효화
+    invalidatePattern(cache, "todos:*")
+    invalidatePattern(cache, "todo:*")
+    invalidatePattern(cache, "list:*")
+
+fn invalidateTodo
+  input: (cache: Cache, todoId: number)
+  output: void
+  intent: "특정 Todo의 캐시 무효화"
+  do
+    let pattern = "todo:" + str(todoId) + ":*"
+    invalidatePattern(cache, pattern)
+    invalidateTodoCache(cache)  # 목록도 무효화
+
+# ─────────────────────────────────────────────────────────────────────────
+# 퇴출 정책 (Eviction Policies)
+# ─────────────────────────────────────────────────────────────────────────
+
+fn evictLRU
+  input: cache: Cache
+  output: Result<void, string>
+  intent: "가장 오래 사용되지 않은 항목 제거"
+  do
+    if cache.currentSize == 0
+      return Err("Cache is empty")
+
+    # 가장 오래 사용된 항목 찾기
+    let oldestKey = ""
+    let oldestTime = getCurrentTimeMs()
+
+    for key in cache.data.keys()
+      let entry = cache.data.get(key).unwrap()
+      if entry.lastAccessedAt < oldestTime
+        oldestKey = key
+        oldestTime = entry.lastAccessedAt
+
+    if oldestKey == ""
+      return Err("Could not find entry to evict")
+
+    if cacheDelete(cache, oldestKey)
+      cache.evictions = cache.evictions + 1
+      return Ok(void)
+    else
+      return Err("Failed to evict entry")
+
+fn evictLFU
+  input: cache: Cache
+  output: Result<void, string>
+  intent: "사용 빈도가 가장 낮은 항목 제거"
+  do
+    if cache.currentSize == 0
+      return Err("Cache is empty")
+
+    # 사용 빈도가 가장 낮은 항목 찾기
+    let leastFrequentKey = ""
+    let minAccessCount = 999999
+
+    for key in cache.data.keys()
+      let entry = cache.data.get(key).unwrap()
+      if entry.accessCount < minAccessCount
+        leastFrequentKey = key
+        minAccessCount = entry.accessCount
+
+    if leastFrequentKey == ""
+      return Err("Could not find entry to evict")
+
+    if cacheDelete(cache, leastFrequentKey)
+      cache.evictions = cache.evictions + 1
+      return Ok(void)
+    else
+      return Err("Failed to evict entry")
+
+fn evictFIFO
+  input: cache: Cache
+  output: Result<void, string>
+  intent: "가장 오래 생성된 항목 제거"
+  do
+    if cache.currentSize == 0
+      return Err("Cache is empty")
+
+    # 가장 오래 생성된 항목 찾기
+    let oldestKey = ""
+    let oldestCreated = getCurrentTimeMs()
+
+    for key in cache.data.keys()
+      let entry = cache.data.get(key).unwrap()
+      if entry.createdAt < oldestCreated
+        oldestKey = key
+        oldestCreated = entry.createdAt
+
+    if oldestKey == ""
+      return Err("Could not find entry to evict")
+
+    if cacheDelete(cache, oldestKey)
+      cache.evictions = cache.evictions + 1
+      return Ok(void)
+    else
+      return Err("Failed to evict entry")
+
+# ─────────────────────────────────────────────────────────────────────────
+# 통계
+# ─────────────────────────────────────────────────────────────────────────
+
+fn hitRate
+  input: cache: Cache
+  output: number
+  intent: "캐시 히트율 (0-100)"
+  do
+    let total = cache.hits + cache.misses
+    if total == 0
+      return 0
+    return (cache.hits * 100) / total
+
+fn cacheSize
+  input: cache: Cache
+  output: CacheStats
+  intent: "캐시 통계 조회"
+  do
+    let totalEntries = cache.currentSize
+    let expiredEntries = 0
+    let now = getCurrentTimeMs()
+
+    for key in cache.data.keys()
+      let entry = cache.data.get(key).unwrap()
+      if now > entry.expiresAt
+        expiredEntries = expiredEntries + 1
+
+    return {
+      totalEntries: totalEntries,
+      maxSize: cache.maxSize,
+      usedPercent: (totalEntries * 100) / cache.maxSize,
+      hits: cache.hits,
+      misses: cache.misses,
+      hitRate: hitRate(cache),
+      evictions: cache.evictions,
+      expiredEntries: expiredEntries
+    }
+
+fn printCacheStats
+  input: cache: Cache
+  output: void
+  intent: "캐시 통계 출력"
+  do
+    let stats = cacheSize(cache)
+    print("═══ Cache Statistics ═══")
+    print("Total Entries: " + str(stats.totalEntries) + "/" + str(stats.maxSize))
+    print("Used: " + str(stats.usedPercent) + "%")
+    print("Hits: " + str(stats.hits))
+    print("Misses: " + str(stats.misses))
+    print("Hit Rate: " + str(stats.hitRate) + "%")
+    print("Evictions: " + str(stats.evictions))
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼
+# ─────────────────────────────────────────────────────────────────────────
+
+struct CacheStats
+  totalEntries: number
+  maxSize: number
+  usedPercent: number
+  hits: number
+  misses: number
+  hitRate: number
+  evictions: number
+  expiredEntries: number
+
+fn getCurrentTimeMs
+  input: void
+  output: number
+  intent: "현재 시간 (밀리초)"
+  do
+    return 0
+
+fn matchesPattern
+  input: (key: string, pattern: string)
+  output: bool
+  intent: "키가 패턴과 일치"
+  do
+    # 간단한 와일드카드 매칭
+    if pattern.endsWith("*")
+      let prefix = pattern.substring(0, pattern.len() - 1)
+      return key.startsWith(prefix)
+    return key == pattern
+
+fn str
+  input: num: number
+  output: string
+  intent: "숫자를 문자열로"
+  do
+    return ""
+
+fn arrayPush<T>
+  input: (arr: array<T>, item: T)
+  output: array<T>
+  intent: "배열에 추가"
+  do
+    return arr
+
+fn unwrap<T>
+  input: opt: Option<T>
+  output: T
+  intent: "Option에서 값 추출"
+  do
+    match opt
+      Some(v) => v
+      None => panic("unwrap on None")
+
+fn panic
+  input: msg: string
+  output: void
+  intent: "패닉"
+  do
+    print("PANIC: " + msg)

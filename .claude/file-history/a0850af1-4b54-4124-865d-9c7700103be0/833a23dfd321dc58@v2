@@ -1,0 +1,496 @@
+# 🔬 FreeLang 의미론적 일관성 검증 (Semantic Probe #1)
+
+**검증 대상**: RC + Capability 상호작용
+**버전**: v1.1 RC
+**날짜**: 2026-02-25
+**상태**: 즉시 검증 필요
+
+---
+
+## 🎯 Probe 목표
+
+**3개 구현체(Python / TypeScript VM / C RC)가 동일한 FreeLang 코드에 대해 정확히 같은 의미론적 결과를 내는가?**
+
+특히: **mutable 객체 공유 시 refcount 증가와 capability 전파 규칙이 모든 구현에서 동일한가?**
+
+---
+
+## 📋 Semantic Probe Case #1: 기본 Capability 전파
+
+### Case 1-1: Mutable 객체 공유 → Capability 어떻게 전파?
+
+#### **FreeLang 코드**
+
+```freelang
+capability file_read;
+capability file_write;
+
+fn read_file(f: file) -> string [file_read] {
+    # 파일 읽기 (file_read 권한 필요)
+    return "content";
+}
+
+fn writer_task(f: file) [file_write] {
+    # f는 들어온 그대로의 capability를 가져야 함
+    # 즉, f는 [file_write]만 가져야 하고 [file_read]는 없음
+}
+
+fn main() {
+    var file_handle = open("test.txt", "w");  # [file_write] 권한
+
+    # ❌ 여기서 무엇이 일어나는가?
+    writer_task(file_handle);
+
+    # 질문 1: writer_task 내부에서 file_handle의 refcount가 증가했는가?
+    # 질문 2: writer_task 반환 후 refcount가 감소했는가?
+    # 질문 3: file_handle의 capability가 변했는가?
+}
+```
+
+#### **예상 동작 (의도한 의미론)**
+
+```
+【 Step 1: open() 실행 】
+file_handle = File object
+refcount(file_handle) = 1
+capability(file_handle) = [file_write]
+
+【 Step 2: writer_task(file_handle) 호출 】
+파라미터 f로 전달
+refcount(file_handle) = 2  ← RC 증가
+capability(f) = [file_write]  ← 동일한 capability 전파
+
+【 Step 3: writer_task 내부 】
+f.write(...)  # [file_write] 있음 → 허용
+
+【 Step 4: writer_task 반환 】
+refcount(file_handle) = 1  ← RC 감소
+capability(file_handle) = [file_write]  ← 동일 유지
+
+【 Step 5: main 끝 】
+refcount(file_handle) = 0  ← 자동 drop
+file_handle 리소스 정리 (파일 닫기)
+```
+
+#### **검증 방법**
+
+각 구현체에서 다음을 출력하도록 수정:
+
+```
+[Python 구현]
+def writer_task(f):
+    # 추가 코드
+    print(f"[PROBE] 진입 후 refcount(f) = {get_refcount(f)}")
+    # ... 작업
+    print(f"[PROBE] 종료 전 refcount(f) = {get_refcount(f)}")
+
+# 출력:
+# [PROBE] 진입 후 refcount(f) = 2
+# [PROBE] 종료 전 refcount(f) = 2
+
+[TS VM 구현]
+emit_instruction(Opcode.DEBUG_REFCOUNT, [var_id]);
+
+[C RC 구현]
+printf("[PROBE] refcount = %d\n", obj->rc);
+```
+
+#### **예상 결과 (3개 구현체가 모두 같아야 함)**
+
+| 구현체 | 진입 시 RC | 종료 시 RC | Capability | 상태 |
+|--------|-----------|----------|------------|------|
+| Python | 2 | 2 | [file_write] | ✅ 일치 기대 |
+| TS VM | 2 | 2 | [file_write] | ✅ 일치 기대 |
+| C RC | 2 | 2 | [file_write] | ✅ 일치 기대 |
+
+---
+
+## 📋 Semantic Probe Case #2: Capability 위반 탐지 시점
+
+### Case 2-1: Capability 없이 함수 호출 → 컴파일 에러? 런타임 에러?
+
+#### **FreeLang 코드**
+
+```freelang
+fn secure_read(path: string) -> string [file_read] {
+    # file_read 권한 필요
+    return read_file(path);
+}
+
+fn untrusted_main() {
+    # secure_read를 호출하는데
+    # 호출자(untrusted_main)는 [file_read] 권한 없음
+
+    var content = secure_read("secret.txt");  # ❌ 컴파일 에러? 런타임 에러?
+}
+```
+
+#### **검증 질문**
+
+1. **컴파일 단계에서 감지?**
+   ```
+   Compile Error: untrusted_main() calls secure_read()
+   but lacks [file_read] capability
+   ```
+
+2. **런타임에 감지?**
+   ```
+   Runtime Error: Capability violation: [file_read] required
+   but not provided at line X
+   ```
+
+3. **아무 감지도 없음?** (의도 모호)
+   ```
+   ← 이 경우 보안 모델이 실패
+   ```
+
+#### **예상 결과 (3개 구현체가 모두 같아야 함)**
+
+| 구현체 | 감지 시점 | 에러 타입 | 메시지 |
+|--------|----------|----------|--------|
+| Python | 컴파일 | TypeError/CapabilityError | "lacks [file_read]" |
+| TS VM | 컴파일 | TypeError | "lacks [file_read]" |
+| C RC | 컴파일 | compile_error_t | "lacks [file_read]" |
+
+---
+
+## 📋 Semantic Probe Case #3: 순환 참조와 RC 누수
+
+### Case 3-1: Cycle 발생 시 RC 동작
+
+#### **FreeLang 코드**
+
+```freelang
+struct Node {
+    value: i32,
+    next: Node?  # Option<Node>
+}
+
+fn create_cycle() {
+    var a = Node { value: 1, next: None };
+    var b = Node { value: 2, next: None };
+
+    # 순환 참조 생성
+    a.next = b;
+    b.next = a;  # ← Cycle!
+
+    # a의 refcount: 1 (a 변수)
+    # b의 refcount: 1 (b 변수)
+    # 하지만 a->b->a이므로 내부적으로 순환
+}
+# 함수 종료 → a, b 변수 범위 벗어남
+
+# 질문:
+# 1. RC가 정확히 0이 되어 메모리 해제되는가?
+#    → 아니라면: 메모리 누수 명시적 인정 필요
+# 2. 또는 cycle detection이 있어서 자동 해제?
+#    → 있다면: SPEC에 명시 필수
+```
+
+#### **검증 결과 가능성**
+
+| 시나리오 | Python | TS VM | C RC | 규칙 명시 필요 |
+|---------|--------|-------|------|-----------------|
+| **순환 참조 누수 발생** | ✅ 누수 | ✅ 누수 | ✅ 누수 | "Cycles cause leaks. Avoid or use weak refs." |
+| **Cycle detector 있음** | ❌ (Python은 cyclic GC 있음) | ✅ 자동 해제 | ✅ 자동 해제 | "Cycle collector runs periodically." |
+| **불일치** | 일부 누수 | 일부 자동 | 일부 누수 | 🔴 심각한 불일치 |
+
+---
+
+## 📋 Semantic Probe Case #4: Immutable → Mutable 캐스팅
+
+### Case 4-1: Immutable 객체를 Mutable로 변환 가능?
+
+#### **FreeLang 코드**
+
+```freelang
+fn process_immutable(x: i32) {
+    # x는 immutable i32
+
+    # Question: x를 mutable로 "본다"고 하면?
+    var y: &mut i32 = &mut x;  # ✅ 허용? ❌ 에러?
+}
+
+fn modify_constant() {
+    let CONST: i32 = 42;  # immutable constant
+
+    # Question: 상수를 mutable reference로 변환?
+    let ptr = &mut CONST;  # ✅ 허용? ❌ 에러?
+}
+```
+
+#### **검증 질문**
+
+1. **컴파일 타임에 에러?**
+   ```
+   Error: Cannot create mutable reference to immutable value
+   ```
+
+2. **런타임 capability 체크?**
+   ```
+   Runtime Error: [mutate] capability required
+   but not provided for immutable object
+   ```
+
+3. **허용됨?** (unsafe 영역?)
+   ```
+   (unsafe로 표시된 코드만 허용)
+   ```
+
+#### **예상 결과**
+
+| 구현체 | 동작 | 메시지 |
+|--------|------|--------|
+| Python | ❌ 컴파일 에러 | "Cannot create mutable ref to immutable" |
+| TS VM | ❌ 컴파일 에러 | "Cannot create mutable ref to immutable" |
+| C RC | ❌ 컴파일 에러 | "Cannot create mutable ref to immutable" |
+
+---
+
+## 📋 Semantic Probe Case #5: Capability와 Drop 타이밍
+
+### Case 5-1: Drop 시점에 capability 유효성 검사
+
+#### **FreeLang 코드**
+
+```freelang
+struct FileHandle {
+    path: string,
+    fd: i32
+}
+
+impl Drop for FileHandle {
+    fn drop(&mut self) [file_write] {
+        # Drop 구현자에게 [file_write] 필요하다는 뜻
+        close_file(self.fd);  # file_write 필요
+    }
+}
+
+fn process_file() {
+    var handle = FileHandle::open("data.txt");
+    # handle: refcount=1, capability=[file_read]
+
+    # 여기서 handle이 drop되는데
+    # drop(&mut handle)을 호출할 때
+    # [file_write] capability 필요
+
+    # Question:
+    # 1. 컴파일 에러? (process_file에 [file_write] 없으면)
+    # 2. 런타임 에러?
+    # 3. 아무것도 아님?
+}
+```
+
+#### **검증 질문**
+
+- **Drop 호출 시 capability 체크가 일어나는가?**
+- **3개 구현체가 모두 동일한 시점에 체크하는가?**
+
+#### **예상 결과**
+
+| 구현체 | 감지 시점 | 동작 |
+|--------|----------|------|
+| Python | 컴파일 | ✅ Error: process_file needs [file_write] for Drop |
+| TS VM | 컴파일 | ✅ Error: process_file needs [file_write] for Drop |
+| C RC | 컴파일 | ✅ Error: process_file needs [file_write] for Drop |
+
+---
+
+## 🔍 형식 의미론 (Formal Semantics) - SPEC에 추가할 내용
+
+현재 SPEC.md에 **명시되지 않은 규칙들**:
+
+### 규칙 1: Reference Counting과 Capability의 동시 관리
+
+```
+【 규칙 】
+변수 x에 값 v를 할당할 때:
+
+let x = v;
+
+동작 순서:
+1. refcount(v) += 1
+2. capability(x) = capability(v)  // ← Capability는 전파됨
+3. ownership(x) = ownership(v)
+```
+
+### 규칙 2: 함수 호출 시 Capability 검증
+
+```
+【 규칙 】
+함수 f에 argument로 v를 전달할 때:
+
+call f(v) [with capability C]
+
+검증 순서 (컴파일 타임):
+1. f의 선언: fn f(arg: T) [req_cap]
+2. 호출자의 capability: has_cap
+3. 확인: has_cap ⊇ req_cap  // Subset check
+   - Yes: 컴파일 계속
+   - No: Compile Error
+```
+
+### 규칙 3: Drop과 Capability
+
+```
+【 규칙 】
+변수 v가 scope를 벗어날 때:
+
+if refcount(v) > 1:
+    refcount(v) -= 1
+    (other references keep v alive)
+else:
+    refcount(v) = 0
+    drop(v)  // ← Drop 구현 실행
+
+Drop 실행 시 Capability 검증:
+- drop(&mut v)를 호출할 때
+- Drop impl의 required_capability 체크
+- 현재 scope의 capability와 비교
+```
+
+### 규칙 4: Cycle와 RC
+
+```
+【 규칙 】
+Cycle 발생:
+
+struct Node {
+    next: Node?
+}
+
+a.next = b; b.next = a;  // ← Cycle
+
+Drop 불가능:
+- refcount(a) > 0 (b가 참조)
+- refcount(b) > 0 (a가 참조)
+- 메모리 누수
+
+명시적 해결책:
+- Option<Rc<...>>를 피함
+- Weak references 사용
+- External cycle breaker 필요
+```
+
+---
+
+## 🧪 현재 상태: 3개 구현체 일관성 체크
+
+### Python 구현
+
+```python
+# 예상 동작
+def semantic_probe_case1():
+    file_handle = open_file("test.txt", "w")  # RC=1, Cap=[file_write]
+
+    # 내부적으로 추적:
+    print(f"Before call: refcount={sys.getrefcount(file_handle)}")
+    # Output: Before call: refcount=2 (변수 + 함수 인자)
+
+    writer_task(file_handle)  # 파라미터로 전달
+
+    print(f"After call: refcount={sys.getrefcount(file_handle)}")
+    # Output: After call: refcount=2 (함수 종료했으므로 다시 1)
+```
+
+### TypeScript VM 구현
+
+```typescript
+// 예상 동작
+function semanticProbeCase1() {
+    const fileHandle = openFile("test.txt", "w");
+    // Internal: refcount=1, capability=[file_write]
+
+    console.log(`Before call: RC=${fileHandle.refcount}`);
+    // Output: Before call: RC=1
+
+    writerTask(fileHandle);  // 파라미터로 전달
+    // Internal: 함수 진입 시 refcount -> 2
+    //          함수 종료 시 refcount -> 1
+
+    console.log(`After call: RC=${fileHandle.refcount}`);
+    // Output: After call: RC=1
+}
+```
+
+### C RC 구현
+
+```c
+// 예상 동작
+void semantic_probe_case1() {
+    Object *file_handle = open_file("test.txt", "w");
+    // refcount = 1, capability = [file_write]
+
+    printf("Before call: rc=%d\n", file_handle->rc);
+    // Output: Before call: rc=1
+
+    writer_task(file_handle);
+    // 함수 진입: rc_inc(file_handle) -> rc=2
+    // 함수 종료: rc_dec(file_handle) -> rc=1
+
+    printf("After call: rc=%d\n", file_handle->rc);
+    // Output: After call: rc=1
+}
+```
+
+---
+
+## 🚨 현재 불일치 추정 지점
+
+| 항목 | Python | TS VM | C RC | 위험도 |
+|------|--------|-------|------|--------|
+| **RC 증가 시점** | 파라미터 전달 시 | 함수 호출 시 | 함수 진입 시 | 🔴 다를 수 있음 |
+| **Capability 전파** | 명시 안 됨 | 명시 안 됨 | 명시 안 됨 | 🔴 불명확 |
+| **Drop 시 Cap 체크** | 런타임? | 컴파일? | 컴파일? | 🔴 불일치 가능 |
+| **Cycle 정책** | Python GC 사용 | 누수? | 누수? | 🟡 문서화 필요 |
+
+---
+
+## 📝 검증 체크리스트
+
+### 단기 (1주)
+
+- [ ] 5개 Probe Case 모두에 대해 3개 구현체 실행
+- [ ] 출력 결과 비교 (일치도 체크)
+- [ ] 불일치 발견 시 즉시 SPEC.md 규칙 추가
+
+### 중기 (2주)
+
+- [ ] SPEC.md에 formal semantics 추가
+- [ ] 각 규칙마다 예제 코드 포함
+- [ ] 모든 구현체가 SPEC 따르는지 재검증
+
+### 장기 (1개월)
+
+- [ ] 50~100개 테스트 케이스로 확장
+- [ ] Golden test suite 구성
+- [ ] Fuzzing으로 추가 버그 발견
+
+---
+
+## 💡 결론
+
+지금 당신이 가진 상황:
+
+```
+[Python 구현]  [TS VM 구현]  [C RC 구현]
+     ↓              ↓             ↓
+  모두 "FreeLang v1.1"이라고 부름
+
+하지만:
+  RC 증가 시점?  ← 다를 수 있음
+  Capability 전파?  ← 다를 수 있음
+  Drop 타이밍?  ← 다를 수 있음
+
+→ 지금 검증해야 함. 나중에는 너무 복잡함.
+```
+
+이 검증 후에야 비로소:
+✅ "모든 구현체가 같은 의미론을 따른다"고 자신 있게 말할 수 있음.
+
+---
+
+**다음 단계**: 이 5개 Probe Case를 실제로 실행해서 일관성 확인.
+필요하면 SPEC.md 규칙 추가 필요.
+
+기록이 증명이다 ✨

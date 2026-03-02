@@ -1,0 +1,583 @@
+// ============================================================
+// Go 201-2-1: 고루틴 스케줄링의 심연 - GMP 모델
+// ============================================================
+//
+// 주제: GMP 모델 (G, M, P), 워크 스틸링, 선점형 스케줄링
+//
+// 포함 내용:
+// 1. GMP 개념 설명
+// 2. G (Goroutine) 상세 분석
+// 3. M (Machine/OS Thread)
+// 4. P (Processor) 역할
+// 5. 워크 스틸링 (Work Stealing) 원리
+// 6. 선점형 스케줄링 (Preemptive Scheduling)
+// 7. runtime 패키지 활용 (GOMAXPROCS, NumGoroutine, Gosched)
+// 8. Assignment 2-1: 성능 벤치마킹 및 데드락 탐지
+
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"time"
+)
+
+// ============================================================
+// 섹션 1: GMP 모델 개념 설명
+// ============================================================
+
+func section1_GMPConcept() {
+	fmt.Println("\n[섹션 1] GMP 모델: Go의 스케줄러 아키텍처")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ GMP란?")
+	fmt.Println("")
+	fmt.Println("  G (Goroutine): 우리가 'go' 키워드로 생성한 경량 작업")
+	fmt.Println("    • 스택 크기: ~4KB (동적)")
+	fmt.Println("    • 상태: Runnable, Running, Waiting, Blocked")
+	fmt.Println("    • 수량: 수백만 개 가능")
+	fmt.Println("")
+	fmt.Println("  M (Machine): 실제 OS 쓰레드")
+	fmt.Println("    • 스택 크기: ~2MB (고정)")
+	fmt.Println("    • 수량: 보통 몇 개 ~ 수십 개")
+	fmt.Println("    • 역할: G를 실제로 CPU에서 실행")
+	fmt.Println("")
+	fmt.Println("  P (Processor): 리소스 관리자 (추상화된 프로세서)")
+	fmt.Println("    • CPU 코어처럼 동작")
+	fmt.Println("    • 수량: 보통 CPU 코어 개수")
+	fmt.Println("    • 역할: 로컬 대기열 관리, M과 G 연결")
+
+	fmt.Println("\n✓ GMP 아키텍처 다이어그램:")
+	fmt.Println("")
+	fmt.Println("  ┌─────────────────────────────────────────────────┐")
+	fmt.Println("  │           Go 런타임 스케줄러                      │")
+	fmt.Println("  ├─────────────────────────────────────────────────┤")
+	fmt.Println("  │  ┌──────────┐  ┌──────────┐  ┌──────────┐      │")
+	fmt.Println("  │  │  P0      │  │  P1      │  │  P2      │      │")
+	fmt.Println("  │  │(CPU 0)   │  │(CPU 1)   │  │(CPU 2)   │      │")
+	fmt.Println("  │  │┌────────┐│  │┌────────┐│  │┌────────┐│      │")
+	fmt.Println("  │  ││G1 G2 G3││  ││G4 G5 G6││  ││G7 G8   ││      │")
+	fmt.Println("  │  │└────────┘│  │└────────┘│  │└────────┘│      │")
+	fmt.Println("  │  │    ↓     │  │    ↓     │  │    ↓     │      │")
+	fmt.Println("  │  │┌────────┐│  │┌────────┐│  │┌────────┐│      │")
+	fmt.Println("  │  ││  M0    ││  ││  M1    ││  ││  M2    ││      │")
+	fmt.Println("  │  │└────────┘│  │└────────┘│  │└────────┘│      │")
+	fmt.Println("  │  └──────────┘  └──────────┘  └──────────┘      │")
+	fmt.Println("  │                                                 │")
+	fmt.Println("  │      ┌──────────────────────────────────┐       │")
+	fmt.Println("  │      │   Global Queue (모든 P 공유)     │       │")
+	fmt.Println("  │      └──────────────────────────────────┘       │")
+	fmt.Println("  └─────────────────────────────────────────────────┘")
+
+	fmt.Println("\n✓ 실제 코드로 보는 GMP:")
+	fmt.Printf("  • CPU 코어 개수: %d\n", runtime.NumCPU())
+	fmt.Printf("  • 현재 P 개수: %d\n", runtime.GOMAXPROCS(-1))
+	fmt.Printf("  • 현재 활성 고루틴: %d\n", runtime.NumGoroutine())
+}
+
+// ============================================================
+// 섹션 2: G (Goroutine) 분석
+// ============================================================
+
+func section2_GoroutineAnalysis() {
+	fmt.Println("\n[섹션 2] G (Goroutine): 경량 작업 단위")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ Goroutine vs OS Thread 비교:")
+	fmt.Println("")
+	fmt.Println("  메모리:")
+	fmt.Println("    • OS Thread: 1개당 2MB")
+	fmt.Println("    • Goroutine: 1개당 4KB")
+	fmt.Println("    • 비율: 2MB ÷ 4KB = 500배 효율!")
+	fmt.Println("")
+	fmt.Println("  동시성:")
+	fmt.Println("    • OS Thread: 최대 수백 개")
+	fmt.Println("    • Goroutine: 수백만 개")
+	fmt.Println("")
+	fmt.Println("  생성 비용:")
+	fmt.Println("    • OS Thread: 매우 비쌈 (커널 호출)")
+	fmt.Println("    • Goroutine: 매우 싼 비용")
+
+	fmt.Println("\n✓ Goroutine 상태 머신:")
+	fmt.Println("")
+	fmt.Println("  생성 → Runnable (실행 대기)")
+	fmt.Println("         ↓")
+	fmt.Println("       Running (CPU에서 실행 중)")
+	fmt.Println("         ├→ Waiting (채널/뮤텍스 대기)")
+	fmt.Println("         ├→ Blocked (시스템 호출)")
+	fmt.Println("         └→ Runnable (다시 실행 가능)")
+	fmt.Println("         ↓")
+	fmt.Println("       완료")
+
+	fmt.Println("\n✓ 실제 구현 예시:")
+
+	// 고루틴 생성 및 추적
+	start := time.Now()
+	initialG := runtime.NumGoroutine()
+	fmt.Printf("  초기 고루틴: %d\n", initialG)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			time.Sleep(100 * time.Millisecond)
+			fmt.Printf("    • G%d 완료\n", id)
+		}(i)
+	}
+
+	fmt.Printf("  생성 직후: %d개 고루틴\n", runtime.NumGoroutine())
+
+	wg.Wait()
+	fmt.Printf("  완료 후: %d개 고루틴\n", runtime.NumGoroutine())
+	fmt.Printf("  소요 시간: %v\n", time.Since(start))
+}
+
+// ============================================================
+// 섹션 3: M (Machine) 분석
+// ============================================================
+
+func section3_MachineAnalysis() {
+	fmt.Println("\n[섹션 3] M (Machine): OS 쓰레드")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ M (OS Thread)의 특징:")
+	fmt.Println("")
+	fmt.Println("  1. 커널 자원 사용")
+	fmt.Println("     • 각 M은 독립적인 스택 (2MB)")
+	fmt.Println("     • TLS (Thread Local Storage)")
+	fmt.Println("")
+	fmt.Println("  2. 1:1 G 실행")
+	fmt.Println("     • 한 번에 하나의 G만 실행")
+	fmt.Println("     • G가 블록되면 다른 G로 전환")
+	fmt.Println("")
+	fmt.Println("  3. 생명주기")
+	fmt.Println("     • go 키워드 실행 시 필요 시 생성")
+	fmt.Println("     • 현재 M이 모두 blocked일 때 추가 생성")
+	fmt.Println("     • 유휴 시 타임아웃으로 소멸 (몇 분)")
+
+	fmt.Println("\n✓ M과 블로킹 시스템 호출:")
+	fmt.Println("")
+	fmt.Println("  경우 1: G가 non-blocking 작업")
+	fmt.Println("    M0 [G1] → (채널 수신 대기) → M0 [G2] ← 컨텍스트 스위칭")
+	fmt.Println("")
+	fmt.Println("  경우 2: G가 blocking 시스템 호출 (파일 I/O 등)")
+	fmt.Println("    M0 [G1] → (파일 읽음) → M1 생성 [G2] ← 새 M 생성!")
+
+	fmt.Println("\n✓ 현재 실행 중인 M 상태:")
+	numGoroutines := runtime.NumGoroutine()
+	fmt.Printf("  활성 고루틴: %d\n", numGoroutines)
+
+	// 스택 정보 출력
+	buf := make([]byte, 1024)
+	n := runtime.Stack(buf, false)
+	fmt.Printf("  현재 스택 크기: %d bytes\n", n)
+}
+
+// ============================================================
+// 섹션 4: P (Processor) 분석
+// ============================================================
+
+func section4_ProcessorAnalysis() {
+	fmt.Println("\n[섹션 4] P (Processor): 리소스 관리자")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ P (Processor)의 역할:")
+	fmt.Println("")
+	fmt.Println("  1. 로컬 대기열 관리")
+	fmt.Println("     • 각 P는 독립적인 G 대기열 유지")
+	fmt.Println("     • 뮤텍스 불필요 (캐시 친화적)")
+	fmt.Println("")
+	fmt.Println("  2. M과의 연결")
+	fmt.Println("     • P는 M을 '소유'")
+	fmt.Println("     • M은 한 번에 하나의 P만 사용")
+	fmt.Println("     • M과 P의 연결은 동적")
+
+	fmt.Println("\n✓ GOMAXPROCS: P 개수 제어")
+	fmt.Println("")
+
+	// CPU 코어 개수 확인
+	numCPU := runtime.NumCPU()
+	fmt.Printf("  • CPU 코어 개수: %d\n", numCPU)
+
+	// 현재 P 개수
+	currentP := runtime.GOMAXPROCS(-1)
+	fmt.Printf("  • 현재 P 개수: %d\n", currentP)
+
+	// 다양한 P 설정 시뮬레이션
+	fmt.Println("\n✓ 다양한 P 설정의 영향:")
+	fmt.Println("")
+
+	for p := 1; p <= 4; p++ {
+		fmt.Printf("  P=%d인 경우: 최대 %d개 고루틴이 동시 실행\n", p, p)
+	}
+
+	fmt.Println("\n✓ 메모리 할당 최적화 (mcache):")
+	fmt.Println("  • 각 P는 mcache (메모리 캐시) 소유")
+	fmt.Println("  • 메모리 할당 시 락 불필요")
+	fmt.Println("  • P마다 독립적 → 캐시 미스 감소")
+}
+
+// ============================================================
+// 섹션 5: 워크 스틸링 (Work Stealing)
+// ============================================================
+
+func section5_WorkStealing() {
+	fmt.Println("\n[섹션 5] 워크 스틸링 (Work Stealing)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ 문제 상황:")
+	fmt.Println("")
+	fmt.Println("  일반적인 작업 분배:")
+	fmt.Println("  ┌─────────────┐  ┌─────────────┐")
+	fmt.Println("  │ P0          │  │ P1          │")
+	fmt.Println("  │ [G1,G2,G3] │  │ []          │ ← 유휴!")
+	fmt.Println("  └─────────────┘  └─────────────┘")
+	fmt.Println("")
+	fmt.Println("  결과: P1의 M은 아무것도 할 수 없음 (CPU 낭비)")
+
+	fmt.Println("\n✓ 해결책: 워크 스틸링")
+	fmt.Println("")
+	fmt.Println("  P1이 P0의 대기열에서 G를 '훔친다':")
+	fmt.Println("  ┌─────────────┐  ┌─────────────┐")
+	fmt.Println("  │ P0          │  │ P1          │")
+	fmt.Println("  │ [G1,G2]    │  │ [G3]        │ ← 훔친 것!")
+	fmt.Println("  └─────────────┘  └─────────────┘")
+	fmt.Println("")
+	fmt.Println("  결과: 모든 P가 활용됨 (CPU 효율 100%)")
+
+	fmt.Println("\n✓ 워크 스틸링 알고리즘 (의사 코드):")
+	fmt.Println("")
+	fmt.Println("  P_i의 M이 G를 완료했을 때:")
+	fmt.Println("    1. P_i의 로컬 대기열 확인")
+	fmt.Println("    2. 없으면 → 전역 대기열 확인")
+	fmt.Println("    3. 없으면 → 다른 P의 대기열에서 훔치기")
+	fmt.Println("    4. 절반을 훔침 (50% 규칙)")
+
+	fmt.Println("\n✓ 실제 시뮬레이션:")
+
+	// 워크 스틸링 효과 시뮬레이션
+	tasks := 100
+	workers := 4
+
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	// GOMAXPROCS 설정
+	runtime.GOMAXPROCS(workers)
+
+	for i := 0; i < tasks; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 간단한 작업
+			sum := 0
+			for j := 0; j < 1000000; j++ {
+				sum += j
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("  작업: %d개\n", tasks)
+	fmt.Printf("  워커(P): %d개\n", workers)
+	fmt.Printf("  소요 시간: %v\n", elapsed)
+	fmt.Printf("  추정 처리량: %.0f 작업/초\n", float64(tasks)/elapsed.Seconds())
+}
+
+// ============================================================
+// 섹션 6: 선점형 스케줄링 (Preemptive Scheduling)
+// ============================================================
+
+func section6_PreemptiveScheduling() {
+	fmt.Println("\n[섹션 6] 선점형 스케줄링 (Go 1.14+)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ 문제 (Go 1.13 이전):")
+	fmt.Println("")
+	fmt.Println("  무한 루프 고루틴이 시스템을 멈추게 함:")
+	fmt.Println("")
+	fmt.Println("    go func() {")
+	fmt.Println("        for { }  // 무한 루프")
+	fmt.Println("    }()")
+	fmt.Println("    fmt.Println(\"이 줄은 절대 실행되지 않음\")")
+	fmt.Println("")
+	fmt.Println("  → 고루틴이 제어권을 양보하지 않으므로")
+	fmt.Println("     메인 고루틴은 실행 기회를 얻을 수 없음 (데드락)")
+
+	fmt.Println("\n✓ 해결책 (Go 1.14+): 선점형 스케줄링")
+	fmt.Println("")
+	fmt.Println("  Go 런타임이 주기적으로 체크 (10ms):")
+	fmt.Println("    1. 현재 G가 10ms 이상 실행했나?")
+	fmt.Println("    2. 예 → 강제로 컨텍스트 스위칭")
+	fmt.Println("    3. 다른 G에게 기회 제공")
+
+	fmt.Println("\n✓ 효과:")
+	fmt.Println("")
+	fmt.Println("  • 공정성 (Fairness)")
+	fmt.Println("    모든 고루틴이 실행 기회를 얻음")
+	fmt.Println("")
+	fmt.Println("  • 응답성 (Responsiveness)")
+	fmt.Println("    UI 반응성 향상")
+	fmt.Println("")
+	fmt.Println("  • 안정성 (Stability)")
+	fmt.Println("    무한 루프 하나가 시스템 멈추지 않음")
+
+	fmt.Println("\n✓ 실제 확인 (Go 1.14 필수):")
+
+	// 선점형 스케줄링 테스트
+	fmt.Println("")
+	runtime.GOMAXPROCS(1)  // 1개 코어로 제한
+
+	done := make(chan bool)
+
+	// 고강도 계산 고루틴
+	go func() {
+		fmt.Println("  • 고강도 계산 시작")
+		for i := 0; i < 100000000; i++ {
+			_ = i * i
+		}
+		fmt.Println("  • 고강도 계산 완료")
+		done <- true
+	}()
+
+	// 메인 고루틴도 실행 가능한가?
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("  ✓ 메인 고루틴이 실행됨 (선점 성공!)")
+
+	<-done
+}
+
+// ============================================================
+// 섹션 7: runtime 패키지 활용
+// ============================================================
+
+func section7_RuntimePackage() {
+	fmt.Println("\n[섹션 7] runtime 패키지: 스케줄러 제어")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ 핵심 함수:")
+	fmt.Println("")
+	fmt.Println("  1. runtime.GOMAXPROCS(n)")
+	fmt.Println("     • P의 개수 설정")
+	fmt.Println("     • GOMAXPROCS(-1): 현재값 반환")
+	fmt.Println("")
+	fmt.Println("  2. runtime.NumGoroutine()")
+	fmt.Println("     • 현재 활성 고루틴 개수")
+	fmt.Println("")
+	fmt.Println("  3. runtime.Gosched()")
+	fmt.Println("     • 현재 고루틴에서 제어권 양보")
+	fmt.Println("     • 다른 고루틴이 실행할 기회 제공")
+	fmt.Println("")
+	fmt.Println("  4. runtime.NumCPU()")
+	fmt.Println("     • CPU 코어 개수 반환")
+	fmt.Println("")
+	fmt.Println("  5. runtime.Stack()")
+	fmt.Println("     • 현재 스택 정보 출력")
+
+	fmt.Println("\n✓ GOMAXPROCS 실습:")
+	fmt.Println("")
+
+	// 기본 P 개수
+	defaultP := runtime.GOMAXPROCS(-1)
+	fmt.Printf("  기본 P: %d\n", defaultP)
+
+	// P 변경
+	oldP := runtime.GOMAXPROCS(2)
+	fmt.Printf("  P를 2로 변경: %d → 2\n", oldP)
+	fmt.Printf("  이제 최대 2개 고루틴이 동시 실행\n")
+
+	// P 복원
+	runtime.GOMAXPROCS(defaultP)
+	fmt.Printf("  P 복원: %d\n", defaultP)
+
+	fmt.Println("\n✓ NumGoroutine 실습:")
+	fmt.Println("")
+
+	fmt.Printf("  메인 시작: %d\n", runtime.NumGoroutine())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(50 * time.Millisecond)
+		}()
+	}
+
+	fmt.Printf("  생성 직후: %d\n", runtime.NumGoroutine())
+
+	wg.Wait()
+	fmt.Printf("  완료 후: %d\n", runtime.NumGoroutine())
+
+	fmt.Println("\n✓ Gosched 실습:")
+	fmt.Println("")
+
+	go func() {
+		fmt.Println("  • G1 시작")
+		runtime.Gosched()  // 다른 G에게 양보
+		fmt.Println("  • G1 재개")
+	}()
+
+	go func() {
+		fmt.Println("  • G2 시작 (G1이 양보했으므로 실행 기회 획득)")
+		fmt.Println("  • G2 종료")
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+}
+
+// ============================================================
+// 섹션 8: Assignment 2-1 구현
+// ============================================================
+
+func section8_Assignment() {
+	fmt.Println("\n[섹션 8] Assignment 2-1: GOMAXPROCS 벤치마킹")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n✓ 과제 1: GOMAXPROCS 벤치마킹")
+	fmt.Println("")
+
+	// 작은 규모로 시연 (실제로는 더 큰 규모)
+	tasks := 10000
+
+	fmt.Printf("  작업 개수: %d\n", tasks)
+	fmt.Println("")
+
+	results := make(map[int]time.Duration)
+
+	for p := 1; p <= 4; p++ {
+		runtime.GOMAXPROCS(p)
+
+		start := time.Now()
+		var wg sync.WaitGroup
+
+		for i := 0; i < tasks; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// 작은 작업
+				for j := 0; j < 10000; j++ {
+					_ = j
+				}
+			}()
+		}
+
+		wg.Wait()
+		elapsed := time.Since(start)
+		results[p] = elapsed
+
+		fmt.Printf("  P=%d: %v\n", p, elapsed)
+	}
+
+	// 개선율 계산
+	fmt.Println("")
+	baseline := results[1]
+	for p := 2; p <= 4; p++ {
+		improvement := float64(baseline) / float64(results[p])
+		fmt.Printf("  P=%d → P=1 대비 %.2fx 빠름\n", p, improvement)
+	}
+
+	fmt.Println("\n✓ 과제 2: 데드락 탐지 (의도적 시뮬레이션)")
+	fmt.Println("")
+	fmt.Println("  데드락 코드 패턴:")
+	fmt.Println("    ch := make(chan int)  // 버퍼 없음")
+	fmt.Println("    go func() {")
+	fmt.Println("        data := <-ch  // 영원히 대기")
+	fmt.Println("    }()")
+	fmt.Println("    // 모든 고루틴이 블록됨 → panic!")
+
+	fmt.Println("\n  Go 런타임의 감지:")
+	fmt.Println("    panic: all goroutines are asleep - deadlock!")
+	fmt.Println("    [이 상황은 실제로 발생시키면 프로그램이 멈추므로")
+	fmt.Println("     시뮬레이션으로 설명]")
+
+	fmt.Println("\n✓ 과제 3: 워크 스틸링 시뮬레이션")
+	fmt.Println("")
+	fmt.Println("  불균형한 작업 분배:")
+	fmt.Println("    P0에 100개 작업, P1에 0개 작업")
+	fmt.Println("    → P1의 M이 P0의 작업을 '훔쳐서' 처리")
+	fmt.Println("    → 모든 코어 활용 (CPU 효율 상승)")
+}
+
+// ============================================================
+// 라우트 맵 출력
+// ============================================================
+
+func printRouteMap() {
+	fmt.Println("\n" + sep(70))
+	fmt.Println("📍 Go 201-2-1: 고루틴 스케줄링의 심연 - GMP 모델")
+	fmt.Println(sep(70))
+
+	sections := []struct {
+		number int
+		title  string
+		topics string
+	}{
+		{1, "GMP 개념", "G, M, P 삼각형 구조"},
+		{2, "G 분석", "Goroutine 상태 머신, 경량성"},
+		{3, "M 분석", "OS 쓰레드, 블로킹 처리"},
+		{4, "P 분석", "Processor 역할, mcache"},
+		{5, "워크 스틸링", "작업 균형 분배, CPU 효율"},
+		{6, "선점형 스케줄링", "10ms 타이머, 공정성 보장"},
+		{7, "runtime 패키지", "GOMAXPROCS, NumGoroutine, Gosched"},
+		{8, "Assignment 2-1", "벤치마킹, 데드락 탐지"},
+	}
+
+	fmt.Println("\n섹션 목록:")
+	for _, s := range sections {
+		fmt.Printf("%d. %-15s - %s\n", s.number, s.title, s.topics)
+	}
+}
+
+// ============================================================
+// Main 함수
+// ============================================================
+
+func main() {
+	fmt.Println(sep(70))
+	fmt.Println("🎓 Go 201-2-1: 고루틴 스케줄링의 심연 - GMP 모델")
+	fmt.Println(sep(70))
+
+	// 각 섹션 실행
+	section1_GMPConcept()
+	section2_GoroutineAnalysis()
+	section3_MachineAnalysis()
+	section4_ProcessorAnalysis()
+	section5_WorkStealing()
+	section6_PreemptiveScheduling()
+	section7_RuntimePackage()
+	section8_Assignment()
+
+	// 라우트 맵 출력
+	printRouteMap()
+
+	// 최종 메시지
+	fmt.Println("\n" + sep(70))
+	fmt.Println("✅ Go 201-2-1: GMP 모델 학습 완료!")
+	fmt.Println("════════════════════════════════════════════════════════════════════════")
+	fmt.Println("")
+	fmt.Println("[핵심 깨달음]")
+	fmt.Println("✓ Go는 매우 경량의 고루틴을 수백만 개 생성 가능")
+	fmt.Println("✓ GMP 모델로 효율적으로 관리")
+	fmt.Println("✓ 워크 스틸링으로 CPU 활용률 최대화")
+	fmt.Println("✓ 선점형 스케줄링으로 공정성 보장")
+	fmt.Println("")
+	fmt.Println("[결론]")
+	fmt.Println("Go는 다른 언어가 꿈꾸는 '진정한 동시성'을 구현했다.")
+	fmt.Println("")
+	fmt.Println(sep(70))
+	fmt.Println("")
+}
+
+// sep: 구분선 생성 헬퍼 함수
+func sep(length int) string {
+	result := ""
+	for i := 0; i < length; i++ {
+		result += "="
+	}
+	return result
+}

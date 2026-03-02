@@ -1,0 +1,267 @@
+/**
+ * 인덱스 관리자
+ *
+ * - B-Tree 인덱싱 전략
+ * - 복합 인덱스 관리
+ * - 자동 인덱스 제안
+ */
+
+import type { IndexInfo, IndexAdvice } from '../types/performance.types';
+
+export class IndexManager {
+  private _db: any;
+  private _indexes = new Map<string, IndexInfo>();
+  private _indexStats = new Map<string, { uses: number; scans: number }>();
+
+  constructor(db: any) {
+    this._db = db;
+    this._loadExistingIndexes();
+  }
+
+  /**
+   * 기존 인덱스 로드
+   */
+  private _loadExistingIndexes(): void {
+    try {
+      const indexes = this._db.queryAll(`
+        SELECT name, tbl_name as table_name, sql
+        FROM sqlite_master
+        WHERE type='index' AND sql IS NOT NULL
+      `);
+
+      for (const idx of indexes) {
+        const info: IndexInfo = {
+          name: idx.name,
+          table: idx.table_name,
+          columns: this._parseColumns(idx.sql),
+          type: 'SINGLE',
+          unique: idx.sql?.includes('UNIQUE') || false,
+          createdAt: Date.now(),
+          size: 0,
+          cardinality: 0
+        };
+
+        this._indexes.set(idx.name, info);
+        this._indexStats.set(idx.name, { uses: 0, scans: 0 });
+      }
+    } catch (error) {
+      console.error('Failed to load existing indexes:', error);
+    }
+  }
+
+  /**
+   * 단일 컬럼 인덱스 생성
+   */
+  createIndex(
+    table: string,
+    columns: string[],
+    options?: { unique?: boolean; name?: string }
+  ): IndexInfo {
+    const unique = options?.unique ? 'UNIQUE' : '';
+    const indexName = options?.name || `idx_${table}_${columns.join('_')}`;
+    const columnList = columns.join(', ');
+
+    try {
+      this._db.exec(`CREATE ${unique} INDEX IF NOT EXISTS ${indexName} ON ${table}(${columnList})`);
+
+      const info: IndexInfo = {
+        name: indexName,
+        table,
+        columns,
+        type: columns.length === 1 ? 'SINGLE' : 'COMPOSITE',
+        unique: options?.unique || false,
+        createdAt: Date.now(),
+        size: 0,
+        cardinality: this._estimateCardinality(table, columns[0])
+      };
+
+      this._indexes.set(indexName, info);
+      this._indexStats.set(indexName, { uses: 0, scans: 0 });
+
+      return info;
+    } catch (error) {
+      throw new Error(`Failed to create index: ${error}`);
+    }
+  }
+
+  /**
+   * 복합 인덱스 생성
+   */
+  createCompositeIndex(
+    table: string,
+    columns: string[],
+    options?: { covering?: string[]; name?: string }
+  ): IndexInfo {
+    const indexName = options?.name || `idx_${table}_${columns.join('_')}`;
+
+    // Covering index의 경우 추가 컬럼 포함
+    const fullColumns = [
+      ...columns,
+      ...(options?.covering || [])
+    ];
+
+    return this.createIndex(table, fullColumns, { name: indexName });
+  }
+
+  /**
+   * 드롭 인덱스
+   */
+  dropIndex(name: string): void {
+    try {
+      this._db.exec(`DROP INDEX IF EXISTS ${name}`);
+      this._indexes.delete(name);
+      this._indexStats.delete(name);
+    } catch (error) {
+      throw new Error(`Failed to drop index: ${error}`);
+    }
+  }
+
+  /**
+   * 인덱스 통계
+   */
+  getIndexStats(name?: string): IndexInfo | IndexInfo[] {
+    if (name) {
+      return this._indexes.get(name) || { name, table: '', columns: [], type: 'SINGLE', unique: false, createdAt: 0, size: 0, cardinality: 0 };
+    }
+    return Array.from(this._indexes.values());
+  }
+
+  /**
+   * 인덱스 사용 추적
+   */
+  trackIndexUse(indexName: string): void {
+    const stat = this._indexStats.get(indexName);
+    if (stat) {
+      stat.uses++;
+    }
+  }
+
+  /**
+   * 인덱스 스캔 추적
+   */
+  trackIndexScan(indexName: string): void {
+    const stat = this._indexStats.get(indexName);
+    if (stat) {
+      stat.scans++;
+    }
+  }
+
+  /**
+   * 쿼리 분석 및 자동 인덱스 추천
+   */
+  analyzeAndRecommend(sql: string): IndexAdvice[] {
+    const advice: IndexAdvice[] = [];
+
+    // WHERE 절 분석
+    const whereMatch = sql.match(/WHERE\s+(.+?)(?:ORDER|GROUP|LIMIT|$)/i);
+    if (whereMatch) {
+      const conditions = whereMatch[1].split(/\s+AND\s+/i);
+
+      for (const condition of conditions) {
+        const columnMatch = condition.match(/(\w+)\s*[=<>]/);
+        if (columnMatch) {
+          const column = columnMatch[1];
+
+          // 기존 인덱스 확인
+          const hasIndex = Array.from(this._indexes.values()).some(idx =>
+            idx.columns.includes(column)
+          );
+
+          if (!hasIndex) {
+            advice.push({
+              table: this._extractTableName(sql),
+              columns: [column],
+              benefit: 80,
+              impact: 90,
+              priority: 'HIGH',
+              reason: 'Column used in WHERE clause without index'
+            });
+          }
+        }
+      }
+    }
+
+    // ORDER BY 분석
+    const orderMatch = sql.match(/ORDER\s+BY\s+(.+?)(?:LIMIT|$)/i);
+    if (orderMatch) {
+      const columns = orderMatch[1].split(',').map(c => c.trim().split(/\s+/)[0]);
+
+      for (const column of columns) {
+        const hasIndex = Array.from(this._indexes.values()).some(idx =>
+          idx.columns.includes(column)
+        );
+
+        if (!hasIndex) {
+          advice.push({
+            table: this._extractTableName(sql),
+            columns: [column],
+            benefit: 50,
+            impact: 70,
+            priority: 'MEDIUM',
+            reason: 'Column used in ORDER BY clause'
+          });
+        }
+      }
+    }
+
+    return advice;
+  }
+
+  /**
+   * 기수성 추정
+   */
+  private _estimateCardinality(table: string, column: string): number {
+    try {
+      const result = (this._db.query as any)(
+        `SELECT COUNT(DISTINCT ${column}) as distinct FROM ${table}`
+      );
+      return result?.distinct || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * 테이블명 추출
+   */
+  private _extractTableName(sql: string): string {
+    const match = sql.match(/FROM\s+(\w+)/i);
+    return match ? match[1] : 'unknown';
+  }
+
+  /**
+   * 컬럼 파싱
+   */
+  private _parseColumns(sql: string): string[] {
+    const match = sql.match(/\((.*?)\)/);
+    if (!match) return [];
+
+    return match[1]
+      .split(',')
+      .map(col => col.trim())
+      .filter(col => col.length > 0);
+  }
+
+  /**
+   * 모든 인덱스 조회
+   */
+  listAllIndexes(): IndexInfo[] {
+    return Array.from(this._indexes.values());
+  }
+
+  /**
+   * 인덱스 효율성 계산 (0-100)
+   */
+  getIndexEfficiency(name: string): number {
+    const stat = this._indexStats.get(name);
+    if (!stat) return 0;
+
+    // 사용 횟수 / 스캔 횟수 비율
+    if (stat.scans === 0) return 0;
+
+    const ratio = stat.uses / (stat.scans + 1);
+    return Math.min(Math.round(ratio * 100), 100);
+  }
+}
+
+export default IndexManager;

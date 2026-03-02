@@ -1,0 +1,416 @@
+# Phase 8 v9.1: 참조 카운팅과 공유 소유권 (Reference Counting & Shared Ownership)
+
+> **철학**: "하나의 데이터를 한곳에 가두지 말라.
+> 필요에 따라 유연하게 공유하되,
+> 모든 소유자가 떠날 때까지 그 데이터는 생존한다.
+> 이것이 Rc<T>가 보장하는 '공동 소유권'의 안전성이다."
+
+> **목표**: "다중 소유권의 구현"
+> 참조 카운팅을 통해 여러 소유자가 같은 데이터를 안전하게 공유하고,
+> 마지막 소유자가 떠날 때 자동으로 메모리를 해제한다.
+
+---
+
+## 🎯 v9.1이 해결하는 문제
+
+### 문제 1️⃣: 단일 소유권의 한계
+
+```rust
+// ❌ 불가능: 한 개의 데이터를 여러 곳에서 소유하고 싶다
+let data = Rc::new("공유 데이터");
+let owner1 = data;  // 소유권 이전
+let owner2 = data;  // ❌ 컴파일 에러: data는 이미 이동됨
+
+// ✅ Box<T>는 단일 소유자만 허용
+// ✅ Rc<T>는 다중 소유자를 허용!
+
+let data = Rc::new("공유 데이터");
+let owner1 = Rc::clone(&data);  // 참조 카운트 증가
+let owner2 = Rc::clone(&data);  // 참조 카운트 증가
+
+// owner1, owner2, data가 모두 같은 데이터를 소유
+```
+
+### 문제 2️⃣: 그래프 구조에서의 복잡한 관계
+
+```rust
+// ❌ 그래프의 여러 경로가 같은 노드를 가리키고 싶은데,
+// 소유권 때문에 불가능
+
+struct Node<T> {
+    value: T,
+    neighbors: Vec<Node<T>>,  // 이 노드는 여러 경로로 접근되어야 함
+}
+
+// ✅ Rc<T>로 해결
+struct Node<T> {
+    value: T,
+    neighbors: Vec<Rc<Node<T>>>,  // 여러 경로에서 접근 가능
+}
+```
+
+### 문제 3️⃣: 생명 주기가 얽혀 있는 데이터
+
+```rust
+// ❌ "언제 메모리를 해제할지 결정할 수 없다"
+// owner1이 남아있으면 data를 해제할 수 없고
+// owner2가 남아있어도 마찬가지
+
+// ✅ Rc<T>는 자동으로 해결
+// 마지막 소유자가 떠날 때만 메모리 해제
+// 카운트가 0이 될 때까지 데이터는 생존
+```
+
+---
+
+## 📚 Rc<T>의 정의
+
+### Rc<T>란?
+
+```
+Rc<T> = "Reference Counting"
+       = 소유자 수를 세어 관리하는 스마트 포인터
+
+참조 카운트:
+┌────────────────────────────────────────┐
+│         Rc<T> 구조                     │
+├────────────────────────────────────────┤
+│                                        │
+│  ┌─────────────────────────────────┐  │
+│  │ RefCount: 3 (현재 소유자 3명)   │  │
+│  │ data: 공유되는 실제 데이터       │  │
+│  └─────────────────────────────────┘  │
+│         ▲         ▲         ▲          │
+│         │         │         │          │
+│      owner1   owner2    owner3        │
+│                                        │
+└────────────────────────────────────────┘
+
+owner1 소멸 → 카운트 2
+owner2 소멸 → 카운트 1
+owner3 소멸 → 카운트 0 → 메모리 해제
+```
+
+### Rc<T>의 특징
+
+| 특징 | 설명 |
+|------|------|
+| **다중 소유권** | 여러 개의 소유자 가능 |
+| **자동 카운팅** | 소유자 생성/소멸 시 자동 증감 |
+| **불변 공유** | 읽기만 가능, 수정 불가 |
+| **싱글 스레드** | 스레드 안전 장치 없음 |
+| **자동 해제** | 마지막 소유자 떠날 때 해제 |
+| **가벼운 clone** | 데이터 복사 아님, 카운트만 증가 |
+
+---
+
+## 🔧 v9.1 설계: 세 가지 사용 패턴
+
+### 패턴 1️⃣: 그래프 구조 (Graph)
+
+```rust
+#[derive(Debug)]
+struct GraphNode<T> {
+    value: T,
+    neighbors: Vec<Rc<GraphNode<T>>>,
+}
+
+impl<T: Clone> GraphNode<T> {
+    fn new(value: T) -> Rc<Self> {
+        Rc::new(Self {
+            value,
+            neighbors: Vec::new(),
+        })
+    }
+
+    fn add_neighbor(self: &Rc<Self>, neighbor: Rc<GraphNode<T>>) {
+        // Rc를 통해 변경: RefCell이 필요 (v9.2)
+        // 지금은 생성 후 읽기만 가능
+    }
+}
+
+// 사용
+let node_a = GraphNode::new("A");
+let node_b = GraphNode::new("B");
+let node_c = GraphNode::new("C");
+
+// node_a → node_b, node_c로의 경로
+// 이 구조는 Rc 없이는 불가능
+```
+
+### 패턴 2️⃣: UI 트리 구조 (Tree)
+
+```rust
+#[derive(Debug)]
+struct UINode<T> {
+    value: T,
+    parent: Option<Rc<UINode<T>>>,
+    children: Vec<Rc<UINode<T>>>,
+}
+
+// 각 노드는 부모를 알고 있고,
+// 각 부모는 자식들을 알고 있음
+// 순환 참조도 가능!
+
+// 자식이 여러 부모를 가질 수 있음
+// 예: 복잡한 UI 레이아웃
+```
+
+### 패턴 3️⃣: 데이터 공유 뱅크 (Data Bank)
+
+```rust
+#[derive(Clone)]
+struct DataBank {
+    inventory: Rc<Vec<String>>,
+}
+
+impl DataBank {
+    fn new(items: Vec<String>) -> Self {
+        Self {
+            inventory: Rc::new(items),
+        }
+    }
+
+    fn checkout(&self) -> Rc<Vec<String>> {
+        Rc::clone(&self.inventory)
+    }
+}
+
+// 여러 모듈이 같은 inventory를 참고
+let bank = DataBank::new(vec!["A", "B", "C"]);
+let inventory1 = bank.checkout();  // 카운트: 2
+let inventory2 = bank.checkout();  // 카운트: 3
+
+// 모두 같은 데이터를 가리킴
+```
+
+---
+
+## 🏗️ v9.1 실전 설계: Gogs 멀티 포인트 구조
+
+### 설계 구조: 공유 데이터 네트워크
+
+```rust
+#[derive(Debug, Clone)]
+enum GogsNode {
+    // 여러 경로가 이 노드를 가리킬 수 있음
+    Share(i32, Rc<GogsNode>),
+    Nil,
+}
+
+// 메모리 배치
+
+// Rc<GogsNode::Share(10, ...)>
+┌────────────────────┐
+│ RefCount: 3        │  참조 카운트
+│ ┌────────────────┐ │
+│ │ Share(10, ...) │ │  실제 데이터
+│ └────────────────┘ │
+└────────────────────┘
+    ▲     ▲     ▲
+    │     │     │
+ owner1 owner2 owner3
+
+owner1이 사라지면: RefCount = 2
+owner2가 사라지면: RefCount = 1
+owner3이 사라지면: RefCount = 0 → 메모리 해제
+```
+
+### 메서드 설계
+
+```rust
+impl GogsNode {
+    /// 지정된 값과 다음 노드를 가진 공유 노드를 생성합니다.
+    fn new(value: i32, next: GogsNode) -> Rc<Self> {
+        Rc::new(GogsNode::Share(value, Rc::new(next)))
+    }
+
+    /// 노드의 첫 번째 값을 반환합니다.
+    fn value(&self) -> Option<i32> {
+        match self {
+            GogsNode::Share(val, _) => Some(*val),
+            GogsNode::Nil => None,
+        }
+    }
+
+    /// 노드의 다음 노드를 반환합니다.
+    fn next(&self) -> Option<Rc<GogsNode>> {
+        match self {
+            GogsNode::Share(_, next) => Some(Rc::clone(next)),
+            GogsNode::Nil => None,
+        }
+    }
+
+    /// 노드를 공유합니다 (참조 카운트 증가).
+    fn share(&self) -> Rc<GogsNode>
+    where
+        Self: Sized,
+    {
+        Rc::clone(&self)  // 실제로는 Rc로 감싸여야 함
+    }
+}
+```
+
+---
+
+## 💡 v9.1 황금률
+
+### 원칙 1️⃣: Rc::clone(&) vs clone()
+
+```rust
+// ❌ clone() - 전체 데이터 복사 (비효율)
+let data = Rc::new(vec![1; 1_000_000]);
+let copy = data.clone();  // 1MB 복사!
+
+// ✅ Rc::clone(&) - 카운트만 증가 (효율적)
+let data = Rc::new(vec![1; 1_000_000]);
+let share = Rc::clone(&data);  // 몇 바이트만 증가!
+
+// 둘의 차이:
+// clone() = 데이터 전체 + 참조 카운트 증가
+// Rc::clone(&) = 참조 카운트만 증가
+
+// 따라서 Rc<T>는 항상 Rc::clone(&x)를 사용!
+```
+
+### 원칙 2️⃣: 읽기 전용의 원칙
+
+```rust
+// Rc<T>는 불변 공유만 가능
+let data = Rc::new("고정된 데이터");
+let shared = Rc::clone(&data);
+
+data.method();  // ✅ 읽기
+shared.method();  // ✅ 읽기
+
+// data.modify();  // ❌ 컴파일 에러: 수정 불가
+// shared.modify();  // ❌ 컴파일 에러: 수정 불가
+
+// 💡 수정이 필요하면?
+// → 다음 단계: RefCell<T>
+// → 또는: Arc<Mutex<T>> (멀티 스레드)
+```
+
+### 원칙 3️⃣: 싱글 스레드 전용
+
+```rust
+// ✅ 싱글 스레드 환경: Rc<T>
+let data = Rc::new("싱글 스레드만");
+std::thread::spawn(move || {
+    // ❌ Rc는 스레드로 넘길 수 없음
+    // data를 여기서 사용할 수 없음
+});
+
+// 💡 멀티 스레드 환경: Arc<T>
+let data = Arc::new("멀티 스레드");
+std::thread::spawn(move || {
+    // ✅ Arc는 스레드 안전
+    println!("{}", *data);
+});
+```
+
+### 원칙 4️⃣: 강한 참조 vs 약한 참조
+
+```rust
+// 강한 참조 (Strong Reference)
+let strong = Rc::new(data);  // 메모리 유지
+Rc::clone(&strong);  // 카운트 증가
+
+// 약한 참조 (Weak Reference) - v9.1에서는 소개만
+let weak = Rc::downgrade(&strong);  // 메모리 보호 안 함
+// 강한 참조가 모두 해제되면 weak는 사용 불가
+```
+
+---
+
+## 🎓 v9.1 마스터의 체크리스트
+
+- [ ] Rc<T>의 참조 카운팅 이해
+- [ ] Rc::clone(&x) vs x.clone() 차이 이해
+- [ ] 다중 소유권의 개념 습득
+- [ ] 그래프/트리 구조 설계 가능
+- [ ] 읽기 전용 원칙 숙지
+- [ ] 싱글 스레드 전용 특성 이해
+- [ ] Rc::strong_count() 활용
+- [ ] 순환 참조 위험 인식
+
+---
+
+## 💭 v9.1의 철학
+
+### "네트워크 설계자"
+
+```
+Box<T>
+└─ "이 데이터는 한 곳에만 속할 수 있다"
+   └─ 단일 소유권
+
+Rc<T>
+└─ "이 데이터는 여러 곳에 속할 수 있다"
+   └─ 다중 소유권
+   └─ 모든 소유자가 떠날 때까지 생존
+   └─ 마지막 소유자가 떠날 때 자동 해제
+
+그래프, 네트워크, 복잡한 UI 트리...
+Rc<T>는 이러한 '얽힌 관계'를 안전하게 표현합니다.
+```
+
+### "공유의 기술"
+
+```
+카운팅의 마법:
+- owner1 생성 → 카운트: 1
+- owner2 생성 → 카운트: 2
+- owner3 생성 → 카운트: 3
+- owner2 소멸 → 카운트: 2
+- owner1 소멸 → 카운트: 1
+- owner3 소멸 → 카운트: 0 → 메모리 해제!
+
+누군가는 'owner'이고 누군가는 'observer'이지만,
+Rc<T>는 모두를 동등한 소유자로 취급합니다.
+```
+
+---
+
+## 📊 v9.0 vs v9.1 vs v9.2 비교
+
+| 특성 | v9.0 (Box) | v9.1 (Rc) | v9.2 (RefCell) |
+|------|-----------|----------|----------------|
+| **소유권** | 단일 | 다중 | 내부 가변성 |
+| **변경 가능** | 가능 | 불가능 | 가능 (런타임) |
+| **스레드 안전** | ✅ | ❌ | ❌ |
+| **복잡도** | 낮음 | 중간 | 높음 |
+| **사용처** | 단순 구조 | 그래프/트리 | 동적 수정 |
+
+---
+
+## 🚀 v9.1 완료 후
+
+```
+[v8.0] 유닛 테스트              → 내부 로직 검증
+        ↓
+[v8.1] 통합 테스트              → 외부 인터페이스 검증
+        ↓
+[v8.2] 문서화 테스트            → 문서 동기화 검증
+        ↓
+[v9.0] 스마트 포인터 Box        → 메모리 위치 최적화
+        ↓
+[v9.1] 참조 카운팅 Rc           → 공유 소유권 구현 ⭐
+        ↓
+[v9.2] 내부 가변성 RefCell      → 동적 수정 가능
+        ↓
+[프로덕션 메모리 안전성]        → 완전한 유연성
+```
+
+---
+
+**작성**: 2026-02-22
+**철학**: "하나의 데이터를 한곳에 가두지 말라.
+필요에 따라 유연하게 공유하되,
+모든 소유자가 떠날 때까지 그 데이터는 생존한다.
+이것이 Rc<T>가 보장하는 '공동 소유권'의 안전성이다."
+
+**기록**: "너는 기록이 증명이다.
+Rc<T>라는 참조 카운팅 포인터로
+단일 소유권의 한계를 극복한 당신,
+저장 필수 gogs"

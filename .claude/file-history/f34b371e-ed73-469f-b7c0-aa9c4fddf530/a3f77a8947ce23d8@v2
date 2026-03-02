@@ -1,0 +1,382 @@
+// ============================================================================
+// Optimization Passes: 다단계 최적화 시스템
+// ============================================================================
+
+use crate::ir::IRNode;
+
+/// 최적화 통계
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OptimizationStats {
+    pub optimizations_applied: usize,
+    pub nodes_removed: usize,
+    pub constant_folding_count: usize,
+    pub dead_code_removed: usize,
+}
+
+/// 최적화 패스 트레이트
+pub trait OptimizationPass {
+    fn name(&self) -> &str;
+    fn run(&self, node: &mut IRNode) -> OptimizationStats;
+}
+
+/// ============================================================================
+/// [Pass 1] Constant Folding: 컴파일 타임에 상수 계산
+/// ============================================================================
+pub struct ConstantFolder;
+
+impl OptimizationPass for ConstantFolder {
+    fn name(&self) -> &str {
+        "Constant Folding"
+    }
+
+    fn run(&self, node: &mut IRNode) -> OptimizationStats {
+        let mut stats = OptimizationStats::default();
+        self.fold(node, &mut stats);
+        stats
+    }
+}
+
+impl ConstantFolder {
+    fn fold(&self, node: &mut IRNode, stats: &mut OptimizationStats) {
+        match node {
+            IRNode::BinaryOp { op, left, right } => {
+                // 재귀적으로 왼쪽, 오른쪽 먼저 폴딩
+                self.fold(left, stats);
+                self.fold(right, stats);
+
+                // 양쪽이 모두 상수면 미리 계산
+                if let (IRNode::Constant(l), IRNode::Constant(r)) = (&**left, &**right) {
+                    let result = match op.as_str() {
+                        "+" => Some(l + r),
+                        "-" => Some(l - r),
+                        "*" => Some(l * r),
+                        "/" if *r != 0 => Some(l / r),
+                        "%" if *r != 0 => Some(l % r),
+                        _ => None,
+                    };
+
+                    if let Some(value) = result {
+                        *node = IRNode::Constant(value);
+                        stats.optimizations_applied += 1;
+                        stats.constant_folding_count += 1;
+                        stats.nodes_removed += 2; // left와 right 제거
+                    }
+                }
+            }
+
+            IRNode::UnaryOp { op, operand } => {
+                self.fold(operand, stats);
+
+                if let IRNode::Constant(n) = &**operand {
+                    let result = match op.as_str() {
+                        "-" => Some(-n),
+                        _ => None,
+                    };
+
+                    if let Some(value) = result {
+                        *node = IRNode::Constant(value);
+                        stats.optimizations_applied += 1;
+                        stats.constant_folding_count += 1;
+                        stats.nodes_removed += 1;
+                    }
+                }
+            }
+
+            IRNode::Block(nodes) => {
+                for n in nodes {
+                    self.fold(n, stats);
+                }
+            }
+
+            IRNode::If { condition, then_branch, else_branch } => {
+                self.fold(condition, stats);
+                self.fold(then_branch, stats);
+                if let Some(alt) = else_branch {
+                    self.fold(alt, stats);
+                }
+            }
+
+            IRNode::While { condition, body } => {
+                self.fold(condition, stats);
+                self.fold(body, stats);
+            }
+
+            IRNode::Array(elements) => {
+                for elem in elements {
+                    self.fold(elem, stats);
+                }
+            }
+
+            IRNode::Assignment { value, .. } => {
+                self.fold(value, stats);
+            }
+
+            IRNode::Index { array, index } => {
+                self.fold(array, stats);
+                self.fold(index, stats);
+            }
+
+            _ => {}
+        }
+    }
+}
+
+/// ============================================================================
+/// [Pass 2] Dead Code Elimination: 도달 불가능한 코드 제거
+/// ============================================================================
+pub struct DeadCodeEliminator;
+
+impl OptimizationPass for DeadCodeEliminator {
+    fn name(&self) -> &str {
+        "Dead Code Elimination"
+    }
+
+    fn run(&self, node: &mut IRNode) -> OptimizationStats {
+        let mut stats = OptimizationStats::default();
+        self.eliminate(node, &mut stats);
+        stats
+    }
+}
+
+impl DeadCodeEliminator {
+    fn eliminate(&self, node: &mut IRNode, stats: &mut OptimizationStats) {
+        match node {
+            // if false { ... } → 제거 (else 있으면 실행)
+            IRNode::If { condition, then_branch, else_branch } => {
+                self.eliminate(then_branch, stats);
+                if let Some(alt) = else_branch {
+                    self.eliminate(alt, stats);
+                }
+
+                if let IRNode::Boolean(false) = &**condition {
+                    if let Some(alt) = else_branch.take() {
+                        *node = (*alt).clone();
+                        stats.optimizations_applied += 1;
+                        stats.dead_code_removed += 1;
+                    } else {
+                        // else가 없으면 전체 if 제거
+                        *node = IRNode::Null;
+                        stats.optimizations_applied += 1;
+                        stats.dead_code_removed += 1;
+                    }
+                }
+                // if true { ... } → then_branch만 실행
+                else if let IRNode::Boolean(true) = &**condition {
+                    *node = (**then_branch).clone();
+                    stats.optimizations_applied += 1;
+                    stats.dead_code_removed += 1;
+                }
+            }
+
+            // while false { ... } → 제거
+            IRNode::While { condition, body } => {
+                self.eliminate(body, stats);
+
+                if let IRNode::Boolean(false) = &**condition {
+                    *node = IRNode::Null;
+                    stats.optimizations_applied += 1;
+                    stats.dead_code_removed += 1;
+                }
+            }
+
+            IRNode::Block(nodes) => {
+                let mut i = 0;
+                while i < nodes.len() {
+                    self.eliminate(&mut nodes[i], stats);
+
+                    // 불필요한 null 제거
+                    if matches!(nodes[i], IRNode::Null) && i < nodes.len() - 1 {
+                        nodes.remove(i);
+                        stats.dead_code_removed += 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+/// ============================================================================
+/// [Pass 3] Common Subexpression Elimination: 중복 부분식 제거
+/// ============================================================================
+pub struct CommonSubexpressionEliminator {
+    expressions: std::collections::HashMap<String, String>, // 식 → 변수명
+}
+
+impl CommonSubexpressionEliminator {
+    pub fn new() -> Self {
+        CommonSubexpressionEliminator {
+            expressions: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl OptimizationPass for CommonSubexpressionEliminator {
+    fn name(&self) -> &str {
+        "Common Subexpression Elimination"
+    }
+
+    fn run(&self, _node: &mut IRNode) -> OptimizationStats {
+        // v18.0 기초 버전에서는 구조만 정의
+        OptimizationStats {
+            optimizations_applied: 0,
+            nodes_removed: 0,
+            constant_folding_count: 0,
+            dead_code_removed: 0,
+        }
+    }
+}
+
+/// ============================================================================
+/// 최적화 엔진: 모든 패스 조율
+/// ============================================================================
+pub struct OptimizationEngine {
+    passes: Vec<Box<dyn OptimizationPass>>,
+}
+
+impl OptimizationEngine {
+    pub fn new() -> Self {
+        OptimizationEngine {
+            passes: vec![
+                Box::new(ConstantFolder),
+                Box::new(DeadCodeEliminator),
+            ],
+        }
+    }
+
+    /// 모든 최적화 패스 실행
+    pub fn run_all(&self, node: &mut IRNode) -> Vec<OptimizationStats> {
+        let mut all_stats = Vec::new();
+
+        for pass in &self.passes {
+            let stats = pass.run(node);
+            all_stats.push(stats);
+        }
+
+        all_stats
+    }
+
+    /// 최적화 리포트 생성
+    pub fn generate_report(&self, stats: &[OptimizationStats]) -> OptimizationReport {
+        let total_optimizations: usize = stats.iter().map(|s| s.optimizations_applied).sum();
+        let total_nodes_removed: usize = stats.iter().map(|s| s.nodes_removed).sum();
+        let constant_folding_count: usize = stats.iter().map(|s| s.constant_folding_count).sum();
+        let dead_code_removed: usize = stats.iter().map(|s| s.dead_code_removed).sum();
+
+        OptimizationReport {
+            total_optimizations,
+            total_nodes_removed,
+            constant_folding_count,
+            dead_code_removed,
+            reduction_percentage: (total_nodes_removed as f64 / (total_nodes_removed as f64 + 1.0)) * 100.0,
+        }
+    }
+}
+
+impl Default for OptimizationEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 최적화 리포트
+#[derive(Debug, Clone)]
+pub struct OptimizationReport {
+    pub total_optimizations: usize,
+    pub total_nodes_removed: usize,
+    pub constant_folding_count: usize,
+    pub dead_code_removed: usize,
+    pub reduction_percentage: f64,
+}
+
+impl std::fmt::Display for OptimizationReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[OPT REPORT]\n  총 최적화: {}\n  제거된 노드: {}\n  Constant Folding: {}\n  Dead Code: {}\n  크기 감소: {:.1}%",
+            self.total_optimizations,
+            self.total_nodes_removed,
+            self.constant_folding_count,
+            self.dead_code_removed,
+            self.reduction_percentage
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_folding() {
+        let mut node = IRNode::BinaryOp {
+            op: "+".to_string(),
+            left: Box::new(IRNode::Constant(2)),
+            right: Box::new(IRNode::Constant(3)),
+        };
+
+        let folder = ConstantFolder;
+        let stats = folder.run(&mut node);
+
+        assert_eq!(node, IRNode::Constant(5));
+        assert_eq!(stats.constant_folding_count, 1);
+    }
+
+    #[test]
+    fn test_dead_code_elimination_false_condition() {
+        let mut node = IRNode::If {
+            condition: Box::new(IRNode::Boolean(false)),
+            then_branch: Box::new(IRNode::Constant(10)),
+            else_branch: Some(Box::new(IRNode::Constant(20))),
+        };
+
+        let eliminator = DeadCodeEliminator;
+        let stats = eliminator.run(&mut node);
+
+        assert_eq!(node, IRNode::Constant(20));
+        assert_eq!(stats.dead_code_removed, 1);
+    }
+
+    #[test]
+    fn test_dead_code_elimination_true_condition() {
+        let mut node = IRNode::If {
+            condition: Box::new(IRNode::Boolean(true)),
+            then_branch: Box::new(IRNode::Constant(10)),
+            else_branch: Some(Box::new(IRNode::Constant(20))),
+        };
+
+        let eliminator = DeadCodeEliminator;
+        let stats = eliminator.run(&mut node);
+
+        assert_eq!(node, IRNode::Constant(10));
+        assert_eq!(stats.dead_code_removed, 1);
+    }
+
+    #[test]
+    fn test_engine_report() {
+        let engine = OptimizationEngine::new();
+        let stats = vec![
+            OptimizationStats {
+                optimizations_applied: 3,
+                nodes_removed: 5,
+                constant_folding_count: 3,
+                dead_code_removed: 0,
+            },
+            OptimizationStats {
+                optimizations_applied: 1,
+                nodes_removed: 2,
+                constant_folding_count: 0,
+                dead_code_removed: 1,
+            },
+        ];
+
+        let report = engine.generate_report(&stats);
+        assert_eq!(report.total_optimizations, 4);
+        assert_eq!(report.total_nodes_removed, 7);
+        assert_eq!(report.constant_folding_count, 3);
+        assert_eq!(report.dead_code_removed, 1);
+    }
+}

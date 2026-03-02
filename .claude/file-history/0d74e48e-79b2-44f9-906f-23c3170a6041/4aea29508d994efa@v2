@@ -1,0 +1,524 @@
+# ============================================================================
+# grpc/server.fl - gRPC 서버 (JSON-RPC 기반)
+# ============================================================================
+# gRPC 구현 (WebSocket over HTTP/1.1)
+# 작성: 2026-03-02
+# 책임: gRPC 서버 관리, 메서드 라우팅
+
+# ─────────────────────────────────────────────────────────────────────────
+# gRPC 서버 구조
+# ─────────────────────────────────────────────────────────────────────────
+
+struct GrpcServer
+  serviceName: string       # \"todo.TodoService\"
+  host: string
+  port: number
+  isRunning: bool
+  methods: map<string, GrpcMethodHandler>
+  db: Database
+  maxConcurrentCalls: number
+  activeCalls: number
+
+struct GrpcMethodHandler
+  name: string              # \"GetTodo\"
+  handler: function         # 실제 핸들러 함수
+  inputType: string
+  outputType: string
+  isStreaming: bool
+
+struct GrpcCall
+  method: string
+  metadata: map<string, string>
+  message: map<string, string>
+  deadline: number
+
+# ─────────────────────────────────────────────────────────────────────────
+# 서버 생성 및 관리
+# ─────────────────────────────────────────────────────────────────────────
+
+fn newGrpcServer
+  input: (serviceName: string, host: string, port: number, db: Database)
+  output: GrpcServer
+  intent: \"gRPC 서버 생성\"
+  do
+    return {
+      serviceName: serviceName,
+      host: host,
+      port: port,
+      isRunning: false,
+      methods: {},
+      db: db,
+      maxConcurrentCalls: 100,
+      activeCalls: 0
+    }
+
+fn registerGrpcMethod
+  input: (server: GrpcServer, method: GrpcMethodHandler)
+  output: GrpcServer
+  intent: \"gRPC 메서드 등록\"
+  do
+    server.methods[method.name] = method
+    return server
+
+fn startGrpcServer
+  input: server: GrpcServer
+  output: Result<void, string>
+  intent: \"gRPC 서버 시작\"
+  do
+    if server.isRunning
+      return Err(\"Server already running\")
+
+    # WebSocket으로 gRPC 구현
+    print(\"🚀 gRPC Server starting\")
+    print(\"  Service: \" + server.serviceName)
+    print(\"  Address: \" + server.host + \":\" + str(server.port))
+    print(\"  Methods: \" + str(mapLen(server.methods)))
+
+    server.isRunning = true
+    return Ok(void)
+
+fn stopGrpcServer
+  input: server: GrpcServer
+  output: Result<void, string>
+  intent: \"gRPC 서버 중지\"
+  do
+    if !server.isRunning
+      return Err(\"Server not running\")
+
+    # 활성 연결 종료
+    if server.activeCalls > 0
+      print(\"Waiting for \" + str(server.activeCalls) + \" calls to complete...\")
+
+    server.isRunning = false
+    return Ok(void)
+
+# ─────────────────────────────────────────────────────────────────────────
+# gRPC 호출 처리
+# ─────────────────────────────────────────────────────────────────────────
+
+fn handleGrpcCall
+  input: (server: GrpcServer, call: GrpcCall)
+  output: Result<map<string, string>, GrpcError>
+  intent: \"gRPC 호출 처리\"
+  do
+    # 동시 호출 수 확인
+    if server.activeCalls >= server.maxConcurrentCalls
+      return Err({
+        status: 8,  # RESOURCE_EXHAUSTED
+        message: \"Server overloaded\",
+        details: \"Max concurrent calls exceeded\"
+      })
+
+    server.activeCalls = server.activeCalls + 1
+
+    # 메서드 라우팅
+    match server.methods.get(call.method)
+      Some(methodHandler) => {
+        # 메서드 호출
+        match callGrpcMethod(server.db, methodHandler, call)
+          Ok(response) => {
+            server.activeCalls = server.activeCalls - 1
+            Ok(response)
+          }
+          Err(e) => {
+            server.activeCalls = server.activeCalls - 1
+            Err(e)
+          }
+      }
+      None => {
+        server.activeCalls = server.activeCalls - 1
+        Err({
+          status: 12,  # UNIMPLEMENTED
+          message: \"Method not found: \" + call.method,
+          details: \"\"
+        })
+      }
+
+fn callGrpcMethod
+  input: (db: Database, handler: GrpcMethodHandler, call: GrpcCall)
+  output: Result<map<string, string>, GrpcError>
+  intent: \"gRPC 메서드 호출 (라우팅)\"
+  do
+    # 메서드명으로 분기
+    match handler.name
+      \"GetTodo\" => {
+        match parseGetTodoRequest(call.message)
+          Ok(req) => {
+            match grpcGetTodo(db, req)
+              Ok(resp) => Ok(encodeGetTodoResponse(resp))
+              Err(e) => Err(e)
+          }
+          Err(e) => Err({
+            status: 3,
+            message: \"Invalid argument: \" + e,
+            details: \"\"
+          })
+      }
+      \"ListTodos\" => {
+        match parseListTodosRequest(call.message)
+          Ok(req) => {
+            match grpcListTodos(db, req)
+              Ok(responses) => {
+                if arrayLen(responses) > 0
+                  Ok(encodeListTodosResponse(arrayGet(responses, 0)))
+                else
+                  Err({
+                    status: 13,
+                    message: \"Internal error\",
+                    details: \"\"
+                  })
+              }
+              Err(e) => Err(e)
+          }
+          Err(e) => Err({
+            status: 3,
+            message: \"Invalid argument: \" + e,
+            details: \"\"
+          })
+      }
+      \"CreateTodo\" => {
+        match parseCreateTodoRequest(call.message)
+          Ok(req) => {
+            match grpcCreateTodo(db, req)
+              Ok(resp) => Ok(encodeCreateTodoResponse(resp))
+              Err(e) => Err(e)
+          }
+          Err(e) => Err({
+            status: 3,
+            message: \"Invalid argument: \" + e,
+            details: \"\"
+          })
+      }
+      \"UpdateTodo\" => {
+        match parseUpdateTodoRequest(call.message)
+          Ok(req) => {
+            match grpcUpdateTodo(db, req)
+              Ok(resp) => Ok(encodeUpdateTodoResponse(resp))
+              Err(e) => Err(e)
+          }
+          Err(e) => Err({
+            status: 3,
+            message: \"Invalid argument: \" + e,
+            details: \"\"
+          })
+      }
+      \"DeleteTodo\" => {
+        match parseDeleteTodoRequest(call.message)
+          Ok(req) => {
+            match grpcDeleteTodo(db, req)
+              Ok(resp) => Ok(encodeDeleteTodoResponse(resp))
+              Err(e) => Err(e)
+          }
+          Err(e) => Err({
+            status: 3,
+            message: \"Invalid argument: \" + e,
+            details: \"\"
+          })
+      }
+      _ => Err({
+        status: 12,
+        message: \"Method not implemented: \" + handler.name,
+        details: \"\"
+      })
+
+# ─────────────────────────────────────────────────────────────────────────
+# 메시지 파싱
+# ─────────────────────────────────────────────────────────────────────────
+
+fn parseGetTodoRequest
+  input: message: map<string, string>
+  output: Result<GetTodoRequest, string>
+  intent: \"GetTodoRequest 파싱\"
+  do
+    let idStr = message.get(\"id\").getOrElse(\"0\")
+    match stringToNumber(idStr)
+      Some(id) => Ok({ id: id })
+      None => Err(\"Invalid ID\")
+
+fn parseListTodosRequest
+  input: message: map<string, string>
+  output: Result<ListTodosRequest, string>
+  intent: \"ListTodosRequest 파싱\"
+  do
+    let page = stringToNumber(message.get(\"page\").getOrElse(\"1\")).getOrElse(1)
+    let pageSize = stringToNumber(message.get(\"pageSize\").getOrElse(\"10\")).getOrElse(10)
+    let filter = message.get(\"filter\").getOrElse(\"\")
+
+    Ok({
+      page: page,
+      pageSize: pageSize,
+      filter: filter
+    })
+
+fn parseCreateTodoRequest
+  input: message: map<string, string>
+  output: Result<CreateTodoRequest, string>
+  intent: \"CreateTodoRequest 파싱\"
+  do
+    let title = message.get(\"title\").getOrElse(\"\")
+    if stringLen(title) == 0
+      return Err(\"Title is required\")
+
+    Ok({
+      title: title,
+      description: message.get(\"description\").getOrElse(\"\")
+    })
+
+fn parseUpdateTodoRequest
+  input: message: map<string, string>
+  output: Result<UpdateTodoRequest, string>
+  intent: \"UpdateTodoRequest 파싱\"
+  do
+    let id = stringToNumber(message.get(\"id\").getOrElse(\"0\")).getOrElse(0)
+    if id <= 0
+      return Err(\"Invalid ID\")
+
+    Ok({
+      id: id,
+      title: message.get(\"title\").getOrElse(\"\"),
+      description: message.get(\"description\").getOrElse(\"\"),
+      completed: message.get(\"completed\").getOrElse(\"false\") == \"true\"
+    })
+
+fn parseDeleteTodoRequest
+  input: message: map<string, string>
+  output: Result<DeleteTodoRequest, string>
+  intent: \"DeleteTodoRequest 파싱\"
+  do
+    let id = stringToNumber(message.get(\"id\").getOrElse(\"0\")).getOrElse(0)
+    if id <= 0
+      return Err(\"Invalid ID\")
+
+    Ok({ id: id })
+
+# ─────────────────────────────────────────────────────────────────────────
+# 메시지 인코딩
+# ─────────────────────────────────────────────────────────────────────────
+
+fn encodeGetTodoResponse
+  input: resp: GetTodoResponse
+  output: map<string, string>
+  intent: \"GetTodoResponse 인코딩\"
+  do
+    return {
+      \"success\": boolToString(resp.success),
+      \"id\": str(resp.todo.id),
+      \"title\": resp.todo.title,
+      \"completed\": boolToString(resp.todo.completed),
+      \"error\": resp.error
+    }
+
+fn encodeListTodosResponse
+  input: resp: ListTodosResponse
+  output: map<string, string>
+  intent: \"ListTodosResponse 인코딩\"
+  do
+    return {
+      \"success\": boolToString(resp.success),
+      \"total\": str(resp.total),
+      \"page\": str(resp.page),
+      \"pageSize\": str(resp.pageSize),
+      \"count\": str(arrayLen(resp.todos)),
+      \"error\": resp.error
+    }
+
+fn encodeCreateTodoResponse
+  input: resp: CreateTodoResponse
+  output: map<string, string>
+  intent: \"CreateTodoResponse 인코딩\"
+  do
+    return {
+      \"success\": boolToString(resp.success),
+      \"id\": str(resp.todo.id),
+      \"title\": resp.todo.title,
+      \"error\": resp.error
+    }
+
+fn encodeUpdateTodoResponse
+  input: resp: UpdateTodoResponse
+  output: map<string, string>
+  intent: \"UpdateTodoResponse 인코딩\"
+  do
+    return {
+      \"success\": boolToString(resp.success),
+      \"id\": str(resp.todo.id),
+      \"title\": resp.todo.title,
+      \"completed\": boolToString(resp.todo.completed),
+      \"error\": resp.error
+    }
+
+fn encodeDeleteTodoResponse
+  input: resp: DeleteTodoResponse
+  output: map<string, string>
+  intent: \"DeleteTodoResponse 인코딩\"
+  do
+    return {
+      \"success\": boolToString(resp.success),
+      \"error\": resp.error
+    }
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn boolToString
+  input: b: bool
+  output: string
+  intent: \"불린을 문자열로\"
+  do
+    if b \"true\" else \"false\"
+
+fn stringToNumber
+  input: str: string
+  output: Option<number>
+  intent: \"문자열을 숫자로\"
+  do
+    return None
+
+fn str
+  input: num: number
+  output: string
+  intent: \"숫자를 문자열로\"
+  do
+    return \"\"
+
+fn stringLen
+  input: str: string
+  output: number
+  intent: \"문자열 길이\"
+  do
+    return 0
+
+fn mapLen<K, V>
+  input: m: map<K, V>
+  output: number
+  intent: \"맵 크기\"
+  do
+    return 0
+
+fn arrayLen<T>
+  input: arr: array<T>
+  output: number
+  intent: \"배열 길이\"
+  do
+    return 0
+
+fn arrayGet<T>
+  input: (arr: array<T>, index: number)
+  output: T
+  intent: \"배열 요소\"
+  do
+    return arr[0]
+
+fn getOrElse<T>
+  input: (opt: Option<T>, default: T)
+  output: T
+  intent: \"Option 또는 기본값\"
+  do
+    match opt
+      Some(v) => v
+      None => default
+
+fn print
+  input: msg: string
+  output: void
+  intent: \"출력\"
+  do
+    return void
+
+# 외부 함수 (참조)
+fn grpcGetTodo
+  input: (db: Database, request: GetTodoRequest)
+  output: Result<GetTodoResponse, GrpcError>
+  do
+    return Err({status: 2, message: \"Not implemented\", details: \"\"})
+
+fn grpcListTodos
+  input: (db: Database, request: ListTodosRequest)
+  output: Result<array<ListTodosResponse>, GrpcError>
+  do
+    return Err({status: 2, message: \"Not implemented\", details: \"\"})
+
+fn grpcCreateTodo
+  input: (db: Database, request: CreateTodoRequest)
+  output: Result<CreateTodoResponse, GrpcError>
+  do
+    return Err({status: 2, message: \"Not implemented\", details: \"\"})
+
+fn grpcUpdateTodo
+  input: (db: Database, request: UpdateTodoRequest)
+  output: Result<UpdateTodoResponse, GrpcError>
+  do
+    return Err({status: 2, message: \"Not implemented\", details: \"\"})
+
+fn grpcDeleteTodo
+  input: (db: Database, request: DeleteTodoRequest)
+  output: Result<DeleteTodoResponse, GrpcError>
+  do
+    return Err({status: 2, message: \"Not implemented\", details: \"\"})
+
+# 도메인 모델 (참조)
+struct Database
+  pass: void
+
+struct GetTodoRequest
+  id: number
+
+struct GetTodoResponse
+  success: bool
+  todo: Todo
+  error: string
+
+struct ListTodosRequest
+  page: number
+  pageSize: number
+  filter: string
+
+struct ListTodosResponse
+  success: bool
+  todos: array<Todo>
+  total: number
+  page: number
+  pageSize: number
+  error: string
+
+struct CreateTodoRequest
+  title: string
+  description: string
+
+struct CreateTodoResponse
+  success: bool
+  todo: Todo
+  error: string
+
+struct UpdateTodoRequest
+  id: number
+  title: string
+  description: string
+  completed: bool
+
+struct UpdateTodoResponse
+  success: bool
+  todo: Todo
+  error: string
+
+struct DeleteTodoRequest
+  id: number
+
+struct DeleteTodoResponse
+  success: bool
+  error: string
+
+struct GrpcError
+  status: number
+  message: string
+  details: string
+
+struct Todo
+  id: number
+  title: string
+  description: string
+  completed: bool
+  createdAt: number
+  updatedAt: number
+  lastLoginAt: number

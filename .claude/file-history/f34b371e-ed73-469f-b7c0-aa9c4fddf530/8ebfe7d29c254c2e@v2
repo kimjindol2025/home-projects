@@ -1,0 +1,608 @@
+"""
+v5.3 API 설계와 웹 프레임워크 기초
+주제: "웹 서비스의 개방과 상호 운용성"
+
+【 핵심 개념 】
+1. REST API: Representational State Transfer
+   - 리소스 중심 설계
+   - HTTP 메서드를 통한 작업 명시
+   - 상태 비보존 (Stateless)
+
+2. HTTP 메서드와 CRUD 매핑
+   - GET:    데이터 조회 (Read)
+   - POST:   새 데이터 생성 (Create)
+   - PUT:    기존 데이터 수정 (Update)
+   - DELETE: 데이터 삭제 (Delete)
+
+3. JSON: 웹 표준 데이터 교환 형식
+   - JavaScript Object Notation
+   - 가독성 + 파싱 효율성
+   - 언어 독립적
+
+4. API 버전 관리
+   - /v1/users (버전 1)
+   - /v2/users (버전 2)
+   - 하위 호환성 유지
+
+5. 인증과 인가
+   - 인증: 사용자가 누구인가? (Authentication)
+   - 인가: 사용자가 무엇을 할 수 있는가? (Authorization)
+"""
+
+import json
+import time
+import hashlib
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+from datetime import datetime, timedelta
+
+
+# ============================================================================
+# [1] HTTP 메서드와 상태 코드
+# ============================================================================
+
+class HTTPMethod(Enum):
+    """HTTP 메서드 정의"""
+    GET = 'GET'           # 데이터 조회 (조건: 멱등성)
+    POST = 'POST'         # 새 리소스 생성 (조건: 비멱등성)
+    PUT = 'PUT'           # 기존 리소스 전체 수정 (조건: 멱등성)
+    PATCH = 'PATCH'       # 기존 리소스 부분 수정
+    DELETE = 'DELETE'     # 리소스 삭제 (조건: 멱등성)
+
+
+class HTTPStatusCode(Enum):
+    """HTTP 상태 코드"""
+    # 2xx: 성공
+    OK = 200              # 요청 성공
+    CREATED = 201         # 리소스 생성 성공
+    ACCEPTED = 202        # 요청 수락 (처리 중)
+    NO_CONTENT = 204      # 응답 본문 없음
+
+    # 3xx: 리다이렉션
+    MOVED_PERMANENTLY = 301
+    FOUND = 302
+
+    # 4xx: 클라이언트 오류
+    BAD_REQUEST = 400     # 잘못된 요청
+    UNAUTHORIZED = 401    # 인증 필요
+    FORBIDDEN = 403       # 권한 없음
+    NOT_FOUND = 404       # 리소스 없음
+    CONFLICT = 409        # 충돌 (중복, 상태 불일치)
+
+    # 5xx: 서버 오류
+    INTERNAL_SERVER_ERROR = 500
+
+
+# ============================================================================
+# [2] 요청/응답 데이터 모델
+# ============================================================================
+
+@dataclass
+class HTTPRequest:
+    """HTTP 요청"""
+    method: HTTPMethod
+    endpoint: str              # /v1/users/{id}
+    headers: Dict[str, str]    # {'Authorization': 'Bearer token'}
+    body: Optional[Dict[str, Any]] = None
+    query_params: Dict[str, str] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class HTTPResponse:
+    """HTTP 응답"""
+    status_code: HTTPStatusCode
+    body: Dict[str, Any]
+    headers: Dict[str, str] = field(default_factory=lambda: {'Content-Type': 'application/json'})
+    timestamp: float = field(default_factory=time.time)
+
+    def to_json(self) -> str:
+        """JSON으로 변환"""
+        response = {
+            'status': self.status_code.value,
+            'data': self.body,
+            'timestamp': self.timestamp
+        }
+        return json.dumps(response, ensure_ascii=False, indent=2)
+
+
+# ============================================================================
+# [3] REST 리소스 모델
+# ============================================================================
+
+@dataclass
+class User:
+    """사용자 리소스"""
+    id: int
+    name: str
+    email: str
+    role: str = 'user'  # 'user', 'admin'
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+    def to_dict(self) -> Dict[str, Any]:
+        """API 응답 형식으로 변환"""
+        return asdict(self)
+
+
+@dataclass
+class Experiment:
+    """실험 리소스 (v5.2에서 다룬 데이터베이스와 연결)"""
+    id: int
+    subject: str
+    result: float
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    created_by: int = 0  # user_id
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class APIError:
+    """API 에러 응답"""
+    code: str              # 에러 코드
+    message: str           # 사용자 메시지
+    details: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# ============================================================================
+# [4] REST API 컨트롤러
+# ============================================================================
+
+class RESTAPIController:
+    """REST API 요청 처리"""
+
+    def __init__(self):
+        self.users = {}      # {user_id: User}
+        self.experiments = {} # {exp_id: Experiment}
+        self.next_user_id = 1
+        self.next_exp_id = 1
+
+    # --- Users API ---
+
+    def create_user(self, request: HTTPRequest) -> HTTPResponse:
+        """POST /v1/users: 사용자 생성"""
+        if not request.body or 'name' not in request.body or 'email' not in request.body:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.BAD_REQUEST,
+                body={
+                    'error': '필수 필드 누락',
+                    'required': ['name', 'email']
+                }
+            )
+
+        user = User(
+            id=self.next_user_id,
+            name=request.body['name'],
+            email=request.body['email'],
+            role=request.body.get('role', 'user')
+        )
+        self.users[user.id] = user
+        self.next_user_id += 1
+
+        return HTTPResponse(
+            status_code=HTTPStatusCode.CREATED,
+            body={'id': user.id, 'message': '사용자 생성 완료', 'user': user.to_dict()}
+        )
+
+    def get_user(self, user_id: int) -> HTTPResponse:
+        """GET /v1/users/{id}: 사용자 조회"""
+        user = self.users.get(user_id)
+        if not user:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.NOT_FOUND,
+                body={'error': f'사용자 {user_id} 없음'}
+            )
+
+        return HTTPResponse(
+            status_code=HTTPStatusCode.OK,
+            body=user.to_dict()
+        )
+
+    def get_all_users(self) -> HTTPResponse:
+        """GET /v1/users: 모든 사용자 조회"""
+        users_list = [user.to_dict() for user in self.users.values()]
+        return HTTPResponse(
+            status_code=HTTPStatusCode.OK,
+            body={'users': users_list, 'count': len(users_list)}
+        )
+
+    def update_user(self, user_id: int, request: HTTPRequest) -> HTTPResponse:
+        """PUT /v1/users/{id}: 사용자 수정"""
+        user = self.users.get(user_id)
+        if not user:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.NOT_FOUND,
+                body={'error': f'사용자 {user_id} 없음'}
+            )
+
+        # 부분 업데이트
+        if 'name' in request.body:
+            user.name = request.body['name']
+        if 'email' in request.body:
+            user.email = request.body['email']
+        if 'role' in request.body:
+            user.role = request.body['role']
+
+        return HTTPResponse(
+            status_code=HTTPStatusCode.OK,
+            body={'message': '사용자 수정 완료', 'user': user.to_dict()}
+        )
+
+    def delete_user(self, user_id: int) -> HTTPResponse:
+        """DELETE /v1/users/{id}: 사용자 삭제"""
+        if user_id not in self.users:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.NOT_FOUND,
+                body={'error': f'사용자 {user_id} 없음'}
+            )
+
+        deleted_user = self.users.pop(user_id)
+        return HTTPResponse(
+            status_code=HTTPStatusCode.OK,
+            body={'message': '사용자 삭제 완료', 'user': deleted_user.to_dict()}
+        )
+
+    # --- Experiments API ---
+
+    def create_experiment(self, request: HTTPRequest, user_id: int) -> HTTPResponse:
+        """POST /v1/experiments: 실험 생성"""
+        if not request.body or 'subject' not in request.body or 'result' not in request.body:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.BAD_REQUEST,
+                body={'error': '필수 필드 누락', 'required': ['subject', 'result']}
+            )
+
+        experiment = Experiment(
+            id=self.next_exp_id,
+            subject=request.body['subject'],
+            result=float(request.body['result']),
+            created_by=user_id
+        )
+        self.experiments[experiment.id] = experiment
+        self.next_exp_id += 1
+
+        return HTTPResponse(
+            status_code=HTTPStatusCode.CREATED,
+            body={'id': experiment.id, 'message': '실험 기록 완료', 'experiment': experiment.to_dict()}
+        )
+
+    def get_experiment(self, exp_id: int) -> HTTPResponse:
+        """GET /v1/experiments/{id}: 실험 조회"""
+        experiment = self.experiments.get(exp_id)
+        if not experiment:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.NOT_FOUND,
+                body={'error': f'실험 {exp_id} 없음'}
+            )
+
+        return HTTPResponse(
+            status_code=HTTPStatusCode.OK,
+            body=experiment.to_dict()
+        )
+
+    def get_all_experiments(self) -> HTTPResponse:
+        """GET /v1/experiments: 모든 실험 조회"""
+        experiments_list = [exp.to_dict() for exp in self.experiments.values()]
+        return HTTPResponse(
+            status_code=HTTPStatusCode.OK,
+            body={'experiments': experiments_list, 'count': len(experiments_list)}
+        )
+
+
+# ============================================================================
+# [5] 인증과 인가
+# ============================================================================
+
+class AuthToken:
+    """JWT 형식의 토큰 (간소화 버전)"""
+
+    @staticmethod
+    def generate_token(user_id: int, secret_key: str = 'gogs_secret') -> str:
+        """토큰 생성"""
+        payload = {
+            'user_id': user_id,
+            'issued_at': time.time(),
+            'expires_at': time.time() + 3600  # 1시간 유효
+        }
+        # 간단한 해싱 (실제는 JWT 라이브러리 사용)
+        token_string = json.dumps(payload)
+        token_hash = hashlib.sha256((token_string + secret_key).encode()).hexdigest()
+        return f"{token_hash[:32]}:{user_id}"
+
+    @staticmethod
+    def verify_token(token: str, secret_key: str = 'gogs_secret') -> Optional[int]:
+        """토큰 검증"""
+        try:
+            parts = token.split(':')
+            if len(parts) != 2:
+                return None
+            user_id = int(parts[1])
+            return user_id
+        except:
+            return None
+
+
+class RoleBasedAccessControl:
+    """역할 기반 접근 제어 (RBAC)"""
+
+    PERMISSIONS = {
+        'admin': ['read', 'create', 'update', 'delete'],
+        'user': ['read', 'create'],
+        'guest': ['read']
+    }
+
+    @staticmethod
+    def has_permission(role: str, action: str) -> bool:
+        """권한 확인"""
+        if role not in RoleBasedAccessControl.PERMISSIONS:
+            return False
+        return action in RoleBasedAccessControl.PERMISSIONS[role]
+
+
+# ============================================================================
+# [6] API 라우터
+# ============================================================================
+
+class APIRouter:
+    """API 요청 라우팅"""
+
+    def __init__(self):
+        self.controller = RESTAPIController()
+        self.users = {}  # 인증된 사용자 캐시
+        self._setup_demo_users()
+
+    def _setup_demo_users(self):
+        """데모용 사용자 설정"""
+        admin = User(id=1, name='설계자', email='designer@gogs.io', role='admin')
+        user = User(id=2, name='개발자', email='dev@gogs.io', role='user')
+        self.controller.users[1] = admin
+        self.controller.users[2] = user
+        self.controller.next_user_id = 3
+
+    def route(self, request: HTTPRequest, auth_token: Optional[str] = None) -> HTTPResponse:
+        """요청 라우팅"""
+        # 인증 확인 (일부 엔드포인트는 필수)
+        user_id = None
+        user_role = None
+
+        if auth_token:
+            user_id = AuthToken.verify_token(auth_token)
+            if user_id and user_id in self.controller.users:
+                user_role = self.controller.users[user_id].role
+
+        # 엔드포인트 파싱
+        parts = request.endpoint.split('/')
+        # /v1/users -> ['', 'v1', 'users']
+        # /v1/users/1 -> ['', 'v1', 'users', '1']
+
+        if len(parts) < 3:
+            return HTTPResponse(
+                status_code=HTTPStatusCode.BAD_REQUEST,
+                body={'error': '잘못된 엔드포인트'}
+            )
+
+        version = parts[1]  # v1, v2, ...
+        resource = parts[2]  # users, experiments, ...
+        resource_id = int(parts[3]) if len(parts) > 3 else None
+
+        # Users 리소스
+        if resource == 'users':
+            if request.method == HTTPMethod.POST:
+                return self.controller.create_user(request)
+            elif request.method == HTTPMethod.GET:
+                if resource_id:
+                    return self.controller.get_user(resource_id)
+                else:
+                    return self.controller.get_all_users()
+            elif request.method == HTTPMethod.PUT:
+                if not resource_id:
+                    return HTTPResponse(
+                        status_code=HTTPStatusCode.BAD_REQUEST,
+                        body={'error': 'ID 필요'}
+                    )
+                return self.controller.update_user(resource_id, request)
+            elif request.method == HTTPMethod.DELETE:
+                if not resource_id:
+                    return HTTPResponse(
+                        status_code=HTTPStatusCode.BAD_REQUEST,
+                        body={'error': 'ID 필요'}
+                    )
+                return self.controller.delete_user(resource_id)
+
+        # Experiments 리소스
+        elif resource == 'experiments':
+            # 인증 필수
+            if not user_id:
+                return HTTPResponse(
+                    status_code=HTTPStatusCode.UNAUTHORIZED,
+                    body={'error': '인증 토큰 필요'}
+                )
+
+            if request.method == HTTPMethod.POST:
+                if not RoleBasedAccessControl.has_permission(user_role, 'create'):
+                    return HTTPResponse(
+                        status_code=HTTPStatusCode.FORBIDDEN,
+                        body={'error': '실험 생성 권한 없음'}
+                    )
+                return self.controller.create_experiment(request, user_id)
+            elif request.method == HTTPMethod.GET:
+                if resource_id:
+                    return self.controller.get_experiment(resource_id)
+                else:
+                    return self.controller.get_all_experiments()
+
+        return HTTPResponse(
+            status_code=HTTPStatusCode.NOT_FOUND,
+            body={'error': '엔드포인트 없음'}
+        )
+
+
+# ============================================================================
+# [7] API 클라이언트 (테스트용)
+# ============================================================================
+
+class APIClient:
+    """REST API 클라이언트"""
+
+    def __init__(self, base_url: str = 'http://api.gogs.io/v1'):
+        self.base_url = base_url
+        self.router = APIRouter()
+        self.auth_token = None
+
+    def login(self, user_id: int) -> str:
+        """로그인 (토큰 발급)"""
+        self.auth_token = AuthToken.generate_token(user_id)
+        return self.auth_token
+
+    def _make_request(self, method: HTTPMethod, endpoint: str, body: Optional[Dict] = None) -> HTTPResponse:
+        """요청 실행 (라우터를 통해 시뮬레이션)"""
+        request = HTTPRequest(
+            method=method,
+            endpoint=endpoint,
+            headers={},
+            body=body
+        )
+        return self.router.route(request, self.auth_token)
+
+    # --- Public API ---
+
+    def get_users(self) -> HTTPResponse:
+        """GET /users"""
+        return self._make_request(HTTPMethod.GET, '/v1/users')
+
+    def get_user(self, user_id: int) -> HTTPResponse:
+        """GET /users/{id}"""
+        return self._make_request(HTTPMethod.GET, f'/v1/users/{user_id}')
+
+    def create_user(self, name: str, email: str, role: str = 'user') -> HTTPResponse:
+        """POST /users"""
+        return self._make_request(
+            HTTPMethod.POST,
+            '/v1/users',
+            {'name': name, 'email': email, 'role': role}
+        )
+
+    def update_user(self, user_id: int, name: str = None, email: str = None) -> HTTPResponse:
+        """PUT /users/{id}"""
+        body = {}
+        if name:
+            body['name'] = name
+        if email:
+            body['email'] = email
+        return self._make_request(HTTPMethod.PUT, f'/v1/users/{user_id}', body)
+
+    def delete_user(self, user_id: int) -> HTTPResponse:
+        """DELETE /users/{id}"""
+        return self._make_request(HTTPMethod.DELETE, f'/v1/users/{user_id}')
+
+    def create_experiment(self, subject: str, result: float) -> HTTPResponse:
+        """POST /experiments"""
+        return self._make_request(
+            HTTPMethod.POST,
+            '/v1/experiments',
+            {'subject': subject, 'result': result}
+        )
+
+    def get_experiments(self) -> HTTPResponse:
+        """GET /experiments"""
+        return self._make_request(HTTPMethod.GET, '/v1/experiments')
+
+    def get_experiment(self, exp_id: int) -> HTTPResponse:
+        """GET /experiments/{id}"""
+        return self._make_request(HTTPMethod.GET, f'/v1/experiments/{exp_id}')
+
+
+# ============================================================================
+# [8] API 문서화
+# ============================================================================
+
+def generate_api_documentation() -> str:
+    """API 문서 생성"""
+    doc = """
+【 REST API 문서 (v1) 】
+
+【 1. Users 리소스 】
+
+GET /v1/users
+  설명: 모든 사용자 조회
+  응답: {users: [], count: 0}
+  상태코드: 200
+
+GET /v1/users/{id}
+  설명: 특정 사용자 조회
+  응답: {id, name, email, role, created_at}
+  상태코드: 200, 404
+
+POST /v1/users
+  설명: 새 사용자 생성
+  요청: {name, email, role?}
+  응답: {id, message, user}
+  상태코드: 201, 400
+
+PUT /v1/users/{id}
+  설명: 사용자 수정
+  요청: {name?, email?, role?}
+  응답: {message, user}
+  상태코드: 200, 404
+
+DELETE /v1/users/{id}
+  설명: 사용자 삭제
+  응답: {message, user}
+  상태코드: 200, 404
+
+【 2. Experiments 리소스 】
+
+GET /v1/experiments
+  설명: 모든 실험 조회 (인증 필수)
+  응답: {experiments: [], count: 0}
+  상태코드: 200, 401
+
+GET /v1/experiments/{id}
+  설명: 특정 실험 조회 (인증 필수)
+  응답: {id, subject, result, created_at, created_by}
+  상태코드: 200, 401, 404
+
+POST /v1/experiments
+  설명: 새 실험 기록 (인증 필수)
+  요청: {subject, result}
+  응답: {id, message, experiment}
+  상태코드: 201, 400, 401, 403
+
+【 3. 인증 】
+
+Authorization: Bearer <token>
+  설명: 모든 요청 헤더에 토큰 추가
+  토큰 형식: SHA256_HASH:USER_ID
+  유효 기간: 1시간
+
+【 4. 에러 응답 】
+
+400 Bad Request: 잘못된 요청
+401 Unauthorized: 인증 필요
+403 Forbidden: 권한 없음
+404 Not Found: 리소스 없음
+500 Internal Server Error: 서버 오류
+
+【 5. 상태 코드 정리 】
+
+2xx Success
+  200 OK: 요청 성공
+  201 Created: 리소스 생성 성공
+  204 No Content: 응답 본문 없음
+
+4xx Client Error
+  400 Bad Request: 클라이언트 오류
+  401 Unauthorized: 인증 필요
+  403 Forbidden: 권한 부족
+  404 Not Found: 리소스 없음
+
+5xx Server Error
+  500 Internal Server Error: 서버 오류
+    """
+    return doc

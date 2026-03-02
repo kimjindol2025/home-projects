@@ -1,0 +1,638 @@
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+)
+
+// ============================================================================
+// 섹션 1️⃣: Service Registry - 중앙 전화번호부
+// ============================================================================
+
+// ServiceInstance: 서비스 인스턴스
+type ServiceInstance struct {
+	ID       string
+	Name     string
+	Address  string
+	Port     int
+	Status   string // "UP", "DOWN"
+	LastHeat time.Time
+}
+
+// ServiceRegistry: 중앙 서비스 저장소
+type ServiceRegistry struct {
+	services map[string][]ServiceInstance
+	mu       sync.RWMutex
+}
+
+// NewServiceRegistry 생성
+func NewServiceRegistry() *ServiceRegistry {
+	return &ServiceRegistry{
+		services: make(map[string][]ServiceInstance),
+	}
+}
+
+// ============================================================================
+// 섹션 2️⃣: 등록/조회/해제 (Register/Discover/Deregister)
+// ============================================================================
+
+// Register: 서비스 등록
+func (sr *ServiceRegistry) Register(instance ServiceInstance) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	instance.Status = "UP"
+	instance.LastHeat = time.Now()
+
+	sr.services[instance.Name] = append(sr.services[instance.Name], instance)
+	fmt.Printf("[Registry] ✓ 등록: %s (%s:%d) - ID: %s\n",
+		instance.Name, instance.Address, instance.Port, instance.ID)
+}
+
+// Discover: 서비스 발견
+func (sr *ServiceRegistry) Discover(serviceName string) []ServiceInstance {
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+
+	var result []ServiceInstance
+	for _, instance := range sr.services[serviceName] {
+		if instance.Status == "UP" {
+			result = append(result, instance)
+		}
+	}
+
+	fmt.Printf("[Registry] 🔍 발견: %s - %d개 인스턴스\n", serviceName, len(result))
+	return result
+}
+
+// Deregister: 서비스 해제
+func (sr *ServiceRegistry) Deregister(serviceName, instanceID string) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	instances := sr.services[serviceName]
+	for i, instance := range instances {
+		if instance.ID == instanceID {
+			sr.services[serviceName] = append(instances[:i], instances[i+1:]...)
+			fmt.Printf("[Registry] ✗ 해제: %s - ID: %s\n", serviceName, instanceID)
+			return
+		}
+	}
+}
+
+// ListAllServices: 모든 서비스 조회
+func (sr *ServiceRegistry) ListAllServices() {
+	sr.mu.RLock()
+	defer sr.mu.RUnlock()
+
+	fmt.Println("\n[Registry] 📊 전체 서비스 목록:")
+	for serviceName, instances := range sr.services {
+		fmt.Printf("  %s:\n", serviceName)
+		for _, instance := range instances {
+			fmt.Printf("    - ID:%s, 주소:%s:%d, 상태:%s\n",
+				instance.ID, instance.Address, instance.Port, instance.Status)
+		}
+	}
+}
+
+// ============================================================================
+// 섹션 3️⃣: Health Check - 서비스 생존 확인
+// ============================================================================
+
+// HealthChecker: 주기적 상태 확인
+type HealthChecker struct {
+	registry *ServiceRegistry
+	interval time.Duration
+}
+
+// NewHealthChecker 생성
+func NewHealthChecker(registry *ServiceRegistry, interval time.Duration) *HealthChecker {
+	return &HealthChecker{
+		registry: registry,
+		interval: interval,
+	}
+}
+
+// CheckHealth: 상태 확인 및 제거
+func (hc *HealthChecker) CheckHealth() {
+	ticker := time.NewTicker(hc.interval)
+	defer ticker.Stop()
+
+	fmt.Println("\n[HealthChecker] 💓 상태 확인 시작")
+
+	for i := 0; i < 3; i++ {
+		<-ticker.C
+
+		// 먼저 상태 확인 대상 수집 (락 짧게)
+		hc.registry.mu.RLock()
+		var toCheck []struct {
+			serviceName string
+			instance    ServiceInstance
+		}
+
+		for serviceName, instances := range hc.registry.services {
+			for _, instance := range instances {
+				toCheck = append(toCheck, struct {
+					serviceName string
+					instance    ServiceInstance
+				}{serviceName, instance})
+			}
+		}
+		hc.registry.mu.RUnlock()
+
+		// 상태 확인 (락 없이)
+		for _, item := range toCheck {
+			if rand.Float32() > 0.5 {
+				fmt.Printf("[HealthChecker] ✓ %s (%s) 정상\n", item.serviceName, item.instance.ID)
+			} else {
+				fmt.Printf("[HealthChecker] ⚠️ %s (%s) 다운 감지 - 제거\n", item.serviceName, item.instance.ID)
+				hc.registry.Deregister(item.serviceName, item.instance.ID)
+			}
+		}
+	}
+}
+
+// ============================================================================
+// 섹션 4️⃣: Client-side Discovery - 클라이언트가 직접 선택
+// ============================================================================
+
+// ClientSideDiscovery: 클라이언트 구현
+type ClientSideDiscovery struct {
+	registry      *ServiceRegistry
+	loadBalancer  LoadBalancer
+}
+
+// NewClientSideDiscovery 생성
+func NewClientSideDiscovery(registry *ServiceRegistry, lb LoadBalancer) *ClientSideDiscovery {
+	return &ClientSideDiscovery{
+		registry:     registry,
+		loadBalancer: lb,
+	}
+}
+
+// CallService: 서비스 호출
+func (csd *ClientSideDiscovery) CallService(serviceName string) {
+	// 1. 서비스 발견
+	instances := csd.registry.Discover(serviceName)
+
+	if len(instances) == 0 {
+		fmt.Printf("[Client] ❌ %s 인스턴스 없음\n", serviceName)
+		return
+	}
+
+	// 2. 부하분산으로 선택
+	selected := csd.loadBalancer.Select(instances)
+
+	// 3. 직접 호출
+	fmt.Printf("[Client] 📤 %s에 요청 → %s:%d\n",
+		serviceName, selected.Address, selected.Port)
+}
+
+// ============================================================================
+// 섹션 5️⃣: Server-side Discovery - 로드밸런서가 중개
+// ============================================================================
+
+// LoadBalancer: 로드밸런서 인터페이스
+type LoadBalancer interface {
+	Select(instances []ServiceInstance) ServiceInstance
+}
+
+// RoundRobinLB: Round Robin 로드밸런서
+type RoundRobinLB struct {
+	index int
+	mu    sync.Mutex
+}
+
+// Select: Round Robin 선택
+func (rrb *RoundRobinLB) Select(instances []ServiceInstance) ServiceInstance {
+	rrb.mu.Lock()
+	defer rrb.mu.Unlock()
+
+	if len(instances) == 0 {
+		return ServiceInstance{}
+	}
+
+	selected := instances[rrb.index%len(instances)]
+	rrb.index++
+	return selected
+}
+
+// LeastConnectionLB: Least Connection 로드밸런서
+type LeastConnectionLB struct {
+	connections map[string]int
+	mu          sync.Mutex
+}
+
+// NewLeastConnectionLB 생성
+func NewLeastConnectionLB() *LeastConnectionLB {
+	return &LeastConnectionLB{
+		connections: make(map[string]int),
+	}
+}
+
+// Select: 연결이 적은 서버 선택
+func (lcb *LeastConnectionLB) Select(instances []ServiceInstance) ServiceInstance {
+	lcb.mu.Lock()
+	defer lcb.mu.Unlock()
+
+	minConns := int(^uint(0) >> 1) // 최대값
+	var selected ServiceInstance
+
+	for _, instance := range instances {
+		conns := lcb.connections[instance.ID]
+		if conns < minConns {
+			minConns = conns
+			selected = instance
+		}
+	}
+
+	// 연결 증가
+	lcb.connections[selected.ID]++
+	fmt.Printf("[LB] Least Connection: %s 선택 (활성 연결: %d)\n",
+		selected.ID, lcb.connections[selected.ID])
+
+	return selected
+}
+
+// ReleaseConnection: 연결 해제
+func (lcb *LeastConnectionLB) ReleaseConnection(instanceID string) {
+	lcb.mu.Lock()
+	defer lcb.mu.Unlock()
+
+	if lcb.connections[instanceID] > 0 {
+		lcb.connections[instanceID]--
+	}
+}
+
+// ServerSideProxy: 로드밸런서 프록시
+type ServerSideProxy struct {
+	registry     *ServiceRegistry
+	loadBalancer LoadBalancer
+}
+
+// NewServerSideProxy 생성
+func NewServerSideProxy(registry *ServiceRegistry, lb LoadBalancer) *ServerSideProxy {
+	return &ServerSideProxy{
+		registry:     registry,
+		loadBalancer: lb,
+	}
+}
+
+// Forward: 요청 중개
+func (ssp *ServerSideProxy) Forward(serviceName string) {
+	instances := ssp.registry.Discover(serviceName)
+
+	if len(instances) == 0 {
+		fmt.Printf("[Proxy] ❌ %s 인스턴스 없음\n", serviceName)
+		return
+	}
+
+	selected := ssp.loadBalancer.Select(instances)
+	fmt.Printf("[Proxy] 🔄 %s → %s:%d로 forward\n",
+		serviceName, selected.Address, selected.Port)
+}
+
+// ============================================================================
+// 섹션 6️⃣: 부하분산 알고리즘 비교
+// ============================================================================
+
+// LoadBalancingComparison: 알고리즘 비교
+func LoadBalancingComparison() {
+	fmt.Println("\n[부하분산] 알고리즘 비교 시연")
+	fmt.Println(repeatStr("-", 68))
+
+	registry := NewServiceRegistry()
+
+	// 서비스 등록
+	for i := 1; i <= 3; i++ {
+		registry.Register(ServiceInstance{
+			ID:      fmt.Sprintf("service-a-%d", i),
+			Name:    "service-a",
+			Address: fmt.Sprintf("10.0.1.%d", i),
+			Port:    3000,
+		})
+	}
+
+	fmt.Println("\n1️⃣ Round Robin (순환)")
+	fmt.Println(repeatStr("-", 68))
+	rrLB := &RoundRobinLB{}
+	for i := 1; i <= 5; i++ {
+		instances := registry.Discover("service-a")
+		selected := rrLB.Select(instances)
+		fmt.Printf("  요청 %d → %s\n", i, selected.ID)
+	}
+
+	fmt.Println("\n2️⃣ Least Connection (연결 적은 곳)")
+	fmt.Println(repeatStr("-", 68))
+	lcLB := NewLeastConnectionLB()
+	for i := 1; i <= 3; i++ {
+		instances := registry.Discover("service-a")
+		selected := lcLB.Select(instances)
+		fmt.Printf("  요청 %d → %s\n", i, selected.ID)
+	}
+
+	fmt.Println("\n  (연결 해제)")
+	lcLB.ReleaseConnection("service-a-1")
+	lcLB.ReleaseConnection("service-a-1")
+
+	fmt.Println("\n  (추가 요청들)")
+	for i := 4; i <= 6; i++ {
+		instances := registry.Discover("service-a")
+		selected := lcLB.Select(instances)
+		fmt.Printf("  요청 %d → %s\n", i, selected.ID)
+	}
+}
+
+// ============================================================================
+// 섹션 7️⃣: Raft 분산 합의 시뮬레이션
+// ============================================================================
+
+// RaftNode: Raft 노드 상태
+type RaftNode struct {
+	ID       string
+	State    string // "FOLLOWER", "CANDIDATE", "LEADER"
+	Term     int
+	VotedFor string
+	Logs     []string
+}
+
+// RaftCluster: Raft 클러스터
+type RaftCluster struct {
+	nodes map[string]*RaftNode
+	mu    sync.Mutex
+}
+
+// NewRaftCluster 생성
+func NewRaftCluster() *RaftCluster {
+	return &RaftCluster{
+		nodes: make(map[string]*RaftNode),
+	}
+}
+
+// AddNode: 노드 추가
+func (rc *RaftCluster) AddNode(id string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	rc.nodes[id] = &RaftNode{
+		ID:    id,
+		State: "FOLLOWER",
+		Term:  0,
+		Logs:  make([]string, 0),
+	}
+	fmt.Printf("[Raft] ✓ 노드 추가: %s (FOLLOWER)\n", id)
+}
+
+// ElectLeader: 리더 선출
+func (rc *RaftCluster) ElectLeader() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	// 모든 노드의 term 증가
+	for _, node := range rc.nodes {
+		node.Term++
+		node.State = "CANDIDATE"
+		fmt.Printf("[Raft] 🗳️ %s: term=%d, CANDIDATE로 변신\n", node.ID, node.Term)
+	}
+
+	// 첫 번째 노드를 리더로 선출
+	for _, node := range rc.nodes {
+		node.State = "FOLLOWER"
+	}
+
+	firstNode := rc.nodes["node-1"]
+	if firstNode != nil {
+		firstNode.State = "LEADER"
+		fmt.Printf("[Raft] 👑 리더 선출: %s\n", firstNode.ID)
+	}
+
+	// 다른 노드들은 FOLLOWER
+	for _, node := range rc.nodes {
+		if node.State != "LEADER" {
+			node.State = "FOLLOWER"
+		}
+	}
+}
+
+// ReplicateLog: 로그 복제
+func (rc *RaftCluster) ReplicateLog(entry string) {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	var leader *RaftNode
+	for _, node := range rc.nodes {
+		if node.State == "LEADER" {
+			leader = node
+			break
+		}
+	}
+
+	if leader == nil {
+		fmt.Println("[Raft] ❌ 리더 없음, 로그 복제 불가")
+		return
+	}
+
+	// 리더에서 로그 추가
+	leader.Logs = append(leader.Logs, entry)
+	fmt.Printf("[Raft] 📝 리더 %s에 로그 추가: %s\n", leader.ID, entry)
+
+	// 모든 Follower에 복제
+	for _, node := range rc.nodes {
+		if node.State == "FOLLOWER" {
+			node.Logs = append(node.Logs, entry)
+			fmt.Printf("[Raft]   → %s에 복제\n", node.ID)
+		}
+	}
+
+	fmt.Println("[Raft] ✓ 로그 복제 완료 (quorum 수락)")
+}
+
+// RaftDemo: Raft 시뮬레이션
+func RaftDemo() {
+	fmt.Println("\n[Raft] 분산 합의 시뮬레이션")
+	fmt.Println(repeatStr("-", 68))
+
+	cluster := NewRaftCluster()
+
+	fmt.Println("\n1️⃣ 클러스터 구성 (3개 노드)")
+	for i := 1; i <= 3; i++ {
+		cluster.AddNode(fmt.Sprintf("node-%d", i))
+	}
+
+	fmt.Println("\n2️⃣ 리더 선출")
+	cluster.ElectLeader()
+
+	fmt.Println("\n3️⃣ 로그 복제 (상태 변화)")
+	cluster.ReplicateLog("ServiceA registered")
+	cluster.ReplicateLog("ServiceB registered")
+	cluster.ReplicateLog("ServiceC registered")
+}
+
+// ============================================================================
+// 섹션 8️⃣: 할당 과제 3-3 - Service Discovery 통합 Demo
+// ============================================================================
+
+// Assignment3_3: Service Discovery 통합 Demo
+func Assignment3_3() {
+	fmt.Println("\n" + repeatStr("=", 70))
+	fmt.Println("【 할당 과제 3-3: 분산 시스템의 나침반 (Service Discovery) 】")
+	fmt.Println(repeatStr("=", 70))
+
+	// 1. Service Registry 생성
+	fmt.Println("\n[과제 1] Service Registry 구축")
+	fmt.Println(repeatStr("-", 68))
+	registry := NewServiceRegistry()
+
+	// 2. 서비스 등록
+	fmt.Println("\n[과제 2] 마이크로서비스 클러스터 구성")
+	fmt.Println(repeatStr("-", 68))
+
+	services := []struct {
+		name  string
+		addrs []string
+		port  int
+	}{
+		{"auth-service", []string{"10.0.1.1", "10.0.1.2"}, 3000},
+		{"order-service", []string{"10.0.2.1", "10.0.2.2", "10.0.2.3"}, 4000},
+		{"payment-service", []string{"10.0.3.1"}, 5000},
+	}
+
+	for _, svc := range services {
+		for i, addr := range svc.addrs {
+			registry.Register(ServiceInstance{
+				ID:      fmt.Sprintf("%s-%d", svc.name, i+1),
+				Name:    svc.name,
+				Address: addr,
+				Port:    svc.port,
+			})
+		}
+	}
+
+	// 3. 전체 서비스 목록
+	registry.ListAllServices()
+
+	// 4. Client-side Discovery
+	fmt.Println("\n[과제 3] Client-side Discovery (클라이언트가 선택)")
+	fmt.Println(repeatStr("-", 68))
+	clientLB := &RoundRobinLB{}
+	csd := NewClientSideDiscovery(registry, clientLB)
+
+	for i := 1; i <= 3; i++ {
+		csd.CallService("order-service")
+	}
+
+	// 5. Server-side Discovery (로드밸런서가 중개)
+	fmt.Println("\n[과제 4] Server-side Discovery (로드밸런서가 선택)")
+	fmt.Println(repeatStr("-", 68))
+	proxyLB := NewLeastConnectionLB()
+	proxy := NewServerSideProxy(registry, proxyLB)
+
+	for i := 1; i <= 3; i++ {
+		proxy.Forward("order-service")
+	}
+
+	// 6. Health Check
+	fmt.Println("\n[과제 5] Health Check (상태 모니터링)")
+	fmt.Println(repeatStr("-", 68))
+	hc := NewHealthChecker(registry, 500*time.Millisecond)
+	go hc.CheckHealth()
+	time.Sleep(2*time.Second)
+
+	// 7. 부하분산 알고리즘 비교
+	fmt.Println("\n[과제 6] 부하분산 알고리즘 비교")
+	LoadBalancingComparison()
+
+	// 8. Raft 시뮬레이션
+	fmt.Println("\n[과제 7] Raft 분산 합의")
+	RaftDemo()
+
+	// 9. 최종 상태 출력
+	fmt.Println("\n[과제 8] 최종 클러스터 상태")
+	fmt.Println(repeatStr("-", 68))
+	registry.ListAllServices()
+
+	fmt.Println("\n" + repeatStr("=", 70))
+	fmt.Println("✓ Service Discovery 아키텍처 완성!")
+	fmt.Println("✓ 다음: API Gateway & 인증 (3-4)")
+	fmt.Println(repeatStr("=", 70))
+}
+
+// ============================================================================
+// Helper 함수
+// ============================================================================
+
+func repeatStr(s string, count int) string {
+	result := ""
+	for i := 0; i < count; i++ {
+		result += s
+	}
+	return result
+}
+
+// ============================================================================
+// Main 함수
+// ============================================================================
+
+func main() {
+	fmt.Println("🎓 Go 301-3-3: 분산 시스템의 나침반 - Service Discovery\n")
+
+	rand.Seed(time.Now().UnixNano())
+
+	// 섹션 1-2: Service Registry
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 1-2️⃣: Service Registry & 등록/조회/해제\n" + "]" + repeatStr("=", 70))
+	registry := NewServiceRegistry()
+
+	registry.Register(ServiceInstance{
+		ID:      "service-a-1",
+		Name:    "service-a",
+		Address: "10.0.1.1",
+		Port:    3000,
+	})
+
+	registry.Register(ServiceInstance{
+		ID:      "service-a-2",
+		Name:    "service-a",
+		Address: "10.0.1.2",
+		Port:    3000,
+	})
+
+	instances := registry.Discover("service-a")
+	fmt.Printf("✓ 발견된 인스턴스: %d개\n\n", len(instances))
+
+	// 섹션 3: Health Check
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 3️⃣: Health Check\n" + "]" + repeatStr("=", 70))
+	hc := NewHealthChecker(registry, 300*time.Millisecond)
+	go hc.CheckHealth()
+	time.Sleep(1500 * time.Millisecond)
+
+	// 섹션 4-5: Client-side vs Server-side
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 4-5️⃣: Client-side vs Server-side Discovery\n" + "]" + repeatStr("=", 70))
+
+	fmt.Println("\n[Client-side Discovery]")
+	rrLB := &RoundRobinLB{}
+	csd := NewClientSideDiscovery(registry, rrLB)
+	for i := 1; i <= 2; i++ {
+		csd.CallService("service-a")
+	}
+
+	fmt.Println("\n[Server-side Discovery]")
+	lcLB := NewLeastConnectionLB()
+	proxy := NewServerSideProxy(registry, lcLB)
+	for i := 1; i <= 2; i++ {
+		proxy.Forward("service-a")
+	}
+
+	// 섹션 6: 부하분산 알고리즘
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 6️⃣: 부하분산 알고리즘\n" + "]" + repeatStr("=", 70))
+	LoadBalancingComparison()
+
+	// 섹션 7: Raft
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 7️⃣: Raft 분산 합의\n" + "]" + repeatStr("=", 70))
+	RaftDemo()
+
+	// 섹션 8: 할당 과제
+	fmt.Println("\n[" + repeatStr("=", 70) + "\n섹션 8️⃣: 할당 과제 3-3\n" + "]" + repeatStr("=", 70))
+	Assignment3_3()
+}

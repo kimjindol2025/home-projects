@@ -1,0 +1,522 @@
+#!/usr/bin/env node
+
+/**
+ * Code Indexer - 오프라인 버전
+ *
+ * API 없이 파일 시스템만으로 저장소를 분석합니다
+ * - 구조 분석
+ * - 파일 타입 분류
+ * - 키워드 기반 API 추출
+ * - 위험도 평가
+ */
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+class CodeIndexerOffline {
+  constructor() {
+    this.dbDir = path.join(__dirname, "db");
+    this.ensureDbDir();
+  }
+
+  ensureDbDir() {
+    if (!fs.existsSync(this.dbDir)) {
+      fs.mkdirSync(this.dbDir, { recursive: true });
+    }
+  }
+
+  /**
+   * 디렉토리를 스캔하고 모든 저장소 인덱싱
+   */
+  indexAllRepositories(baseDir) {
+    if (!fs.existsSync(baseDir)) {
+      throw new Error(`디렉토리를 찾을 수 없습니다: ${baseDir}`);
+    }
+
+    const repos = [];
+    const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+
+      const repoPath = path.join(baseDir, entry.name);
+      // .git이나 node_modules가 있으면 저장소로 간주
+      const isRepo =
+        fs.existsSync(path.join(repoPath, ".git")) ||
+        fs.existsSync(path.join(repoPath, "src")) ||
+        fs.existsSync(path.join(repoPath, "lib")) ||
+        fs.existsSync(path.join(repoPath, "package.json")) ||
+        fs.existsSync(path.join(repoPath, "Cargo.toml"));
+
+      if (isRepo) {
+        try {
+          console.log(`📂 인덱싱: ${entry.name}`);
+          const analysis = this.analyzeRepository(repoPath, entry.name);
+          this.saveIndex(entry.name, analysis);
+          repos.push(analysis);
+        } catch (e) {
+          console.warn(`⚠️ ${entry.name} 실패:`, e.message);
+        }
+      }
+    }
+
+    // 종합 정보 저장
+    this.saveRepositoryList(repos);
+    return repos;
+  }
+
+  /**
+   * 저장소 분석 (오프라인)
+   */
+  analyzeRepository(repoPath, repoName) {
+    // 1. 소스 파일 수집
+    const sourceFiles = this.getSourceFiles(repoPath);
+
+    // 2. 파일 메타데이터 추출
+    const metadata = this.extractMetadata(repoPath, sourceFiles);
+
+    // 3. API 추출 (파일명 기반)
+    const publicAPI = this.extractPublicAPI(sourceFiles);
+
+    // 4. 외부 의존성 감지
+    const externalDeps = this.extractDependencies(repoPath);
+
+    // 5. 위험도 평가
+    const risks = this.assessRisks(sourceFiles, repoPath);
+
+    // 6. 디렉토리 구조 분석
+    const structure = this.analyzeStructure(repoPath);
+
+    return {
+      name: repoName,
+      path: repoPath,
+      files: sourceFiles.length,
+      sourceFiles: sourceFiles,
+      metadata: metadata,
+      summary: {
+        publicAPI,
+        externalDeps,
+        risks,
+        structure,
+        fileCount: sourceFiles.length,
+        analyzed: Math.min(sourceFiles.length, 10),
+        timestamp: new Date().toISOString()
+      }
+    };
+  }
+
+  /**
+   * 소스 파일 수집
+   */
+  getSourceFiles(repoPath, maxDepth = 10) {
+    const extensions = [
+      ".rs",    // Rust
+      ".ts",    // TypeScript
+      ".js",    // JavaScript
+      ".py",    // Python
+      ".go",    // Go
+      ".cpp",   // C++
+      ".cc",
+      ".c",     // C
+      ".h",     // Header
+      ".java",  // Java
+      ".rb",    // Ruby
+      ".php",   // PHP
+      ".swift", // Swift
+      ".kt",    // Kotlin
+      ".scala"  // Scala
+    ];
+
+    const files = [];
+
+    const walk = (dir, depth = 0) => {
+      if (depth > maxDepth) return;
+
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+        for (const entry of entries) {
+          // 제외할 디렉토리
+          if (
+            entry.isDirectory() &&
+            [
+              "node_modules",
+              ".git",
+              "dist",
+              "build",
+              ".pytest_cache",
+              "target",
+              "__pycache__",
+              ".venv",
+              "venv",
+              ".idea",
+              ".vscode"
+            ].includes(entry.name)
+          ) {
+            continue;
+          }
+
+          const fullPath = path.join(dir, entry.name);
+          const relativePath = path.relative(repoPath, fullPath);
+
+          if (entry.isDirectory()) {
+            walk(fullPath, depth + 1);
+          } else if (
+            extensions.includes(path.extname(entry.name).toLowerCase())
+          ) {
+            files.push(relativePath);
+          }
+        }
+      } catch (e) {
+        // 권한 없음 등의 에러 무시
+      }
+    };
+
+    walk(repoPath);
+    return files.slice(0, 1000); // 최대 1000개 파일
+  }
+
+  /**
+   * 파일 메타데이터 추출
+   */
+  extractMetadata(repoPath, sourceFiles) {
+    const metadata = {
+      languages: {},
+      directories: {},
+      extensions: {}
+    };
+
+    for (const file of sourceFiles) {
+      // 언어 감지
+      const ext = path.extname(file);
+      const lang = this.extToLanguage(ext);
+      metadata.languages[lang] = (metadata.languages[lang] || 0) + 1;
+
+      // 확장자 통계
+      metadata.extensions[ext] = (metadata.extensions[ext] || 0) + 1;
+
+      // 디렉토리 통계
+      const dir = file.split("/")[0];
+      if (dir) {
+        metadata.directories[dir] = (metadata.directories[dir] || 0) + 1;
+      }
+    }
+
+    return metadata;
+  }
+
+  /**
+   * 공개 API 추출 (파일명 기반)
+   */
+  extractPublicAPI(sourceFiles) {
+    const apis = new Set();
+
+    // 파일명에서 키워드 추출
+    const keywords = [
+      "vm",
+      "interpreter",
+      "parser",
+      "compiler",
+      "lexer",
+      "ast",
+      "gc",
+      "garbage",
+      "memory",
+      "allocator",
+      "ffi",
+      "binding",
+      "crypto",
+      "encrypt",
+      "hash",
+      "http",
+      "server",
+      "client",
+      "router",
+      "middleware",
+      "database",
+      "orm",
+      "query",
+      "transaction",
+      "cache",
+      "stream",
+      "async",
+      "concurrency",
+      "thread",
+      "lock",
+      "mutex",
+      "channel",
+      "io",
+      "file",
+      "network",
+      "socket",
+      "protocol",
+      "format",
+      "json",
+      "xml",
+      "yaml",
+      "toml",
+      "serializ",
+      "deserializ",
+      "codec",
+      "compress",
+      "archive",
+      "test",
+      "benchmark",
+      "profil",
+      "monitor",
+      "log",
+      "trace",
+      "debug"
+    ];
+
+    for (const file of sourceFiles) {
+      const lower = file.toLowerCase();
+      for (const keyword of keywords) {
+        if (lower.includes(keyword)) {
+          apis.add(keyword);
+        }
+      }
+    }
+
+    return Array.from(apis).sort();
+  }
+
+  /**
+   * 외부 의존성 추출
+   */
+  extractDependencies(repoPath) {
+    const deps = new Set();
+
+    // package.json 분석
+    try {
+      const pkgPath = path.join(repoPath, "package.json");
+      if (fs.existsSync(pkgPath)) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+        if (pkg.dependencies) {
+          Object.keys(pkg.dependencies).forEach((d) => deps.add(d));
+        }
+      }
+    } catch (e) {
+      // 무시
+    }
+
+    // Cargo.toml 분석
+    try {
+      const cargoPath = path.join(repoPath, "Cargo.toml");
+      if (fs.existsSync(cargoPath)) {
+        const content = fs.readFileSync(cargoPath, "utf-8");
+        const matches = content.match(/^\w[\w-]*/gm) || [];
+        matches.forEach((m) => deps.add(m));
+      }
+    } catch (e) {
+      // 무시
+    }
+
+    // pyproject.toml, requirements.txt 분석
+    try {
+      const reqPath = path.join(repoPath, "requirements.txt");
+      if (fs.existsSync(reqPath)) {
+        const lines = fs.readFileSync(reqPath, "utf-8").split("\n");
+        for (const line of lines) {
+          const pkg = line.split(/[=<>!]/)[0].trim();
+          if (pkg) deps.add(pkg);
+        }
+      }
+    } catch (e) {
+      // 무시
+    }
+
+    return Array.from(deps).slice(0, 20).sort();
+  }
+
+  /**
+   * 위험도 평가
+   */
+  assessRisks(sourceFiles, repoPath) {
+    const risks = {
+      unsafe: false,
+      ffi: false,
+      external: [],
+      warnings: []
+    };
+
+    // Unsafe 코드 감지
+    for (const file of sourceFiles) {
+      if (file.toLowerCase().includes("unsafe")) {
+        risks.unsafe = true;
+      }
+      if (file.toLowerCase().includes("ffi") || file.toLowerCase().includes("binding")) {
+        risks.ffi = true;
+      }
+    }
+
+    // 파일 내용 샘플링
+    try {
+      for (const file of sourceFiles.slice(0, 10)) {
+        const filePath = path.join(repoPath, file);
+        if (fs.existsSync(filePath)) {
+          const content = fs.readFileSync(filePath, "utf-8").substring(0, 2000);
+
+          if (content.includes("unsafe")) risks.unsafe = true;
+          if (content.includes("extern")) risks.ffi = true;
+          if (content.includes("eval(")) {
+            risks.warnings.push("eval() 사용 감지");
+          }
+          if (content.includes("exec(")) {
+            risks.warnings.push("exec() 사용 감지");
+          }
+        }
+      }
+    } catch (e) {
+      // 무시
+    }
+
+    return risks;
+  }
+
+  /**
+   * 디렉토리 구조 분석
+   */
+  analyzeStructure(repoPath) {
+    const structure = {};
+
+    try {
+      const entries = fs.readdirSync(repoPath, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (entry.isDirectory() && !entry.name.startsWith(".")) {
+          const subPath = path.join(repoPath, entry.name);
+          const fileCount = this.countFilesInDir(subPath);
+          if (fileCount > 0) {
+            structure[entry.name] = fileCount;
+          }
+        }
+      }
+    } catch (e) {
+      // 무시
+    }
+
+    return structure;
+  }
+
+  /**
+   * 디렉토리 내 파일 수 세기
+   */
+  countFilesInDir(dir, max = 1000) {
+    let count = 0;
+
+    const walk = (d) => {
+      try {
+        const entries = fs.readdirSync(d, { withFileTypes: true });
+        for (const entry of entries) {
+          if (count >= max) return;
+          if (
+            entry.isDirectory() &&
+            ![
+              "node_modules",
+              ".git",
+              "dist",
+              "build",
+              "target"
+            ].includes(entry.name)
+          ) {
+            walk(path.join(d, entry.name));
+          } else if (entry.isFile()) {
+            count++;
+          }
+        }
+      } catch (e) {
+        // 무시
+      }
+    };
+
+    walk(dir);
+    return count;
+  }
+
+  /**
+   * 확장자를 언어로 변환
+   */
+  extToLanguage(ext) {
+    const map = {
+      ".rs": "Rust",
+      ".ts": "TypeScript",
+      ".js": "JavaScript",
+      ".py": "Python",
+      ".go": "Go",
+      ".cpp": "C++",
+      ".cc": "C++",
+      ".c": "C",
+      ".h": "C/C++",
+      ".java": "Java",
+      ".rb": "Ruby",
+      ".php": "PHP",
+      ".swift": "Swift",
+      ".kt": "Kotlin"
+    };
+    return map[ext.toLowerCase()] || "Other";
+  }
+
+  /**
+   * 인덱스 저장
+   */
+  saveIndex(repoName, analysis) {
+    const fileName = `${repoName}.json`;
+    const filePath = path.join(this.dbDir, fileName);
+
+    fs.writeFileSync(filePath, JSON.stringify(analysis, null, 2));
+  }
+
+  /**
+   * 저장소 목록 저장
+   */
+  saveRepositoryList(repos) {
+    const list = {
+      timestamp: new Date().toISOString(),
+      totalRepos: repos.length,
+      repos: repos.map((r) => ({
+        name: r.name,
+        files: r.files,
+        summary: r.summary
+      }))
+    };
+
+    const filePath = path.join(this.dbDir, "repos.json");
+    fs.writeFileSync(filePath, JSON.stringify(list, null, 2));
+  }
+
+  /**
+   * 저장된 인덱스 로드
+   */
+  loadIndex(repoName) {
+    const filePath = path.join(this.dbDir, `${repoName}.json`);
+
+    if (!fs.existsSync(filePath)) {
+      return null;
+    }
+
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  }
+
+  /**
+   * 모든 인덱스 로드
+   */
+  loadAllIndexes() {
+    const files = fs.readdirSync(this.dbDir);
+    const indexes = {};
+
+    for (const file of files) {
+      if (file.endsWith(".json") && file !== "repos.json") {
+        const repoName = file.replace(".json", "");
+        indexes[repoName] = this.loadIndex(repoName);
+      }
+    }
+
+    return indexes;
+  }
+}
+
+export default CodeIndexerOffline;

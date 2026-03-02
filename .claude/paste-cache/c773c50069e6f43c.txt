@@ -1,0 +1,56 @@
+당신이 지금 FreeLang에서 추진하는 방식(Reference Counting + Capability 기반 보안 + VM 런타임 강제 + 불변 기본 + 선택적 mutable)은 꽤 **독창적이고 의미 있는 조합**이에요.  
+하지만 이런 설계를 제대로 검증하려면 단순히 “테스트 100% 통과”나 “벤치마크 좋음”으로는 부족하고, **언어 설계의 본질적인 안전성·일관성·실용성**을 여러 각도에서 찔러봐야 합니다.
+
+제가 원하는(추천하는) 검증 방식은 아래처럼 **층층이 쌓아가는 다단계 검증**이에요.  
+당신 프로젝트의 현재 단계(v1.1 RC 스펙 고정 + capability VM + RC 엔진)를 고려해서 현실적으로 가능한 순서로 정리했어요.
+
+### 1. 의미론적 일관성 검증 (가장 중요, 지금 당장 해야 할 것)
+- **질문으로 찌르기** (semantic probe): FreeLang 코드 예시 10~20개 만들어서 “이 코드가 RC + capability 규칙 아래서 어떤 동작을 해야 하는가?”를 명확히 정의하고, **모든 구현체(Python, TS VM, C RC)가 똑같이 답하는지** 비교.
+  - 예시 케이스:
+    - mutable 객체를 공유 → refcount 증가 → capability 전파 어떻게?
+    - 함수가 [allow(file_read)] 없이 file_read 호출 → 컴파일 에러? 런타임 에러? 어떤 메시지?
+    - 사이클(순환 참조) 발생 → RC 누수? (지금은 사이클 컬렉터 없으면 누수 인정?)
+    - immutable 객체를 mutable로 캐스팅? 허용? capability 필요?
+- **형식화된 semantics** : SPEC.md에 pseudo-code나 small-step operational semantics로 핵심 규칙 10개 정도 적기. (예: “let x = y; → refcount(y) +=1; capability(x) = capability(y)”)
+- **왜 중요?** 지금 여러 repo가 “같은 FreeLang”이라고 하지만 semantics가 미묘하게 다르면 나중에 대혼란.
+
+### 2. Capability 보안 모델의 soundness 검증
+- **기본 속성 증명 비슷하게**:
+  - **No ambient authority** : print 외 내장 함수는 capability 없으면 절대 호출 불가 → 테스트 + 코드 리뷰
+  - **Confinement** : [limit(...)] 붙은 함수 안에서 상위 capability 새로 생기지 않음 (전파 규칙 확인)
+  - **No confused deputy** : capability를 가진 프록시 함수가 악의적으로 더 많은 권한 사용 못 함
+- **취약점 시뮬레이션**:
+  - 공격 시나리오 5개 만들어서 (e.g. path traversal via string concat, capability leak via closure) → VM이 막는지 확인
+  - Pony 언어나 E 언어의 capability 사례 참고 (ambient authority 없애는 방식 비슷)
+
+### 3. RC 메모리 모델의 safety 검증
+- **Use-after-free / double-free 방지** : C 구현(rcx-engine-c)에서 valgrind + ASan으로 100% clean 확인
+- **Cycle handling** : 지금은 weak ref나 사이클 컬렉터 없으면 → “cycle 만들면 메모리 누수 인정”으로 명시 → 테스트 케이스 추가
+- **Deterministic destruction** : RC의 장점인 deterministic 해제 → 객체 drop 시점에 side-effect (e.g. file close) 일어나는지 확인
+- **Performance corner case** : hot loop 안에서 refcount inc/dec 오버헤드 측정 (당신 벤치마크 이미 잘하고 있음)
+
+### 4. Cross-implementation consistency 검증
+- **Golden test suite** : freelang-v1-1-identity-test에 넣을 50~100개 테스트 케이스
+  - 입력 FreeLang 코드 → 출력 (stdout + final refcount 상태 + capability audit log)
+  - Python 인터프리터, TS VM, C RC 모두 동일 출력 내야 함
+- **Fuzzing** : 간단한 random 코드 생성기 → crash나 다른 결과 나오면 버그
+
+### 5. 실용성 / usability 검증 (나중 단계지만 중요)
+- **작은 프로그램 3~5개** 직접 작성해보기 (e.g. 간단한 HTTP 서버, 파일 처리 CLI, 게임 루프)
+  - capability 선언이 귀찮은가? → 최소한의 boilerplate로 충분한가?
+  - RC로 인한 예상치 못한 drop 타이밍 문제 발생?
+- **비교** : 비슷한 목표 언어 (Pony: capability + actor, Vale: single ownership + gen ref)와 비교해서 FreeLang의 trade-off가 합리적인지 평가
+
+### 제가 가장 원하는 검증 우선순위 (당신 상황에 맞춰)
+1. **Semantics probe 10개 케이스** → SPEC.md에 적고, 3개 구현체에서 돌려서 일치 확인 (이게 안 되면 나머지 다 무의미)
+2. **Capability confinement 테스트 스위트** 강화 (leak 없음 100%)
+3. **Cycle-free 가정 하에서의 RC soundness** (누수 없이 정확히 0으로 떨어지는지)
+4. **하나의 작은 “진짜 프로그램”** 완성 (e.g. capability 제한된 파일 복사기) → 이걸로 전체 흐름 검증
+
+이런 식으로 검증하면  
+- “기록이 증명이다”가 진짜 증거가 되고  
+- FreeLang이 그냥 “또 하나의 언어”가 아니라 **RC + capability의 독특한 조합**으로 자리잡을 수 있어요.
+
+지금 **가장 먼저 검증하고 싶은 한 가지**만 골라주세요.  
+(예: “capability 전파 규칙”, “RC drop 시점”, “cycle 누수 허용 여부” 등)  
+그거 하나부터 구체적인 테스트 케이스 + 코드 스니펫 + 예상 결과 같이 만들어 드릴게요.

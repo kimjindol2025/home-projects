@@ -1,0 +1,159 @@
+/**
+ * 트랜잭션 테스트
+ */
+
+import { Transaction, TransactionManager } from '../src/index';
+
+describe('Transaction', () => {
+  let mockDb: any;
+  let txManager: TransactionManager;
+
+  beforeAll(() => {
+    // Mock DB
+    mockDb = {
+      exec: jest.fn(),
+      run: jest.fn((sql, ...params) => ({ changes: 1, lastInsertRowid: 1 })),
+      query: jest.fn((sql, ...params) => ({ id: 1, name: 'Alice' })),
+      queryAll: jest.fn((sql, ...params) => [{ id: 1 }, { id: 2 }]),
+      transaction: jest.fn((callback, options) => callback())
+    };
+
+    txManager = new TransactionManager(mockDb);
+  });
+
+  describe('Basic Transaction', () => {
+    it('should commit successfully', async () => {
+      mockDb.exec.mockClear();
+
+      await txManager.transaction(async (tx) => {
+        await tx.run('INSERT INTO users (name) VALUES (?)', 'Alice');
+      });
+
+      expect(mockDb.exec).toHaveBeenCalledWith(expect.stringContaining('BEGIN'));
+      expect(mockDb.exec).toHaveBeenCalledWith('COMMIT');
+    });
+
+    it('should rollback on error', async () => {
+      mockDb.exec.mockClear();
+
+      try {
+        await txManager.transaction(async (tx) => {
+          throw new Error('Test error');
+        });
+      } catch {
+        // Expected
+      }
+
+      expect(mockDb.exec).toHaveBeenCalledWith('ROLLBACK');
+    });
+
+    it('should track statistics', async () => {
+      mockDb.exec.mockClear();
+
+      await txManager.transaction(async (tx) => {
+        await tx.run('INSERT INTO users (name) VALUES (?)', 'Alice');
+        await tx.query('SELECT * FROM users WHERE id = ?', 1);
+      });
+
+      const stats = txManager.getStats();
+      expect(stats.length).toBeGreaterThan(0);
+
+      const lastStat = stats[stats.length - 1];
+      expect(lastStat.status).toBe('COMMITTED');
+      expect(lastStat.writeCount).toBeGreaterThan(0);
+      expect(lastStat.readCount).toBeGreaterThan(0);
+    });
+
+    it('should support savepoints', async () => {
+      mockDb.exec.mockClear();
+
+      await txManager.transaction(async (tx) => {
+        await tx.run('INSERT INTO users (name) VALUES (?)', 'Alice');
+
+        const sp = await tx.savepoint('sp1');
+        expect(sp).toBeDefined();
+        expect(sp.name).toBe('sp1');
+
+        await tx.rollbackTo(sp);
+        await tx.release('sp1');
+      });
+
+      expect(mockDb.exec).toHaveBeenCalledWith(expect.stringContaining('SAVEPOINT'));
+      expect(mockDb.exec).toHaveBeenCalledWith(expect.stringContaining('ROLLBACK TO'));
+    });
+  });
+
+  describe('Isolation Levels', () => {
+    it('should apply READ_COMMITTED isolation', async () => {
+      mockDb.exec.mockClear();
+
+      await txManager.transaction(async (tx) => {
+        expect(tx.getIsolationLevel()).toBe('READ_COMMITTED');
+      }, { isolationLevel: 'READ_COMMITTED' });
+    });
+
+    it('should apply SERIALIZABLE isolation', async () => {
+      mockDb.exec.mockClear();
+
+      await txManager.transaction(async (tx) => {
+        expect(tx.getIsolationLevel()).toBe('SERIALIZABLE');
+      }, { isolationLevel: 'SERIALIZABLE' });
+    });
+  });
+
+  describe('Pessimistic Locking', () => {
+    it('should use IMMEDIATE mode for pessimistic locking', async () => {
+      mockDb.exec.mockClear();
+
+      const tx = await txManager.beginPessimistic();
+      expect(tx.getIsolationLevel()).toBe('SERIALIZABLE');
+
+      await tx.commit();
+    });
+  });
+
+  describe('Optimistic Locking', () => {
+    it('should use DEFERRED mode for optimistic locking', async () => {
+      mockDb.exec.mockClear();
+
+      const tx = await txManager.beginOptimistic();
+      expect(tx.getIsolationLevel()).toBe('READ_COMMITTED');
+
+      await tx.commit();
+    });
+  });
+
+  describe('Retry Logic', () => {
+    it('should retry on deadlock', async () => {
+      let attempts = 0;
+      mockDb.exec.mockImplementation(() => {
+        attempts++;
+        if (attempts < 2) {
+          throw new Error('database is locked');
+        }
+      });
+
+      await txManager.executeWithRetry(async (tx) => {
+        // Success on retry
+      }, { maxAttempts: 3, backoffMs: 10 });
+
+      expect(attempts).toBe(2);
+    });
+  });
+
+  describe('Statistics', () => {
+    it('should provide transaction summary', async () => {
+      txManager.resetStats();
+
+      await txManager.transaction(async (tx) => {
+        await tx.run('INSERT INTO users (name) VALUES (?)', 'Alice');
+      });
+
+      const summary = txManager.getSummary();
+
+      expect(summary.totalTransactions).toBeGreaterThan(0);
+      expect(summary.successCount).toBeGreaterThan(0);
+      expect(summary.avgDuration).toBeGreaterThanOrEqual(0);
+    });
+  });
+});

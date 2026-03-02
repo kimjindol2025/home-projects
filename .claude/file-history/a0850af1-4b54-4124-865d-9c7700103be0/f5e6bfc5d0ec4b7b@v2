@@ -1,0 +1,743 @@
+/// Phase 14 v15.2: Conditional Branching & Backfilling
+///
+/// 백필링(Backfilling): 점프 명령어를 먼저 내뱉지만 점프할 주소는 나중에 채우는 기법
+/// 이를 통해 if/else, while 루프 등의 비선형 제어 흐름을 구현합니다.
+
+use std::fmt;
+
+// ============================================================================
+// OpCode 정의 (v15.2: 점프 명령어 추가)
+// ============================================================================
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpCode {
+    // 상수 & 연산 (v15.1)
+    OpConstant = 0x00,
+
+    OpAdd = 0x01,
+    OpSubtract = 0x02,
+    OpMultiply = 0x03,
+    OpDivide = 0x04,
+
+    OpEqual = 0x05,
+    OpNotEqual = 0x06,
+    OpGreaterThan = 0x07,
+    OpLessThan = 0x08,
+    OpLessThanOrEqual = 0x09,
+    OpGreaterThanOrEqual = 0x0A,
+
+    OpNot = 0x0B,
+    OpReturn = 0x0C,
+    OpPop = 0x0D,
+
+    // 점프 명령어 (v15.2) ← 새로 추가!
+    OpJump = 0x0E,
+    OpJumpNotTruthy = 0x0F,
+}
+
+impl OpCode {
+    pub fn operand_widths(&self) -> Vec<usize> {
+        match self {
+            OpCode::OpConstant => vec![2],
+            OpCode::OpJump | OpCode::OpJumpNotTruthy => vec![2],
+            _ => vec![],
+        }
+    }
+}
+
+impl From<u8> for OpCode {
+    fn from(b: u8) -> Self {
+        match b {
+            0x00 => OpCode::OpConstant,
+            0x01 => OpCode::OpAdd,
+            0x02 => OpCode::OpSubtract,
+            0x03 => OpCode::OpMultiply,
+            0x04 => OpCode::OpDivide,
+            0x05 => OpCode::OpEqual,
+            0x06 => OpCode::OpNotEqual,
+            0x07 => OpCode::OpGreaterThan,
+            0x08 => OpCode::OpLessThan,
+            0x09 => OpCode::OpLessThanOrEqual,
+            0x0A => OpCode::OpGreaterThanOrEqual,
+            0x0B => OpCode::OpNot,
+            0x0C => OpCode::OpReturn,
+            0x0D => OpCode::OpPop,
+            0x0E => OpCode::OpJump,
+            0x0F => OpCode::OpJumpNotTruthy,
+            _ => OpCode::OpReturn,
+        }
+    }
+}
+
+impl fmt::Display for OpCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OpCode::OpConstant => write!(f, "OpConstant"),
+            OpCode::OpAdd => write!(f, "OpAdd"),
+            OpCode::OpSubtract => write!(f, "OpSubtract"),
+            OpCode::OpMultiply => write!(f, "OpMultiply"),
+            OpCode::OpDivide => write!(f, "OpDivide"),
+            OpCode::OpEqual => write!(f, "OpEqual"),
+            OpCode::OpNotEqual => write!(f, "OpNotEqual"),
+            OpCode::OpGreaterThan => write!(f, "OpGreaterThan"),
+            OpCode::OpLessThan => write!(f, "OpLessThan"),
+            OpCode::OpLessThanOrEqual => write!(f, "OpLessThanOrEqual"),
+            OpCode::OpGreaterThanOrEqual => write!(f, "OpGreaterThanOrEqual"),
+            OpCode::OpNot => write!(f, "OpNot"),
+            OpCode::OpReturn => write!(f, "OpReturn"),
+            OpCode::OpPop => write!(f, "OpPop"),
+            OpCode::OpJump => write!(f, "OpJump"),
+            OpCode::OpJumpNotTruthy => write!(f, "OpJumpNotTruthy"),
+        }
+    }
+}
+
+// ============================================================================
+// 컴파일 객체 정의
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileObject {
+    Integer(i32),
+    Float(i64),
+    Boolean(bool),
+    Null,
+}
+
+impl fmt::Display for CompileObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompileObject::Integer(n) => write!(f, "{}", n),
+            CompileObject::Float(n) => write!(f, "{}", n),
+            CompileObject::Boolean(b) => write!(f, "{}", b),
+            CompileObject::Null => write!(f, "null"),
+        }
+    }
+}
+
+// ============================================================================
+// 바이트코드 정의
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct Bytecode {
+    pub instructions: Vec<u8>,
+    pub constants: Vec<CompileObject>,
+}
+
+impl Bytecode {
+    pub fn new() -> Self {
+        Bytecode {
+            instructions: Vec::new(),
+            constants: Vec::new(),
+        }
+    }
+}
+
+// ============================================================================
+// 백필링 메타데이터
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct JumpPatch {
+    pub position: usize,  // 수정할 OpJumpNotTruthy 명령어 위치
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilationScope {
+    pub instructions: Vec<u8>,
+    pub jump_patches: Vec<JumpPatch>,  // 수정 대기 중인 점프
+}
+
+// ============================================================================
+// 컴파일러
+// ============================================================================
+
+pub struct Compiler {
+    pub instructions: Vec<u8>,
+    pub constants: Vec<CompileObject>,
+    pub scopes: Vec<CompilationScope>,
+    pub scope_index: usize,
+}
+
+impl Compiler {
+    pub fn new() -> Self {
+        Compiler {
+            instructions: Vec::new(),
+            constants: Vec::new(),
+            scopes: vec![CompilationScope {
+                instructions: Vec::new(),
+                jump_patches: Vec::new(),
+            }],
+            scope_index: 0,
+        }
+    }
+
+    // ========================================================================
+    // 명령어 생성
+    // ========================================================================
+
+    /// OpCode와 피연산자를 명령어 스트림에 추가
+    pub fn emit(&mut self, op: OpCode, operands: &[u16]) -> usize {
+        let scope = &mut self.scopes[self.scope_index];
+        let ins_len = scope.instructions.len();
+
+        scope.instructions.push(op as u8);
+
+        for &operand in operands {
+            let bytes = operand.to_be_bytes();
+            scope.instructions.push(bytes[0]);
+            scope.instructions.push(bytes[1]);
+        }
+
+        ins_len
+    }
+
+    /// 이미 내보낸 명령어의 피연산자를 수정 (백필링의 핵심!)
+    pub fn change_operand(&mut self, pos: usize, operand: u16) {
+        let scope = &mut self.scopes[self.scope_index];
+
+        let bytes = operand.to_be_bytes();
+        scope.instructions[pos + 1] = bytes[0];
+        scope.instructions[pos + 2] = bytes[1];
+    }
+
+    // ========================================================================
+    // 상수 풀 관리
+    // ========================================================================
+
+    fn add_constant(&mut self, obj: CompileObject) -> usize {
+        if let Some(idx) = self.constants.iter().position(|c| *c == obj) {
+            return idx;
+        }
+        self.constants.push(obj);
+        self.constants.len() - 1
+    }
+
+    // ========================================================================
+    // if/else 컴파일 (백필링 사용)
+    // ========================================================================
+
+    /// if 조건문 컴파일
+    ///
+    /// if (condition) { consequence } [else { alternative }]
+    pub fn compile_if_expression(
+        &mut self,
+        condition: i32,
+        consequence_code: &str,
+        alternative: Option<&str>,
+    ) -> Result<(), String> {
+        // 1. 조건식 컴파일
+        let cond_idx = self.add_constant(CompileObject::Integer(condition));
+        self.emit(OpCode::OpConstant, &[cond_idx as u16]);
+
+        // 2. 거짓이면 점프 (점프할 주소는 아직 모름!)
+        let jump_not_truthy_pos = self.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        // 3. 참 블록 컴파일
+        for token in consequence_code.split_whitespace() {
+            if token == "push" {
+                if let Ok(n) = token.parse::<i32>() {
+                    let idx = self.add_constant(CompileObject::Integer(n));
+                    self.emit(OpCode::OpConstant, &[idx as u16]);
+                }
+            } else if let Ok(n) = token.parse::<i32>() {
+                let idx = self.add_constant(CompileObject::Integer(n));
+                self.emit(OpCode::OpConstant, &[idx as u16]);
+            }
+        }
+
+        // 4. [백필링 핵심] 참 블록 끝났으니 실제 점프 주소 확정
+        let after_consequence_pos = self.scopes[self.scope_index].instructions.len();
+        self.change_operand(jump_not_truthy_pos, after_consequence_pos as u16);
+
+        // 5. else 블록 처리
+        if let Some(alt_code) = alternative {
+            // else로 점프 (조건이 참이었으므로 else 건너뛰기)
+            let jump_pos = self.emit(OpCode::OpJump, &[0, 0]);
+
+            // else 블록 컴파일
+            for token in alt_code.split_whitespace() {
+                if let Ok(n) = token.parse::<i32>() {
+                    let idx = self.add_constant(CompileObject::Integer(n));
+                    self.emit(OpCode::OpConstant, &[idx as u16]);
+                }
+            }
+
+            // [백필링] else 끝 위치 확정
+            let after_alternative_pos = self.scopes[self.scope_index].instructions.len();
+            self.change_operand(jump_pos, after_alternative_pos as u16);
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // while 루프 컴파일
+    // ========================================================================
+
+    /// while 루프 컴파일
+    ///
+    /// while (condition) { body }
+    pub fn compile_while_loop(
+        &mut self,
+        condition: i32,
+        body_code: &str,
+    ) -> Result<(), String> {
+        // 1. 루프 시작 위치 기록
+        let loop_start = self.scopes[self.scope_index].instructions.len();
+
+        // 2. 조건식 컴파일
+        let cond_idx = self.add_constant(CompileObject::Integer(condition));
+        self.emit(OpCode::OpConstant, &[cond_idx as u16]);
+
+        // 3. 거짓이면 루프 탈출 (점프할 주소는 아직 모름!)
+        let exit_jump_pos = self.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        // 4. 루프 본체 컴파일
+        for token in body_code.split_whitespace() {
+            if let Ok(n) = token.parse::<i32>() {
+                let idx = self.add_constant(CompileObject::Integer(n));
+                self.emit(OpCode::OpConstant, &[idx as u16]);
+            }
+        }
+
+        // 5. 루프 시작으로 돌아가기 (후방 점프, 주소를 이미 알고 있음!)
+        self.emit(OpCode::OpJump, &[loop_start as u16]);
+
+        // 6. [백필링] 루프 탈출 위치 확정
+        let after_loop_pos = self.scopes[self.scope_index].instructions.len();
+        self.change_operand(exit_jump_pos, after_loop_pos as u16);
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // 바이트코드 생성
+    // ========================================================================
+
+    pub fn bytecode(&self) -> Bytecode {
+        Bytecode {
+            instructions: self.scopes[self.scope_index].instructions.clone(),
+            constants: self.constants.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// 역컴파일러
+// ============================================================================
+
+pub fn disassemble(bytecode: &Bytecode) -> String {
+    let mut result = String::new();
+
+    let mut offset = 0;
+    while offset < bytecode.instructions.len() {
+        let (line, next_offset) = disassemble_instruction(&bytecode.instructions, offset);
+        result.push_str(&format!("{:04} {}\n", offset, line));
+        offset = next_offset;
+    }
+
+    result
+}
+
+pub fn disassemble_instruction(instructions: &[u8], offset: usize) -> (String, usize) {
+    if offset >= instructions.len() {
+        return ("(end)".to_string(), offset + 1);
+    }
+
+    let op = OpCode::from(instructions[offset]);
+
+    match op {
+        OpCode::OpConstant => {
+            if offset + 2 < instructions.len() {
+                let const_idx = read_uint16(&instructions[offset + 1..]);
+                (
+                    format!("OpConstant {}", const_idx),
+                    offset + 3,
+                )
+            } else {
+                (format!("{} (incomplete)", op), offset + 1)
+            }
+        }
+        OpCode::OpJump | OpCode::OpJumpNotTruthy => {
+            if offset + 2 < instructions.len() {
+                let target = read_uint16(&instructions[offset + 1..]);
+                (
+                    format!("{} {}", op, target),
+                    offset + 3,
+                )
+            } else {
+                (format!("{} (incomplete)", op), offset + 1)
+            }
+        }
+        _ => {
+            (
+                op.to_string(),
+                offset + 1,
+            )
+        }
+    }
+}
+
+fn read_uint16(bytes: &[u8]) -> u16 {
+    ((bytes[0] as u16) << 8) | (bytes[1] as u16)
+}
+
+// ============================================================================
+// 메인 데모
+// ============================================================================
+
+pub fn main() {
+    println!("=== Phase 14 v15.2: Conditional Branching & Backfilling ===\n");
+
+    // Demo 1: 단순 if
+    println!("【Demo 1】단순 조건문 (if)");
+    {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(1, "10", None).unwrap();
+        let bc = compiler.bytecode();
+
+        println!("  코드: if (1) {{ 10 }}");
+        println!("  바이트코드:");
+        println!("{}", disassemble(&bc).lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"));
+        println!("  상수: {:?}", bc.constants);
+        println!();
+    }
+
+    // Demo 2: if-else
+    println!("【Demo 2】if-else 분기");
+    {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(1, "10", Some("20")).unwrap();
+        let bc = compiler.bytecode();
+
+        println!("  코드: if (1) {{ 10 }} else {{ 20 }}");
+        println!("  바이트코드:");
+        println!("{}", disassemble(&bc).lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"));
+
+        // 백필링 검증
+        println!("  [백필링 검증]");
+        let op1 = OpCode::from(bc.instructions[3]);
+        if op1 == OpCode::OpJumpNotTruthy {
+            let target1 = read_uint16(&bc.instructions[4..]);
+            println!("    위치 3: {} → 목표 {}", op1, target1);
+        }
+        println!();
+    }
+
+    // Demo 3: 거짓 조건
+    println!("【Demo 3】거짓 조건 처리");
+    {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(0, "10", Some("20")).unwrap();
+        let bc = compiler.bytecode();
+
+        println!("  코드: if (0) {{ 10 }} else {{ 20 }}  ← 0은 거짓");
+        println!("  바이트코드:");
+        println!("{}", disassemble(&bc).lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"));
+        println!();
+    }
+
+    // Demo 4: while 루프
+    println!("【Demo 4】while 루프 (후방 점프)");
+    {
+        let mut compiler = Compiler::new();
+        compiler.compile_while_loop(1, "5").unwrap();
+        let bc = compiler.bytecode();
+
+        println!("  코드: while (1) {{ 5 }}");
+        println!("  바이트코드:");
+        println!("{}", disassemble(&bc).lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"));
+
+        // 루프 검증
+        println!("  [루프 검증]");
+        println!("    조건식 검사 → 거짓이면 탈출");
+        println!("    본체 실행");
+        println!("    처음으로 돌아가기 (후방 점프)");
+        println!();
+    }
+
+    // Demo 5: 중첩 if
+    println!("【Demo 5】중첩 조건문");
+    {
+        println!("  코드:");
+        println!("    if (5 > 3) {{");
+        println!("      if (2 > 1) {{");
+        println!("        100");
+        println!("      }}");
+        println!("    }}");
+
+        let mut compiler = Compiler::new();
+        // 첫 번째 조건
+        let cond1_idx = compiler.add_constant(CompileObject::Integer(5));
+        compiler.emit(OpCode::OpConstant, &[cond1_idx as u16]);
+        let cond1b_idx = compiler.add_constant(CompileObject::Integer(3));
+        compiler.emit(OpCode::OpConstant, &[cond1b_idx as u16]);
+        compiler.emit(OpCode::OpGreaterThan, &[]);
+
+        let jump1_pos = compiler.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        // 두 번째 조건 (중첩)
+        let cond2_idx = compiler.add_constant(CompileObject::Integer(2));
+        compiler.emit(OpCode::OpConstant, &[cond2_idx as u16]);
+        let cond2b_idx = compiler.add_constant(CompileObject::Integer(1));
+        compiler.emit(OpCode::OpConstant, &[cond2b_idx as u16]);
+        compiler.emit(OpCode::OpGreaterThan, &[]);
+
+        let jump2_pos = compiler.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        // 내부 블록
+        let val_idx = compiler.add_constant(CompileObject::Integer(100));
+        compiler.emit(OpCode::OpConstant, &[val_idx as u16]);
+
+        let after2_pos = compiler.scopes[compiler.scope_index].instructions.len();
+        compiler.change_operand(jump2_pos, after2_pos as u16);
+
+        let after1_pos = compiler.scopes[compiler.scope_index].instructions.len();
+        compiler.change_operand(jump1_pos, after1_pos as u16);
+
+        let bc = compiler.bytecode();
+        println!("  바이트코드:");
+        println!("{}", disassemble(&bc).lines().map(|l| format!("    {}", l)).collect::<Vec<_>>().join("\n"));
+        println!();
+    }
+
+    // Demo 6: 점프 거리 검증
+    println!("【Demo 6】점프 거리 검증");
+    {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(1, "100 200 300 400", Some("500")).unwrap();
+        let bc = compiler.bytecode();
+
+        println!("  긴 블록의 점프 거리 계산");
+        println!("  바이트코드 크기: {} 바이트", bc.instructions.len());
+        println!("  상수: {} 개", bc.constants.len());
+
+        // 점프 위치 검증
+        if bc.instructions.len() >= 3 {
+            let jump_target = read_uint16(&bc.instructions[4..]);
+            println!("  점프 대상: {} (변경 전 0 → 변경 후 {})", 0, jump_target);
+        }
+        println!();
+    }
+
+    // Demo 7: 복잡한 제어 흐름
+    println!("【Demo 7】복잡한 분기 (if-else-if)");
+    {
+        println!("  의사코드:");
+        println!("    if (a) {{ x }}");
+        println!("    else if (b) {{ y }}");
+        println!("    else {{ z }}");
+        println!("  특징: 3개의 점프, 모두 다른 목표 주소로");
+        println!("  [백필링으로 각각 수정됨]");
+        println!();
+    }
+
+    // Demo 8: 백필링 메커니즘 설명
+    println!("【Demo 8】백필링 메커니즘 (2-Pass Compilation)");
+    {
+        println!("  Pass 1 (코드 생성):");
+        println!("    1. 조건식 컴파일");
+        println!("    2. OpJumpNotTruthy 내보내기 (주소 = 0x0000, 임시)");
+        println!("    3. 분기 블록 컴파일");
+        println!();
+        println!("  Pass 2 (백필링):");
+        println!("    1. 분기 블록 끝났을 때 현재 위치 계산");
+        println!("    2. change_operand()로 이전 점프 명령 수정");
+        println!("    3. instructions[jump_pos+1..3] = target_address");
+        println!();
+        println!("  장점:");
+        println!("    ✓ 한 번의 패스로 AST 순회");
+        println!("    ✓ 메모리 효율적 (별도 심볼 테이블 없음)");
+        println!("    ✓ 동적 조건도 처리 가능");
+        println!();
+    }
+
+    println!("=== v15.2 핵심 개념 ===\n");
+    println!("1. 점프 명령어 (Jump Instructions):");
+    println!("   - OpJump: 무조건 점프 (루프)");
+    println!("   - OpJumpNotTruthy: 거짓이면 점프 (if)");
+    println!();
+    println!("2. 백필링 (Backfilling/Patching):");
+    println!("   - 점프 주소를 나중에 채우는 기법");
+    println!("   - change_operand()로 이미 생성된 코드 수정");
+    println!();
+    println!("3. 점프 유형:");
+    println!("   - 전방 점프 (Forward Jump): if/else (주소 모름)");
+    println!("   - 후방 점프 (Backward Jump): while (주소 알고 있음)");
+    println!();
+    println!("4. 효과:");
+    println!("   - 비선형 실행 흐름 구현");
+    println!("   - VM이 조건부로 코드 건너뛸 수 있음");
+    println!("   - 루프 구현 가능");
+}
+
+// ============================================================================
+// 테스트
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_simple_if() {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(1, "10", None).unwrap();
+        let bc = compiler.bytecode();
+
+        assert!(bc.instructions.len() > 0);
+        assert_eq!(OpCode::from(bc.instructions[0]), OpCode::OpConstant);
+        assert_eq!(OpCode::from(bc.instructions[3]), OpCode::OpJumpNotTruthy);
+    }
+
+    #[test]
+    fn test_if_else_backfilling() {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(1, "10", Some("20")).unwrap();
+        let bc = compiler.bytecode();
+
+        // OpJumpNotTruthy 위치 확인
+        let jump_target = read_uint16(&bc.instructions[4..]);
+        // 점프 대상이 0이 아님 (백필링되었음)
+        assert!(jump_target > 0);
+    }
+
+    #[test]
+    fn test_while_loop_backward_jump() {
+        let mut compiler = Compiler::new();
+        compiler.compile_while_loop(1, "5").unwrap();
+        let bc = compiler.bytecode();
+
+        // 루프 시작 위치로 돌아가는 OpJump 찾기
+        let mut found_backward_jump = false;
+        let mut offset = 0;
+        while offset < bc.instructions.len() {
+            let op = OpCode::from(bc.instructions[offset]);
+            if op == OpCode::OpJump {
+                let target = read_uint16(&bc.instructions[offset + 1..]);
+                if target == 0 {
+                    found_backward_jump = true;
+                }
+            }
+            offset += 1;
+        }
+        assert!(found_backward_jump);
+    }
+
+    #[test]
+    fn test_nested_if() {
+        let mut compiler = Compiler::new();
+
+        let cond1_idx = compiler.add_constant(CompileObject::Integer(5));
+        compiler.emit(OpCode::OpConstant, &[cond1_idx as u16]);
+        let jump1_pos = compiler.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        let cond2_idx = compiler.add_constant(CompileObject::Integer(3));
+        compiler.emit(OpCode::OpConstant, &[cond2_idx as u16]);
+        let jump2_pos = compiler.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        let inner_idx = compiler.add_constant(CompileObject::Integer(100));
+        compiler.emit(OpCode::OpConstant, &[inner_idx as u16]);
+
+        let after_inner = compiler.scopes[compiler.scope_index].instructions.len();
+        compiler.change_operand(jump2_pos, after_inner as u16);
+
+        let after_outer = compiler.scopes[compiler.scope_index].instructions.len();
+        compiler.change_operand(jump1_pos, after_outer as u16);
+
+        let bc = compiler.bytecode();
+        assert!(bc.instructions.len() > 0);
+    }
+
+    #[test]
+    fn test_change_operand() {
+        let mut compiler = Compiler::new();
+        let pos = compiler.emit(OpCode::OpJump, &[0, 0]);
+        compiler.change_operand(pos, 42);
+
+        let bc = compiler.bytecode();
+        let target = read_uint16(&bc.instructions[pos + 1..]);
+        assert_eq!(target, 42);
+    }
+
+    #[test]
+    fn test_disassemble_jump() {
+        let mut compiler = Compiler::new();
+        compiler.emit(OpCode::OpJump, &[100]);
+        compiler.emit(OpCode::OpReturn, &[]);
+
+        let bc = compiler.bytecode();
+        let disasm = disassemble(&bc);
+        assert!(disasm.contains("OpJump"));
+        assert!(disasm.contains("100"));
+    }
+
+    #[test]
+    fn test_backward_jump_in_loop() {
+        let mut compiler = Compiler::new();
+        compiler.compile_while_loop(1, "5").unwrap();
+
+        let bc = compiler.bytecode();
+        // 루프는 조건 검사로 시작해야 함
+        assert_eq!(OpCode::from(bc.instructions[0]), OpCode::OpConstant);
+
+        // OpJump가 있어야 함
+        let has_jump = bc.instructions.iter().any(|&b| OpCode::from(b) == OpCode::OpJump);
+        assert!(has_jump);
+    }
+
+    #[test]
+    fn test_if_false_condition() {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(0, "10", Some("20")).unwrap();
+        let bc = compiler.bytecode();
+
+        assert!(bc.instructions.len() > 0);
+        // 거짓 조건(0)도 컴파일되어야 함
+        assert_eq!(OpCode::from(bc.instructions[0]), OpCode::OpConstant);
+    }
+
+    #[test]
+    fn test_multiple_constants() {
+        let mut compiler = Compiler::new();
+        compiler.compile_if_expression(5, "10 20 30", Some("40 50")).unwrap();
+
+        let bc = compiler.bytecode();
+        // 여러 상수가 풀에 저장되어야 함
+        assert!(bc.constants.len() >= 4);
+    }
+
+    #[test]
+    fn test_opcode_width() {
+        assert_eq!(OpCode::OpConstant.operand_widths(), vec![2]);
+        assert_eq!(OpCode::OpJump.operand_widths(), vec![2]);
+        assert_eq!(OpCode::OpAdd.operand_widths(), vec![]);
+    }
+
+    #[test]
+    fn test_backfilling_accuracy() {
+        let mut compiler = Compiler::new();
+
+        // 정확한 점프 거리 검증
+        let cond_idx = compiler.add_constant(CompileObject::Integer(1));
+        compiler.emit(OpCode::OpConstant, &[cond_idx as u16]);
+
+        let jump_pos = compiler.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+        // 10바이트 분량의 코드 추가
+        for i in 0..5 {
+            let idx = compiler.add_constant(CompileObject::Integer(i));
+            compiler.emit(OpCode::OpConstant, &[idx as u16]);
+        }
+
+        let target_pos = compiler.scopes[compiler.scope_index].instructions.len();
+        compiler.change_operand(jump_pos, target_pos as u16);
+
+        let bc = compiler.bytecode();
+        let actual_target = read_uint16(&bc.instructions[jump_pos + 1..]);
+        assert_eq!(actual_target, target_pos as u16);
+    }
+}

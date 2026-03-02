@@ -1,0 +1,263 @@
+"""
+Phase 2: GogsGlobalNetwork - 클러스터 통신 버스
+실제 TCP 없이 asyncio로 네트워크 파티션, 지연, 손실 시뮬레이션
+"""
+
+import asyncio
+import random
+from dataclasses import dataclass
+from typing import Dict, Optional, Set
+from collections import defaultdict
+
+from .node import RaftNode, VoteRequest, VoteResponse, AppendEntriesRequest, AppendEntriesResponse
+
+
+@dataclass
+class NetworkConfig:
+    """네트워크 시뮬레이션 파라미터"""
+    min_delay_ms: float = 10.0
+    max_delay_ms: float = 150.0
+    packet_loss_rate: float = 0.0  # 0.0 ~ 1.0
+
+
+class GogsGlobalNetwork:
+    """
+    Raft 클러스터 통신 버스
+
+    기능:
+    - 노드 간 RPC 메시지 라우팅
+    - 네트워크 지연 시뮬레이션
+    - 패킷 손실 시뮬레이션
+    - 네트워크 파티션 (split-brain 시나리오)
+    - 노드 장애 시뮬레이션
+    """
+
+    def __init__(self, config: NetworkConfig):
+        self.config = config
+        self.nodes: Dict[str, RaftNode] = {}
+
+        # 파티션: frozenset 쌍으로 표현 (양방향 차단)
+        self._partitions: Set[frozenset] = set()
+
+        # 메시지 라우팅 큐 (테스트용)
+        self._message_log: list = []
+
+    def add_node(self, node: RaftNode) -> None:
+        """클러스터에 노드 추가"""
+        self.nodes[node.node_id] = node
+
+    def _is_partitioned(self, from_id: str, to_id: str) -> bool:
+        """두 노드 간 파티션 여부 확인"""
+        pair = frozenset([from_id, to_id])
+        return pair in self._partitions
+
+    def _should_drop_packet(self) -> bool:
+        """패킷 손실 시뮬레이션"""
+        return random.random() < self.config.packet_loss_rate
+
+    async def _simulate_network_delay(self) -> None:
+        """네트워크 지연 시뮬레이션"""
+        delay_ms = random.uniform(
+            self.config.min_delay_ms,
+            self.config.max_delay_ms,
+        )
+        await asyncio.sleep(delay_ms / 1000.0)
+
+    async def send_vote_request(
+        self, from_id: str, to_id: str, request: VoteRequest
+    ) -> Optional[VoteResponse]:
+        """
+        투표 요청 전송
+
+        흐름:
+        1. 파티션 차단 확인
+        2. 패킷 손실 확인
+        3. 네트워크 지연 시뮬레이션
+        4. 대상 노드가 활성인지 확인
+        5. RPC 핸들러 호출
+        """
+        self._message_log.append(("vote_request", from_id, to_id, request.term))
+
+        # 1. 파티션 확인
+        if self._is_partitioned(from_id, to_id):
+            return None
+
+        # 2. 패킷 손실 확인
+        if self._should_drop_packet():
+            return None
+
+        # 3. 지연 시뮬레이션
+        await self._simulate_network_delay()
+
+        # 4. 대상 노드 활성 확인
+        if to_id not in self.nodes or not self.nodes[to_id].is_alive:
+            return None
+
+        # 5. RPC 호출
+        try:
+            response = await self.nodes[to_id].on_vote_request(request)
+            return response
+        except Exception:
+            return None
+
+    async def send_append_entries(
+        self, from_id: str, to_id: str, request: AppendEntriesRequest
+    ) -> Optional[AppendEntriesResponse]:
+        """
+        로그 복제 요청 전송
+
+        흐름:
+        1. 파티션 차단 확인
+        2. 패킷 손실 확인
+        3. 네트워크 지연 시뮬레이션
+        4. 대상 노드가 활성인지 확인
+        5. RPC 핸들러 호출
+        """
+        self._message_log.append(
+            ("append_entries", from_id, to_id, request.term, len(request.entries))
+        )
+
+        # 1. 파티션 확인
+        if self._is_partitioned(from_id, to_id):
+            return None
+
+        # 2. 패킷 손실 확인
+        if self._should_drop_packet():
+            return None
+
+        # 3. 지연 시뮬레이션
+        await self._simulate_network_delay()
+
+        # 4. 대상 노드 활성 확인
+        if to_id not in self.nodes or not self.nodes[to_id].is_alive:
+            return None
+
+        # 5. RPC 호출
+        try:
+            response = await self.nodes[to_id].on_append_entries(request)
+            return response
+        except Exception:
+            return None
+
+    def partition_nodes(self, node_a: str, node_b: str) -> None:
+        """두 노드 간 네트워크 파티션 (양방향)"""
+        partition = frozenset([node_a, node_b])
+        self._partitions.add(partition)
+
+    def heal_partition(self, node_a: str, node_b: str) -> None:
+        """네트워크 파티션 복구"""
+        partition = frozenset([node_a, node_b])
+        self._partitions.discard(partition)
+
+    def partition_majority(self, alive_nodes: list, total: int) -> None:
+        """다수파와 소수파 분할 (3+2 시나리오)
+
+        예: 5개 노드에서 [A, B, C] vs [D, E] 분할
+        """
+        dead_nodes = [n for n in self.nodes.keys() if n not in alive_nodes]
+        for alive in alive_nodes:
+            for dead in dead_nodes:
+                self.partition_nodes(alive, dead)
+
+    def heal_all_partitions(self) -> None:
+        """모든 파티션 복구"""
+        self._partitions.clear()
+
+    def kill_node(self, node_id: str) -> None:
+        """노드 장애 (네트워크 차단)"""
+        if node_id in self.nodes:
+            self.nodes[node_id].is_alive = False
+
+    def revive_node(self, node_id: str) -> None:
+        """노드 복구"""
+        if node_id in self.nodes:
+            self.nodes[node_id].is_alive = True
+
+    def get_current_leader(self) -> Optional[str]:
+        """현재 리더 반환"""
+        for node_id, node in self.nodes.items():
+            if node.state.value == "LEADER" and node.is_alive:
+                return node_id
+        return None
+
+    def get_active_followers(self) -> list:
+        """활성 팔로워 목록"""
+        return [
+            node_id
+            for node_id, node in self.nodes.items()
+            if node.state.value == "FOLLOWER" and node.is_alive
+        ]
+
+    def get_active_candidates(self) -> list:
+        """활성 후보 목록"""
+        return [
+            node_id
+            for node_id, node in self.nodes.items()
+            if node.state.value == "CANDIDATE" and node.is_alive
+        ]
+
+    def get_term_statistics(self) -> dict:
+        """현재 모든 노드의 term 통계"""
+        terms = defaultdict(int)
+        for node in self.nodes.values():
+            if node.is_alive:
+                terms[node.current_term] += 1
+        return dict(terms)
+
+    def get_log_consistency(self) -> bool:
+        """모든 활성 노드의 로그 일관성 확인 (모든 term과 index 동일)"""
+        active_nodes = [n for n in self.nodes.values() if n.is_alive]
+        if not active_nodes:
+            return True
+
+        first_node = active_nodes[0]
+        first_log_length = len(first_node.log)
+
+        for node in active_nodes[1:]:
+            if len(node.log) != first_log_length:
+                return False
+
+            for i in range(len(node.log)):
+                if (
+                    node.log[i].term != first_node.log[i].term
+                    or node.log[i].command != first_node.log[i].command
+                ):
+                    return False
+
+        return True
+
+    def print_cluster_table(self) -> str:
+        """클러스터 상태를 ASCII 테이블로 출력"""
+        lines = []
+        lines.append("╔════════╦═════════╦═══════╦════════╦════════════╦═══════════╗")
+        lines.append(
+            "║ Node   ║ State    ║ Term  ║ Status ║ Log Length ║ Committed ║"
+        )
+        lines.append("╠════════╬═════════╬═══════╬════════╬════════════╬═══════════╣")
+
+        for node_id in sorted(self.nodes.keys()):
+            node = self.nodes[node_id]
+            state_str = node.state.value[:7]
+            status = "ALIVE" if node.is_alive else "DOWN"
+            term = node.current_term
+            log_len = len(node.log)
+            commit = node.commit_index
+
+            lines.append(
+                f"║ {node_id:6} ║ {state_str:7} ║ {term:5} ║ {status:6} ║ {log_len:10} ║ {commit:9} ║"
+            )
+
+        lines.append("╚════════╩═════════╩═══════╩════════╩════════════╩═══════════╝")
+
+        leader = self.get_current_leader()
+        lines.append(f"Leader: {leader if leader else 'NONE'}")
+
+        return "\n".join(lines)
+
+    def get_message_log(self) -> list:
+        """메시지 로그 반환"""
+        return self._message_log.copy()
+
+    def clear_message_log(self) -> None:
+        """메시지 로그 초기화"""
+        self._message_log.clear()

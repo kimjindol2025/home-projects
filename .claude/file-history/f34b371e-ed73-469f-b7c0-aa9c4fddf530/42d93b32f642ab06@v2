@@ -1,0 +1,354 @@
+"""
+v5.6 Flask Web Application
+웹 UI 기반 연구 기록 관리 시스템
+"""
+
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask_session import Session
+import os
+import sys
+from datetime import datetime, timedelta
+
+# v5.5 모듈 import
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from v5_5_capstone_integration.db_layer import GogsDatabase
+from v5_5_capstone_integration.auth import AuthManager
+from v5_5_capstone_integration.api_handler import APIHandler, HTTPStatusCode
+
+import json
+
+# Flask 앱 생성
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'gogs_secret_key_2026'
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+
+# 글로벌 컴포넌트 초기화
+db = None
+auth = None
+api = None
+
+
+def init_app():
+    """앱 초기화"""
+    global db, auth, api
+    db = GogsDatabase('gogs_research.db')
+    auth = AuthManager(db)
+    api = APIHandler(db, auth)
+
+
+# 【 Helper Functions 】
+def login_required(f):
+    """로그인 필수 데코레이터"""
+    def decorated_function(*args, **kwargs):
+        if 'token' not in session or 'researcher_id' not in session:
+            return redirect(url_for('login_page'))
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
+
+
+def get_current_researcher():
+    """현재 사용자 정보"""
+    if 'researcher_id' in session:
+        return db.get_researcher(session['researcher_id'])
+    return None
+
+
+# 【 Auth Routes 】
+@app.route('/')
+def index():
+    """홈페이지"""
+    if 'token' in session:
+        researcher = get_current_researcher()
+        return redirect(url_for('dashboard', name=researcher['name']))
+    return redirect(url_for('login_page'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    """로그인 페이지"""
+    if request.method == 'POST':
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+
+        token = auth.authenticate(email, password)
+        if token:
+            researcher = db.get_researcher_by_email(email)
+            session['token'] = token
+            session['researcher_id'] = researcher['id']
+            session['email'] = email
+            session['name'] = researcher['name']
+            session['role'] = researcher.get('role', 'researcher')
+            return jsonify({'success': True, 'redirect': url_for('dashboard', name=researcher['name'])})
+        else:
+            return jsonify({'success': False, 'message': '이메일 또는 비밀번호가 잘못되었습니다'}), 401
+
+    return render_template('login.html')
+
+
+@app.route('/logout')
+def logout():
+    """로그아웃"""
+    token = session.get('token')
+    if token:
+        auth.logout(token)
+    session.clear()
+    return redirect(url_for('login_page'))
+
+
+# 【 Dashboard Routes 】
+@app.route('/dashboard/<name>')
+@login_required
+def dashboard(name):
+    """대시보드"""
+    researcher = get_current_researcher()
+    stats = db.get_statistics()
+    top_experiments = db.get_top_experiments(5)
+
+    return render_template(
+        'dashboard.html',
+        researcher=researcher,
+        stats=stats,
+        top_experiments=top_experiments
+    )
+
+
+# 【 Researchers Routes 】
+@app.route('/researchers')
+@login_required
+def researchers():
+    """연구자 목록"""
+    researchers_list = db.get_all_researchers()
+    return render_template('researchers.html', researchers=researchers_list)
+
+
+@app.route('/api/v1/researchers', methods=['GET'])
+@login_required
+def api_researchers_list():
+    """API: 연구자 목록"""
+    try:
+        researchers_list = db.get_all_researchers()
+        return jsonify({'success': True, 'data': researchers_list})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/researchers', methods=['POST'])
+@login_required
+def api_researchers_create():
+    """API: 연구자 생성"""
+    try:
+        data = request.get_json()
+        name = data.get('name')
+        email = data.get('email')
+        role = data.get('role', 'researcher')
+
+        if not name or not email:
+            return jsonify({'success': False, 'message': 'name과 email은 필수'}), 400
+
+        researcher = db.create_researcher(name, email, role)
+        return jsonify({'success': True, 'data': researcher}), 201
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/researchers/<int:researcher_id>', methods=['GET'])
+@login_required
+def api_researchers_get(researcher_id):
+    """API: 연구자 조회"""
+    try:
+        researcher = db.get_researcher(researcher_id)
+        if not researcher:
+            return jsonify({'success': False, 'message': '연구자를 찾을 수 없습니다'}), 404
+        return jsonify({'success': True, 'data': researcher})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/researchers/<int:researcher_id>', methods=['PUT'])
+@login_required
+def api_researchers_update(researcher_id):
+    """API: 연구자 정보 수정"""
+    try:
+        data = request.get_json()
+        researcher = db.update_researcher(researcher_id, **data)
+        return jsonify({'success': True, 'data': researcher})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/researchers/<int:researcher_id>', methods=['DELETE'])
+@login_required
+def api_researchers_delete(researcher_id):
+    """API: 연구자 삭제"""
+    try:
+        if db.delete_researcher(researcher_id):
+            return jsonify({'success': True, 'message': '삭제되었습니다'})
+        else:
+            return jsonify({'success': False, 'message': '연구자를 찾을 수 없습니다'}), 404
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# 【 Experiments Routes 】
+@app.route('/experiments')
+@login_required
+def experiments():
+    """실험 목록"""
+    status_filter = request.args.get('status', None)
+    experiments_list = db.get_all_experiments(status_filter)
+
+    # 현재 사용자가 작성한 실험만 필터링 (Researcher 역할인 경우)
+    researcher = get_current_researcher()
+    if researcher.get('role') == 'researcher':
+        experiments_list = [e for e in experiments_list if e['researcher_id'] == researcher['id']]
+
+    return render_template('experiments.html', experiments=experiments_list)
+
+
+@app.route('/api/v1/experiments', methods=['GET'])
+@login_required
+def api_experiments_list():
+    """API: 실험 목록"""
+    try:
+        status = request.args.get('status', None)
+        experiments_list = db.get_all_experiments(status)
+        return jsonify({'success': True, 'data': experiments_list})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/experiments', methods=['POST'])
+@login_required
+def api_experiments_create():
+    """API: 실험 생성"""
+    try:
+        data = request.get_json()
+        researcher_id = data.get('researcher_id')
+        subject = data.get('subject')
+        description = data.get('description', '')
+        status = data.get('status', 'pending')
+
+        if not researcher_id or not subject:
+            return jsonify({'success': False, 'message': 'researcher_id와 subject는 필수'}), 400
+
+        experiment = db.create_experiment(researcher_id, subject, description, status)
+        return jsonify({'success': True, 'data': experiment}), 201
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/experiments/<int:experiment_id>', methods=['GET'])
+@login_required
+def api_experiments_get(experiment_id):
+    """API: 실험 조회"""
+    try:
+        experiment = db.get_experiment(experiment_id)
+        if not experiment:
+            return jsonify({'success': False, 'message': '실험을 찾을 수 없습니다'}), 404
+        return jsonify({'success': True, 'data': experiment})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/experiments/<int:experiment_id>', methods=['PUT'])
+@login_required
+def api_experiments_update(experiment_id):
+    """API: 실험 수정"""
+    try:
+        data = request.get_json()
+        experiment = db.update_experiment(experiment_id, **data)
+        return jsonify({'success': True, 'data': experiment})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/experiments/<int:experiment_id>', methods=['DELETE'])
+@login_required
+def api_experiments_delete(experiment_id):
+    """API: 실험 삭제"""
+    try:
+        if db.delete_experiment(experiment_id):
+            return jsonify({'success': True, 'message': '삭제되었습니다'})
+        else:
+            return jsonify({'success': False, 'message': '실험을 찾을 수 없습니다'}), 404
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# 【 Logs Routes 】
+@app.route('/api/v1/experiments/<int:experiment_id>/logs', methods=['GET'])
+@login_required
+def api_logs_list(experiment_id):
+    """API: 로그 조회"""
+    try:
+        logs = db.get_experiment_logs(experiment_id)
+        return jsonify({'success': True, 'data': logs})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/experiments/<int:experiment_id>/logs', methods=['POST'])
+@login_required
+def api_logs_add(experiment_id):
+    """API: 로그 추가"""
+    try:
+        data = request.get_json()
+        log_text = data.get('log_text')
+
+        if not log_text:
+            return jsonify({'success': False, 'message': 'log_text는 필수'}), 400
+
+        log = db.add_experiment_log(experiment_id, log_text)
+        return jsonify({'success': True, 'data': log}), 201
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# 【 Statistics Routes 】
+@app.route('/api/v1/statistics', methods=['GET'])
+@login_required
+def api_statistics():
+    """API: 통계"""
+    try:
+        stats = db.get_statistics()
+        return jsonify({'success': True, 'data': stats})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/v1/top-experiments', methods=['GET'])
+@login_required
+def api_top_experiments():
+    """API: 상위 실험"""
+    try:
+        limit = request.args.get('limit', 5, type=int)
+        experiments = db.get_top_experiments(limit)
+        return jsonify({'success': True, 'data': experiments})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# 【 Error Handlers 】
+@app.errorhandler(404)
+def not_found(error):
+    """404 에러 처리"""
+    return render_template('404.html'), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    """500 에러 처리"""
+    return render_template('500.html'), 500
+
+
+if __name__ == '__main__':
+    init_app()
+    print('\n' + '=' * 70)
+    print('🌐 Gogs Web UI 서버 시작')
+    print('=' * 70)
+    print('주소: http://localhost:5000')
+    print('=' * 70 + '\n')
+    app.run(debug=True, host='0.0.0.0', port=5000)

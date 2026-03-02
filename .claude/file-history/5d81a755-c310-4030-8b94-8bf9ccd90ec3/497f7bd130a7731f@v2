@@ -1,0 +1,414 @@
+"""
+v7.2 주문 서비스 (Order Service)
+
+2계층 설계:
+1. OrderBusinessLogic: 순수 Python, grpc 의존성 없음, 테스트 용이
+2. OrderServicer: gRPC 어댑터 (grpc 설치 시에만 활성화)
+"""
+
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Dict, List, Generator, Optional
+from dataclasses import dataclass, asdict
+import uuid
+
+# ============================================================================
+# 비즈니스 로직 레이어 (grpc 의존성 없음)
+# ============================================================================
+
+
+class OrderStatus(Enum):
+    """주문 상태"""
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    SHIPPED = "SHIPPED"
+    DELIVERED = "DELIVERED"
+    CANCELLED = "CANCELLED"
+
+
+@dataclass
+class Order:
+    """주문 도메인 모델"""
+    order_id: str
+    product_name: str
+    quantity: int
+    price: float
+    status: OrderStatus = OrderStatus.PENDING
+    created_at: str = None
+    updated_at: str = None
+
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.utcnow().isoformat()
+        if self.updated_at is None:
+            self.updated_at = datetime.utcnow().isoformat()
+
+    def to_dict(self) -> Dict:
+        """딕셔너리 변환"""
+        data = asdict(self)
+        data["status"] = self.status.value
+        return data
+
+
+class OrderBusinessLogic:
+    """
+    주문 비즈니스 로직 (4가지 RPC 패턴 구현)
+
+    1. create_order (Unary): 단일 요청 → 단일 응답
+    2. track_order_stream (Server Streaming): 주문 추적 상태 스트림
+    3. process_batch_orders (Client Streaming): 다중 주문 배치 처리
+    4. process_orders_bidirectional (Bidirectional): 양방향 주문-피드백
+    """
+
+    def __init__(self):
+        """주문 저장소 초기화"""
+        self.orders: Dict[str, Order] = {}
+        self.order_count = 0
+        self.metrics = {
+            "total_created": 0,
+            "total_shipped": 0,
+            "total_cancelled": 0,
+            "batch_processed": 0,
+        }
+
+    # ========================================================================
+    # 1. Unary RPC: create_order
+    # ========================================================================
+
+    def create_order(
+        self,
+        product_name: str,
+        quantity: int,
+        price: float,
+    ) -> Dict:
+        """
+        주문 생성 (Unary RPC)
+
+        Args:
+            product_name: 상품명
+            quantity: 수량
+            price: 가격
+
+        Returns:
+            주문 정보 딕셔너리
+        """
+        order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+        order = Order(
+            order_id=order_id,
+            product_name=product_name,
+            quantity=quantity,
+            price=price,
+            status=OrderStatus.PENDING,
+        )
+
+        self.orders[order_id] = order
+        self.order_count += 1
+        self.metrics["total_created"] += 1
+
+        return {
+            "success": True,
+            "order": order.to_dict(),
+            "message": f"주문 {order_id} 생성됨",
+        }
+
+    # ========================================================================
+    # 2. Server Streaming RPC: track_order_stream
+    # ========================================================================
+
+    def track_order_stream(
+        self,
+        order_id: str,
+    ) -> Generator[Dict, None, None]:
+        """
+        주문 상태 추적 스트림 (Server Streaming RPC)
+
+        서버가 여러 상태 변화를 순차적으로 클라이언트에 스트림합니다.
+
+        Args:
+            order_id: 주문 ID
+
+        Yields:
+            각 상태 변화의 딕셔너리
+        """
+        if order_id not in self.orders:
+            yield {
+                "success": False,
+                "error": f"주문 {order_id}을(를) 찾을 수 없습니다",
+            }
+            return
+
+        order = self.orders[order_id]
+        statuses = [
+            OrderStatus.PENDING,
+            OrderStatus.PROCESSING,
+            OrderStatus.SHIPPED,
+            OrderStatus.DELIVERED,
+        ]
+
+        for i, status in enumerate(statuses):
+            # 각 단계별 처리 시간 시뮬레이션
+            delay_seconds = (i + 1) * 5
+
+            # 상태 업데이트
+            order.status = status
+            order.updated_at = datetime.utcnow().isoformat()
+
+            yield {
+                "success": True,
+                "order": order.to_dict(),
+                "message": f"상태 변경: {status.value}",
+                "estimated_delivery": (
+                    datetime.utcnow() + timedelta(seconds=delay_seconds)
+                ).isoformat(),
+            }
+
+        self.metrics["total_shipped"] += 1
+
+    # ========================================================================
+    # 3. Client Streaming RPC: process_batch_orders
+    # ========================================================================
+
+    def process_batch_orders(
+        self,
+        orders_data: List[Dict],
+    ) -> Dict:
+        """
+        배치 주문 처리 (Client Streaming RPC)
+
+        클라이언트가 여러 주문을 순차적으로 전송하고,
+        서버가 모두 수신한 후 최종 결과를 반환합니다.
+
+        Args:
+            orders_data: 주문 정보 리스트
+
+        Returns:
+            배치 처리 결과
+        """
+        processed = []
+        errors = []
+
+        for order_data in orders_data:
+            try:
+                result = self.create_order(
+                    product_name=order_data.get("product_name"),
+                    quantity=order_data.get("quantity"),
+                    price=order_data.get("price"),
+                )
+                if result["success"]:
+                    processed.append(result["order"])
+                else:
+                    errors.append(order_data)
+            except Exception as e:
+                errors.append({**order_data, "error": str(e)})
+
+        self.metrics["batch_processed"] += 1
+
+        return {
+            "success": len(errors) == 0,
+            "total_received": len(orders_data),
+            "total_processed": len(processed),
+            "total_failed": len(errors),
+            "processed_orders": processed,
+            "failed_orders": errors if errors else None,
+            "message": f"배치 처리 완료: {len(processed)}/{len(orders_data)}",
+        }
+
+    # ========================================================================
+    # 4. Bidirectional Streaming RPC: process_orders_bidirectional
+    # ========================================================================
+
+    def process_orders_bidirectional(
+        self,
+        requests: List[Dict],
+    ) -> Generator[Dict, None, None]:
+        """
+        양방향 주문 처리 (Bidirectional Streaming RPC)
+
+        클라이언트와 서버가 동시에 데이터를 주고받습니다.
+        서버는 각 주문을 받을 때마다 피드백을 전송합니다.
+
+        Args:
+            requests: 주문 요청 리스트
+
+        Yields:
+            각 주문마다의 처리 결과
+        """
+        for i, request in enumerate(requests, 1):
+            try:
+                result = self.create_order(
+                    product_name=request.get("product_name"),
+                    quantity=request.get("quantity"),
+                    price=request.get("price"),
+                )
+
+                yield {
+                    "success": True,
+                    "sequence": i,
+                    "order": result["order"],
+                    "message": f"주문 {i} 처리됨",
+                }
+
+            except Exception as e:
+                yield {
+                    "success": False,
+                    "sequence": i,
+                    "error": str(e),
+                    "message": f"주문 {i} 처리 실패",
+                }
+
+    # ========================================================================
+    # 유틸리티
+    # ========================================================================
+
+    def get_order(self, order_id: str) -> Optional[Dict]:
+        """주문 조회"""
+        if order_id in self.orders:
+            return self.orders[order_id].to_dict()
+        return None
+
+    def cancel_order(self, order_id: str) -> Dict:
+        """주문 취소"""
+        if order_id not in self.orders:
+            return {"success": False, "error": f"주문 {order_id}을(를) 찾을 수 없습니다"}
+
+        order = self.orders[order_id]
+        order.status = OrderStatus.CANCELLED
+        order.updated_at = datetime.utcnow().isoformat()
+        self.metrics["total_cancelled"] += 1
+
+        return {
+            "success": True,
+            "order": order.to_dict(),
+            "message": f"주문 {order_id} 취소됨",
+        }
+
+    def get_orders(self) -> List[Dict]:
+        """모든 주문 조회"""
+        return [order.to_dict() for order in self.orders.values()]
+
+    def get_metrics(self) -> Dict:
+        """메트릭 조회"""
+        return {
+            **self.metrics,
+            "total_orders_in_store": len(self.orders),
+        }
+
+
+# ============================================================================
+# gRPC 서비스 레이어 (선택적)
+# ============================================================================
+
+try:
+    import grpc
+    from ..generated import order_pb2, order_pb2_grpc
+
+    GRPC_AVAILABLE = True
+
+    class OrderServicer(order_pb2_grpc.OrderServiceServicer):
+        """
+        gRPC OrderService 구현
+
+        OrderBusinessLogic을 위임하여 실제 서비스 제공
+        """
+
+        def __init__(self, business_logic: Optional[OrderBusinessLogic] = None):
+            self.logic = business_logic or OrderBusinessLogic()
+
+        def CreateOrder(self, request, context):
+            """Unary RPC: 주문 생성"""
+            try:
+                result = self.logic.create_order(
+                    product_name=request.product_name,
+                    quantity=request.quantity,
+                    price=request.price,
+                )
+                return order_pb2.CreateOrderResponse(
+                    success=result["success"],
+                    order_id=result["order"]["order_id"],
+                    message=result["message"],
+                )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def TrackOrderStream(self, request, context):
+            """Server Streaming RPC: 주문 추적"""
+            try:
+                for status_update in self.logic.track_order_stream(
+                    order_id=request.order_id
+                ):
+                    if status_update["success"]:
+                        yield order_pb2.TrackOrderResponse(
+                            success=True,
+                            status=status_update["order"]["status"],
+                            message=status_update["message"],
+                        )
+                    else:
+                        context.abort(
+                            grpc.StatusCode.NOT_FOUND,
+                            status_update["error"],
+                        )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def ProcessBatchOrders(self, request_iterator, context):
+            """Client Streaming RPC: 배치 주문 처리"""
+            try:
+                orders_data = [
+                    {
+                        "product_name": req.product_name,
+                        "quantity": req.quantity,
+                        "price": req.price,
+                    }
+                    for req in request_iterator
+                ]
+
+                result = self.logic.process_batch_orders(orders_data)
+
+                return order_pb2.ProcessBatchOrdersResponse(
+                    success=result["success"],
+                    total_received=result["total_received"],
+                    total_processed=result["total_processed"],
+                    total_failed=result["total_failed"],
+                    message=result["message"],
+                )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+        def ProcessOrdersBidirectional(self, request_iterator, context):
+            """Bidirectional Streaming RPC: 양방향 주문 처리"""
+            try:
+                requests = list(request_iterator)
+                for response in self.logic.process_orders_bidirectional(
+                    [
+                        {
+                            "product_name": req.product_name,
+                            "quantity": req.quantity,
+                            "price": req.price,
+                        }
+                        for req in requests
+                    ]
+                ):
+                    if response["success"]:
+                        yield order_pb2.ProcessOrdersBidirectionalResponse(
+                            success=True,
+                            sequence=response["sequence"],
+                            order_id=response["order"]["order_id"],
+                            message=response["message"],
+                        )
+                    else:
+                        yield order_pb2.ProcessOrdersBidirectionalResponse(
+                            success=False,
+                            sequence=response["sequence"],
+                            message=response["message"],
+                        )
+            except Exception as e:
+                context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+except ImportError:
+    GRPC_AVAILABLE = False
+
+    class OrderServicer:
+        """그루핑을 위한 더미 클래스 (grpc 미설치 시)"""
+
+        def __init__(self, business_logic: Optional[OrderBusinessLogic] = None):
+            self.logic = business_logic or OrderBusinessLogic()

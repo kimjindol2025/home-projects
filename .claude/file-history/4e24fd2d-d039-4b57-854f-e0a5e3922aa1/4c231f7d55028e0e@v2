@@ -1,0 +1,806 @@
+# 🎓 Go 201-2-3: 공유 자원의 사수 - 뮤텍스(Mutex)와 원자적 연산(Atomic)
+
+> **전공 201: 고성능 병행 시스템 및 분산 아키텍처**
+>
+> 저자: Claude Haiku 4.5
+> 수준: 대학원 고급 (시스템 아키텍트 수준)
+> 이전 학습: Go 201-2-2 Fan-out/Fan-in 패턴 완료
+
+---
+
+## 🎯 핵심 철학
+
+```
+많은 일꾼이 같은 금고를 열면:
+┌─────────────────────────────┐
+│  고루틴 1  고루틴 2  고루틴 3 │
+└─────────────────────────────┘
+         ↓ ↓ ↓
+    ┌──────────────┐
+    │  금고(메모리) │  ← 동시 접근 시 데이터 꼬임!
+    └──────────────┘
+
+해결: 한 번에 하나씩만 접근 (뮤텍스로 자물쇠 채우기)
+┌─────────────────────────────┐
+│  고루틴 1  대기    대기      │
+└─────────────────────────────┘
+     ↓
+┌──────────────┐
+│  금고(잠금) │  ← 안전하게 보호됨!
+└──────────────┘
+```
+
+**경쟁 상태(Race Condition)란?**
+여러 고루틴이 동시에 같은 데이터에 접근할 때, 실행 순서에 따라 결과가 달라지는 현상
+
+**예시: 계좌 송금**
+```
+A 계좌: 1,000원
+
+고루틴1: 100원 인출
+고루틴2: 200원 인출
+
+올바른 순서: 1,000 - 100 - 200 = 700원
+잘못된 순서 (경쟁상태): 900원 (인출한 돈 사라짐!)
+```
+
+---
+
+## 📚 학습 목표
+
+이 레슨을 마치면 다음을 이해하게 됩니다:
+
+1. **뮤텍스**: 상호 배제로 임계 영역 보호
+2. **RWMutex**: 읽기와 쓰기를 분리하여 성능 최적화
+3. **Atomic**: CPU 수준의 원자적 연산
+4. **Race Detector**: 경쟁 상태 자동 탐지
+5. **설계 원칙**: 채널 vs 뮤텍스 선택 기준
+6. **안전한 맵**: 동시성 안전 자료구조 설계
+
+---
+
+## 1️⃣ 뮤텍스 (sync.Mutex): 상호 배제
+
+### 📋 기본 개념
+
+**Mutex = Mutual Exclusion (상호 배제)**
+
+뮤텍스는 임계 영역(Critical Section)을 보호하는 자물쇠입니다.
+
+```go
+import "sync"
+
+type Counter struct {
+    mu    sync.Mutex  // 자물쇠
+    value int         // 보호되는 데이터
+}
+
+// 안전한 증가 연산
+func (c *Counter) Increment() {
+    c.mu.Lock()         // 자물쇠 채우기
+    defer c.mu.Unlock() // 함수 종료 시 반드시 자물쇠 열기
+
+    c.value++           // 이 코드는 한 번에 하나의 고루틴만 실행
+}
+
+// 안전한 읽기
+func (c *Counter) Value() int {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return c.value
+}
+```
+
+### 🔒 Lock/Unlock 패턴
+
+**패턴 1: 기본 잠금**
+```go
+c.mu.Lock()
+c.value++
+c.mu.Unlock()
+```
+
+**패턴 2: defer를 이용한 안전한 잠금 해제 (권장)**
+```go
+c.mu.Lock()
+defer c.mu.Unlock()
+c.value++
+// 함수 종료 시 자동으로 Unlock()
+```
+
+**패턴 3: 패닉 발생 시에도 안전**
+```go
+func (c *Counter) SafeIncrement() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    // 중간에 패닉 발생 → defer가 자동 실행 → 자물쇠 해제
+    c.value++
+    if c.value > 1000 {
+        panic("초과!")  // Unlock()이 여전히 실행됨
+    }
+}
+```
+
+### ⚠️ 뮤텍스 사용 시 주의사항
+
+**1. 데드락 (Deadlock)**
+```go
+// 위험: 데드락 발생!
+func (c *Counter) Deadlock() {
+    c.mu.Lock()
+    c.mu.Lock()  // 이미 잠긴 뮤텍스를 다시 잠그려 함 → 무한 대기!
+}
+```
+
+**해결: sync.RWMutex 또는 구조 변경**
+
+**2. 자물쇠 누락**
+```go
+// 위험: 경쟁 상태 발생!
+func (c *Counter) UnsafeIncrement() {
+    c.value++  // 뮤텍스 없음!
+}
+```
+
+**3. 과도한 잠금 (성능 저하)**
+```go
+// 비효율: 전체 함수를 잠금
+func (c *Counter) SlowMethod() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    // 오래 걸리는 작업 (네트워크 요청 등)
+    time.Sleep(1 * time.Second)
+
+    c.value++  // 임계 영역은 아주 작음
+}
+
+// 효율적: 임계 영역만 잠금
+func (c *Counter) FastMethod() {
+    // 오래 걸리는 작업 (뮤텍스 없음)
+    time.Sleep(1 * time.Second)
+
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.value++  // 짧은 시간만 잠금
+}
+```
+
+### 📊 벤치마크: 뮤텍스 성능
+
+```
+고루틴 100개 × 10,000회 증가
+
+뮤텍스 없음 (경쟁상태):
+- 시간: ~5ms
+- 최종값: 예상 1,000,000 → 실제 984,523 (데이터 손상!)
+
+뮤텍스 사용:
+- 시간: ~150ms
+- 최종값: 정확히 1,000,000
+
+트레이드오프: 정확성 > 성능
+```
+
+---
+
+## 2️⃣ 읽기/쓰기 뮤텍스 (sync.RWMutex): 성능 최적화
+
+### 📋 개념
+
+**RWMutex = Read-Write Mutual Exclusion**
+
+```
+읽기(Read):  여러 고루틴이 동시에 가능 → 안전 (데이터 변경 없음)
+쓰기(Write): 한 고루틴만 단독 실행 → 안전 (배타적 접근)
+```
+
+### 🔓 RLock/RUnlock vs Lock/Unlock
+
+```go
+import "sync"
+
+type DataStore struct {
+    mu   sync.RWMutex
+    data map[string]int
+}
+
+// 읽기: 여러 고루틴이 동시 실행 가능
+func (ds *DataStore) Get(key string) int {
+    ds.mu.RLock()        // 읽기 잠금
+    defer ds.mu.RUnlock()
+    return ds.data[key]
+}
+
+// 쓰기: 한 고루틴만 단독 실행
+func (ds *DataStore) Set(key string, value int) {
+    ds.mu.Lock()         // 쓰기 잠금
+    defer ds.mu.Unlock()
+    ds.data[key] = value
+}
+
+// 읽기 여러 번 + 쓰기 한 번
+func (ds *DataStore) Update(key string, f func(int) int) {
+    // 먼저 읽기
+    ds.mu.RLock()
+    oldValue := ds.data[key]
+    ds.mu.RUnlock()
+
+    // 계산 (잠금 없음)
+    newValue := f(oldValue)
+
+    // 쓰기
+    ds.mu.Lock()
+    ds.data[key] = newValue
+    ds.mu.Unlock()
+}
+```
+
+### 📊 성능 비교: Mutex vs RWMutex
+
+```
+시나리오: 읽기 90%, 쓰기 10% (매우 일반적)
+
+Mutex 사용:
+- 읽기 시간: 100ms (순차 처리)
+- 쓰기 시간: 10ms
+- 총합: 110ms
+
+RWMutex 사용:
+- 읽기 시간: 5ms (동시 실행)
+- 쓰기 시간: 10ms
+- 총합: 15ms
+
+성능 개선: 110 / 15 ≈ 7.3배 ✨
+```
+
+### ⚠️ RWMutex 주의사항
+
+**1. 쓰기 중 읽기 불가**
+```go
+// 위험: 데드락!
+func (ds *DataStore) Dangerous() {
+    ds.mu.Lock()        // 쓰기 잠금
+    defer ds.mu.Unlock()
+
+    ds.mu.RLock()       // 읽기 잠금 시도 → 대기 (쓰기가 이미 잠금)
+    defer ds.mu.RUnlock()
+}
+```
+
+**2. 읽기에서 쓰기로 업그레이드 불가**
+```go
+// 위험: 데드락!
+func (ds *DataStore) ReadThenWrite() {
+    ds.mu.RLock()       // 읽기 잠금
+    defer ds.mu.RUnlock()
+
+    ds.mu.Lock()        // 쓰기 잠금 시도 → 대기 (읽기가 이미 잠금)
+    defer ds.mu.Unlock()
+}
+
+// 해결: 분리 실행
+func (ds *DataStore) ReadThenWrite() {
+    ds.mu.RLock()
+    value := ds.data["key"]
+    ds.mu.RUnlock()
+
+    // 읽기 잠금 해제 후 쓰기
+    ds.mu.Lock()
+    ds.data["key"] = value + 1
+    ds.mu.Unlock()
+}
+```
+
+---
+
+## 3️⃣ 원자적 연산 (sync/atomic): CPU 수준 최적화
+
+### 📋 개념
+
+**Atomic = 더 이상 쪼개질 수 없는 단일 연산**
+
+뮤텍스 없이도 CPU 하드웨어 지원으로 안전한 연산을 수행합니다.
+
+```
+뮤텍스: 소프트웨어 수준 (더 느림, 더 안전)
+Atomic: 하드웨어 수준 (더 빠름, 특정 연산만 지원)
+```
+
+### 🔧 주요 Atomic 연산
+
+```go
+import "sync/atomic"
+
+// 1. 정수 연산
+var count int64
+
+atomic.AddInt64(&count, 1)        // count += 1 (안전)
+atomic.AddInt64(&count, -1)       // count -= 1 (안전)
+
+val := atomic.LoadInt64(&count)   // 안전하게 읽기
+atomic.StoreInt64(&count, 100)    // 안전하게 쓰기
+
+// 2. 비교 및 스왑 (Compare-and-Swap)
+oldVal := int64(100)
+newVal := int64(200)
+swapped := atomic.CompareAndSwapInt64(&count, oldVal, newVal)
+// oldVal과 현재값이 같으면 newVal로 변경, true 반환
+// 다르면 변경 안 함, false 반환
+
+// 3. 포인터
+var ptr *Counter
+atomic.StorePointer(&ptr, unsafe.Pointer(newCounter))
+loadedPtr := atomic.LoadPointer(&ptr)
+
+// 4. 불린
+var flag int32  // atomic은 bool을 직접 지원하지 않음
+atomic.StoreInt32(&flag, 1)  // true (1)
+atomic.LoadInt32(&flag)      // 1 (true로 해석)
+```
+
+### 📊 성능 비교: Mutex vs Atomic
+
+```
+고루틴 100개 × 100,000회 증가
+
+Mutex 사용:
+- 시간: ~200ms
+- 오버헤드: 높음 (잠금/해제 비용)
+
+Atomic 사용:
+- 시간: ~50ms
+- 오버헤드: 매우 낮음 (CPU 직접 지원)
+
+성능 개선: 200 / 50 = 4배
+
+제약사항: 단순 정수 연산만 가능
+```
+
+### 💡 Atomic 사용 시 주의사항
+
+**1. 단순 연산만 지원**
+```go
+// 가능
+atomic.AddInt64(&count, 1)
+
+// 불가능 (복잡한 로직)
+atomic.AddInt64(&count, complexCalculation())
+```
+
+**2. 구조체 필드는 불가**
+```go
+type Counter struct {
+    value int64
+}
+
+// 위험: atomic 연산 불가능
+c := &Counter{}
+// atomic.AddInt64(&c.value, 1)  // 컴파일 에러!
+
+// 해결: 구조체 외부에 int64 필드 배치
+type SafeCounter struct {
+    mu    sync.Mutex
+    value int64
+}
+```
+
+---
+
+## 4️⃣ Race Detector: 경쟁 상태 탐지
+
+### 📋 개념
+
+Go의 내장 도구로 **실행 시점에 데이터 경쟁을 감지**합니다.
+
+```bash
+# 기본 실행
+go run main.go
+
+# Race Detector 활성화
+go run -race main.go
+
+# 테스트에서 Race Detector 활성화
+go test -race ./...
+```
+
+### 🔍 Race Detector 결과 읽기
+
+```
+WARNING: DATA RACE
+Write at 0x00c000140090 by goroutine 23:
+    main.increment()
+        /path/to/main.go:42 +0x44
+
+Previous read at 0x00c000140090 by goroutine 22:
+    main.read()
+        /path/to/main.go:50 +0x50
+
+Goroutine 23 (running) created at:
+    main.main()
+        /path/to/main.go:20 +0x6c
+```
+
+**해석:**
+- 주소 0x00c000140090에서 데이터 경쟁 감지
+- 고루틴 23이 쓰기 시도 (라인 42)
+- 고루틴 22가 읽기 시도 (라인 50)
+- 동시 접근으로 데이터 손상 위험
+
+### 🛠️ Race Detector 제약사항
+
+```
+- 모든 경쟁 상태를 100% 감지하지는 않음
+- 거짓 양성(False Positive) 가능성 존재
+- 실행 시간 약 5-10배 증가 (오버헤드)
+- 본 운영에서는 사용하지 않음 (개발/테스트 단계만)
+```
+
+---
+
+## 5️⃣ 설계 원칙: 채널 vs 뮤텍스
+
+### 📋 선택 기준
+
+```
+채널(Channel):
+┌──────────────────────────────┐
+│ 목적: 데이터 흐름 및 소유권  │
+│ 사용: 고루틴 간 통신           │
+│ 스타일: "CSP (Communicating Sequential Processes)" │
+└──────────────────────────────┘
+
+뮤텍스(Mutex):
+┌──────────────────────────────┐
+│ 목적: 공유 메모리 보호        │
+│ 사용: 구조체 필드 동기화      │
+│ 스타일: "공유 메모리 (Shared Memory)" │
+└──────────────────────────────┘
+```
+
+### 🎯 선택 기준 결정 트리
+
+```
+Q1: 여러 고루틴이 데이터를 주고받는가?
+└─ Yes → 채널 사용 ✓
+
+Q2: 구조체 필드를 공유하며 보호해야 하는가?
+└─ Yes → 뮤텍스 사용 ✓
+
+Q3: 초당 수백만 번 접근이 필요한가?
+└─ Yes → Atomic 사용 ✓
+
+Q4: 읽기가 90% 이상인가?
+└─ Yes → RWMutex 사용 ✓
+```
+
+### 📚 실전 예제
+
+**예제 1: 작업 분산 → 채널 사용**
+```go
+// 채널: 일꾼들이 작업을 받음
+jobs := make(chan Job)
+for worker := 0; worker < 10; worker++ {
+    go func() {
+        for job := range jobs {
+            process(job)
+        }
+    }()
+}
+```
+
+**예제 2: 공유 카운터 → 뮤텍스 사용**
+```go
+// 뮤텍스: 카운터 필드 보호
+type Server struct {
+    mu       sync.RWMutex
+    requests int
+}
+
+func (s *Server) RecordRequest() {
+    s.mu.Lock()
+    s.requests++
+    s.mu.Unlock()
+}
+```
+
+**예제 3: 고속 카운터 → Atomic 사용**
+```go
+// Atomic: 매우 자주 접근하는 카운터
+var requests int64
+atomic.AddInt64(&requests, 1)  // 뮤텍스 오버헤드 없음
+```
+
+**예제 4: 캐시 읽기/쓰기 → RWMutex 사용**
+```go
+type Cache struct {
+    mu    sync.RWMutex
+    items map[string]interface{}
+}
+
+func (c *Cache) Get(key string) interface{} {
+    c.mu.RLock()        // 여러 고루틴이 동시 읽기
+    defer c.mu.RUnlock()
+    return c.items[key]
+}
+
+func (c *Cache) Set(key string, val interface{}) {
+    c.mu.Lock()         // 한 고루틴만 쓰기
+    defer c.mu.Unlock()
+    c.items[key] = val
+}
+```
+
+---
+
+## 6️⃣ Assignment 2-3: 안전한 설계
+
+### 📝 Assignment 2-3-1: Race Condition 재현 및 분석
+
+**요구사항:**
+1. 고루틴 1,000개가 공유 변수 count를 1씩 증가
+2. 뮤텍스 없이 실행 → 결과 확인 (1,000이 아님)
+3. Race Detector 실행: `go run -race` → 경쟁 상태 리포트 분석
+
+**예상 결과:**
+```
+뮤텍스 없음:
+- 최종값: 예상 1,000,000 → 실제 ~850,000 (데이터 손상!)
+- 실행 시마다 다른 결과 (비결정적)
+
+Race Detector 리포트:
+WARNING: DATA RACE
+Write at 0x00c000140090 by goroutine 523:
+    main.unsafeIncrement()
+        /path/to/main.go:45 +0x44
+
+Previous write at 0x00c000140090 by goroutine 522:
+    main.unsafeIncrement()
+        /path/to/main.go:45 +0x50
+```
+
+### 📝 Assignment 2-3-2: SafeMap 구현
+
+**요구사항:**
+1. map + RWMutex로 구성된 SafeMap 타입 설계
+2. Get, Set, Delete, Length, Keys 메서드 구현
+3. 여러 고루틴이 동시에 접근 가능 (Race Detector 통과)
+
+**구조체 정의:**
+```go
+type SafeMap struct {
+    mu    sync.RWMutex
+    items map[string]interface{}
+}
+
+func (sm *SafeMap) Get(key string) (interface{}, bool)
+func (sm *SafeMap) Set(key string, value interface{})
+func (sm *SafeMap) Delete(key string)
+func (sm *SafeMap) Length() int
+func (sm *SafeMap) Keys() []string
+```
+
+**테스트:**
+- 고루틴 100개가 동시에 Set/Get/Delete 수행
+- Race Detector 실행: `go run -race` → 에러 없음 확인
+- 모든 작업 완료 후 최종 상태 검증
+
+### 📊 벤치마킹: SafeMap 성능
+
+```go
+// 시나리오: 1,000,000개 항목, 읽기 90% / 쓰기 10%
+
+Mutex 사용 (모든 작업 순차):
+- 시간: ~2,000ms
+- 처리량: ~500 ops/ms
+
+RWMutex 사용 (읽기 병렬):
+- 시간: ~300ms
+- 처리량: ~3,300 ops/ms
+
+성능 개선: 2,000 / 300 ≈ 6.7배
+```
+
+---
+
+## 7️⃣ 고급 패턴: Once, Cond, 뮤텍스 조합
+
+### 📋 한 번만 실행 (sync.Once)
+
+```go
+import "sync"
+
+var (
+    instance *Singleton
+    once     sync.Once
+)
+
+func GetInstance() *Singleton {
+    once.Do(func() {
+        instance = &Singleton{}
+        instance.Initialize()
+    })
+    return instance
+}
+
+// 특징:
+// - 여러 고루틴이 호출해도 정확히 한 번만 실행
+// - Race Condition 없음
+// - Singleton 패턴 구현에 유용
+```
+
+### 📋 조건 변수 (sync.Cond)
+
+```go
+import "sync"
+
+type Queue struct {
+    mu   sync.Mutex
+    cond *sync.Cond
+    data []int
+}
+
+func NewQueue() *Queue {
+    q := &Queue{
+        data: make([]int, 0),
+    }
+    q.cond = sync.NewCond(&q.mu)
+    return q
+}
+
+func (q *Queue) Enqueue(item int) {
+    q.mu.Lock()
+    defer q.mu.Unlock()
+
+    q.data = append(q.data, item)
+    q.cond.Signal()  // 대기 중인 고루틴 깨우기
+}
+
+func (q *Queue) Dequeue() int {
+    q.mu.Lock()
+    defer q.mu.Unlock()
+
+    for len(q.data) == 0 {
+        q.cond.Wait()  // 데이터가 들어올 때까지 대기
+    }
+
+    item := q.data[0]
+    q.data = q.data[1:]
+    return item
+}
+```
+
+### 📋 뮤텍스 조합: 읽기 + 쓰기 분리
+
+```go
+type Database struct {
+    mu    sync.RWMutex
+    data  map[string]string
+    stats sync.Mutex  // 별도 통계 뮤텍스
+    reads int64
+}
+
+func (db *Database) Query(key string) string {
+    db.mu.RLock()
+    value := db.data[key]
+    db.mu.RUnlock()
+
+    // 통계 업데이트 (별도 뮤텍스)
+    db.stats.Lock()
+    db.reads++
+    db.stats.Unlock()
+
+    return value
+}
+```
+
+---
+
+## 8️⃣ 종합 실전 예제: 안전한 웹 서버
+
+```go
+import (
+    "sync"
+    "sync/atomic"
+)
+
+type WebServer struct {
+    // 동적 설정 (RWMutex)
+    mu          sync.RWMutex
+    settings    map[string]string
+
+    // 통계 (Atomic)
+    requestsServed int64
+    bytesServed    int64
+
+    // 싱글톤 (Once)
+    once     sync.Once
+    logger   *Logger
+}
+
+func (ws *WebServer) GetLogger() *Logger {
+    ws.once.Do(func() {
+        ws.logger = NewLogger()
+    })
+    return ws.logger
+}
+
+func (ws *WebServer) HandleRequest() {
+    // 통계 업데이트 (Atomic)
+    atomic.AddInt64(&ws.requestsServed, 1)
+
+    // 설정 읽기 (RWMutex)
+    ws.mu.RLock()
+    timeout := ws.settings["timeout"]
+    ws.mu.RUnlock()
+
+    // ... 처리 ...
+
+    atomic.AddInt64(&ws.bytesServed, 1024)
+}
+
+func (ws *WebServer) UpdateSettings(key, value string) {
+    ws.mu.Lock()
+    defer ws.mu.Unlock()
+    ws.settings[key] = value
+}
+```
+
+---
+
+## 📊 종합 성능 비교
+
+```
+1,000,000번 카운터 증가, 고루틴 100개
+
+| 방식         | 시간     | 최종값        | 비고            |
+|-------------|---------|--------------|-----------------|
+| 뮤텍스 없음  | 5ms     | ~850,000 ✗   | 데이터 손상!    |
+| Mutex       | 200ms   | 1,000,000 ✓  | 안전 (느림)      |
+| RWMutex     | 250ms   | 1,000,000 ✓  | 쓰기 배타적      |
+| Atomic      | 50ms    | 1,000,000 ✓  | 안전 (빠름)      |
+```
+
+---
+
+## 🎓 학습 체크리스트
+
+- [ ] Mutex와 Lock/Unlock 이해
+- [ ] defer Unlock() 패턴 숙달
+- [ ] RWMutex의 RLock/RUnlock 개념 이해
+- [ ] Atomic 연산의 제약사항 인식
+- [ ] Race Detector 사용 방법 숙달
+- [ ] 채널 vs 뮤텍스 선택 기준 이해
+- [ ] SafeMap 구현 및 테스트 완료
+- [ ] -race 옵션으로 경쟁 상태 감지 경험
+
+---
+
+## 🚀 다음 Lesson 2-4 예고
+
+**[2-4: 고루틴 생명주기 관리 - Context와 WaitGroup]**
+
+```
+- Context: 고루틴의 라이프사이클 제어
+- WaitGroup: 여러 고루틴의 완료 대기
+- Cancellation: 멀리 떨어진 고루틴에 종료 신호
+- Timeout: 일정 시간 후 자동 취소
+```
+
+---
+
+## 💡 핵심 요약
+
+```
+1. 뮤텍스: 소프트웨어 수준의 보편적 해결책
+2. RWMutex: 읽기 위주 시나리오의 성능 최적화
+3. Atomic: CPU 수준의 극도의 최적화 (단순 연산만)
+4. Race Detector: 개발/테스트 단계의 필수 검사 도구
+5. 설계 원칙: 채널(통신) vs 뮤텍스(공유 메모리)
+
+단순함은 복잡함을 다스리는 궁극의 도구다.
+데이터 안전이 확보된 고루틴 시스템이 진정한 병행 시스템이다.
+
+Your record is your proof. (기록이 증명이다.)
+```

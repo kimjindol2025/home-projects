@@ -1,0 +1,301 @@
+// Phase 4: Unsafe 격리 레이어 - UnsafeManager
+
+/**
+ * Unsafe 메모리 영역 정의
+ */
+export interface UnsafeZone {
+  id: number
+  startAddr: number        // 시뮬레이션된 시작 주소
+  endAddr: number          // 시뮬레이션된 종료 주소
+  maxSize: number          // 최대 크기 (바이트)
+  currentSize: number      // 현재 사용 크기
+  data: number[]           // 실제 메모리 영역 (숫자 배열)
+  permissions: Set<string> // 접근 권한
+  createdAt: number        // 생성 시간
+  lastAccess: number       // 마지막 접근
+}
+
+/**
+ * Unsafe 메모리 통계
+ */
+export interface UnsafeStats {
+  totalZones: number
+  totalMemory: number
+  overflowViolations: number
+  accessDenials: number
+  peakMemory: number
+}
+
+/**
+ * UnsafeManager: Unsafe 메모리 영역 관리 및 보호
+ */
+export class UnsafeManager {
+  private zones: Map<number, UnsafeZone> = new Map()
+  private nextZoneId: number = 1
+  private nextAddr: number = 1000000  // 시뮬레이션된 주소 시작
+  private stats = {
+    totalZones: 0,
+    totalMemory: 0,
+    overflowViolations: 0,
+    accessDenials: 0,
+    peakMemory: 0,
+  }
+
+  /**
+   * 새로운 Unsafe 메모리 영역 생성
+   */
+  public createZone(maxSize: number): number {
+    if (maxSize <= 0) {
+      return -1
+    }
+
+    const id = this.nextZoneId++
+    const startAddr = this.nextAddr
+    this.nextAddr += maxSize + 1024  // 영역 간 간격 유지
+
+    const zone: UnsafeZone = {
+      id,
+      startAddr,
+      endAddr: startAddr + maxSize,
+      maxSize,
+      currentSize: 0,
+      data: new Array(maxSize).fill(0),
+      permissions: new Set(['read', 'write']),
+      createdAt: Date.now(),
+      lastAccess: Date.now(),
+    }
+
+    this.zones.set(id, zone)
+    this.stats.totalZones++
+    this.stats.totalMemory += maxSize
+    if (this.stats.totalMemory > this.stats.peakMemory) {
+      this.stats.peakMemory = this.stats.totalMemory
+    }
+
+    return id
+  }
+
+  /**
+   * 메모리 영역 접근 검증
+   */
+  public validateAccess(
+    zoneId: number,
+    offset: number,
+    size: number
+  ): { valid: boolean; reason?: string } {
+    const zone = this.zones.get(zoneId)
+    if (!zone) {
+      this.stats.accessDenials++
+      return { valid: false, reason: `Invalid zone ID: ${zoneId}` }
+    }
+
+    if (offset < 0) {
+      this.stats.overflowViolations++
+      return { valid: false, reason: `Negative offset: ${offset}` }
+    }
+
+    if (offset + size > zone.maxSize) {
+      this.stats.overflowViolations++
+      return {
+        valid: false,
+        reason: `Buffer overflow: offset=${offset}, size=${size}, maxSize=${zone.maxSize}`,
+      }
+    }
+
+    zone.lastAccess = Date.now()
+    return { valid: true }
+  }
+
+  /**
+   * 메모리 읽기
+   */
+  public read(zoneId: number, offset: number, size: number): number[] {
+    const validation = this.validateAccess(zoneId, offset, size)
+    if (!validation.valid) {
+      return []
+    }
+
+    const zone = this.zones.get(zoneId)!
+    return zone.data.slice(offset, offset + size)
+  }
+
+  /**
+   * 메모리 쓰기
+   */
+  public write(
+    zoneId: number,
+    offset: number,
+    data: number[]
+  ): { success: boolean; reason?: string } {
+    const validation = this.validateAccess(zoneId, offset, data.length)
+    if (!validation.valid) {
+      return { success: false, reason: validation.reason }
+    }
+
+    const zone = this.zones.get(zoneId)!
+    for (let i = 0; i < data.length; i++) {
+      zone.data[offset + i] = data[i]
+    }
+    zone.currentSize = Math.max(zone.currentSize, offset + data.length)
+
+    return { success: true }
+  }
+
+  /**
+   * 단일 바이트 읽기
+   */
+  public readByte(zoneId: number, offset: number): number | null {
+    const data = this.read(zoneId, offset, 1)
+    return data.length > 0 ? data[0] : null
+  }
+
+  /**
+   * 단일 바이트 쓰기
+   */
+  public writeByte(
+    zoneId: number,
+    offset: number,
+    value: number
+  ): boolean {
+    const result = this.write(zoneId, offset, [value])
+    return result.success
+  }
+
+  /**
+   * 메모리 영역 확장/재할당
+   */
+  public realloc(
+    zoneId: number,
+    newSize: number
+  ): { success: boolean; newZoneId?: number; reason?: string } {
+    const zone = this.zones.get(zoneId)
+    if (!zone) {
+      return { success: false, reason: `Invalid zone ID: ${zoneId}` }
+    }
+
+    if (newSize <= 0) {
+      return { success: false, reason: `Invalid size: ${newSize}` }
+    }
+
+    // 기존 데이터 복사
+    const oldData = [...zone.data]
+    const oldSize = zone.maxSize
+
+    // 새 영역 생성
+    const newZoneId = this.createZone(newSize)
+    if (newZoneId < 0) {
+      return { success: false, reason: 'Failed to create new zone' }
+    }
+
+    const newZone = this.zones.get(newZoneId)!
+
+    // 기존 데이터 복사 (최소값만큼)
+    const copySize = Math.min(oldSize, newSize)
+    for (let i = 0; i < copySize; i++) {
+      newZone.data[i] = oldData[i]
+    }
+    newZone.currentSize = copySize
+
+    // 기존 영역 해제
+    this.free(zoneId)
+
+    return { success: true, newZoneId }
+  }
+
+  /**
+   * 메모리 영역 해제
+   */
+  public free(zoneId: number): boolean {
+    const zone = this.zones.get(zoneId)
+    if (!zone) {
+      return false
+    }
+
+    this.zones.delete(zoneId)
+    this.stats.totalMemory -= zone.maxSize
+
+    return true
+  }
+
+  /**
+   * 버퍼 오버플로우 감지
+   */
+  public detectOverflow(
+    zoneId: number,
+    offset: number,
+    size: number
+  ): boolean {
+    const validation = this.validateAccess(zoneId, offset, size)
+    return !validation.valid
+  }
+
+  /**
+   * 메모리 영역 정보 조회
+   */
+  public getZoneInfo(zoneId: number): UnsafeZone | null {
+    return this.zones.get(zoneId) || null
+  }
+
+  /**
+   * 모든 활성 영역 조회
+   */
+  public getActiveZones(): UnsafeZone[] {
+    return Array.from(this.zones.values())
+  }
+
+  /**
+   * 통계 조회
+   */
+  public getStats(): UnsafeStats {
+    return {
+      totalZones: this.stats.totalZones,
+      totalMemory: this.stats.totalMemory,
+      overflowViolations: this.stats.overflowViolations,
+      accessDenials: this.stats.accessDenials,
+      peakMemory: this.stats.peakMemory,
+    }
+  }
+
+  /**
+   * 모든 영역 메모리 누수 확인
+   */
+  public checkLeaks(): { leakedZones: number; totalLeaked: number } {
+    let leakedZones = 0
+    let totalLeaked = 0
+
+    this.zones.forEach((zone) => {
+      if (zone.currentSize > 0) {
+        leakedZones++
+        totalLeaked += zone.currentSize
+      }
+    })
+
+    return { leakedZones, totalLeaked }
+  }
+
+  /**
+   * 모든 영역 정리
+   */
+  public clear(): void {
+    this.zones.clear()
+    this.stats = {
+      totalZones: 0,
+      totalMemory: 0,
+      overflowViolations: 0,
+      accessDenials: 0,
+      peakMemory: 0,
+    }
+  }
+
+  /**
+   * 디버그: 상세 정보 출력
+   */
+  public debugDump(): void {
+    console.log(`[UnsafeManager] ${this.zones.size} active zones`)
+    this.zones.forEach((zone) => {
+      console.log(
+        `  [Zone ${zone.id}] addr=${zone.startAddr}, size=${zone.maxSize}, used=${zone.currentSize}`
+      )
+    })
+  }
+}

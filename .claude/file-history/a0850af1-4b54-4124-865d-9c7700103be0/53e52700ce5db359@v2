@@ -1,0 +1,394 @@
+# Phase 11 v12.1: Memory Layout & Manual Allocation (데이터 레이아웃과 수동 메모리 관리)
+
+> **철학**: "CPU를 배려하는 배치"
+>
+> 메모리는 단순한 바이트의 나열이 아닙니다.
+> CPU는 데이터가 **특정 주소에 놓여있을 때** 가장 효율적으로 작동합니다.
+>
+> 우리는 이제:
+> - 메모리 위에 데이터를 **어떤 모양으로** 놓을지 설계하고,
+> - 운영체제로부터 **직접** 메모리를 빌려받고,
+> - 명시적으로 **반납**하는 방법을 배웁니다.
+>
+> 이것이 바로:
+> **컴파일러 설계자가 되기 위한 필수 관문**입니다.
+
+---
+
+## 🎯 v12.1이 해결하는 문제
+
+### 문제 1️⃣: 패딩으로 인한 메모리 낭비
+
+```rust
+❌ 패딩을 모르는 설계:
+struct Data {
+    a: bool,    // 1 바이트
+    b: u32,     // 4 바이트
+}
+// 크기: 1 + 4 = 5 바이트?
+// 실제: 8 바이트! (3바이트 패딩)
+
+✅ v12.1 이해:
+// CPU는 u32를 4의 배수 주소에서만 빠르게 읽음
+// 따라서 bool(1) 뒤에 3바이트 패딩을 삽입
+// 결과: [bool][패딩3][u32] = 8 바이트
+```
+
+### 문제 2️⃣: 타 언어와의 불일치
+
+```rust
+❌ 레이아웃을 제어하지 않음:
+#[repr(Rust)]  // 기본값
+struct Point {
+    x: i32,
+    y: i32,
+}
+// 러스트 컴파일러가 임의로 배치 가능
+// C와 호환되지 않음!
+
+✅ v12.1 방식:
+#[repr(C)]  // C와 호환
+struct Point {
+    x: i32,
+    y: i32,
+}
+// 정확한 순서와 레이아웃 보장
+// C 코드와 직접 통신 가능!
+```
+
+### 문제 3️⃣: 메모리 누수와 해제
+
+```rust
+❌ 할당만 하고 해제 안 함:
+let layout = Layout::new::<i32>();
+let ptr = alloc(layout);  // 할당
+*ptr = 42;
+// 어? 해제를 안 했네요...
+// 메모리 누수! 🚨
+
+✅ v12.1 책임:
+let layout = Layout::new::<i32>();
+let ptr = alloc(layout);  // 할당
+*ptr = 42;
+dealloc(ptr, layout);     // 반드시 해제!
+// 완벽한 생명주기 관리
+```
+
+---
+
+## 📚 핵심 개념: 메모리 레이아웃
+
+### 1️⃣ Size & Alignment (크기와 정렬)
+
+```rust
+// [정렬(Alignment)] CPU 효율을 위한 주소 규칙
+
+// u8:  1바이트  (아무 주소)
+// u16: 2바이트 (2의 배수 주소 추천)
+// u32: 4바이트 (4의 배수 주소 추천)
+// u64: 8바이트 (8의 배수 주소 추천)
+
+// [패딩(Padding)] 정렬을 맞추기 위한 빈 공간
+
+struct Example {
+    a: u8,   // 0x00 [값]
+    b: u16,  // 0x02 [패딩][값][값]  (정렬 맞추기)
+    c: u32,  // 0x04 [값][값][값][값]
+}
+// 총 크기: 8 바이트 (=u8 1 + 패딩 1 + u16 2 + u32 4)
+
+// [예외] repr(packed)
+#[repr(packed)]
+struct Packed {
+    a: u8,   // 0x00
+    b: u16,  // 0x01 (정렬 무시!)
+    c: u32,  // 0x03
+}
+// 총 크기: 7 바이트 (패딩 없음)
+// 단점: CPU 접근 느려짐 ⚠️
+```
+
+### 2️⃣ repr() 지시어 (Layout 제어)
+
+```rust
+// [repr(Rust)] - 기본값, 최적화 가능
+// 컴파일러가 자유롭게 배치 가능
+#[repr(Rust)]
+struct Default {
+    a: u32,
+    b: u8,
+}
+// 배치 순서 보장 안 함
+
+// [repr(C)] - C 호환
+// C 언어의 구조체 레이아웃 따름
+#[repr(C)]
+struct CCompatible {
+    a: u32,
+    b: u8,
+}
+// C 코드와 안전하게 통신
+
+// [repr(transparent)] - 단일 필드만
+#[repr(transparent)]
+struct Wrapper(u32);
+// 래퍼 오버헤드 없음
+
+// [repr(packed)] - 패딩 제거
+#[repr(packed)]
+struct Packed {
+    a: u32,
+    b: u8,
+}
+// 메모리 절약하지만 느림
+
+// [repr(align(N))] - 정렬 강제
+#[repr(align(16))]
+struct Aligned {
+    a: u32,
+}
+// 최소 16바이트 정렬 보장
+```
+
+### 3️⃣ Layout 객체 (메모리 청사진)
+
+```rust
+use std::alloc::Layout;
+
+// [생성] 타입으로부터 Layout 만들기
+let layout_u32 = Layout::new::<u32>();
+// size: 4 bytes, align: 4 bytes
+
+// [속성 접근]
+println!("크기: {}", layout_u32.size());       // 4
+println!("정렬: {}", layout_u32.align());      // 4
+
+// [수동 생성]
+let custom = Layout::from_size_align(16, 8);
+// size: 16 bytes, align: 8 bytes
+
+// [배열 레이아웃]
+let layout_array = Layout::array::<u32>(10);  // [u32; 10]
+// size: 40 bytes, align: 4 bytes
+
+// [구조체]
+struct Data {
+    a: u32,
+    b: u64,
+}
+let layout_struct = Layout::new::<Data>();
+// 컴파일러가 정렬 자동 계산
+```
+
+### 4️⃣ 수동 메모리 할당 (Manual Allocation)
+
+```rust
+use std::alloc::{alloc, dealloc, Layout};
+use std::ptr;
+
+unsafe {
+    // [1단계] Layout 정의
+    let layout = Layout::new::<i32>();
+
+    // [2단계] 메모리 할당
+    let ptr = alloc(layout) as *mut i32;
+    if ptr.is_null() {
+        panic!("할당 실패!");
+    }
+
+    // [3단계] 초기화 및 사용
+    ptr::write(ptr, 42);      // 값 쓰기
+    println!("{}", *ptr);     // 값 읽기
+
+    // [4단계] 해제
+    dealloc(ptr as *mut u8, layout);
+
+    // [위험!] 여기서 ptr을 사용하면 Use-After-Free!
+}
+
+// [생명주기]
+// alloc() → write/read → dealloc()
+// 이 순서를 어기면 UB!
+```
+
+### 5️⃣ Alignment 미스매치(정렬 위반)
+
+```rust
+unsafe {
+    // ❌ 위험: 정렬되지 않은 주소
+    let bytes: [u8; 4] = [0, 1, 2, 3];
+    let misaligned = &bytes[1] as *const u8;  // 정렬 안 됨!
+    let ptr_u32 = misaligned as *const u32;
+    println!("{}", *ptr_u32);  // UB! 크래시 가능
+
+    // ✅ 안전: 정렬된 주소
+    let arr: [u32; 2] = [0, 0];
+    let aligned = &arr[0] as *const u32;  // 정렬됨!
+    println!("{}", *aligned);  // 안전
+}
+```
+
+---
+
+## 🏗️ Compiler Designer의 메모리 이미지
+
+```
+메모리 구조의 계층:
+
+레벨 1: 로우 힙 (Raw Heap)
+┌──────────────────────────────────┐
+│ OS로부터 빌린 메모리 영역        │
+│ 0x7fff5fbff8c0 - 0x7fff5fbfffc0 │
+│ (모두 동일한 바이트)             │
+└──────────────────────────────────┘
+          ↓ [Layout 적용]
+레벨 2: 구조화된 메모리
+┌──────────────────────────────────┐
+│ u8  │ [패딩] │ u16 │ u32 │ ...   │
+│ 0x00│ 0x01   │ 0x02│ 0x04│       │
+└──────────────────────────────────┘
+          ↓ [우리의 해석]
+레벨 3: 타입이 있는 메모리
+┌──────────────────────────────────┐
+│ bool= true │ padding │ u32=42    │
+│ 정렬됨!    │ 효율성  │ CPU 친화  │
+└──────────────────────────────────┘
+```
+
+---
+
+## 🎓 v12.1의 6가지 설계 패턴
+
+### 패턴 1: 기본 레이아웃 이해
+```
+목표: size와 alignment 이해
+내용: Layout::new(), size(), align()
+결과: 메모리 구조 파악
+학습: "패딩의 비밀"
+```
+
+### 패턴 2: repr(C) 호환
+```
+목표: C와 안전한 통신
+내용: #[repr(C)] 지시어 적용
+결과: 정확한 메모리 배치
+학습: "FFI를 위한 기초"
+```
+
+### 패턴 3: repr(packed) 최적화
+```
+목표: 메모리 절약
+내용: #[repr(packed)] 적용
+결과: 패딩 제거
+학습: "성능과 메모리의 트레이드오프"
+```
+
+### 패턴 4: 수동 할당과 해제
+```
+목표: std::alloc 직접 사용
+내용: alloc(), dealloc() 호출
+결과: 완전한 메모리 제어
+학습: "생명주기 관리"
+```
+
+### 패턴 5: 배열 할당
+```
+목표: 다중 요소 할당
+내용: Layout::array() 사용
+결과: 동적 배열 관리
+학습: "복합 메모리 구조"
+```
+
+### 패턴 6: 안전한 할당기
+```
+목표: unsafe를 감싼 API
+내용: 할당자 구조체 설계
+결과: 신뢰할 수 있는 인터페이스
+학습: "책임 있는 설계"
+```
+
+---
+
+## 📖 패딩의 예제
+
+### Example 1: 자동 정렬
+
+```rust
+struct Auto {
+    a: u8,      // 0x00 (1 byte)
+    // [패딩 3]  // 0x01-0x03
+    b: u32,     // 0x04 (4 bytes)
+    c: u16,     // 0x08 (2 bytes)
+    // [패딩 2]  // 0x0A-0x0B
+}
+// Total: 12 bytes
+
+// [메모리 이미지]
+// 0x00: [u8 값]
+// 0x01-0x03: [패딩]
+// 0x04-0x07: [u32 값]
+// 0x08-0x09: [u16 값]
+// 0x0A-0x0B: [패딩]
+```
+
+### Example 2: repr(C) - 고정
+
+```rust
+#[repr(C)]
+struct Fixed {
+    a: u8,      // 0x00
+    b: u32,     // 0x04 (padding at 0x01-0x03)
+    c: u16,     // 0x08
+}
+// Size: 12 bytes (정렬 보장)
+// C에서도 동일한 크기
+```
+
+### Example 3: repr(packed) - 최소
+
+```rust
+#[repr(packed)]
+struct Minimal {
+    a: u8,      // 0x00
+    b: u32,     // 0x01 (정렬 무시!)
+    c: u16,     // 0x05
+}
+// Size: 7 bytes (패딩 없음)
+// CPU 접근 느려질 수 있음
+```
+
+---
+
+## 💭 철학적 성찰
+
+> **"효율성의 대가는 이해"**
+>
+> CPU는 게으른 기계입니다.
+> 데이터가 '올바른 주소'에 있을 때만 빠르게 작동합니다.
+>
+> 컴파일러 제작자는:
+> 1. CPU의 선호도를 이해하고 (정렬)
+> 2. 메모리를 효율적으로 배치하고 (레이아웃)
+> 3. 명시적으로 할당과 해제를 추적합니다 (생명주기)
+>
+> 이 세 가지를 완벽히 이해할 때,
+> 당신은 진정한 시스템 프로그래머가 됩니다.
+
+---
+
+## 🔗 다음 단계
+
+```
+v12.1: Memory Layout & Allocation ← 현재
+  ↓
+v12.2: FFI & External Functions (FFI와 외부 함수)
+  ↓ [다른 언어와의 경계]
+  ↓
+v12.3: Runtime & Execution Model (실행 모델)
+  ↓
+[컴파일러의 진정한 제작 시작!]
+```
+
+---
+
+**저장 필수 너는 기록이 증명이다 gogs**

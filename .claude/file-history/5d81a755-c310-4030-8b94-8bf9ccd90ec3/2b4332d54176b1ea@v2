@@ -1,0 +1,299 @@
+"""
+v7.2 서비스 디스커버리 (Service Discovery)
+
+서비스 인스턴스의 동적 등록, 해제, 발견을 관리합니다.
+"""
+
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from enum import Enum
+import uuid
+
+
+class ServiceStatus(Enum):
+    """서비스 상태"""
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    UNHEALTHY = "UNHEALTHY"
+    MAINTENANCE = "MAINTENANCE"
+
+
+@dataclass
+class ServiceInstance:
+    """
+    서비스 인스턴스
+
+    각 서비스의 네트워크 위치와 헬스 상태를 나타냅니다.
+    """
+
+    service_name: str  # e.g., "OrderService"
+    instance_id: str  # 유니크 인스턴스 ID
+    host: str  # e.g., "localhost"
+    port: int  # e.g., 50051
+    status: ServiceStatus = ServiceStatus.HEALTHY
+    weight: int = 100  # 로드 밸런싱 가중치
+    registered_at: str = None
+    last_heartbeat: str = None
+    metadata: Dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.registered_at is None:
+            self.registered_at = datetime.utcnow().isoformat()
+        if self.last_heartbeat is None:
+            self.last_heartbeat = datetime.utcnow().isoformat()
+
+    def is_alive(self, ttl_seconds: int = 30) -> bool:
+        """
+        인스턴스가 살아있는지 확인 (TTL 기반)
+
+        Args:
+            ttl_seconds: Time-to-live 초
+
+        Returns:
+            TTL 내에서 하트비트를 받았는지 여부
+        """
+        if not self.last_heartbeat:
+            return False
+
+        last_beat = datetime.fromisoformat(self.last_heartbeat)
+        age = (datetime.utcnow() - last_beat).total_seconds()
+        return age < ttl_seconds
+
+    def heartbeat(self) -> None:
+        """하트비트 업데이트"""
+        self.last_heartbeat = datetime.utcnow().isoformat()
+
+    def to_dict(self) -> Dict:
+        """딕셔너리 변환"""
+        return {
+            "service_name": self.service_name,
+            "instance_id": self.instance_id,
+            "host": self.host,
+            "port": self.port,
+            "status": self.status.value,
+            "weight": self.weight,
+            "registered_at": self.registered_at,
+            "last_heartbeat": self.last_heartbeat,
+            "metadata": self.metadata,
+        }
+
+
+class GogsServiceRegistry:
+    """
+    서비스 레지스트리
+
+    서비스 인스턴스를 등록, 해제, 발견하는 중앙 저장소입니다.
+    """
+
+    def __init__(self, ttl_seconds: int = 30):
+        """
+        서비스 레지스트리 초기화
+
+        Args:
+            ttl_seconds: 하트비트 TTL (초)
+        """
+        self.ttl_seconds = ttl_seconds
+        self.instances: Dict[str, List[ServiceInstance]] = {}
+        self.instance_map: Dict[str, ServiceInstance] = {}
+        self.metrics = {
+            "total_registered": 0,
+            "total_deregistered": 0,
+            "total_heartbeats": 0,
+            "total_discoveries": 0,
+        }
+
+    def register(
+        self,
+        service_name: str,
+        host: str,
+        port: int,
+        weight: int = 100,
+        metadata: Optional[Dict] = None,
+    ) -> str:
+        """
+        서비스 인스턴스 등록
+
+        Args:
+            service_name: 서비스 이름
+            host: 호스트 주소
+            port: 포트 번호
+            weight: 로드 밸런싱 가중치
+            metadata: 메타데이터
+
+        Returns:
+            인스턴스 ID
+        """
+        instance_id = f"{service_name}-{uuid.uuid4().hex[:8]}"
+
+        instance = ServiceInstance(
+            service_name=service_name,
+            instance_id=instance_id,
+            host=host,
+            port=port,
+            weight=weight,
+            metadata=metadata or {},
+        )
+
+        if service_name not in self.instances:
+            self.instances[service_name] = []
+
+        self.instances[service_name].append(instance)
+        self.instance_map[instance_id] = instance
+        self.metrics["total_registered"] += 1
+
+        return instance_id
+
+    def deregister(self, instance_id: str) -> bool:
+        """
+        서비스 인스턴스 해제
+
+        Args:
+            instance_id: 인스턴스 ID
+
+        Returns:
+            성공 여부
+        """
+        if instance_id not in self.instance_map:
+            return False
+
+        instance = self.instance_map[instance_id]
+        service_name = instance.service_name
+
+        if service_name in self.instances:
+            self.instances[service_name] = [
+                inst for inst in self.instances[service_name]
+                if inst.instance_id != instance_id
+            ]
+
+        del self.instance_map[instance_id]
+        self.metrics["total_deregistered"] += 1
+
+        return True
+
+    def discover(self, service_name: str) -> List[ServiceInstance]:
+        """
+        서비스 인스턴스 발견
+
+        살아있고 건강한 인스턴스만 반환합니다.
+
+        Args:
+            service_name: 서비스 이름
+
+        Returns:
+            살아있는 서비스 인스턴스 리스트
+        """
+        if service_name not in self.instances:
+            return []
+
+        # 살아있고 건강한 인스턴스만 필터링
+        healthy = [
+            inst for inst in self.instances[service_name]
+            if inst.is_alive(self.ttl_seconds)
+            and inst.status in [ServiceStatus.HEALTHY, ServiceStatus.DEGRADED]
+        ]
+
+        self.metrics["total_discoveries"] += 1
+        return healthy
+
+    def heartbeat(self, instance_id: str) -> bool:
+        """
+        하트비트 기록
+
+        Args:
+            instance_id: 인스턴스 ID
+
+        Returns:
+            성공 여부
+        """
+        if instance_id not in self.instance_map:
+            return False
+
+        self.instance_map[instance_id].heartbeat()
+        self.metrics["total_heartbeats"] += 1
+        return True
+
+    def set_status(self, instance_id: str, status: ServiceStatus) -> bool:
+        """
+        인스턴스 상태 변경
+
+        Args:
+            instance_id: 인스턴스 ID
+            status: 새 상태
+
+        Returns:
+            성공 여부
+        """
+        if instance_id not in self.instance_map:
+            return False
+
+        self.instance_map[instance_id].status = status
+        return True
+
+    def cleanup_stale(self) -> int:
+        """
+        TTL 만료된 인스턴스 정리
+
+        Returns:
+            정리된 인스턴스 수
+        """
+        removed_count = 0
+
+        for service_name in list(self.instances.keys()):
+            original_count = len(self.instances[service_name])
+
+            # 살아있는 인스턴스만 유지
+            self.instances[service_name] = [
+                inst for inst in self.instances[service_name]
+                if inst.is_alive(self.ttl_seconds)
+            ]
+
+            removed = original_count - len(self.instances[service_name])
+            removed_count += removed
+
+            # 서비스에 인스턴스가 없으면 제거
+            if not self.instances[service_name]:
+                del self.instances[service_name]
+
+        # instance_map도 정리
+        for instance_id in list(self.instance_map.keys()):
+            if not self.instance_map[instance_id].is_alive(self.ttl_seconds):
+                del self.instance_map[instance_id]
+
+        return removed_count
+
+    def get_all_services(self) -> Dict[str, List[Dict]]:
+        """모든 등록된 서비스 조회"""
+        return {
+            service_name: [inst.to_dict() for inst in instances]
+            for service_name, instances in self.instances.items()
+        }
+
+    def get_service_info(self, service_name: str) -> Dict:
+        """서비스 정보 조회"""
+        if service_name not in self.instances:
+            return {}
+
+        instances = self.instances[service_name]
+        healthy = [
+            inst for inst in instances
+            if inst.is_alive(self.ttl_seconds)
+            and inst.status == ServiceStatus.HEALTHY
+        ]
+
+        return {
+            "service_name": service_name,
+            "total_instances": len(instances),
+            "healthy_instances": len(healthy),
+            "instances": [inst.to_dict() for inst in instances],
+        }
+
+    def get_metrics(self) -> Dict:
+        """메트릭 조회"""
+        total_instances = sum(len(insts) for insts in self.instances.values())
+
+        return {
+            **self.metrics,
+            "total_services": len(self.instances),
+            "total_instances": total_instances,
+        }

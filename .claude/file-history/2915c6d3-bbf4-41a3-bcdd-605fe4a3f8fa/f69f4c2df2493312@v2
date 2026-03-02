@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""
+Just-In-Time (JIT) Optimizer: 런타임 동적 최적화
+
+컴파일 시점에 에이전트가 현재 하드웨어 상태를 감지하고
+실시간으로 최적화를 조정하는 '실시간 튜닝' 시스템
+
+"On-device" = 컴파일러 내부에서 즉시 결정
+"JIT Tuning" = 컴파일 시점에 동적 조정
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
+import time
+from abc import ABC, abstractmethod
+
+
+@dataclass
+class HardwareState:
+    """실시간 하드웨어 상태"""
+
+    # 메모리 상태
+    total_memory_mb: float
+    available_memory_mb: float
+    used_memory_percent: float
+
+    # 캐시 상태
+    cache_miss_rate: float
+    cache_hit_rate: float
+
+    # 전력 상태
+    current_power_watts: float
+    max_power_watts: float
+    power_headroom_percent: float
+
+    # 온도
+    current_temp_celsius: float
+    max_safe_temp_celsius: float
+    thermal_headroom_percent: float
+
+    # 연산 부하
+    sm_utilization_percent: float  # Streaming Multiprocessor
+    memory_bandwidth_utilization: float
+
+    # 네트워크 상태 (분산 시스템의 경우)
+    interconnect_latency_us: Optional[float] = None
+
+    def get_constraints(self) -> Dict[str, float]:
+        """현재 상태에서 도출되는 제약 조건"""
+        constraints = {}
+
+        # 메모리 제약
+        if self.available_memory_mb < 512:  # 512MB 미만
+            constraints['memory_tight'] = 1.0  # 엄격한 제약
+        elif self.available_memory_mb < 1024:
+            constraints['memory_tight'] = 0.5  # 중간 제약
+        else:
+            constraints['memory_tight'] = 0.0  # 제약 없음
+
+        # 전력 제약
+        if self.power_headroom_percent < 10:
+            constraints['power_tight'] = 1.0
+        elif self.power_headroom_percent < 30:
+            constraints['power_tight'] = 0.5
+        else:
+            constraints['power_tight'] = 0.0
+
+        # 열 제약
+        if self.thermal_headroom_percent < 10:
+            constraints['thermal_tight'] = 1.0
+        elif self.thermal_headroom_percent < 30:
+            constraints['thermal_tight'] = 0.5
+        else:
+            constraints['thermal_tight'] = 0.0
+
+        return constraints
+
+
+class HardwareMonitor(ABC):
+    """하드웨어 상태 모니터 (추상 클래스)"""
+
+    @abstractmethod
+    def get_current_state(self) -> HardwareState:
+        """현재 하드웨어 상태 조회"""
+        pass
+
+    @abstractmethod
+    def predict_future_state(self, seconds: int) -> HardwareState:
+        """미래 하드웨어 상태 예측"""
+        pass
+
+
+class SimulatedHardwareMonitor(HardwareMonitor):
+    """시뮬레이션된 하드웨어 모니터 (테스트용)"""
+
+    def __init__(self, device_type: str = "NVIDIA_H100"):
+        self.device_type = device_type
+        self.base_power = 250  # 기본 전력 (Watts)
+        self.peak_power = 700  # 최대 전력
+
+    def get_current_state(self) -> HardwareState:
+        """현재 상태 (시뮬레이션)"""
+        return HardwareState(
+            total_memory_mb=141 * 1024,  # H100: 141GB
+            available_memory_mb=np.random.uniform(50*1024, 120*1024),
+            used_memory_percent=np.random.uniform(15, 70),
+
+            cache_miss_rate=np.random.uniform(0.05, 0.20),
+            cache_hit_rate=np.random.uniform(0.80, 0.95),
+
+            current_power_watts=np.random.uniform(200, 600),
+            max_power_watts=self.peak_power,
+            power_headroom_percent=np.random.uniform(10, 90),
+
+            current_temp_celsius=np.random.uniform(50, 80),
+            max_safe_temp_celsius=85,
+            thermal_headroom_percent=np.random.uniform(5, 50),
+
+            sm_utilization_percent=np.random.uniform(30, 95),
+            memory_bandwidth_utilization=np.random.uniform(20, 85),
+        )
+
+    def predict_future_state(self, seconds: int) -> HardwareState:
+        """미래 상태 예측"""
+        # 간단한 선형 외삽
+        current = self.get_current_state()
+
+        # 부하가 증가할 확률
+        load_increase_factor = np.random.uniform(0.95, 1.15)
+
+        return HardwareState(
+            total_memory_mb=current.total_memory_mb,
+            available_memory_mb=max(1, current.available_memory_mb / load_increase_factor),
+            used_memory_percent=min(100, current.used_memory_percent * load_increase_factor),
+
+            cache_miss_rate=current.cache_miss_rate * load_increase_factor,
+            cache_hit_rate=current.cache_hit_rate / load_increase_factor,
+
+            current_power_watts=min(self.peak_power, current.current_power_watts * load_increase_factor),
+            max_power_watts=self.peak_power,
+            power_headroom_percent=max(0, 100 - (current.current_power_watts * load_increase_factor / self.peak_power * 100)),
+
+            current_temp_celsius=min(85, current.current_temp_celsius * load_increase_factor),
+            max_safe_temp_celsius=85,
+            thermal_headroom_percent=max(0, 100 - (current.current_temp_celsius * load_increase_factor / 85 * 100)),
+
+            sm_utilization_percent=min(100, current.sm_utilization_percent * load_increase_factor),
+            memory_bandwidth_utilization=min(100, current.memory_bandwidth_utilization * load_increase_factor),
+        )
+
+
+class AdaptiveStateAugmenter:
+    """런타임 하드웨어 상태를 기반으로 상태 벡터 확장"""
+
+    def __init__(self, hardware_monitor: HardwareMonitor):
+        self.monitor = hardware_monitor
+
+    def augment_state(
+        self,
+        base_state: np.ndarray,  # 100 dims (기존 IR 상태)
+        lookahead_seconds: int = 1
+    ) -> np.ndarray:
+        """
+        기존 상태 벡터에 하드웨어 상태 추가
+
+        Args:
+            base_state: 기존 상태 (100 dims)
+            lookahead_seconds: 미래 상태 예측 시간
+
+        Returns:
+            확장된 상태 (130 dims)
+        """
+        augmented = np.zeros(130, dtype=np.float32)
+
+        # 원래 상태 (0-99)
+        augmented[:100] = base_state
+
+        # 현재 하드웨어 상태 (100-114)
+        current_state = self.monitor.get_current_state()
+        constraints = current_state.get_constraints()
+
+        augmented[100] = current_state.available_memory_mb / 141000  # 정규화
+        augmented[101] = current_state.used_memory_percent / 100
+        augmented[102] = current_state.cache_hit_rate
+        augmented[103] = current_state.power_headroom_percent / 100
+        augmented[104] = current_state.thermal_headroom_percent / 100
+        augmented[105] = current_state.sm_utilization_percent / 100
+        augmented[106] = current_state.memory_bandwidth_utilization / 100
+
+        # 제약 조건 임베딩 (107-109)
+        augmented[107] = constraints.get('memory_tight', 0.0)
+        augmented[108] = constraints.get('power_tight', 0.0)
+        augmented[109] = constraints.get('thermal_tight', 0.0)
+
+        # 미래 상태 예측 (110-119)
+        future_state = self.monitor.predict_future_state(lookahead_seconds)
+        augmented[110] = future_state.available_memory_mb / 141000
+        augmented[111] = future_state.power_headroom_percent / 100
+        augmented[112] = future_state.thermal_headroom_percent / 100
+        augmented[113] = future_state.sm_utilization_percent / 100
+
+        # 추가 정보 (120-129)
+        # (예약됨)
+
+        return augmented
+
+
+class JITOptimizer:
+    """Just-In-Time 최적화 엔진"""
+
+    def __init__(
+        self,
+        policy_net: nn.Module,
+        value_net: nn.Module,
+        hardware_monitor: HardwareMonitor,
+        device: str = 'cpu',
+        adaptive_threshold: float = 0.7
+    ):
+        """
+        JIT 최적화기 초기화
+
+        Args:
+            policy_net: 정책 네트워크 (130 dims 입력)
+            value_net: 가치 네트워크
+            hardware_monitor: 하드웨어 모니터
+            device: 실행 디바이스
+            adaptive_threshold: 적응형 최적화 임계값
+                - 1.0: 항상 정책 따름
+                - 0.7: 가치 추정이 0.7 이상일 때만
+                - 0.5: 보수적 선택 (높은 확신도만)
+        """
+        self.policy_net = policy_net.to(device)
+        self.value_net = value_net.to(device)
+        self.monitor = hardware_monitor
+        self.device = device
+        self.adaptive_threshold = adaptive_threshold
+
+        self.augmenter = AdaptiveStateAugmenter(hardware_monitor)
+
+        # 추론 모드
+        self.policy_net.eval()
+        self.value_net.eval()
+
+        # 통계
+        self.inference_count = 0
+        self.decisions_made = []
+
+    def optimize_with_jit(
+        self,
+        base_state: np.ndarray,
+        fallback_action: int = 0,
+        use_lookahead: bool = True
+    ) -> Dict[str, Any]:
+        """
+        JIT 기반 최적화 결정
+
+        Args:
+            base_state: 기존 IR 상태 (100 dims)
+            fallback_action: 신뢰도가 낮을 때 사용할 기본 행동
+            use_lookahead: 미래 상태 예측 사용 여부
+
+        Returns:
+            최적화 결정 + 메타데이터
+        """
+        start_time = time.time()
+
+        # 1. 하드웨어 상태 보강
+        if use_lookahead:
+            augmented_state = self.augmenter.augment_state(base_state, lookahead_seconds=1)
+        else:
+            # 현재 상태만 사용 (128 → 130 변환)
+            augmented_state = np.zeros(130, dtype=np.float32)
+            augmented_state[:100] = base_state
+            current = self.monitor.get_current_state()
+            augmented_state[100:107] = [
+                current.available_memory_mb / 141000,
+                current.used_memory_percent / 100,
+                current.cache_hit_rate,
+                current.power_headroom_percent / 100,
+                current.thermal_headroom_percent / 100,
+                current.sm_utilization_percent / 100,
+                current.memory_bandwidth_utilization / 100,
+            ]
+
+        # 2. 정책 네트워크 추론
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(augmented_state).to(self.device).unsqueeze(0)
+
+            # 정책 출력
+            logits, action_probs = self.policy_net(state_tensor)
+            action = torch.argmax(action_probs, dim=-1).item()
+            action_prob = action_probs[0, action].item()
+
+            # 가치 추정
+            value = self.value_net(state_tensor).squeeze().item()
+
+        # 3. 적응형 의사결정
+        if value >= self.adaptive_threshold:
+            selected_action = action
+            decision_type = "policy"
+            confidence = "high"
+        else:
+            # 신뢰도가 낮으면 보수적 선택
+            selected_action = fallback_action
+            decision_type = "fallback"
+            confidence = "low"
+
+        # 4. 하드웨어 상태 기반 추가 조정
+        hardware_state = self.monitor.get_current_state()
+        constraints = hardware_state.get_constraints()
+
+        adjustment_made = False
+        if constraints['memory_tight'] > 0.8:
+            # 메모리가 부족하면 더 작은 타일 크기 선택
+            selected_action = min(selected_action, selected_action // 2)
+            adjustment_made = True
+
+        if constraints['thermal_tight'] > 0.8:
+            # 열이 많으면 더 낮은 병렬성 선택
+            selected_action = max(0, selected_action - 100)
+            adjustment_made = True
+
+        inference_time = (time.time() - start_time) * 1000  # ms
+        self.inference_count += 1
+
+        result = {
+            "selected_action": selected_action,
+            "action_probability": float(action_prob),
+            "value_estimate": float(value),
+            "decision_type": decision_type,
+            "confidence": confidence,
+            "adjustment_made": adjustment_made,
+            "hardware_state": {
+                "memory_available_mb": hardware_state.available_memory_mb,
+                "power_headroom_percent": hardware_state.power_headroom_percent,
+                "thermal_headroom_percent": hardware_state.thermal_headroom_percent,
+                "sm_utilization_percent": hardware_state.sm_utilization_percent,
+            },
+            "inference_time_ms": inference_time,
+            "lookahead_enabled": use_lookahead,
+        }
+
+        self.decisions_made.append(result)
+        return result
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """JIT 최적화 통계"""
+        if not self.decisions_made:
+            return {"total_decisions": 0}
+
+        policy_decisions = sum(1 for d in self.decisions_made if d['decision_type'] == 'policy')
+        fallback_decisions = sum(1 for d in self.decisions_made if d['decision_type'] == 'fallback')
+        adjusted_decisions = sum(1 for d in self.decisions_made if d['adjustment_made'])
+
+        inference_times = [d['inference_time_ms'] for d in self.decisions_made]
+
+        return {
+            "total_decisions": len(self.decisions_made),
+            "policy_decisions": policy_decisions,
+            "policy_decision_rate": policy_decisions / len(self.decisions_made),
+            "fallback_decisions": fallback_decisions,
+            "adjusted_decisions": adjusted_decisions,
+            "adjustment_rate": adjusted_decisions / len(self.decisions_made),
+            "avg_inference_time_ms": np.mean(inference_times),
+            "std_inference_time_ms": np.std(inference_times),
+            "min_inference_time_ms": np.min(inference_times),
+            "max_inference_time_ms": np.max(inference_times),
+        }
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("JIT Optimizer Demo: On-device Runtime Optimization")
+    print("="*70)
+
+    # 1. 더미 네트워크 (130 dims 입력)
+    class DummyPolicyNet(nn.Module):
+        def forward(self, x):
+            batch_size = x.shape[0]
+            logits = torch.randn(batch_size, 1000)
+            probs = torch.softmax(logits, dim=-1)
+            return logits, probs
+
+    class DummyValueNet(nn.Module):
+        def forward(self, x):
+            batch_size = x.shape[0]
+            return torch.randn(batch_size, 1)
+
+    # 2. 하드웨어 모니터 생성
+    monitor = SimulatedHardwareMonitor()
+
+    # 3. JIT 최적화기 생성
+    policy_net = DummyPolicyNet()
+    value_net = DummyValueNet()
+
+    jit_optimizer = JITOptimizer(
+        policy_net,
+        value_net,
+        monitor,
+        device='cpu',
+        adaptive_threshold=0.7
+    )
+
+    # 4. 여러 번의 JIT 최적화 테스트
+    print("\n[JIT Optimization Simulation]")
+    print("시뮬레이션: 10번의 컴파일 요청 처리")
+    print()
+
+    for i in range(10):
+        # 기존 IR 상태 (100 dims)
+        ir_state = np.random.randn(100).astype(np.float32)
+
+        # JIT 최적화 실행
+        result = jit_optimizer.optimize_with_jit(ir_state, use_lookahead=True)
+
+        print(f"[Compilation {i+1}]")
+        print(f"  Decision Type: {result['decision_type'].upper()}")
+        print(f"  Confidence: {result['confidence']}")
+        print(f"  Value Estimate: {result['value_estimate']:.4f}")
+        print(f"  Memory Available: {result['hardware_state']['memory_available_mb']:.1f}MB")
+        print(f"  Power Headroom: {result['hardware_state']['power_headroom_percent']:.1f}%")
+        print(f"  Adjustment Made: {'YES' if result['adjustment_made'] else 'NO'}")
+        print(f"  Inference Time: {result['inference_time_ms']:.2f}ms")
+        print()
+
+    # 5. 통계 출력
+    print("="*70)
+    print("JIT Optimizer Statistics")
+    print("="*70)
+
+    stats = jit_optimizer.get_statistics()
+    for key, value in stats.items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.3f}")
+        else:
+            print(f"  {key}: {value}")

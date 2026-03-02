@@ -1,0 +1,351 @@
+# Phase 3: FastAPI Gateway + 캐싱
+
+## 개요
+
+Phase 3에서는 Pulse를 CLI에서 HTTP 서버로 격상합니다.
+
+```
+Phase 1-2: CLI                    Phase 3: Server Architecture
+┌─────────────┐                 ┌──────────────────────────────────┐
+│ 자연어 입력 │                 │      FastAPI Gateway             │
+└──────┬──────┘                 ├──────────────────────────────────┤
+       │                        │ POST /pulse                      │
+       │                        │ GET  /agents, /agents/{id}       │
+       │                        │ DELETE /agents/{id}              │
+       │                        │ GET  /health, /metrics           │
+       │                        │ WS   /ws/{session}               │
+       │                        └──────┬───────────────────────────┘
+       │                               │
+       └───────────────────────────────┴──┬──────────────────────┐
+                                          │                      │
+                                      ┌───▼───┐          ┌──────▼──┐
+                                      │ Redis │          │ Ollama  │
+                                      └───────┘          └─────────┘
+                                      (캐싱)            (로컬 LLM)
+```
+
+## 새로운 파일들
+
+### 1. `src/cache.py` - Redis 기반 다층 캐싱
+
+**기능:**
+- `get_or_compute()`: 캐시-어사이드 패턴
+- TTL 관리 (NLU 1시간, LLM 30분, 웹검색 15분)
+- 비용 추적 (일일 누적)
+
+**사용 예시:**
+```python
+result = await cache.get_or_compute(
+    prefix="nlu",
+    key_data="슬랙 봇 만들어",
+    compute_fn=async_compute_fn
+)
+```
+
+### 2. `src/registry.py` - 에이전트 중앙 관리
+
+**기능:**
+- 에이전트 등록/등록 해제
+- 상태 조회 및 업데이트
+- 메트릭 수집 (실행 중, 중지됨, 실패 등)
+
+**사용 예시:**
+```python
+await registry.register("abc-123", {
+    "role": "뉴스 에이전트",
+    "status": "running",
+    "deployment": "scheduled"
+})
+
+metrics = await registry.get_metrics()
+```
+
+### 3. `src/gateway.py` - FastAPI 게이트웨이
+
+**엔드포인트:**
+
+#### POST /pulse
+```json
+{
+  "instruction": "매일 아침 9시에 뉴스 검색해서 이메일로 보내줘",
+  "session_id": "user-123",
+  "dry_run": false,
+  "force_llm": false
+}
+```
+
+응답:
+```json
+{
+  "success": true,
+  "agent_id": "abc-123",
+  "pulse_code": "로서 뉴스 큐레이션 에이전트\n...",
+  "llm_used": "FastNLU",
+  "cost_usd": 0.025,
+  "time_ms": 1234
+}
+```
+
+#### GET /agents
+모든 에이전트 목록 + 메트릭
+
+#### GET /agents/{id}
+특정 에이전트 상태
+
+#### DELETE /agents/{id}
+에이전트 중지
+
+#### GET /health
+헬스 체크
+
+#### GET /metrics
+시스템 메트릭 (LLM, 에이전트, 캐시, 비용)
+
+#### WS /ws/{session_id}
+WebSocket - 실시간 스트리밍 응답
+
+## 로컬 개발 환경 설정
+
+### 1. 환경변수 설정
+
+```bash
+cp .env.example .env
+# .env 파일 수정
+```
+
+### 2. Docker Compose로 실행
+
+```bash
+docker-compose up
+```
+
+서비스:
+- FastAPI Gateway: http://localhost:8000
+- Redis: localhost:6379
+- Ollama: localhost:11434
+
+### 3. 개발 모드 (핫 리로드)
+
+```bash
+# 단일 서비스만 실행
+docker-compose up pulse
+
+# 또는 로컬 직접 실행
+pip install -r requirements.txt
+uvicorn src.gateway:create_app --reload
+```
+
+## LLM 계층화 전략
+
+```
+1단계: Redis 캐시
+  └─ 캐시 히트 → 즉시 반환 ($0)
+
+2단계: 로컬 LLM (Qwen 7B)
+  └─ 신뢰도 >= 0.85 → 반환 (비용 무료)
+  └─ 신뢰도 < 0.85 → 다음 계층
+
+3단계: Claude 3 Haiku
+  └─ 신뢰도 >= 0.90 → 반환 (저비용)
+  └─ 신뢰도 < 0.90 → 다음 계층
+
+4단계: Claude 3.5 Sonnet
+  └─ 무조건 반환 (최고 품질)
+```
+
+## 캐싱 전략
+
+### TTL 설정
+
+| 캐시 타입 | TTL | 용도 |
+|----------|-----|------|
+| NLU | 1시간 | 같은 명령 재사용 |
+| LLM | 30분 | 유사 명령 캐시 |
+| 웹검색 | 15분 | 최신 정보 반영 |
+| 에이전트 상태 | 1분 | 실시간 모니터링 |
+| 메트릭 | 5분 | 대시보드 갱신 |
+
+### 캐시 히트율 모니터링
+
+```bash
+curl http://localhost:8000/metrics | jq .cache
+```
+
+## 비용 추적
+
+### 일일 누적 비용
+
+```bash
+# 현재 일일 비용 조회
+curl http://localhost:8000/metrics | jq .cost.daily_usd
+
+# 누적 비용 조회
+curl http://localhost:8000/metrics | jq .cost.total_usd
+```
+
+### 비용 절감 팁
+
+1. **캐싱 활용**: 같은 명령 반복 → 재사용 비용 $0
+2. **로컬 LLM 우선**: Qwen 7B는 완전 무료
+3. **DRY-RUN 테스트**: 배포 전에 Pulse 코드만 확인
+
+## 테스트 실행
+
+### 단위 테스트
+
+```bash
+pytest tests/unit/ -v
+```
+
+### 통합 테스트
+
+```bash
+pytest tests/integration/ -v
+```
+
+### 전체 테스트 + 커버리지
+
+```bash
+pytest tests/ -v --cov=src --cov-report=html
+```
+
+## 예제: API 호출
+
+### 1. Dry-run (코드만 생성)
+
+```bash
+curl -X POST http://localhost:8000/pulse \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instruction": "슬랙 봇 만들어",
+    "dry_run": true
+  }'
+```
+
+### 2. 전체 배포
+
+```bash
+curl -X POST http://localhost:8000/pulse \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instruction": "매일 9시에 뉴스 검색해서 이메일로 보내줘",
+    "session_id": "user-001"
+  }'
+```
+
+### 3. 에이전트 모니터링
+
+```bash
+# 목록
+curl http://localhost:8000/agents
+
+# 상세 조회
+curl http://localhost:8000/agents/abc-123
+
+# 중지
+curl -X DELETE http://localhost:8000/agents/abc-123
+```
+
+### 4. WebSocket 연결 (Python)
+
+```python
+import asyncio
+import websockets
+import json
+
+async def test_websocket():
+    async with websockets.connect("ws://localhost:8000/ws/session-001") as ws:
+        # 지시 전송
+        await ws.send(json.dumps({
+            "type": "instruction",
+            "data": "슬랙 봇 만들어"
+        }))
+
+        # 스트리밍 응답 수신
+        while True:
+            msg = await ws.recv()
+            data = json.loads(msg)
+            print(data)
+            if data["type"] == "done":
+                break
+
+asyncio.run(test_websocket())
+```
+
+## 성능 최적화
+
+### 1. Redis 연결 풀
+
+```python
+redis_pool = aioredis.from_url(
+    "redis://localhost",
+    max_connections=10,
+    encoding="utf8",
+    decode_responses=True
+)
+```
+
+### 2. 요청 병렬화
+
+```python
+# 여러 에이전트 동시 배포
+await asyncio.gather(
+    agent_pool.deploy_agent(intent1),
+    agent_pool.deploy_agent(intent2),
+    agent_pool.deploy_agent(intent3)
+)
+```
+
+### 3. 백그라운드 작업
+
+```python
+# 응답 후 백그라운드에서 배포
+@app.post("/pulse")
+async def create_agent(request: PulseRequest, background_tasks: BackgroundTasks):
+    # ... 빠른 응답 ...
+    background_tasks.add_task(deploy_agent)
+    return response
+```
+
+## 트러블슈팅
+
+### Redis 연결 실패
+
+```bash
+# Redis 상태 확인
+docker ps | grep redis
+
+# Redis 접속 테스트
+redis-cli ping
+
+# 로그 확인
+docker logs pulse-redis
+```
+
+### Ollama 모델 다운로드
+
+```bash
+# 모델 다운로드
+docker exec pulse-ollama ollama pull qwen2.5:7b
+
+# 모델 목록 확인
+docker exec pulse-ollama ollama list
+```
+
+### 캐시 초기화
+
+```bash
+# Redis 모든 키 삭제
+redis-cli FLUSHDB
+
+# 또는 특정 패턴만 삭제
+redis-cli KEYS "nlu:*" | xargs redis-cli DEL
+```
+
+## 다음 단계 (Phase 4)
+
+- [ ] 전체 테스트 스위트 완성 (80% 커버리지)
+- [ ] Docker 배포 (Fly.io 또는 Railway)
+- [ ] 모니터링 대시보드 (HTML)
+- [ ] Prometheus 메트릭 내보내기
+- [ ] 마크다운 문서화

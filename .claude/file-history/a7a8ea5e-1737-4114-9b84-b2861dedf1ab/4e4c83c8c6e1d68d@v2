@@ -1,0 +1,334 @@
+"""
+메시지 브로커 테스트
+
+GogsMessageBroker와 PriorityMessageBroker의 기본 기능을 테스트
+"""
+
+import unittest
+import asyncio
+import sys
+sys.path.insert(0, '/data/data/com.termux/files/home/kim/projects/gogs_python')
+
+from src.v7_1_message_queue.message_broker import (
+    GogsMessageBroker, PriorityMessageBroker, Message
+)
+
+
+class TestMessage(unittest.TestCase):
+    """Message 데이터클래스 테스트"""
+
+    def test_message_creation(self):
+        """메시지 생성"""
+        message = Message(
+            id="msg-1",
+            payload={"key": "value"},
+            priority=1
+        )
+        self.assertEqual(message.id, "msg-1")
+        self.assertEqual(message.payload, {"key": "value"})
+        self.assertEqual(message.priority, 1)
+        self.assertEqual(message.retry_count, 0)
+
+    def test_message_can_retry(self):
+        """재시도 가능 여부"""
+        message = Message(id="msg-1", payload="data")
+        self.assertTrue(message.can_retry())
+        self.assertTrue(message.can_retry())
+        self.assertTrue(message.can_retry())
+
+        message.retry_count = 3
+        self.assertFalse(message.can_retry())
+
+    def test_message_increment_retry(self):
+        """재시도 카운트 증가"""
+        message = Message(id="msg-1", payload="data")
+        self.assertEqual(message.retry_count, 0)
+
+        message.increment_retry()
+        self.assertEqual(message.retry_count, 1)
+
+        message.increment_retry()
+        self.assertEqual(message.retry_count, 2)
+
+
+class TestGogsMessageBroker(unittest.TestCase):
+    """GogsMessageBroker 테스트"""
+
+    def setUp(self):
+        """각 테스트 전 초기화"""
+        self.broker = GogsMessageBroker(max_queue_size=100)
+
+    def test_broker_initialization(self):
+        """브로커 초기화"""
+        self.assertEqual(len(self.broker.queue), 0)
+        self.assertEqual(len(self.broker.dead_letter_queue), 0)
+        self.assertEqual(self.broker.message_count, 0)
+        self.assertEqual(self.broker.processed_count, 0)
+
+    async def _async_produce(self):
+        """비동기 produce 테스트 헬퍼"""
+        message = Message(id="msg-1", payload="test")
+        result = await self.broker.produce(message)
+        return result
+
+    def test_produce_basic(self):
+        """기본 produce 테스트"""
+        result = asyncio.run(self._async_produce())
+        self.assertTrue(result)
+        self.assertEqual(self.broker.message_count, 1)
+
+    async def _async_produce_consume(self):
+        """produce/consume 사이클"""
+        # produce
+        message = Message(id="msg-1", payload="test-data")
+        await self.broker.produce(message)
+
+        # consume (timeout 1초)
+        consumed = await self.broker.consume("worker-1", timeout=1.0)
+        return consumed
+
+    def test_consume_basic(self):
+        """기본 consume 테스트"""
+        consumed = asyncio.run(self._async_produce_consume())
+        self.assertIsNotNone(consumed)
+        self.assertEqual(consumed.id, "msg-1")
+        self.assertEqual(consumed.payload, "test-data")
+
+    async def _async_acknowledge(self):
+        """acknowledge 테스트"""
+        message = Message(id="msg-1", payload="test")
+        await self.broker.produce(message)
+        await self.broker.consume("worker-1", timeout=1.0)
+
+        result = await self.broker.acknowledge(message)
+        return result
+
+    def test_acknowledge(self):
+        """메시지 확인 (ACK)"""
+        result = asyncio.run(self._async_acknowledge())
+        self.assertTrue(result)
+        self.assertEqual(self.broker.processed_count, 1)
+
+    async def _async_nack_with_retry(self):
+        """NACK with retry 테스트"""
+        message = Message(id="msg-1", payload="test", max_retries=2)
+        await self.broker.produce(message)
+
+        # consume
+        consumed = await self.broker.consume("worker-1", timeout=1.0)
+        self.assertIsNotNone(consumed)
+
+        # NACK (재시도)
+        result = await self.broker.nack(consumed)
+        return result
+
+    def test_nack_retry(self):
+        """메시지 확인 거부 (NACK) - 재시도"""
+        result = asyncio.run(self._async_nack_with_retry())
+        self.assertTrue(result)  # 재시도 가능
+        self.assertEqual(self.broker.message_count, 1)
+
+    async def _async_nack_dlq(self):
+        """NACK to DLQ 테스트"""
+        message = Message(id="msg-1", payload="test", max_retries=1)
+        await self.broker.produce(message)
+
+        # 첫 번째 NACK
+        consumed = await self.broker.consume("worker-1", timeout=1.0)
+        await self.broker.nack(consumed)
+
+        # 두 번째 NACK (재시도 초과)
+        consumed = await self.broker.consume("worker-1", timeout=1.0)
+        if consumed:
+            result = await self.broker.nack(consumed)
+            return result
+        return False
+
+    def test_nack_dead_letter_queue(self):
+        """재시도 초과 시 DLQ로 이동"""
+        asyncio.run(self._async_nack_dlq())
+        self.assertEqual(len(self.broker.dead_letter_queue), 1)
+        self.assertEqual(self.broker.failed_count, 1)
+
+    async def _async_queue_status(self):
+        """큐 상태 조회"""
+        message = Message(id="msg-1", payload="test")
+        await self.broker.produce(message)
+        status = await self.broker.get_queue_status()
+        return status
+
+    def test_queue_status(self):
+        """큐 상태 조회"""
+        status = asyncio.run(self._async_queue_status())
+        self.assertEqual(status["queue_size"], 1)
+        self.assertEqual(status["total_messages"], 1)
+
+    async def _async_purge(self):
+        """큐 비우기"""
+        message = Message(id="msg-1", payload="test")
+        await self.broker.produce(message)
+        await self.broker.purge()
+        status = await self.broker.get_queue_status()
+        return status
+
+    def test_purge_queue(self):
+        """큐 비우기"""
+        status = asyncio.run(self._async_purge())
+        self.assertEqual(status["queue_size"], 0)
+
+    def test_get_stats(self):
+        """통계 조회"""
+        asyncio.run(self._async_produce())
+        stats = self.broker.get_stats()
+        self.assertEqual(stats["total_messages"], 1)
+        self.assertIn("success_rate", stats)
+
+
+class TestPriorityMessageBroker(unittest.TestCase):
+    """PriorityMessageBroker 테스트"""
+
+    def setUp(self):
+        """각 테스트 전 초기화"""
+        self.broker = PriorityMessageBroker(max_queue_size=100)
+
+    async def _async_produce_priority(self):
+        """우선순위별 produce"""
+        msg_low = Message(id="low", payload="low-priority", priority=0)
+        msg_med = Message(id="med", payload="med-priority", priority=1)
+        msg_high = Message(id="high", payload="high-priority", priority=2)
+
+        # 낮은 순서로 produce
+        await self.broker.produce(msg_low)
+        await self.broker.produce(msg_med)
+        await self.broker.produce(msg_high)
+
+    async def _async_consume_priority_order(self):
+        """우선순위 순서대로 consume"""
+        await self._async_produce_priority()
+
+        # 높은 우선순위부터 consume
+        msg1 = await self.broker.consume("worker-1", timeout=1.0)
+        msg2 = await self.broker.consume("worker-1", timeout=1.0)
+        msg3 = await self.broker.consume("worker-1", timeout=1.0)
+
+        return [msg1, msg2, msg3]
+
+    def test_priority_order(self):
+        """우선순위 순서 테스트"""
+        messages = asyncio.run(self._async_consume_priority_order())
+        self.assertEqual(messages[0].id, "high")
+        self.assertEqual(messages[1].id, "med")
+        self.assertEqual(messages[2].id, "low")
+
+    async def _async_multiple_workers(self):
+        """다중 워커 처리"""
+        # 10개 메시지 produce
+        for i in range(10):
+            msg = Message(id=f"msg-{i}", payload=f"data-{i}", priority=i % 3)
+            await self.broker.produce(msg)
+
+        # 2개 워커가 각각 처리
+        consumed_w1 = []
+        consumed_w2 = []
+
+        for _ in range(5):
+            msg = await self.broker.consume("worker-1", timeout=1.0)
+            if msg:
+                consumed_w1.append(msg)
+
+        for _ in range(5):
+            msg = await self.broker.consume("worker-2", timeout=1.0)
+            if msg:
+                consumed_w2.append(msg)
+
+        return len(consumed_w1), len(consumed_w2)
+
+    def test_multiple_workers(self):
+        """다중 워커 테스트"""
+        w1_count, w2_count = asyncio.run(self._async_multiple_workers())
+        self.assertEqual(w1_count, 5)
+        self.assertEqual(w2_count, 5)
+
+
+class TestAsyncWaitForMessage(unittest.TestCase):
+    """비동기 메시지 대기 테스트"""
+
+    def setUp(self):
+        """각 테스트 전 초기화"""
+        self.broker = GogsMessageBroker()
+
+    async def _async_wait_and_consume(self):
+        """대기 후 consume"""
+        async def produce_delayed():
+            await asyncio.sleep(0.1)
+            msg = Message(id="delayed", payload="data")
+            await self.broker.produce(msg)
+
+        async def consume_with_wait():
+            return await self.broker.consume("worker", timeout=1.0)
+
+        # 동시 실행
+        produce_task = asyncio.create_task(produce_delayed())
+        consume_task = asyncio.create_task(consume_with_wait())
+
+        result = await consume_task
+        await produce_task
+        return result
+
+    def test_async_wait_and_consume(self):
+        """비동기 대기 후 consume"""
+        result = asyncio.run(self._async_wait_and_consume())
+        self.assertIsNotNone(result)
+        self.assertEqual(result.id, "delayed")
+
+
+class TestEdgeCases(unittest.TestCase):
+    """엣지 케이스 테스트"""
+
+    def setUp(self):
+        """각 테스트 전 초기화"""
+        self.broker = GogsMessageBroker(max_queue_size=5)
+
+    async def _async_max_queue_size(self):
+        """최대 큐 크기"""
+        # 5개 이상 produce → 최대 5개만 유지
+        for i in range(10):
+            msg = Message(id=f"msg-{i}", payload=f"data-{i}")
+            await self.broker.produce(msg)
+
+        status = await self.broker.get_queue_status()
+        return status["queue_size"]
+
+    def test_max_queue_size(self):
+        """최대 큐 크기 제한"""
+        size = asyncio.run(self._async_max_queue_size())
+        self.assertEqual(size, 5)
+
+    async def _async_consume_empty_queue(self):
+        """빈 큐에서 consume (timeout)"""
+        result = await self.broker.consume("worker", timeout=0.1)
+        return result
+
+    def test_consume_empty_queue(self):
+        """빈 큐 consume"""
+        result = asyncio.run(self._async_consume_empty_queue())
+        self.assertIsNone(result)
+
+
+def run_tests():
+    """테스트 실행"""
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+
+    suite.addTests(loader.loadTestsFromTestCase(TestMessage))
+    suite.addTests(loader.loadTestsFromTestCase(TestGogsMessageBroker))
+    suite.addTests(loader.loadTestsFromTestCase(TestPriorityMessageBroker))
+    suite.addTests(loader.loadTestsFromTestCase(TestAsyncWaitForMessage))
+    suite.addTests(loader.loadTestsFromTestCase(TestEdgeCases))
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    return runner.run(suite)
+
+
+if __name__ == '__main__':
+    unittest.main()

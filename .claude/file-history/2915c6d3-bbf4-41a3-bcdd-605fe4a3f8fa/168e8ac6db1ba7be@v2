@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+Resharding 계획자 (Resharding Planner)
+
+레이어 간 샤딩 레이아웃 변경을 감지하고 최적화
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import json
+
+
+@dataclass
+class ReshardingOperation:
+    """Resharding 연산"""
+    from_layer: str
+    to_layer: str
+    from_sharding: str
+    to_sharding: str
+    data_size_bytes: float
+    communication_cost_ms: float
+
+
+class ReshardingPlanner:
+    """Resharding 계획"""
+
+    def __init__(self, communication_cost_model):
+        self.cost_model = communication_cost_model
+
+    def detect_resharding_points(self,
+                                layers: List[str],
+                                sharding_sequence: List[str]) -> List[ReshardingOperation]:
+        """Resharding이 필요한 지점 감지"""
+
+        resharding_ops = []
+
+        for i in range(len(layers) - 1):
+            current_sharding = sharding_sequence[i]
+            next_sharding = sharding_sequence[i + 1]
+
+            # 다른 샤딩이면 Resharding 필요
+            if current_sharding != next_sharding:
+                # Data size 추정 (간단화)
+                data_size = 1e9  # 1GB (실제는 텐서 크기로)
+
+                # Resharding은 AllToAll 통신 필요
+                from communication_cost_model import CommunicationCost
+
+                comm = CommunicationCost(
+                    "all_to_all", data_size, 8,  # 8 devices 가정
+                    self.cost_model.bandwidth_gbps,
+                    self.cost_model.latency_us
+                )
+
+                op = ReshardingOperation(
+                    from_layer=layers[i],
+                    to_layer=layers[i + 1],
+                    from_sharding=current_sharding,
+                    to_sharding=next_sharding,
+                    data_size_bytes=data_size,
+                    communication_cost_ms=comm.time_ms()
+                )
+
+                resharding_ops.append(op)
+
+        return resharding_ops
+
+    def minimize_resharding_cost(self,
+                                layers: List[str],
+                                optimal_sharding: List[str],
+                                max_total_cost_increase: float = 0.05) -> List[str]:
+        """Resharding 비용 최소화 (일부 레이어의 샤딩 변경)"""
+
+        # Resharding 포인트 감지
+        resharding_ops = self.detect_resharding_points(layers, optimal_sharding)
+
+        if not resharding_ops:
+            return optimal_sharding
+
+        # 각 Resharding 포인트에 대해:
+        # 이전 또는 다음 레이어의 샤딩을 변경하여 Resharding 제거 가능한지 확인
+
+        optimized_sharding = list(optimal_sharding)
+
+        for op in resharding_ops:
+            # 이전 레이어를 현재 샤딩으로 변경
+            from_idx = layers.index(op.from_layer)
+
+            # 비용 증가 계산 (간단화)
+            cost_increase = 0.02  # 2% 성능 저하 (추정)
+
+            if cost_increase < max_total_cost_increase:
+                optimized_sharding[from_idx] = op.to_sharding
+
+        return optimized_sharding
+
+    def generate_resharding_schedule(self,
+                                    layers: List[str],
+                                    sharding_sequence: List[str],
+                                    num_devices: int) -> Dict:
+        """Resharding 스케줄 생성"""
+
+        resharding_ops = self.detect_resharding_points(layers, sharding_sequence)
+
+        schedule = {
+            "num_layers": len(layers),
+            "num_resharding_points": len(resharding_ops),
+            "operations": []
+        }
+
+        for op in resharding_ops:
+            schedule["operations"].append({
+                "from_layer": op.from_layer,
+                "to_layer": op.to_layer,
+                "from_sharding": op.from_sharding,
+                "to_sharding": op.to_sharding,
+                "communication_type": "all_to_all",
+                "estimated_time_ms": op.communication_cost_ms
+            })
+
+        # 전체 Resharding 시간
+        total_resharding_time = sum(op["estimated_time_ms"]
+                                   for op in schedule["operations"])
+        schedule["total_resharding_time_ms"] = total_resharding_time
+
+        return schedule
+
+    def estimate_resharding_overhead(self,
+                                    layers: List[str],
+                                    sharding_sequence: List[str],
+                                    baseline_computation_time_ms: float) -> Dict:
+        """Resharding 오버헤드 추정"""
+
+        resharding_ops = self.detect_resharding_points(layers, sharding_sequence)
+
+        total_resharding_time = sum(op.communication_cost_ms for op in resharding_ops)
+
+        overhead_percent = (total_resharding_time / baseline_computation_time_ms) * 100
+
+        return {
+            "baseline_time_ms": baseline_computation_time_ms,
+            "resharding_time_ms": total_resharding_time,
+            "overhead_percent": overhead_percent,
+            "num_resharding_points": len(resharding_ops)
+        }
+
+    def recommend_layout_strategy(self,
+                                 layers: List[str],
+                                 sharding_sequence: List[str],
+                                 baseline_time_ms: float) -> Dict:
+        """레이아웃 전략 추천"""
+
+        # 원본 전략의 Resharding 오버헤드
+        original_overhead = self.estimate_resharding_overhead(
+            layers, sharding_sequence, baseline_time_ms
+        )
+
+        # 최적화된 전략 (Resharding 최소화)
+        optimized_sharding = self.minimize_resharding_cost(
+            layers, sharding_sequence
+        )
+
+        optimized_overhead = self.estimate_resharding_overhead(
+            layers, optimized_sharding, baseline_time_ms
+        )
+
+        return {
+            "original_strategy": {
+                "sharding": sharding_sequence,
+                "overhead": original_overhead
+            },
+            "optimized_strategy": {
+                "sharding": optimized_sharding,
+                "overhead": optimized_overhead
+            },
+            "improvement": {
+                "resharding_time_saved_ms": (original_overhead["resharding_time_ms"] -
+                                            optimized_overhead["resharding_time_ms"]),
+                "overhead_reduction_percent": (original_overhead["overhead_percent"] -
+                                              optimized_overhead["overhead_percent"])
+            }
+        }
+
+    def generate_resharding_mlir(self,
+                                resharding_ops: List[ReshardingOperation]) -> str:
+        """Resharding 연산을 MLIR 코드로 생성"""
+
+        mlir_code = "// Resharding Operations\n\n"
+
+        for i, op in enumerate(resharding_ops):
+            mlir_code += f"// Resharding {i+1}: {op.from_layer} → {op.to_layer}\n"
+            mlir_code += f"// {op.from_sharding} → {op.to_sharding}\n"
+            mlir_code += f"%resharding_{i} = multidevice.all_to_all\n"
+            mlir_code += f"  on %device_group\n"
+            mlir_code += f"  input %output_from_{op.from_layer}\n"
+            mlir_code += f"  resharding_pattern {{from: {op.from_sharding}, to: {op.to_sharding}}}\n"
+            mlir_code += f"  → tensor<?x?xf32>\n\n"
+
+        return mlir_code
+
+    def report_resharding_plan(self, recommendation: Dict) -> str:
+        """Resharding 계획 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║              RESHARDING PLAN AND OPTIMIZATION                     ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        orig = recommendation["original_strategy"]["overhead"]
+        report += "Original Strategy:\n"
+        report += f"  Baseline Time: {orig['baseline_time_ms']:.2f} ms\n"
+        report += f"  Resharding Time: {orig['resharding_time_ms']:.2f} ms\n"
+        report += f"  Overhead: {orig['overhead_percent']:.2f}%\n"
+        report += f"  Resharding Points: {orig['num_resharding_points']}\n\n"
+
+        opt = recommendation["optimized_strategy"]["overhead"]
+        report += "Optimized Strategy:\n"
+        report += f"  Baseline Time: {opt['baseline_time_ms']:.2f} ms\n"
+        report += f"  Resharding Time: {opt['resharding_time_ms']:.2f} ms\n"
+        report += f"  Overhead: {opt['overhead_percent']:.2f}%\n"
+        report += f"  Resharding Points: {opt['num_resharding_points']}\n\n"
+
+        improvement = recommendation["improvement"]
+        report += "Improvement:\n"
+        report += f"  Time Saved: {improvement['resharding_time_saved_ms']:.2f} ms\n"
+        report += f"  Overhead Reduction: {improvement['overhead_reduction_percent']:.2f}%\n"
+
+        report += "\n" + "─" * 68 + "\n"
+
+        return report
+
+    def export_to_json(self, recommendation: Dict) -> str:
+        """추천 사항을 JSON으로 내보내기"""
+        return json.dumps(recommendation, indent=2, default=str)
+

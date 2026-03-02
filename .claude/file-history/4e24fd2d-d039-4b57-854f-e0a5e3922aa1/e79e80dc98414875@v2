@@ -1,0 +1,583 @@
+// File: v2_1_concurrency/04_context_waitgroup_lifecycle.go
+// 🎓 Go 201-2-4: 고루틴 생명주기 제어 - Context와 WaitGroup
+// 저자: Claude Haiku 4.5
+// 수준: 대학원 고급 (시스템 아키텍트 수준)
+// 주제: WaitGroup, Context, 타임아웃, 고루틴 누수 방지
+//
+// 실행 명령: CGO_ENABLED=0 go run 04_context_waitgroup_lifecycle.go
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// ============================================================
+// 섹션 1: WaitGroup 기본 (모두 끝날 때까지 기다려라)
+// ============================================================
+
+func section1_waitgroupBasics() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 1: WaitGroup 기본 (모두 끝날 때까지 기다려라)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[1-1] 기본 WaitGroup 사용")
+
+	var wg sync.WaitGroup
+
+	fmt.Println("고루틴 5개 시작:")
+
+	for i := 1; i <= 5; i++ {
+		wg.Add(1)  // 작업 하나 추가
+		go func(id int) {
+			defer wg.Done()  // 작업 완료 신호
+
+			fmt.Printf("고루틴 %d: 시작\n", id)
+			time.Sleep(time.Duration(id*100) * time.Millisecond)
+			fmt.Printf("고루틴 %d: 완료\n", id)
+		}(i)
+	}
+
+	fmt.Println("모든 고루틴 시작됨, 완료 대기 중...")
+	start := time.Now()
+
+	wg.Wait()  // 모든 고루틴이 Done()을 호출할 때까지 대기
+
+	elapsed := time.Since(start)
+	fmt.Printf("\n모든 작업 완료! (소요시간: %v)\n", elapsed)
+
+	// [1-2] WaitGroup 사용 없음 vs 사용 (실패 시나리오)
+	fmt.Println("\n[1-2] WaitGroup 없이 고루틴 사용 (위험)")
+
+	fmt.Println("고루틴 3개 생성 (WaitGroup 없음):")
+	for i := 1; i <= 3; i++ {
+		go func(id int) {
+			fmt.Printf("고루틴 %d 시작\n", id)
+			time.Sleep(100 * time.Millisecond)
+			fmt.Printf("고루틴 %d 완료\n", id)
+		}(i)
+	}
+
+	// main이 바로 계속 진행됨 (고루틴 완료 미확인)
+	fmt.Println("main 고루틴: 계속 진행 (고루틴 완료 미대기)")
+	time.Sleep(200 * time.Millisecond)  // 운 좋게 모두 완료됨
+	fmt.Println("✓ 운 좋게 모든 고루틴 완료")
+
+	fmt.Println("\n⚠️  시간이 짧으면 고루틴이 완료되지 않고 프로그램 종료됨!")
+}
+
+// ============================================================
+// 섹션 2: WaitGroup 오용 (Race Condition)
+// ============================================================
+
+func section2_waitgroupMisuse() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 2: WaitGroup 오용 (Race Condition)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[2-1] 올바른 패턴: Add() 고루틴 생성 전에")
+
+	var wg sync.WaitGroup
+
+	fmt.Println("고루틴 1,000개 × 100회 작업 (올바른 패턴):")
+
+	start := time.Now()
+	count := 0
+	var mu sync.Mutex
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)  // 고루틴 생성 전에 Add 호출
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				mu.Lock()
+				count++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("결과: %d (예상: 100000)\n", count)
+	fmt.Printf("시간: %v\n", elapsed)
+	fmt.Println("✓ 모든 작업 정확히 완료됨")
+
+	// [2-2] 위험한 패턴 설명 (실제로는 실행하지 않음)
+	fmt.Println("\n[2-2] 위험한 패턴 설명 (Add()를 고루틴 내부에서 호출)")
+
+	fmt.Println("위험한 코드:")
+	fmt.Println(`
+    for i := 0; i < 1000; i++ {
+        go func(id int) {
+            wg.Add(1)        // ❌ 위험!
+            defer wg.Done()
+            // 작업...
+        }(i)
+    }
+    wg.Wait()
+`)
+
+	fmt.Println("문제점:")
+	fmt.Println("1. main에서 wg.Wait() 호출")
+	fmt.Println("2. 고루틴들이 아직 wg.Add(1) 미실행")
+	fmt.Println("3. Wait()가 해제되어 프로그램 종료")
+	fmt.Println("4. 고루틴이 Add(1) 실행하려는 순간 프로그램 다운!")
+}
+
+// ============================================================
+// 섹션 3: Context.WithCancel (수동 취소)
+// ============================================================
+
+func section3_contextCancel() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 3: Context.WithCancel (수동 취소)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[3-1] 기본 WithCancel 사용")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()  // 함수 종료 시 리소스 정리
+
+	done := make(chan bool)
+
+	go func(ctx context.Context) {
+		fmt.Println("고루틴: 작업 시작")
+		for {
+			select {
+			case <-time.After(500 * time.Millisecond):
+				fmt.Println("고루틴: 작업 진행 중...")
+			case <-ctx.Done():
+				fmt.Printf("고루틴: 취소됨 (%v)\n", ctx.Err())
+				done <- true
+				return
+			}
+		}
+	}(ctx)
+
+	time.Sleep(1500 * time.Millisecond)
+	fmt.Println("main: 취소 신호 전송")
+	cancel()  // 고루틴에 취소 신호 전파
+
+	<-done
+	fmt.Println("✓ 고루틴 종료")
+
+	// [3-2] 여러 고루틴 취소
+	fmt.Println("\n[3-2] 여러 고루틴 동시 취소")
+
+	ctx, cancel = context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+	numWorkers := 5
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-time.After(200 * time.Millisecond):
+					fmt.Printf("워커 %d: 작업 중...\n", id)
+				case <-ctx.Done():
+					fmt.Printf("워커 %d: 취소됨\n", id)
+					return
+				}
+			}
+		}(w)
+	}
+
+	time.Sleep(600 * time.Millisecond)
+	fmt.Println("모든 워커에 취소 신호 전송")
+	cancel()  // 모든 자식 Context 취소
+
+	wg.Wait()
+	fmt.Println("✓ 모든 워커 종료")
+}
+
+// ============================================================
+// 섹션 4: Context.WithTimeout (자동 타임아웃)
+// ============================================================
+
+func section4_contextTimeout() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 4: Context.WithTimeout (자동 타임아웃)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[4-1] 기본 WithTimeout 사용")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan bool)
+
+	go func(ctx context.Context) {
+		fmt.Println("고루틴: 5초 작업 시작")
+		select {
+		case <-time.After(5 * time.Second):
+			fmt.Println("고루틴: 작업 완료")
+		case <-ctx.Done():
+			fmt.Printf("고루틴: 타임아웃 (%v)\n", ctx.Err())
+		}
+		done <- true
+	}(ctx)
+
+	<-done
+	fmt.Println("✓ 타임아웃으로 작업 중단됨")
+
+	// [4-2] 타임아웃 다양한 시나리오
+	fmt.Println("\n[4-2] 타임아웃 시나리오 테스트")
+
+	testTimeout := func(duration time.Duration, taskTime time.Duration) {
+		ctx, cancel := context.WithTimeout(context.Background(), duration)
+		defer cancel()
+
+		select {
+		case <-time.After(taskTime):
+			fmt.Printf("작업(%dms) 완료\n", taskTime.Milliseconds())
+		case <-ctx.Done():
+			fmt.Printf("타임아웃(%dms) 발생\n", duration.Milliseconds())
+		}
+	}
+
+	fmt.Println("타임아웃 3초, 작업 1초 → 완료:")
+	testTimeout(3*time.Second, 1*time.Second)
+
+	fmt.Println("타임아웃 1초, 작업 3초 → 타임아웃:")
+	testTimeout(1*time.Second, 3*time.Second)
+}
+
+// ============================================================
+// 섹션 5: Context.WithValue (메타데이터)
+// ============================================================
+
+type contextKey string
+
+const (
+	requestIDKey contextKey = "requestID"
+	userIDKey    contextKey = "userID"
+)
+
+func section5_contextValue() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 5: Context.WithValue (메타데이터 전달)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[5-1] Context에 메타데이터 저장 및 조회")
+
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, requestIDKey, "req-12345")
+	ctx = context.WithValue(ctx, userIDKey, 42)
+
+	// 메타데이터 조회
+	requestID := ctx.Value(requestIDKey).(string)
+	userID := ctx.Value(userIDKey).(int)
+
+	fmt.Printf("요청 ID: %s\n", requestID)
+	fmt.Printf("사용자 ID: %d\n", userID)
+
+	// [5-2] Context를 통한 로깅
+	fmt.Println("\n[5-2] Context와 로깅 연계")
+
+	logWithContext := func(ctx context.Context, msg string) {
+		reqID := ctx.Value(requestIDKey).(string)
+		userID := ctx.Value(userIDKey).(int)
+		fmt.Printf("[%s] [User:%d] %s\n", reqID, userID, msg)
+	}
+
+	logWithContext(ctx, "작업 시작")
+	logWithContext(ctx, "데이터 처리 중")
+	logWithContext(ctx, "작업 완료")
+
+	// [5-3] Context 계층 구조
+	fmt.Println("\n[5-3] Context 계층 구조 (값 상속)")
+
+	parentCtx := context.Background()
+	parentCtx = context.WithValue(parentCtx, "level", "parent")
+
+	childCtx := context.WithValue(parentCtx, "level", "child")
+	childCtx = context.WithValue(childCtx, "extra", "childData")
+
+	fmt.Printf("Parent level: %v\n", parentCtx.Value("level"))
+	fmt.Printf("Child level: %v\n", childCtx.Value("level"))
+	fmt.Printf("Child extra: %v\n", childCtx.Value("extra"))
+	fmt.Printf("Parent extra (없음): %v\n", parentCtx.Value("extra"))
+}
+
+// ============================================================
+// 섹션 6: 고루틴 누수 (Goroutine Leak)
+// ============================================================
+
+func section6_goroutineLeak() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 6: 고루틴 누수 (Goroutine Leak) 방지")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[6-1] 고루틴 누수 원인 1: 채널 대기")
+
+	fmt.Println("시나리오: jobs 채널을 기다리는 고루틴 3개")
+
+	leakyJobs := make(chan int, 10)
+	var wg1 sync.WaitGroup
+
+	// 고루틴 3개 시작
+	for i := 0; i < 3; i++ {
+		wg1.Add(1)
+		go func(id int) {
+			defer wg1.Done()
+			for job := range leakyJobs {  // 채널이 닫힐 때까지 대기
+				fmt.Printf("고루틴 %d: 작업 %d\n", id, job)
+			}
+			fmt.Printf("고루틴 %d: 종료\n", id)
+		}(i)
+	}
+
+	// 작업 배포
+	for j := 1; j <= 3; j++ {
+		leakyJobs <- j
+	}
+
+	fmt.Println("✓ 채널 명시적 종료로 고루틴 누수 방지:")
+	close(leakyJobs)  // 채널 종료 → for range 루프 자동 종료
+
+	wg1.Wait()
+	fmt.Println("✓ 모든 고루틴 종료")
+
+	// [6-2] 고루틴 누수 원인 2: Context 미사용
+	fmt.Println("\n[6-2] 고루틴 누수 원인 2: Context 미사용")
+
+	fmt.Println("안전한 패턴: Context로 종료 신호 관리")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-time.After(100 * time.Millisecond):
+					fmt.Printf("백그라운드 작업 %d\n", id)
+				case <-ctx.Done():
+					fmt.Printf("백그라운드 작업 %d: 종료\n", id)
+					return
+				}
+			}
+		}(i)
+	}
+
+	time.Sleep(250 * time.Millisecond)
+	fmt.Println("모든 백그라운드 작업 중단 신호:")
+	cancel()
+
+	wg.Wait()
+	fmt.Println("✓ 모든 고루틴 안전히 종료")
+}
+
+// ============================================================
+// 섹션 7: 타임아웃 서버 (HTTP 시뮬레이션)
+// ============================================================
+
+func section7_timeoutServer() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 7: 타임아웃 서버 (HTTP 시뮬레이션)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[7-1] 무거운 작업 + 타임아웃")
+
+	// 타임아웃 3초 설정
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	result := make(chan string, 1)
+
+	go func() {
+		fmt.Println("서버: 무거운 작업 시작 (5초 소요)")
+		time.Sleep(5 * time.Second)  // 타임아웃 초과
+		result <- "완료"
+	}()
+
+	select {
+	case res := <-result:
+		fmt.Printf("응답: %s\n", res)
+	case <-ctx.Done():
+		fmt.Println("응답: Timeout (504 Gateway Timeout)")
+	}
+
+	// [7-2] 빠른 응답
+	fmt.Println("\n[7-2] 빠른 작업 + 타임아웃")
+
+	ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	result = make(chan string, 1)
+
+	go func() {
+		fmt.Println("서버: 작업 시작 (1초 소요)")
+		time.Sleep(1 * time.Second)
+		result <- "완료"
+	}()
+
+	select {
+	case res := <-result:
+		fmt.Printf("응답: %s\n", res)
+	case <-ctx.Done():
+		fmt.Println("응답: Timeout")
+	}
+}
+
+// ============================================================
+// 섹션 8: Assignment 2-4 - 종합 벤치마킹
+// ============================================================
+
+func section8_assignment2_4() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 8: Assignment 2-4 - 종합 벤치마킹")
+	fmt.Println("============================================================")
+
+	// Assignment 1: 타임아웃 서버
+	fmt.Println("\n[8-1] Assignment 2-4-1: 타임아웃 서버")
+	fmt.Println("요구사항: 3초 타임아웃, 무거운 작업 강제 중단")
+
+	testTimeoutServer := func(taskDuration time.Duration, timeout time.Duration) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		done := make(chan error, 1)
+
+		go func() {
+			fmt.Printf("  작업 시작 (%v 소요)...\n", taskDuration)
+			time.Sleep(taskDuration)
+			done <- nil
+		}()
+
+		select {
+		case <-done:
+			fmt.Println("  ✓ 작업 완료")
+		case <-ctx.Done():
+			fmt.Printf("  ✗ Timeout (%v 초과)\n", timeout)
+		}
+	}
+
+	fmt.Println("시나리오 1: 1초 작업, 3초 타임아웃 → 완료")
+	testTimeoutServer(1*time.Second, 3*time.Second)
+
+	fmt.Println("시나리오 2: 5초 작업, 3초 타임아웃 → 타임아웃")
+	testTimeoutServer(5*time.Second, 3*time.Second)
+
+	// Assignment 2: WaitGroup 벤치마크
+	fmt.Println("\n[8-2] Assignment 2-4-2: WaitGroup 안전성 검증")
+	fmt.Println("요구사항: 고루틴 1,000개, 각 1,000회 작업")
+
+	var wg sync.WaitGroup
+	count := 0
+	var mu sync.Mutex
+
+	fmt.Println("올바른 패턴: Add() 고루틴 생성 전에")
+
+	start := time.Now()
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)  // 올바른 위치
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				mu.Lock()
+				count++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("결과:\n")
+	fmt.Printf("예상값: 1,000,000\n")
+	fmt.Printf("실제값: %d\n", count)
+	fmt.Printf("정확성: %.1f%%\n", float64(count)/10000*100)
+	fmt.Printf("시간: %v\n", elapsed)
+
+	if count == 1000000 {
+		fmt.Println("✓ WaitGroup 패턴 검증 통과")
+	}
+
+	// Assignment 3: Context + WaitGroup 통합
+	fmt.Println("\n[8-3] Assignment 2-4-3: Context + WaitGroup 통합")
+	fmt.Println("요구사항: 타임아웃 내 병렬 작업 수행")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var wg2 sync.WaitGroup
+	successCount := 0
+	timeoutCount := 0
+	var mu2 sync.Mutex
+
+	numTasks := 10
+
+	for i := 0; i < numTasks; i++ {
+		wg2.Add(1)
+		go func(id int) {
+			defer wg2.Done()
+
+			// 각 작업 시간: 100-500ms
+			taskDuration := time.Duration((id%5+1)*100) * time.Millisecond
+
+			select {
+			case <-time.After(taskDuration):
+				fmt.Printf("  작업 %d: 완료 (%v)\n", id, taskDuration)
+				mu2.Lock()
+				successCount++
+				mu2.Unlock()
+			case <-ctx.Done():
+				fmt.Printf("  작업 %d: 취소됨\n", id)
+				mu2.Lock()
+				timeoutCount++
+				mu2.Unlock()
+			}
+		}(i)
+	}
+
+	wg2.Wait()
+
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("성공: %d개\n", successCount)
+	fmt.Printf("취소: %d개\n", timeoutCount)
+	fmt.Printf("타임아웃: 2초 / 모든 고루틴 안전 종료\n")
+	fmt.Println("✓ Context + WaitGroup 통합 검증 완료")
+}
+
+// ============================================================
+// Main: 전체 실행
+// ============================================================
+
+func main() {
+	fmt.Println("\n" + "============================================================")
+	fmt.Println("🎓 Go 201-2-4: 고루틴 생명주기 제어 - Context와 WaitGroup")
+	fmt.Println("============================================================")
+
+	section1_waitgroupBasics()
+	section2_waitgroupMisuse()
+	section3_contextCancel()
+	section4_contextTimeout()
+	section5_contextValue()
+	section6_goroutineLeak()
+	section7_timeoutServer()
+	section8_assignment2_4()
+
+	fmt.Println("\n" + "============================================================")
+	fmt.Println("모든 섹션 완료!")
+	fmt.Println("============================================================")
+	fmt.Println("\nGo 201 과정의 4개 레슨 모두 완성:")
+	fmt.Println("  ✓ 2-1: GMP 모델 (고루틴 스케줄링)")
+	fmt.Println("  ✓ 2-2: Fan-out/Fan-in (병렬 데이터 파이프라인)")
+	fmt.Println("  ✓ 2-3: Mutex와 Atomic (공유 자원 보호)")
+	fmt.Println("  ✓ 2-4: Context와 WaitGroup (생명주기 관리)")
+	fmt.Println("\n🚀 다음: Go 201-2-5 리플렉션과 제네릭 (범용 시스템)")
+}

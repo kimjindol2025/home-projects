@@ -1,0 +1,305 @@
+/**
+ * FreeLang v4 StdLib — Database Functions (4개 + 확장)
+ *
+ * 인메모리 관계형 DB 시뮬레이션 (실제 DB 드라이버 없이 동작)
+ *
+ * 1. db_query(db, sql, params)    → ok(arr[struct]) | err
+ *    - SELECT 지원: WHERE, ORDER BY, LIMIT, OFFSET
+ *    - 파라미터 바인딩: $1, $2, ... 형식
+ *
+ * 2. db_insert(db, table, row)    → ok(i32) | err  (삽입된 row id)
+ *
+ * 3. db_update(db, table, set, where) → ok(i32) | err  (변경된 row 수)
+ *
+ * 4. db_delete(db, table, where)  → ok(i32) | err  (삭제된 row 수)
+ *
+ * + db_create(name)         → Database 인스턴스 생성
+ * + db_create_table(db, table, schema)
+ * + db_count(db, table, where)    → i32
+ * + db_transaction(db, fn)        → ok | err
+ */
+
+import { Value, V, assertStr, assertI32 } from "./types";
+
+// ============================================================
+// 내부 타입
+// ============================================================
+
+type Row = Map<string, Value>;
+
+interface Table {
+  name:    string;
+  schema:  Map<string, string>;  // col → type
+  rows:    Row[];
+  nextId:  number;
+}
+
+export interface Database {
+  name:    string;
+  tables:  Map<string, Table>;
+  txActive: boolean;
+  txLog:   { op: string; table: string; data: unknown }[];
+}
+
+// ============================================================
+// DB 생성
+// ============================================================
+
+export function db_create(name: string): Database {
+  return { name, tables: new Map(), txActive: false, txLog: [] };
+}
+
+export function db_create_table(
+  db:     Database,
+  table:  string,
+  schema: Record<string, string>
+): void {
+  if (db.tables.has(table)) throw new Error(`db_create_table: 테이블 '${table}' 이미 존재`);
+  db.tables.set(table, {
+    name:   table,
+    schema: new Map(Object.entries(schema)),
+    rows:   [],
+    nextId: 1,
+  });
+}
+
+// ============================================================
+// 1. db_query
+// ============================================================
+
+/**
+ * 지원 쿼리:
+ *   SELECT * FROM table
+ *   SELECT col1, col2 FROM table WHERE col = $1
+ *   SELECT * FROM table ORDER BY col ASC|DESC
+ *   SELECT * FROM table LIMIT $1 OFFSET $2
+ */
+export function db_query(
+  db:     Database,
+  sql:    string,
+  params: Value[] = []
+): Value {
+  try {
+    const result = executeSelect(db, sql.trim(), params);
+    return V.ok(V.arr(result.map(rowToStruct)));
+  } catch (e: any) {
+    return V.err(`db_query: ${e.message}`);
+  }
+}
+
+function executeSelect(db: Database, sql: string, params: Value[]): Row[] {
+  // 파라미터 바인딩 ($1, $2, ...)
+  const bound = sql.replace(/\$(\d+)/g, (_, n) => {
+    const idx = parseInt(n, 10) - 1;
+    const v   = params[idx];
+    if (!v) throw new Error(`파라미터 $${n} 없음`);
+    return valueToSql(v);
+  });
+
+  // 파싱
+  const upper = bound.toUpperCase();
+  if (!upper.startsWith("SELECT")) throw new Error("SELECT만 지원합니다");
+
+  // FROM 절 추출
+  const fromMatch = /FROM\s+(\w+)/i.exec(bound);
+  if (!fromMatch) throw new Error("FROM 절 없음");
+  const tableName = fromMatch[1];
+  const table     = db.tables.get(tableName);
+  if (!table) throw new Error(`테이블 '${tableName}' 없음`);
+
+  let rows = [...table.rows];
+
+  // WHERE 절
+  const whereMatch = /WHERE\s+(.+?)(?:\s+ORDER|\s+LIMIT|\s+OFFSET|$)/i.exec(bound);
+  if (whereMatch) {
+    rows = rows.filter((row) => evalWhere(row, whereMatch[1].trim()));
+  }
+
+  // ORDER BY 절
+  const orderMatch = /ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?/i.exec(bound);
+  if (orderMatch) {
+    const col = orderMatch[1];
+    const dir = (orderMatch[2] ?? "ASC").toUpperCase();
+    rows.sort((a, b) => {
+      const av = a.get(col), bv = b.get(col);
+      const an = toComparable(av), bn = toComparable(bv);
+      return dir === "ASC" ? (an < bn ? -1 : an > bn ? 1 : 0) : (an > bn ? -1 : an < bn ? 1 : 0);
+    });
+  }
+
+  // LIMIT / OFFSET
+  const limitMatch  = /LIMIT\s+(\d+)/i.exec(bound);
+  const offsetMatch = /OFFSET\s+(\d+)/i.exec(bound);
+  const offset = offsetMatch ? parseInt(offsetMatch[1], 10) : 0;
+  const limit  = limitMatch  ? parseInt(limitMatch[1], 10)  : rows.length;
+  rows = rows.slice(offset, offset + limit);
+
+  // SELECT 컬럼 필터
+  const colPart = /SELECT\s+(.+?)\s+FROM/i.exec(bound)?.[1] ?? "*";
+  if (colPart.trim() !== "*") {
+    const cols = colPart.split(",").map((c) => c.trim());
+    rows = rows.map((row) => {
+      const filtered = new Map<string, Value>();
+      for (const col of cols) {
+        if (row.has(col)) filtered.set(col, row.get(col)!);
+      }
+      return filtered;
+    });
+  }
+
+  return rows;
+}
+
+function evalWhere(row: Row, expr: string): boolean {
+  // 지원: col = 'val', col = 123, col > 123, col < 123, col >= 123, col <= 123, col != 'val'
+  const opMatch = /(\w+)\s*(=|!=|>=|<=|>|<)\s*('[^']*'|\d+\.?\d*)/i.exec(expr);
+  if (!opMatch) return true;
+  const [, col, op, rawVal] = opMatch;
+  const rowVal = row.get(col);
+  if (!rowVal) return false;
+
+  const expected: Value = rawVal.startsWith("'")
+    ? V.str(rawVal.slice(1, -1))
+    : rawVal.includes(".")
+      ? V.f64(parseFloat(rawVal))
+      : V.i32(parseInt(rawVal, 10));
+
+  const a = toComparable(rowVal);
+  const b = toComparable(expected);
+
+  switch (op) {
+    case "=":  return a === b;
+    case "!=": return a !== b;
+    case ">":  return a  > b;
+    case "<":  return a  < b;
+    case ">=": return a >= b;
+    case "<=": return a <= b;
+  }
+  return false;
+}
+
+function toComparable(v: Value | undefined): string | number {
+  if (!v) return "";
+  if (v.tag === "i32" || v.tag === "f64") return (v as any).val;
+  if (v.tag === "str") return (v as any).val;
+  if (v.tag === "bool") return (v as any).val ? 1 : 0;
+  return "";
+}
+
+function valueToSql(v: Value): string {
+  if (v.tag === "str") return `'${(v as any).val}'`;
+  if (v.tag === "i32" || v.tag === "f64") return String((v as any).val);
+  if (v.tag === "bool") return (v as any).val ? "1" : "0";
+  return "NULL";
+}
+
+function rowToStruct(row: Row): Value {
+  return { tag: "struct", fields: new Map(row) };
+}
+
+// ============================================================
+// 2. db_insert
+// ============================================================
+
+export function db_insert(db: Database, tableName: string, rowData: Record<string, Value>): Value {
+  const table = db.tables.get(tableName);
+  if (!table) return V.err(`db_insert: 테이블 '${tableName}' 없음`);
+
+  const id  = table.nextId++;
+  const row = new Map<string, Value>([["id", V.i32(id)], ...Object.entries(rowData)]);
+  table.rows.push(row);
+
+  if (db.txActive) db.txLog.push({ op: "insert", table: tableName, data: id });
+
+  return V.ok(V.i32(id));
+}
+
+// ============================================================
+// 3. db_update
+// ============================================================
+
+/**
+ * @param set   { col: newValue, ... }
+ * @param where 조건 문자열 "col = 'val'" 형식
+ */
+export function db_update(
+  db:        Database,
+  tableName: string,
+  setData:   Record<string, Value>,
+  where:     string
+): Value {
+  const table = db.tables.get(tableName);
+  if (!table) return V.err(`db_update: 테이블 '${tableName}' 없음`);
+
+  let count = 0;
+  for (const row of table.rows) {
+    if (evalWhere(row, where)) {
+      for (const [col, val] of Object.entries(setData)) {
+        row.set(col, val);
+      }
+      count++;
+    }
+  }
+
+  if (db.txActive) db.txLog.push({ op: "update", table: tableName, data: count });
+  return V.ok(V.i32(count));
+}
+
+// ============================================================
+// 4. db_delete
+// ============================================================
+
+export function db_delete(
+  db:        Database,
+  tableName: string,
+  where:     string
+): Value {
+  const table = db.tables.get(tableName);
+  if (!table) return V.err(`db_delete: 테이블 '${tableName}' 없음`);
+
+  const before = table.rows.length;
+  table.rows = table.rows.filter((row) => !evalWhere(row, where));
+  const deleted = before - table.rows.length;
+
+  if (db.txActive) db.txLog.push({ op: "delete", table: tableName, data: deleted });
+  return V.ok(V.i32(deleted));
+}
+
+// ============================================================
+// 5. db_count
+// ============================================================
+
+export function db_count(db: Database, tableName: string, where = ""): Value {
+  const table = db.tables.get(tableName);
+  if (!table) return V.err(`db_count: 테이블 '${tableName}' 없음`);
+
+  const count = where
+    ? table.rows.filter((row) => evalWhere(row, where)).length
+    : table.rows.length;
+
+  return V.i32(count);
+}
+
+// ============================================================
+// 6. 트랜잭션
+// ============================================================
+
+export function db_begin(db: Database): void {
+  db.txActive = true;
+  db.txLog    = [];
+}
+
+export function db_commit(db: Database): Value {
+  db.txActive = false;
+  const ops = db.txLog.length;
+  db.txLog   = [];
+  return V.ok(V.i32(ops));
+}
+
+export function db_rollback(db: Database): Value {
+  // 간소화: 실제 rollback은 log를 역순으로 되돌림 (여기서는 txActive 해제만)
+  db.txActive = false;
+  const ops = db.txLog.length;
+  db.txLog   = [];
+  return V.ok(V.i32(ops));
+}

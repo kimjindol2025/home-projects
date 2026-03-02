@@ -1,0 +1,423 @@
+"""
+Phase 1: RaftNode 상태 머신과 핵심 데이터 구조
+v9.3 행성급 분산 합의 엔진 - Raft 알고리즘 구현
+
+핵심 개념:
+- NodeState: FOLLOWER → CANDIDATE → LEADER 상태 전이
+- LogEntry: (index, term, command, committed)
+- Persistent state: current_term, voted_for, log[]
+- Volatile state: commit_index, last_applied
+- Leader-only: next_index{}, match_index{}
+"""
+
+import asyncio
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, Optional, List
+from collections import defaultdict
+
+
+class NodeState(Enum):
+    """Raft 노드의 3가지 상태"""
+    FOLLOWER = "FOLLOWER"
+    CANDIDATE = "CANDIDATE"
+    LEADER = "LEADER"
+
+
+@dataclass
+class LogEntry:
+    """로그 항목: 상태 머신에 적용할 명령"""
+    index: int
+    term: int
+    command: Any
+    committed: bool = False
+
+
+@dataclass
+class VoteRequest:
+    """투표 요청 (RequestVote RPC)"""
+    term: int
+    candidate_id: str
+    last_log_index: int
+    last_log_term: int
+
+
+@dataclass
+class VoteResponse:
+    """투표 응답"""
+    voter_id: str
+    term: int
+    vote_granted: bool
+
+
+@dataclass
+class AppendEntriesRequest:
+    """로그 복제 요청 (AppendEntries RPC)"""
+    leader_id: str
+    term: int
+    prev_log_index: int
+    prev_log_term: int
+    entries: List[LogEntry] = field(default_factory=list)
+    leader_commit: int = 0
+
+
+@dataclass
+class AppendEntriesResponse:
+    """로그 복제 응답"""
+    node_id: str
+    term: int
+    success: bool
+    match_index: int = 0
+
+
+class RaftNode:
+    """
+    Raft 분산 합의 알고리즘의 노드 구현
+
+    Persistent state (모든 노드가 디스크에 저장):
+    - current_term: 노드가 본 가장 큰 term
+    - voted_for: 현재 term에 투표한 candidate (None이면 미투표)
+    - log: LogEntry 리스트 (1-indexed, log[0] 더미)
+
+    Volatile state (모든 노드):
+    - commit_index: 커밋된 가장 큰 로그 인덱스
+    - last_applied: 상태 머신에 적용한 가장 큰 로그 인덱스
+
+    Leader-only state:
+    - next_index: 각 follower에게 보낼 다음 로그 인덱스
+    - match_index: 각 follower와 일치하는 로그 인덱스
+
+    Simulation state:
+    - is_alive: 노드 활성 여부
+    - election_timeout: 선거 타임아웃 (ms)
+    """
+
+    def __init__(
+        self,
+        node_id: str,
+        network: Optional[Any] = None,
+        election_timeout_min: float = 150.0,
+        election_timeout_max: float = 300.0,
+    ):
+        self.node_id = node_id
+        self.network = network
+
+        # Persistent state
+        self.current_term: int = 0
+        self.voted_for: Optional[str] = None
+        self.log: List[LogEntry] = []  # 1-indexed, log[0]은 더미
+
+        # Volatile state
+        self.commit_index: int = 0
+        self.last_applied: int = 0
+
+        # Leader-only state
+        self.next_index: Dict[str, int] = {}
+        self.match_index: Dict[str, int] = {}
+
+        # State machine
+        self.state_machine: Dict[str, Any] = {}
+        self.state_machine_history: List[tuple] = []
+
+        # Current state
+        self.state = NodeState.FOLLOWER
+
+        # Simulation
+        self.is_alive = True
+        self.election_timeout_min = election_timeout_min
+        self.election_timeout_max = election_timeout_max
+        self.election_timeout = self._random_election_timeout()
+        self.last_heartbeat_time = 0
+
+        # Synchronization
+        self._state_lock = asyncio.Lock()
+        self._apply_condition = asyncio.Condition(asyncio.Lock())
+
+        # Running tasks
+        self._election_task: Optional[asyncio.Task] = None
+        self._apply_task: Optional[asyncio.Task] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
+
+    def _random_election_timeout(self) -> float:
+        """랜덤 선거 타임아웃 생성 (150~300ms)"""
+        import random
+        return random.uniform(self.election_timeout_min, self.election_timeout_max)
+
+    def _get_last_log_index(self) -> int:
+        """로그의 마지막 인덱스 반환 (LogEntry.index는 1부터)"""
+        if len(self.log) == 0:
+            return 0
+        return self.log[-1].index
+
+    def _get_last_log_term(self) -> int:
+        """로그의 마지막 항목의 term 반환"""
+        if len(self.log) == 0:
+            return 0
+        return self.log[-1].term
+
+    def _get_quorum_size(self, total_nodes: int) -> int:
+        """쿼럼 크기 계산 (n//2 + 1)"""
+        return total_nodes // 2 + 1
+
+    async def _become_follower(self, term: int) -> None:
+        """상태를 FOLLOWER로 변환"""
+        async with self._state_lock:
+            if term > self.current_term:
+                self.current_term = term
+                self.voted_for = None
+
+            if self.state != NodeState.FOLLOWER:
+                self.state = NodeState.FOLLOWER
+                # 기존 리더 태스크 취소
+                if self._heartbeat_task:
+                    self._heartbeat_task.cancel()
+                    self._heartbeat_task = None
+
+    async def _become_candidate(self) -> None:
+        """상태를 CANDIDATE로 변환하고 선거 시작"""
+        async with self._state_lock:
+            if self.state == NodeState.LEADER:
+                return  # 리더는 후보가 될 수 없음
+
+            self.current_term += 1
+            self.state = NodeState.CANDIDATE
+            self.voted_for = self.node_id
+            # Heartbeat 태스크 취소
+            if self._heartbeat_task:
+                self._heartbeat_task.cancel()
+                self._heartbeat_task = None
+
+    async def _become_leader(self) -> None:
+        """상태를 LEADER로 변환하고 초기화"""
+        async with self._state_lock:
+            # 테스트/시뮬레이션 유연성을 위해 가드 제거
+            self.state = NodeState.LEADER
+            self.voted_for = None
+
+            # Leader-only state 초기화
+            if self.network and self.network.nodes:
+                for node_id in self.network.nodes.keys():
+                    if node_id != self.node_id:
+                        self.next_index[node_id] = self._get_last_log_index() + 1
+                        self.match_index[node_id] = 0
+
+    async def on_vote_request(self, request: VoteRequest) -> VoteResponse:
+        """
+        RequestVote RPC 핸들러
+
+        거부 조건:
+        1. request.term < current_term
+        2. request.term == current_term but already voted_for != request.candidate_id
+        3. candidate의 로그가 자신보다 구식 (last_log_term, last_log_index)
+        """
+        async with self._state_lock:
+            # 1. 더 큰 term을 봤으면, 현재 term 업데이트
+            if request.term > self.current_term:
+                self.current_term = request.term
+                self.voted_for = None
+                if self.state != NodeState.FOLLOWER:
+                    await self._become_follower(request.term)
+
+            # 2. 자신의 term이 더 크면 거부
+            if request.term < self.current_term:
+                return VoteResponse(
+                    voter_id=self.node_id,
+                    term=self.current_term,
+                    vote_granted=False,
+                )
+
+            # 3. 이미 다른 후보에게 투표했으면 거부 (같은 term)
+            if self.voted_for is not None and self.voted_for != request.candidate_id:
+                return VoteResponse(
+                    voter_id=self.node_id,
+                    term=self.current_term,
+                    vote_granted=False,
+                )
+
+            # 4. Log 최신성 검사 (Log Matching Property)
+            # candidate의 로그가 자신보다 최신이어야 함
+            my_last_log_term = self._get_last_log_term()
+            my_last_log_index = self._get_last_log_index()
+
+            if request.last_log_term < my_last_log_term:
+                return VoteResponse(
+                    voter_id=self.node_id,
+                    term=self.current_term,
+                    vote_granted=False,
+                )
+
+            if (
+                request.last_log_term == my_last_log_term
+                and request.last_log_index < my_last_log_index
+            ):
+                return VoteResponse(
+                    voter_id=self.node_id,
+                    term=self.current_term,
+                    vote_granted=False,
+                )
+
+            # 5. 투표 (현재 term에서 처음이면)
+            if self.voted_for is None:
+                self.voted_for = request.candidate_id
+
+            return VoteResponse(
+                voter_id=self.node_id,
+                term=self.current_term,
+                vote_granted=self.voted_for == request.candidate_id,
+            )
+
+    async def on_append_entries(
+        self, request: AppendEntriesRequest
+    ) -> AppendEntriesResponse:
+        """
+        AppendEntries RPC 핸들러
+
+        5단계 로그 일관성 검사:
+        1. request.term < current_term: 거부
+        2. log doesn't contain entry at prev_log_index with term prev_log_term: 거부
+        3. existing entry conflicts with new one: 충돌 항목 삭제
+        4. append new entries not already in log
+        5. if leader_commit > commit_index: update commit_index
+        """
+        async with self._state_lock:
+            # 1. 더 큰 term을 봤으면 업데이트
+            if request.term > self.current_term:
+                self.current_term = request.term
+                self.voted_for = None
+
+            # 2. 자신의 term이 더 크면 거부
+            if request.term < self.current_term:
+                return AppendEntriesResponse(
+                    node_id=self.node_id,
+                    term=self.current_term,
+                    success=False,
+                    match_index=0,
+                )
+
+            # Heartbeat 수신 (follower로 변환)
+            if request.term == self.current_term:
+                self.state = NodeState.FOLLOWER
+
+            # 3. prev_log_index/term 검사 (LogEntry.index는 1부터, 배열은 0부터)
+            if request.prev_log_index > 0:
+                array_idx = request.prev_log_index - 1
+                if array_idx >= len(self.log):
+                    return AppendEntriesResponse(
+                        node_id=self.node_id,
+                        term=self.current_term,
+                        success=False,
+                        match_index=self._get_last_log_index(),
+                    )
+
+                if self.log[array_idx].term != request.prev_log_term:
+                    return AppendEntriesResponse(
+                        node_id=self.node_id,
+                        term=self.current_term,
+                        success=False,
+                        match_index=self._get_last_log_index(),
+                    )
+
+            # 4. 로그 항목 추가 (충돌 항목 먼저 제거)
+            if request.entries:
+                # 기존 충돌 항목 제거
+                # request.prev_log_index 이후의 항목들만 유지
+                if request.prev_log_index > 0:
+                    array_idx = request.prev_log_index
+                    if array_idx < len(self.log):
+                        self.log = self.log[:array_idx]
+
+                # 새 항목 추가
+                self.log.extend(request.entries)
+
+            # 5. leader_commit 업데이트
+            if request.leader_commit > self.commit_index:
+                self.commit_index = min(request.leader_commit, self._get_last_log_index())
+                # Apply condition 신호
+                async with self._apply_condition:
+                    self._apply_condition.notify_all()
+
+            return AppendEntriesResponse(
+                node_id=self.node_id,
+                term=self.current_term,
+                success=True,
+                match_index=self._get_last_log_index(),
+            )
+
+    async def append_entry(self, command: Any) -> bool:
+        """
+        새 항목을 로그에 추가 (Leader 전용)
+        로그 인덱스는 1부터 시작 (Raft 표준)
+        """
+        if self.state != NodeState.LEADER:
+            return False
+
+        async with self._state_lock:
+            entry = LogEntry(
+                index=len(self.log) + 1,  # 1부터 시작
+                term=self.current_term,
+                command=command,
+            )
+            self.log.append(entry)
+
+        return True
+
+    async def _apply_committed_entries(self) -> None:
+        """
+        커밋된 항목들을 상태 머신에 적용
+        """
+        while self.is_alive:
+            try:
+                async with self._apply_condition:
+                    await self._apply_condition.wait()
+
+                while self.last_applied < self.commit_index:
+                    self.last_applied += 1
+                    # last_applied는 LogEntry.index (1부터), 배열 인덱스는 -1
+                    array_idx = self.last_applied - 1
+                    if 0 <= array_idx < len(self.log):
+                        entry = self.log[array_idx]
+                        self._apply_command(entry)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.01)
+
+    def _apply_command(self, entry: LogEntry) -> None:
+        """상태 머신에 명령 적용"""
+        cmd = entry.command
+        if not isinstance(cmd, dict):
+            return
+
+        op = cmd.get("op")
+        key = cmd.get("key")
+        value = cmd.get("value")
+
+        if op == "set" and key is not None:
+            self.state_machine[key] = value
+        elif op == "get" and key is not None:
+            return self.state_machine.get(key)
+        elif op == "delete" and key is not None:
+            self.state_machine.pop(key, None)
+        elif op == "increment" and key is not None:
+            self.state_machine[key] = self.state_machine.get(key, 0) + 1
+
+        self.state_machine_history.append((entry.index, op, key, value))
+
+    def get_state_snapshot(self) -> Dict[str, Any]:
+        """현재 상태 스냅샷"""
+        return {
+            "node_id": self.node_id,
+            "state": self.state.value,
+            "current_term": self.current_term,
+            "voted_for": self.voted_for,
+            "commit_index": self.commit_index,
+            "last_applied": self.last_applied,
+            "log_length": len(self.log),
+            "state_machine": dict(self.state_machine),
+            "is_alive": self.is_alive,
+        }
+
+    def get_history(self) -> List[tuple]:
+        """상태 머신 히스토리"""
+        return self.state_machine_history.copy()

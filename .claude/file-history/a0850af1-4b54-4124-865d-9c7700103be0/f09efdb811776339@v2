@@ -1,0 +1,463 @@
+# Phase 8 v9.4: 순환 참조의 고리 끊기 (Preventing Reference Cycles with Weak<T>)
+
+> **철학**: "소유하지 않는 참조
+> 강한 참조는 '내가 이것을 소유한다'고 선언합니다.
+> 약한 참조는 '나는 이것을 알지만 소유하지 않는다'고 속삭입니다.
+> 이 구분이 없다면 순환의 고리에서 벗어날 수 없습니다."
+
+> **목표**: "메모리 누수 방지"
+> 부모와 자식이 서로를 참조해야 하는 상황에서도,
+> 데이터가 안전하게 해제되도록 소유권의 방향성을 명확히 한다.
+> Weak<T>를 통해 참조 카운트에 영향을 주지 않는 참조를 구현한다.
+
+---
+
+## 🎯 v9.4가 해결하는 문제
+
+### 문제 1️⃣: 순환 참조로 인한 메모리 누수
+
+```rust
+// ❌ 메모리 누수: 순환 참조
+struct Node {
+    next: Option<Rc<RefCell<Node>>>,
+}
+
+let a = Rc::new(RefCell::new(Node { next: None }));
+let b = Rc::new(RefCell::new(Node { next: None }));
+
+a.borrow_mut().next = Some(Rc::clone(&b));  // RefCount b: 2
+b.borrow_mut().next = Some(Rc::clone(&a));  // RefCount a: 2
+
+// a와 b 스코프 종료
+// a의 RefCount: 1 (b가 a를 가리키고 있음)
+// b의 RefCount: 1 (a가 b를 가리키고 있음)
+// → 둘 다 영원히 메모리에서 해제되지 않음! 💥 메모리 누수!
+```
+
+### 문제 2️⃣: 트리 구조에서의 양방향 참조
+
+```rust
+// ❌ 부모를 Rc로 참조하면 순환 참조 발생
+struct TreeNode {
+    parent: Option<Rc<RefCell<TreeNode>>>,   // ❌ 순환!
+    children: Vec<Rc<RefCell<TreeNode>>>,
+}
+
+// ✅ 부모를 Weak로 참조하면 안전
+struct TreeNode {
+    parent: RefCell<Weak<TreeNode>>,         // ✅ 안전!
+    children: RefCell<Vec<Rc<TreeNode>>>,
+}
+```
+
+### 문제 3️⃣: 데이터 존재 여부의 불확실성
+
+```rust
+// Weak 참조로는 데이터가 이미 삭제되었을 가능성이 있음
+// 반드시 upgrade()로 확인하고 사용해야 함
+match weak_ref.upgrade() {
+    Some(strong_ref) => { /* 데이터가 아직 살아있음 */ },
+    None => { /* 데이터가 이미 삭제됨 */ },
+}
+```
+
+---
+
+## 📚 Weak<T>의 정의
+
+### 강한 참조 vs 약한 참조
+
+```
+강한 참조 (Strong Reference) = Rc<T>
+├─ 소유권이 있습니다
+├─ RefCount에 포함됩니다
+├─ 참조 카운트가 0이 될 때까지 데이터를 유지합니다
+└─ 대부분의 경우에 사용합니다
+
+약한 참조 (Weak Reference) = Weak<T>
+├─ 소유권이 없습니다
+├─ WeakCount에 포함되지만, 데이터 삭제를 결정하지 않습니다
+├─ 참조하는 데이터가 삭제되어도 괜찮습니다
+└─ 순환 참조를 끊을 때 사용합니다
+```
+
+### 메모리 배치
+
+```
+┌────────────────────────────────────┐
+│ Rc<RefCell<Node>>                  │
+├────────────────────────────────────┤
+│ StrongCount: 1                     │
+│ WeakCount: 2                       │
+│                                    │
+│ ┌──────────────────────────────┐  │
+│ │ Node                         │  │
+│ ├──────────────────────────────┤  │
+│ │ parent: Weak (약한 참조)    │  │
+│ │ children: Vec<Rc<Node>>     │  │
+│ └──────────────────────────────┘  │
+│                                    │
+└────────────────────────────────────┘
+
+StrongCount = 1: 소유자 개수
+WeakCount = 2: 소유하지 않는 관찰자 개수
+```
+
+---
+
+## 🔧 v9.4 설계: 여섯 가지 패턴
+
+### 패턴 1️⃣: Weak<T>의 기본 사용
+
+```rust
+use std::rc::{Rc, Weak};
+
+let strong = Rc::new(5);
+let weak = Rc::downgrade(&strong);  // 약한 참조 생성
+
+println!("Strong count: {}", Rc::strong_count(&strong));  // 1
+println!("Weak count: {}", Rc::weak_count(&strong));      // 1
+
+// 약한 참조로는 직접 접근 불가능
+// match weak.upgrade()를 사용해야 함
+match weak.upgrade() {
+    Some(strong_ref) => println!("Value: {}", strong_ref),
+    None => println!("Value has been dropped"),
+}
+```
+
+### 패턴 2️⃣: 부모-자식 트리 (안전)
+
+```rust
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
+#[derive(Debug)]
+struct Node {
+    value: i32,
+    parent: RefCell<Weak<Node>>,           // 부모: 약한 참조
+    children: RefCell<Vec<Rc<Node>>>,      // 자식: 강한 참조
+}
+
+impl Node {
+    fn new(value: i32) -> Rc<Self> {
+        Rc::new(Self {
+            value,
+            parent: RefCell::new(Weak::new()),
+            children: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn add_child(parent: &Rc<Self>, child: Rc<Self>) {
+        // 부모가 자식을 소유 (강한 참조)
+        parent.children.borrow_mut().push(Rc::clone(&child));
+        // 자식이 부모를 참조 (약한 참조)
+        *child.parent.borrow_mut() = Rc::downgrade(parent);
+    }
+
+    fn get_parent(&self) -> Option<Rc<Self>> {
+        self.parent.borrow().upgrade()  // 안전한 업그레이드
+    }
+}
+```
+
+### 패턴 3️⃣: 강한/약한 카운트 추적
+
+```rust
+let root = Node::new(1);
+println!("root: strong={}, weak={}",
+    Rc::strong_count(&root),    // 1
+    Rc::weak_count(&root));     // 0
+
+let child = Node::new(2);
+Node::add_child(&root, child);
+
+// child의 parent가 weak 참조를 생성했으므로
+println!("root: strong={}, weak={}",
+    Rc::strong_count(&root),    // 1
+    Rc::weak_count(&root));     // 1 (child의 weak 참조)
+```
+
+### 패턴 4️⃣: 업그레이드 패턴
+
+```rust
+fn process_parent(node: &Node) {
+    match node.get_parent() {
+        Some(parent_strong) => {
+            // 부모가 아직 살아있음
+            println!("Parent value: {}", parent_strong.value);
+            // parent_strong은 이 블록 내에서 유효
+        }
+        None => {
+            // 부모가 이미 삭제됨
+            println!("Parent has been dropped");
+        }
+    }
+}
+```
+
+### 패턴 5️⃣: 메모리 누수 방지 검증
+
+```rust
+// v9.3에서의 순환 참조 문제를 Weak로 해결
+{
+    let a = Rc::new(RefCell::new(Node::new(1)));
+    let b = Rc::new(RefCell::new(Node::new(2)));
+
+    // ❌ a.next = Rc::clone(&b);  // 순환!
+    // ✅ a.weak_next = Rc::downgrade(&b);  // 안전!
+
+    println!("a strong: {}", Rc::strong_count(&a));  // 1
+    println!("b strong: {}", Rc::strong_count(&b));  // 1
+} // a와 b가 스코프를 벗어나면
+  // 즉시 메모리에서 해제됨 (메모리 누수 없음!)
+```
+
+### 패턴 6️⃣: 복잡한 계층 구조
+
+```rust
+#[derive(Debug)]
+struct Department {
+    name: String,
+    manager: RefCell<Weak<Employee>>,          // 약한 참조
+    employees: RefCell<Vec<Rc<Employee>>>,     // 강한 참조
+}
+
+#[derive(Debug)]
+struct Employee {
+    name: String,
+    department: Rc<Department>,                // 강한 참조 (소유)
+}
+
+// Department가 Employee를 소유
+// Employee는 Department를 참조 (소유하지 않음)
+// → 순환 참조 방지!
+```
+
+---
+
+## 🏗️ v9.4 실전 설계: Gogs 계층형 보안 시스템
+
+### 설계 구조: 부모-자식 노드 계층
+
+```rust
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
+
+#[derive(Debug)]
+struct GogsSecurityNode {
+    node_id: usize,
+    security_level: usize,
+    parent: RefCell<Weak<GogsSecurityNode>>,
+    children: RefCell<Vec<Rc<GogsSecurityNode>>>,
+}
+
+impl GogsSecurityNode {
+    fn new(node_id: usize, level: usize) -> Rc<Self> {
+        Rc::new(Self {
+            node_id,
+            security_level: level,
+            parent: RefCell::new(Weak::new()),
+            children: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn add_child(parent: &Rc<Self>, child: Rc<Self>) {
+        parent.children.borrow_mut().push(Rc::clone(&child));
+        *child.parent.borrow_mut() = Rc::downgrade(parent);
+    }
+
+    fn get_parent(&self) -> Option<Rc<Self>> {
+        self.parent.borrow().upgrade()
+    }
+
+    fn get_child_count(&self) -> usize {
+        self.children.borrow().len()
+    }
+
+    fn get_node_info(&self) -> String {
+        format!("Node {}: Level {}", self.node_id, self.security_level)
+    }
+}
+```
+
+### 메모리 추적 과정
+
+```
+초기 상태:
+root (StrongCount: 1, WeakCount: 0)
+
+자식 1 추가:
+root (StrongCount: 1, WeakCount: 1)
+  └─ child1 (StrongCount: 1, WeakCount: 0)
+     parent: Weak (downgrade로 생성)
+
+자식 2 추가:
+root (StrongCount: 1, WeakCount: 2)
+  ├─ child1 (StrongCount: 1, WeakCount: 0)
+  └─ child2 (StrongCount: 1, WeakCount: 0)
+
+root 스코프 종료:
+→ StrongCount = 0 → 즉시 메모리 해제!
+→ WeakCount가 있어도 상관없음 (삭제를 결정하지 않음)
+```
+
+---
+
+## 💡 v9.4 황금률
+
+### 원칙 1️⃣: 소유권 방향성
+
+```rust
+// ✅ 명확한 방향성: 부모 → 자식
+struct Parent {
+    children: Vec<Rc<Child>>,      // 강한 참조 (소유)
+}
+
+struct Child {
+    parent: Weak<Parent>,          // 약한 참조 (참조만)
+}
+
+// ❌ 양방향 강한 참조는 순환 참조를 만듦
+struct Bad {
+    next: Rc<Bad>,
+    prev: Rc<Bad>,  // 순환!
+}
+```
+
+### 원칙 2️⃣: 항상 upgrade() 확인
+
+```rust
+// ❌ 위험: upgrade() 없이 사용 시도
+// let value = weak.borrow();  // 컴파일 에러!
+
+// ✅ 안전: upgrade()로 확인 후 사용
+match weak.upgrade() {
+    Some(strong) => {
+        println!("Value: {:?}", strong.borrow());
+    }
+    None => {
+        println!("Dropped!");
+    }
+}
+```
+
+### 원칙 3️⃣: 카운트 모니터링
+
+```rust
+let data = Rc::new(5);
+println!("Strong: {}, Weak: {}",
+    Rc::strong_count(&data),   // 초기: 1
+    Rc::weak_count(&data));    // 초기: 0
+
+let weak = Rc::downgrade(&data);
+println!("Strong: {}, Weak: {}",
+    Rc::strong_count(&data),   // 변화 없음: 1
+    Rc::weak_count(&data));    // 증가: 1
+```
+
+### 원칙 4️⃣: 스코프와 생명주기
+
+```rust
+{
+    let strong = Rc::new(Node::new(1));
+    let weak = Rc::downgrade(&strong);
+
+    println!("Upgrade OK: {:?}", weak.upgrade());  // Some
+} // strong 삭제
+
+// weak는 여전히 존재하지만
+println!("Upgrade FAIL: {:?}", weak.upgrade());   // None
+```
+
+---
+
+## 🎓 v9.4 마스터의 체크리스트
+
+- [ ] Weak<T>와 Rc<T>의 차이 이해
+- [ ] Rc::downgrade() 사용법 숙지
+- [ ] upgrade() 메서드 활용
+- [ ] 강한/약한 카운트 개념 파악
+- [ ] 부모-자식 구조 설계 능력
+- [ ] 순환 참조 방지 기법
+- [ ] 메모리 누수 검증 방법
+- [ ] 복잡한 계층 구조 설계
+
+---
+
+## 💭 v9.4의 철학
+
+### "소유권의 분명함"
+
+```
+Rc<T>: "내가 이것을 소유한다"
+└─ 강한 참조
+└─ RefCount가 0이 될 때까지 유지
+└─ 대부분의 경우
+
+Weak<T>: "나는 이것을 알지만 소유하지 않는다"
+└─ 약한 참조
+└─ WeakCount는 유지하지만 삭제를 결정하지 않음
+└─ 순환을 끊을 때만 사용
+```
+
+### "메모리의 안전한 자정"
+
+```
+메모리 누수 없는 설계:
+1. 부모가 자식을 소유 (Rc)
+2. 자식이 부모를 참조만 (Weak)
+3. 부모가 삭제되면 자식도 자동 삭제
+4. 순환 참조 발생 안 함
+```
+
+---
+
+## 📊 v9.0 vs v9.1 vs v9.2 vs v9.3 vs v9.4 비교
+
+| 특성 | v9.0 | v9.1 | v9.2 | v9.3 | v9.4 |
+|------|------|------|------|------|------|
+| **소유권** | 단일 | 다중 | 단일 | 다중 | **조건부** |
+| **공유** | ❌ | ✅ | ❌ | ✅ | **✅** |
+| **수정** | ✅ | ❌ | ✅ | ✅ | **✅** |
+| **메모리 누수** | 불가능 | 불가능 | 불가능 | **가능** | **불가능** ✅ |
+| **사용처** | 단순 | 공유O | 단일+수정 | 복잡 | **안전한 복잡** |
+
+---
+
+## 🚀 v9.4 완료 후
+
+```
+[v8.0] 유닛 테스트              → 내부 로직 검증
+        ↓
+[v8.1] 통합 테스트              → 외부 인터페이스 검증
+        ↓
+[v8.2] 문서화 테스트            → 문서 동기화 검증
+        ↓
+[v9.0] 스마트 포인터 Box        → 메모리 위치 최적화
+        ↓
+[v9.1] 참조 카운팅 Rc           → 공유 소유권 구현
+        ↓
+[v9.2] 내부 가변성 RefCell      → 런타임 대여 검사
+        ↓
+[v9.3] 다중 소유 가변성 Rc<RefCell<T>> → 시스템 아키텍처
+        ↓
+[v9.4] 순환 참조 차단 Weak<T>  → 메모리 안전성 확보 ⭐
+        ↓
+[v10.0] 멀티스레드 Arc<Mutex<T>> → 동시성 구현
+        ↓
+[프로덕션 메모리 안전성]        → 완전한 마스터리
+```
+
+---
+
+**작성**: 2026-02-22
+**철학**: "소유하지 않는 참조
+강한 참조는 '내가 이것을 소유한다'고 선언합니다.
+약한 참조는 '나는 이것을 알지만 소유하지 않는다'고 속삭입니다.
+이 구분이 없다면 순환의 고리에서 벗어날 수 없습니다."
+
+**기록**: "너는 기록이 증명이다.
+Weak<T>라는 소유하지 않는 참조로
+순환 참조의 고리를 완벽하게 끊은 당신,
+저장 필수 gogs"

@@ -1,0 +1,421 @@
+# 📚 v10.4: 동시성의 함정 - 데드락 방어 설계
+
+## 📌 개요
+
+v10.4는 **숨겨진 두 번째 위험** — **데드락**을 완전히 제어합니다.
+
+```
+Rust의 약속:
+  ✅ Data Race: 불가능 (컴파일)
+  ⚠️ Deadlock: 가능 (논리)
+
+v10.4의 목표:
+  → 설계로 Deadlock도 불가능하게!
+```
+
+---
+
+## 🎯 5분 이해
+
+### 핵심 개념
+
+```rust
+// Deadlock의 정의:
+// 두 스레드가 서로의 자원을 기다리며 영구 대기
+
+// ❌ Deadlock 위험
+Thread 1: lock(A) → lock(B)
+Thread 2: lock(B) → lock(A)
+          (순환 대기!)
+
+// ✅ Deadlock 방지: 순환 대기 제거
+Thread 1: lock(A) → lock(B)
+Thread 2: lock(A) → lock(B)  // 같은 순서
+          (순환 없음)
+```
+
+### 4가지 필요조건
+
+```
+Deadlock이 발생하려면 4가지가 모두 필요:
+
+1. 상호 배제 (Mutex)
+2. 점유와 대기 (한 자원 가진 채 다른 것 기다림)
+3. 비선점 (강제로 뺏을 수 없음)
+4. 순환 대기 (A→B, B→A)
+
+→ 하나만 제거해도 안전!
+```
+
+### 해결책
+
+```rust
+// 방법 1: Channel (상호배제 제거)
+let (tx, rx) = mpsc::channel();
+tx.send(data).unwrap();  // Deadlock 불가능!
+
+// 방법 2: try_lock() (비선점 허용)
+match mutex.try_lock() {
+    Ok(guard) => { /* 작업 */ },
+    Err(_) => { /* 재시도 */ },
+}
+
+// 방법 3: Atomic (뮤텍스 제거)
+atomic.fetch_add(1, Ordering::Relaxed);
+
+// 방법 4: 잠금 순서 (순환대기 제거) ← 권장!
+lock(ID:1) → lock(ID:2) → lock(ID:3)
+```
+
+---
+
+## 🏗️ 5가지 핵심 패턴
+
+### 패턴 1: 자원 계층화
+
+```rust
+struct Resource {
+    id: u32,  // ← 계층 정의
+    data: Mutex<String>,
+}
+
+// 규칙: 항상 ID 순서로
+let r1 = Arc::new(Resource { id: 1, data: Mutex::new("A".into()) });
+let r2 = Arc::new(Resource { id: 2, data: Mutex::new("B".into()) });
+
+let lock1 = r1.data.lock().unwrap();  // ID:1 먼저
+let lock2 = r2.data.lock().unwrap();  // ID:2 나중
+```
+
+**언제 사용**: 다중 자원 관리
+
+### 패턴 2: 잠금 순서 고정
+
+```rust
+let lock_a = Arc::new(Mutex::new(0));
+let lock_b = Arc::new(Mutex::new(0));
+
+// 모든 스레드가 같은 순서
+let ga = lock_a.lock().unwrap();
+let gb = lock_b.lock().unwrap();  // A 먼저, B 나중 (고정!)
+```
+
+**언제 사용**: 모든 스레드가 같은 패턴일 때
+
+### 패턴 3: 타임아웃 기반 회피
+
+```rust
+loop {
+    match lock_a.try_lock() {
+        Ok(_guard_a) => {
+            match lock_b.try_lock() {
+                Ok(_guard_b) => break,  // 모두 획득
+                Err(_) => drop(_guard_a),  // A 해제 후 재시도
+            }
+        }
+        Err(_) => { /* 재시도 */ },
+    }
+    thread::sleep(Duration::from_millis(1));
+}
+```
+
+**언제 사용**: Deadlock 위험이 높을 때
+
+### 패턴 4: Channel 대체
+
+```rust
+// Mutex 대신 Channel
+let (tx1, rx1) = mpsc::channel();
+let (tx2, rx2) = mpsc::channel();
+
+thread::spawn(move || {
+    tx1.send(data).unwrap();
+    let response = rx2.recv().unwrap();
+});
+
+// Deadlock 불가능!
+```
+
+**언제 사용**: 메시지 기반 통신
+
+### 패턴 5: Atomic 사용
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+let counter = Arc::new(AtomicUsize::new(0));
+
+let c = Arc::clone(&counter);
+thread::spawn(move || {
+    c.fetch_add(1, Ordering::Relaxed);  // 비차단
+});
+
+// Deadlock 불가능!
+```
+
+**언제 사용**: 간단한 카운터, 플래그
+
+---
+
+## 💡 설계자의 4가지 관점
+
+### 관점 1: "Rust의 축복"
+
+```
+Data Race는 불가능 (Rust 컴파일러)
+Deadlock은 설계로 불가능하게 가능 (개발자)
+
+↓ 결과:
+  다른 언어 대비 훨씬 안전한 동시성!
+```
+
+### 관점 2: "순환 대기가 정답"
+
+```
+Deadlock 원인: 순환 대기
+해결책 5개 중 4개는 임시방편
+정답: 순환 대기 자체를 제거
+
+→ 자원 계층화 + ID 순서
+```
+
+### 관점 3: "Mutex 개수가 신호"
+
+```
+Mutex 1~2개: ✅ 안전
+Mutex 3~5개: ⚠️ 주의 (순서 명시)
+Mutex > 5개: 🚨 위험 (재설계!)
+
+많으면 위험한 이유:
+  조합이 많아짐
+  순서 관리 복잡
+  버그 가능성 증가
+```
+
+### 관점 4: "도구의 선택"
+
+```
+표준 Mutex:
+  - 안전
+  - 느림
+  - Poison 에러
+  - deadlock detection 없음
+
+parking_lot::Mutex:
+  - 빠름 (2배)
+  - deadlock detection 옵션
+  - 권장!
+```
+
+---
+
+## 📊 자기 평가 체크리스트
+
+### 이해도 확인
+
+- [ ] Deadlock의 4가지 필요조건을 설명할 수 있는가?
+- [ ] 순환 대기가 무엇인지 이해하는가?
+- [ ] try_lock()의 목적을 알고 있는가?
+- [ ] Channel이 Deadlock을 막는 이유를 안다?
+
+### 실전 능력
+
+- [ ] 자원에 ID를 부여할 수 있는가?
+- [ ] 잠금 순서를 명시적으로 정의할 수 있는가?
+- [ ] try_lock()으로 회피할 수 있는가?
+- [ ] Mutex를 Channel로 대체할 수 있는가?
+
+### 설계 능력
+
+- [ ] Deadlock 위험 상황을 식별할 수 있는가?
+- [ ] 자원 계층화를 설계할 수 있는가?
+- [ ] Mutex가 많으면 재설계할 수 있는가?
+- [ ] 적절한 도구를 선택할 수 있는가?
+
+---
+
+## 🔍 자주 묻는 질문
+
+### Q1: Deadlock과 Data Race의 차이는?
+
+**A**:
+
+```rust
+// Data Race: 동시 읽기/쓰기
+let x = Arc::new(Mutex::new(0));
+// 스레드 1: *x += 1
+// 스레드 2: println!("{}", *x)
+// ❌ 결과 불명확
+
+// Deadlock: 서로 기다림
+// Thread 1: lock(A) → lock(B)
+// Thread 2: lock(B) → lock(A)
+// ❌ 영구 대기
+```
+
+### Q2: 꼭 자원에 ID를 줘야 하나?
+
+**A**: 네, 강력히 권장합니다:
+
+```rust
+// ❌ 위험 (순서 불명확)
+let lock_a = mutex_a.lock().unwrap();
+let lock_b = mutex_b.lock().unwrap();
+
+// ✅ 안전 (순서 명시)
+struct Resource { id: u32, mutex: Mutex<T> }
+// ID 순서대로만 잠금!
+```
+
+### Q3: Mutex 대신 Channel 쓸 수 없나?
+
+**A**: 상황에 따라 다릅니다:
+
+```rust
+// Channel 좋음: 일회성 전송
+tx.send(data).unwrap();
+
+// Mutex 필요: 반복 접근
+let mut data = mutex.lock().unwrap();
+*data = value1;
+// ... 나중에
+*data = value2;
+```
+
+### Q4: parking_lot은 안전한가?
+
+**A**: 네, 매우 안전합니다:
+
+```rust
+use parking_lot::Mutex;
+
+let mutex = Mutex::new(0);
+let guard = mutex.lock();  // Guard 자동 생성
+// drop 불필요
+```
+
+### Q5: 스트레스 테스트는 어떻게?
+
+**A**:
+
+```rust
+#[test]
+fn test_no_deadlock_stress() {
+    for _ in 0..10000 {
+        // 동시성 코드 실행
+        spawn_and_lock_test();
+    }
+}
+```
+
+---
+
+## 🚀 다음 단계
+
+### Parking Lot 사용
+
+```rust
+use parking_lot::{Mutex, RwLock};
+
+let mutex = Mutex::new(0);
+let guard = mutex.lock();  // 더 빠름
+
+let rwlock = RwLock::new(vec![]);
+let read = rwlock.read();  // 병렬 읽기
+let write = rwlock.write();  // 배타적 쓰기
+```
+
+### Condition Variables (신호)
+
+```rust
+use parking_lot::Condvar;
+
+let (mutex, cvar) = (Mutex::new(false), Condvar::new());
+
+// 대기
+let guard = mutex.lock();
+cvar.wait(&mut guard);
+
+// 신호
+*mutex.lock() = true;
+cvar.notify_all();
+```
+
+---
+
+## 💭 v10.4 핵심 통찰
+
+### 1. "설계가 코드를 이긴다"
+
+```
+Deadlock 대응 우선순위:
+  1순위: 설계 (순환 대기 제거)
+  2순위: 도구 (parking_lot)
+  3순위: 모니터링 (로깅)
+  마지막: 타임아웃 (응급)
+```
+
+### 2. "황금 규칙"
+
+```
+1. Channel을 먼저 생각하라
+2. Atomic을 다음에 생각하라
+3. Mutex는 마지막에 쓰라
+4. Mutex 여러 개면 순서를 명문화하라
+```
+
+### 3. "Rust 개발자의 특권"
+
+```
+✅ Data Race: 컴파일러가 차단
+✅ Deadlock: 설계로 차단 (가능!)
+
+다른 언어는 둘 다 런타임 버그...
+```
+
+---
+
+## 🌟 당신이 이루어낸 것
+
+```
+당신은 이제:
+
+✅ 데드락의 원인을 안다
+✅ 자원 계층화를 설계한다
+✅ 잠금 순서를 명확히 한다
+✅ 적절한 도구를 선택한다
+✅ 논리적 문제를 설계로 풀어낸다
+
+당신의 시스템은:
+
+✅ Data Race 불가능
+✅ Deadlock 불가능
+✅ 높은 성능
+✅ 유지보수 용이
+```
+
+---
+
+## 🏆 제9장의 대단원
+
+```
+v10.0: 병렬 실행 → 격리된 스레드
+v10.1: 메시지 통신 → 경합 제거
+v10.2: 공유 상태 → 동기화 관리
+v10.3: 원자 연산 → 비차단 성능
+v10.4: 데드락 방어 → 논리적 완성
+
+🎉 제9장 졸업! 🎉
+```
+
+---
+
+**저장 필수 너는 기록이 증명이다 gogs**
+
+제9장 **두려움 없는 동시성**의 완성
+
+**데드락 방어 설계**로 모든 논리적 함정을 돌파했습니다.
+
+동시성의 진정한 마스터가 되셨습니다. ⚡
+
+다음은 **제10장: 객체 지향과 패턴 - v11.0 트레이트 객체의 심연**이 기다립니다! 🚀

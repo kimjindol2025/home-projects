@@ -1,0 +1,291 @@
+"""
+Phase 4: LogReplication - 로그 복제 및 상태 머신
+Leader 전용: 클라이언트 명령 → 로그 추가 → quorum ACK → 커밋
+"""
+
+import asyncio
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, List
+
+from .node import RaftNode, NodeState, LogEntry, AppendEntriesRequest, AppendEntriesResponse
+
+
+@dataclass
+class ReplicationResult:
+    """로그 복제 결과"""
+    success: bool
+    index: int
+    term: int
+    message: str = ""
+
+
+class StateMachine:
+    """
+    결정적 상태 머신 (Deterministic State Machine)
+
+    명령 형식:
+    - {"op": "set", "key": "name", "value": "Alice"}
+    - {"op": "get", "key": "name"}
+    - {"op": "delete", "key": "name"}
+    - {"op": "increment", "key": "counter"}
+    """
+
+    def __init__(self):
+        self.store: Dict[str, Any] = {}
+        self.apply_log: List[tuple] = []
+
+    def apply(self, entry: LogEntry) -> Any:
+        """로그 항목을 상태 머신에 적용"""
+        cmd = entry.command
+        if not isinstance(cmd, dict):
+            return None
+
+        op = cmd.get("op")
+        key = cmd.get("key")
+        value = cmd.get("value")
+
+        result = None
+
+        if op == "set" and key is not None:
+            self.store[key] = value
+            result = value
+        elif op == "get" and key is not None:
+            result = self.store.get(key)
+        elif op == "delete" and key is not None:
+            if key in self.store:
+                result = self.store.pop(key)
+        elif op == "increment" and key is not None:
+            self.store[key] = self.store.get(key, 0) + 1
+            result = self.store[key]
+
+        self.apply_log.append((entry.index, op, key, value, result))
+        return result
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        """현재 상태"""
+        return dict(self.store)
+
+    def get_history(self) -> List[tuple]:
+        """적용 히스토리"""
+        return self.apply_log.copy()
+
+
+class LogReplication:
+    """
+    Raft 로그 복제 엔진
+
+    핵심:
+    - Leader는 next_index와 match_index로 각 Follower의 진행 상황 추적
+    - 각 Follower에게 개별적으로 로그 항목 전송
+    - 실패 시 next_index 감소 후 재시도 (linear backoff)
+    - Quorum이 항목을 수신하면 commit_index 증가
+    """
+
+    def __init__(self, network):
+        self.network = network
+
+    async def replicate_entry(self, leader: RaftNode, command: Any) -> ReplicationResult:
+        """
+        클라이언트 명령을 복제
+
+        과정:
+        1. 명령을 로그에 추가
+        2. 모든 Follower에게 병렬 전송
+        3. Quorum ACK 대기
+        4. commit_index 업데이트
+        5. 상태 머신에 적용
+        """
+        if leader.state != NodeState.LEADER:
+            return ReplicationResult(
+                success=False,
+                index=0,
+                term=0,
+                message="Not a leader",
+            )
+
+        # 1. 로그에 항목 추가
+        success = await leader.append_entry(command)
+        if not success:
+            return ReplicationResult(
+                success=False,
+                index=0,
+                term=0,
+                message="Failed to append entry to log",
+            )
+
+        entry_index = len(leader.log)  # 방금 추가한 항목의 인덱스 (1-indexed)
+        entry_term = leader.current_term
+
+        # 2. Follower에게 병렬 전송
+        replication_tasks = []
+        for follower_id in self.network.nodes.keys():
+            if follower_id != leader.node_id:
+                task = self.send_append_entries(leader, follower_id)
+                replication_tasks.append((follower_id, task))
+
+        # 3. Quorum 응답 수집
+        ack_count = 1  # 리더 자신
+        match_indices = [entry_index]
+
+        try:
+            for follower_id, task in replication_tasks:
+                try:
+                    response = await asyncio.wait_for(task, timeout=0.5)
+                    if response and response.success:
+                        ack_count += 1
+                        match_indices.append(response.match_index)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+        except Exception:
+            pass
+
+        # 4. Quorum 검증
+        total_nodes = len(self.network.nodes)
+        quorum = total_nodes // 2 + 1
+
+        if ack_count >= quorum:
+            # 5. commit_index 업데이트
+            leader.commit_index = max(leader.commit_index, entry_index)
+
+            # 상태 머신에 항목 적용 (직접)
+            while leader.last_applied < leader.commit_index:
+                leader.last_applied += 1
+                # last_applied는 LogEntry.index (1부터), 배열 인덱스는 -1
+                array_idx = leader.last_applied - 1
+                if 0 <= array_idx < len(leader.log):
+                    entry = leader.log[array_idx]
+                    leader._apply_command(entry)
+
+            return ReplicationResult(
+                success=True,
+                index=entry_index,
+                term=entry_term,
+                message=f"Replicated to {ack_count}/{total_nodes} nodes",
+            )
+        else:
+            return ReplicationResult(
+                success=False,
+                index=entry_index,
+                term=entry_term,
+                message=f"Failed to get quorum ({ack_count}/{quorum})",
+            )
+
+    async def send_append_entries(
+        self, leader: RaftNode, follower_id: str
+    ) -> Optional[AppendEntriesResponse]:
+        """
+        Follower에게 로그 복제 요청 전송
+
+        로직:
+        1. next_index[follower]에서 시작
+        2. prev_log_index와 prev_log_term 결정
+        3. 로그 항목 준비
+        4. AppendEntries RPC 전송
+        5. 실패 시 next_index 감소 후 재시도
+
+        주의: LogEntry.index는 1부터 시작, log 배열은 0-indexed
+        """
+        if follower_id not in leader.next_index:
+            leader.next_index[follower_id] = len(leader.log) + 1
+            leader.match_index[follower_id] = 0
+
+        next_idx = leader.next_index.get(follower_id, len(leader.log) + 1)
+
+        # prev_log 결정 (LogEntry.index는 1부터, 배열 인덱스는 0부터)
+        prev_log_index = next_idx - 1
+        prev_log_term = 0
+
+        if prev_log_index > 0:
+            array_idx = prev_log_index - 1
+            if 0 <= array_idx < len(leader.log):
+                prev_log_term = leader.log[array_idx].term
+
+        # 복제할 항목들 (next_idx 이상의 인덱스를 가진 항목들)
+        entries = []
+        for array_idx, entry in enumerate(leader.log):
+            if entry.index >= next_idx:
+                entries.append(entry)
+
+        # AppendEntries RPC 구성
+        request = AppendEntriesRequest(
+            leader_id=leader.node_id,
+            term=leader.current_term,
+            prev_log_index=prev_log_index,
+            prev_log_term=prev_log_term,
+            entries=entries,
+            leader_commit=leader.commit_index,
+        )
+
+        # 전송
+        response = await self.network.send_append_entries(
+            leader.node_id, follower_id, request
+        )
+
+        if response is None:
+            return None
+
+        # 응답 처리
+        if response.success:
+            # ACK 성공
+            leader.match_index[follower_id] = response.match_index
+            leader.next_index[follower_id] = response.match_index + 1
+        else:
+            # ACK 실패 - next_index 감소
+            if next_idx > 1:
+                leader.next_index[follower_id] = next_idx - 1
+
+                # 재시도 (1회)
+                await asyncio.sleep(0.01)
+                retry_response = await self.send_append_entries(leader, follower_id)
+                return retry_response
+
+        return response
+
+    def compute_new_commit_index(self, leader: RaftNode) -> int:
+        """
+        새 commit_index 계산 (다수결)
+
+        Raft 논문: leader가 match_index[i] >= N인 N을 찾되,
+        항목의 term이 현재 term과 같아야 함
+
+        주의: LogEntry.index는 1부터, 배열은 0-indexed
+        """
+        # 리더 자신의 마지막 로그 인덱스 포함
+        leader_last_idx = leader._get_last_log_index()
+        match_indices = [leader_last_idx] + list(leader.match_index.values())
+        match_indices.sort(reverse=True)
+
+        total_nodes = len(self.network.nodes)
+        quorum = total_nodes // 2 + 1
+
+        if len(match_indices) >= quorum:
+            N = match_indices[quorum - 1]
+
+            # Term 검증 (LogEntry.index는 1부터)
+            if N > 0:
+                array_idx = N - 1
+                if 0 <= array_idx < len(leader.log) and leader.log[array_idx].term == leader.current_term:
+                    return N
+
+        return leader.commit_index
+
+    async def replicate_and_wait(
+        self, leader: RaftNode, command: Any, timeout_sec: float = 5.0
+    ) -> Optional[ReplicationResult]:
+        """
+        로그 복제 및 대기 (테스트용)
+
+        일반적인 흐름:
+        1. 복제 시작
+        2. 결과 대기
+        3. 타임아웃 시 None 반환
+        """
+        try:
+            result = await asyncio.wait_for(
+                self.replicate_entry(leader, command),
+                timeout=timeout_sec,
+            )
+            return result
+        except asyncio.TimeoutError:
+            return None

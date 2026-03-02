@@ -1,0 +1,249 @@
+# GRIE 1단계: Zero-Copy 공유 메모리 인터페이스 (Go ↔ Julia)
+## Gogs-Reactive Intelligence Engine
+
+## Context
+Go의 GC와 Julia의 런타임이 서로의 영역을 침범하지 않으면서 한 몸처럼 데이터를 공유하는
+Zero-Copy 공유 메모리 프로토콜을 설계·구현한다.
+Julia가 미설치 상태이므로 Julia 설치 후 실제 IPC를 구현한다.
+
+## 환경 현황
+
+| 항목 | 상태 |
+|------|------|
+| Go 1.26.0 (android/arm64) | ✅ 설치됨 |
+| Julia | ❌ **설치 필요** |
+| `/dev/shm` (POSIX) | ❌ Android 없음 |
+| `/tmp` (tmpfs) | ✅ 대안으로 사용 |
+| `syscall.Mmap` | ✅ 사용 가능 |
+| `unsafe.Pointer` 패턴 | ✅ v4.5에서 검증됨 |
+
+## Step 0: Julia 설치
+
+```bash
+pkg update && pkg install julia
+julia --version   # 확인
+```
+
+설치 후 경로: `/data/data/com.termux/files/usr/bin/julia`
+
+## 프로젝트 구조
+
+```
+grie-engine/
+├── go.mod                           (module grie-engine, go 1.26)
+├── go.sum
+├── README.md
+├── .gitignore
+│
+├── cmd/
+│   ├── writer/main.go               (Go Writer - 공유 메모리 생성 + 데이터 쓰기)
+│   └── reader/main.go               (Go Reader - Julia 역할 시뮬레이션)
+│
+├── internal/
+│   ├── shm/
+│   │   ├── shm.go                   (SharedMemManager: 생성/매핑/해제)
+│   │   └── shm_test.go
+│   └── protocol/
+│       ├── header.go                (EngineHeader 128바이트, StateFlag, Atomic 연산)
+│       └── header_test.go
+│
+├── julia/
+│   └── reader.jl                    (Julia Reader - 공유 메모리 mmap 접근)
+│
+└── bench/
+    └── bench_test.go                (Zero-Copy 레이턴시 벤치마크)
+```
+
+## 핵심 데이터 구조 (Go)
+
+### EngineHeader (128바이트 = 2 × Cache Line)
+
+```go
+// internal/protocol/header.go
+const (
+    MagicNumber uint64 = 0x47524945_00000001 // "GRIE"
+    HeaderSize         = 128
+    DataOffset         = 128
+)
+
+type StateFlag int32
+const (
+    StateIdle    StateFlag = 0
+    StateWriting StateFlag = 1
+    StateReady   StateFlag = 2
+    StateReading StateFlag = 3
+)
+
+// EngineHeader: 공유 메모리 첫 128바이트 (제어 영역)
+// Cache Line 1 (0~63바이트): 식별 + 상태
+// Cache Line 2 (64~127바이트): 데이터 메타정보
+type EngineHeader struct {
+    // Cache Line 1 (64바이트)
+    Magic     uint64    // [0:8]   매직 넘버
+    Version   uint32    // [8:12]  프로토콜 버전
+    State     int32     // [12:16] atomic: StateFlag
+    SeqNum    uint64    // [16:24] 시퀀스 번호 (atomic)
+    Timestamp int64     // [24:32] UnixNano (쓴 시각)
+    DataLen   uint64    // [32:40] 실제 데이터 길이
+    _pad1     [24]byte  // [40:64] 패딩
+
+    // Cache Line 2 (64바이트)
+    WriterPID int64     // [64:72]  Writer 프로세스 ID
+    ReaderPID int64     // [72:80]  Reader 프로세스 ID
+    TotalWrites uint64  // [80:88]  누적 쓰기 횟수
+    TotalReads  uint64  // [88:96]  누적 읽기 횟수
+    _pad2       [32]byte // [96:128] 패딩
+}
+// 컴파일 타임 크기 검증
+var _ [HeaderSize]byte = [unsafe.Sizeof(EngineHeader{})]byte{}
+```
+
+### SharedMemManager (Go)
+
+```go
+// internal/shm/shm.go
+type SharedMemManager struct {
+    path   string         // /tmp/grie_shm_XXXXX
+    size   int            // 10MB = 10*1024*1024
+    data   []byte         // mmap된 슬라이스
+    header *EngineHeader  // unsafe.Pointer(&data[0])
+}
+
+func Create(size int) (*SharedMemManager, error)  // 파일 생성 + mmap
+func Open(path string) (*SharedMemManager, error)  // 기존 파일 열기 + mmap
+func (m *SharedMemManager) Close() error            // munmap + 파일 닫기
+func (m *SharedMemManager) DataSlice() []byte       // data[DataOffset:]
+```
+
+## Atomic 프로토콜 (Lock-Free State Machine)
+
+```
+[Go Writer]                              [Julia/Go Reader]
+IDLE → WRITING (CAS)                     polling State
+  쓰기 완료 후                             State == READY 감지
+WRITING → READY (Store)                  READY → READING (CAS)
+  대기                                    데이터 읽기
+                                         READING → IDLE (Store)
+```
+
+```go
+// Atomic 연산 패턴
+func (h *EngineHeader) CASState(old, new StateFlag) bool {
+    return atomic.CompareAndSwapInt32((*int32)(unsafe.Pointer(&h.State)),
+        int32(old), int32(new))
+}
+func (h *EngineHeader) LoadState() StateFlag {
+    return StateFlag(atomic.LoadInt32((*int32)(unsafe.Pointer(&h.State))))
+}
+func (h *EngineHeader) StoreState(s StateFlag) {
+    atomic.StoreInt32((*int32)(unsafe.Pointer(&h.State)), int32(s))
+}
+```
+
+## Julia Reader (julia/reader.jl)
+
+```julia
+using Mmap
+
+# Go가 만든 파일 경로를 CLI 인자로 받음
+path = ARGS[1]
+SHM_SIZE = 10 * 1024 * 1024  # 10MB
+HEADER_SIZE = 128
+
+fd = open(path, "r+")
+mem = mmap(fd, Vector{UInt8}, (SHM_SIZE,))
+
+# EngineHeader 필드 파싱 (Little Endian, arm64)
+function read_header(mem)
+    magic     = reinterpret(UInt64, mem[1:8])[1]
+    state     = reinterpret(Int32,  mem[13:16])[1]
+    seq_num   = reinterpret(UInt64, mem[17:24])[1]
+    data_len  = reinterpret(UInt64, mem[33:40])[1]
+    return (magic=magic, state=state, seq_num=seq_num, data_len=data_len)
+end
+
+# READY 상태 폴링 후 데이터 읽기
+while true
+    hdr = read_header(mem)
+    if hdr.state == 2  # StateReady
+        data = mem[HEADER_SIZE+1 : HEADER_SIZE+hdr.data_len]
+        println("Julia read: seq=$(hdr.seq_num), len=$(hdr.data_len), data=$(String(data))")
+        # IDLE로 복귀 (직접 쓰기 - Julia에서 atomic 없이 단순 시연)
+        mem[13:16] = reinterpret(UInt8, [Int32(0)])
+        break
+    end
+    sleep(0.001)
+end
+close(fd)
+```
+
+## 테스트 계획 (15개)
+
+### 그룹 1: 기본 구조 (4개)
+```go
+Test01_EngineHeaderSize_Is128Bytes
+Test02_EngineHeader_CacheLineAlignment
+Test03_StateFlag_Values
+Test04_SharedMemManager_Create_And_Close
+```
+
+### 그룹 2: 공유 메모리 생성/접근 (4개)
+```go
+Test05_Create_Writes_Magic_Number
+Test06_Open_Reads_Magic_Number
+Test07_DataSlice_Offset_Is_128
+Test08_Write_And_Read_Data
+```
+
+### 그룹 3: Atomic 프로토콜 (4개)
+```go
+Test09_CASState_IDLE_To_WRITING_Succeeds
+Test10_CASState_IDLE_To_READY_Fails
+Test11_StoreState_And_LoadState
+Test12_FullProtocol_Write_Then_Read_Cycle
+```
+
+### 그룹 4: 벤치마크 (3개)
+```go
+Benchmark01_ZeroCopy_Read_Latency     // 목표: < 100ns
+Benchmark02_AtomicState_Polling       // 목표: < 50ns
+Benchmark03_End_To_End_Throughput     // 목표: > 100MB/s
+```
+
+## 검증 방법
+
+```bash
+# 1. Julia 설치 확인
+julia --version
+
+# 2. Go 테스트 전체
+cd grie-engine
+go test ./... -v
+
+# 3. 벤치마크
+go test ./bench/ -bench=. -benchmem
+
+# 4. Go Writer 실행
+go run cmd/writer/main.go &
+SHM_PATH=$!
+
+# 5. Julia Reader 실행
+julia julia/reader.jl /tmp/grie_shm_XXXXX
+
+# 6. Go Reader (Julia 시뮬레이션) 실행
+go run cmd/reader/main.go /tmp/grie_shm_XXXXX
+```
+
+## 재사용할 기존 패턴
+
+| 패턴 | 출처 |
+|------|------|
+| Cache Line 64B 패딩 `[56]byte` | `405_zero_copy_lockfree_architecture.go` |
+| `atomic.CompareAndSwapInt32` | `v2_1_concurrency/03_mutex_atomic.go` |
+| `unsafe.Pointer` 포인터 산술 | `401_memory_layout_escape_analysis.go` |
+| `syscall.Mmap(MAP_SHARED)` | 신규 구현 (파일 기반) |
+
+## Gogs 저장소
+
+- 신규 저장소: `https://gogs.dclub.kr/kim/grie-engine.git`
+- 첫 커밋 메시지: "🚀 GRIE 1단계: Zero-Copy 공유 메모리 인터페이스 (Go ↔ Julia)"

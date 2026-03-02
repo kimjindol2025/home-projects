@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+샤딩 차원 분석기 (Sharding Dimension Analyzer)
+
+텐서를 어느 축으로 분할할지 분석 및 통신 비용 계산
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+from enum import Enum
+import json
+
+
+class ShardingDimension(Enum):
+    """샤딩 차원"""
+    REPLICATE = "replicate"  # 모든 장치에 복제
+    ROW = "row"  # 행으로 분할
+    COLUMN = "column"  # 열로 분할
+    MESH_2D = "mesh_2d"  # 2D 메시로 분할
+    MESH_3D = "mesh_3d"  # 3D 메시로 분할
+
+
+class CommuncationPattern(Enum):
+    """통신 패턴"""
+    NONE = "none"  # 통신 불필요
+    ALLREDUCE = "all_reduce"  # AllReduce 필요
+    ALLGATHER = "all_gather"  # AllGather 필요
+    REDUCESCATTER = "reduce_scatter"  # ReduceScatter 필요
+    ALLTOALL = "all_to_all"  # AllToAll 필요
+
+
+@dataclass
+class TensorSpec:
+    """텐서 명세"""
+    name: str
+    shape: Tuple[int, ...]  # (batch, sequence, hidden_dim) 등
+    dtype: str  # "float32", "float16" 등
+
+    def size_bytes(self) -> int:
+        """텐서 크기 (바이트)"""
+        dtype_size = {"float32": 4, "float16": 2, "bfloat16": 2, "int8": 1}
+        element_size = dtype_size.get(self.dtype, 4)
+
+        total_elements = 1
+        for dim in self.shape:
+            total_elements *= dim
+
+        return total_elements * element_size
+
+
+@dataclass
+class ShardingInfo:
+    """샤딩 정보"""
+    tensor_name: str
+    dimension: ShardingDimension
+    num_devices: int
+
+    # 샤딩 후 각 장치의 로컬 메모리
+    local_memory_bytes: int
+
+    # 필요한 통신
+    communication_pattern: CommuncationPattern
+    communication_volume_bytes: int  # 총 전송 데이터
+
+
+class ShardingDimensionAnalyzer:
+    """샤딩 차원 분석"""
+
+    def analyze_tensor_sharding(self,
+                               tensor: TensorSpec,
+                               num_devices: int,
+                               sharding_dim: ShardingDimension) -> ShardingInfo:
+        """텐서 샤딩 분석"""
+
+        total_size = tensor.size_bytes()
+
+        if sharding_dim == ShardingDimension.REPLICATE:
+            # 모든 장치에 복제
+            local_memory = total_size
+            pattern = CommuncationPattern.NONE
+            comm_volume = 0
+
+        elif sharding_dim == ShardingDimension.ROW:
+            # 행(첫 번째 차원)으로 분할
+            local_memory = total_size // num_devices
+            pattern = CommuncationPattern.ALLGATHER  # Backward에서 필요
+            comm_volume = total_size
+
+        elif sharding_dim == ShardingDimension.COLUMN:
+            # 열(마지막 차원)로 분할
+            local_memory = total_size // num_devices
+            pattern = CommuncationPattern.ALLREDUCE  # Forward에서 필요
+            comm_volume = total_size
+
+        elif sharding_dim == ShardingDimension.MESH_2D:
+            # 2D 메시로 분할
+            mesh_size = int(num_devices ** 0.5)
+            local_memory = total_size // num_devices
+            pattern = CommuncationPattern.ALLTOALL  # 복잡한 통신
+            comm_volume = total_size * 2  # 추정
+
+        else:
+            local_memory = total_size // num_devices
+            pattern = CommuncationPattern.NONE
+            comm_volume = 0
+
+        return ShardingInfo(
+            tensor_name=tensor.name,
+            dimension=sharding_dim,
+            num_devices=num_devices,
+            local_memory_bytes=local_memory,
+            communication_pattern=pattern,
+            communication_volume_bytes=comm_volume
+        )
+
+    def estimate_communication_time_ms(self,
+                                      sharding_info: ShardingInfo,
+                                      bandwidth_gbps: float,
+                                      latency_us: float) -> float:
+        """통신 시간 추정"""
+
+        if sharding_info.communication_pattern == CommuncationPattern.NONE:
+            return 0.0
+
+        # 기본: 전송 시간 = 데이터 크기 / 대역폭
+        data_size_gb = sharding_info.communication_volume_bytes / (1024 ** 3)
+        transfer_time_ms = (data_size_gb / bandwidth_gbps) * 1000
+
+        # 지연 추가
+        latency_ms = latency_us / 1000
+        total_time = transfer_time_ms + latency_ms
+
+        # 패턴별 계수 적용
+        if sharding_info.communication_pattern == CommuncationPattern.ALLREDUCE:
+            # Ring AllReduce: (N-1) * 2 steps
+            steps = (sharding_info.num_devices - 1) * 2
+            total_time *= steps / sharding_info.num_devices
+
+        elif sharding_info.communication_pattern == CommuncationPattern.ALLGATHER:
+            # AllGather: (N-1) steps
+            steps = sharding_info.num_devices - 1
+            total_time *= steps / sharding_info.num_devices
+
+        return total_time
+
+    def analyze_weight_vs_activation_sharding(self,
+                                             weight_tensor: TensorSpec,
+                                             activation_tensor: TensorSpec,
+                                             num_devices: int) -> Dict:
+        """Weight vs Activation 샤딩 비교"""
+
+        # 시나리오 1: Weight를 Row로, Activation을 복제
+        weight_row = self.analyze_tensor_sharding(
+            weight_tensor, num_devices, ShardingDimension.ROW
+        )
+        activation_rep = self.analyze_tensor_sharding(
+            activation_tensor, num_devices, ShardingDimension.REPLICATE
+        )
+
+        scenario1_memory = weight_row.local_memory_bytes + activation_rep.local_memory_bytes
+        scenario1_comm = weight_row.communication_volume_bytes  # Backward AllGather
+
+        # 시나리오 2: Activation을 Column으로, Weight를 복제
+        weight_rep = self.analyze_tensor_sharding(
+            weight_tensor, num_devices, ShardingDimension.REPLICATE
+        )
+        activation_col = self.analyze_tensor_sharding(
+            activation_tensor, num_devices, ShardingDimension.COLUMN
+        )
+
+        scenario2_memory = weight_rep.local_memory_bytes + activation_col.local_memory_bytes
+        scenario2_comm = activation_col.communication_volume_bytes  # Forward AllReduce
+
+        return {
+            "scenario_1_weight_row_activation_rep": {
+                "memory_per_device": scenario1_memory,
+                "communication_volume": scenario1_comm,
+                "description": "Weight Row Sharding, Activation Replicate"
+            },
+            "scenario_2_weight_rep_activation_col": {
+                "memory_per_device": scenario2_memory,
+                "communication_volume": scenario2_comm,
+                "description": "Weight Replicate, Activation Column Sharding"
+            }
+        }
+
+    def recommend_sharding(self,
+                          tensor: TensorSpec,
+                          num_devices: int,
+                          available_memory_bytes: int,
+                          communication_weight: float = 0.5) -> ShardingDimension:
+        """샤딩 추천"""
+
+        candidates = []
+
+        for dim in ShardingDimension:
+            info = self.analyze_tensor_sharding(tensor, num_devices, dim)
+
+            # 메모리 제약 체크
+            if info.local_memory_bytes > available_memory_bytes:
+                continue
+
+            # Cost 계산: 메모리 + 통신
+            memory_cost = info.local_memory_bytes / available_memory_bytes
+            communication_cost = info.communication_volume_bytes / tensor.size_bytes()
+
+            total_cost = memory_cost + communication_weight * communication_cost
+
+            candidates.append({
+                "dimension": dim,
+                "cost": total_cost,
+                "info": info
+            })
+
+        if not candidates:
+            # 기본값: Replicate
+            return ShardingDimension.REPLICATE
+
+        # 비용이 가장 낮은 것 선택
+        best = min(candidates, key=lambda x: x["cost"])
+        return best["dimension"]
+
+    def generate_sharding_report(self,
+                                sharding_info: ShardingInfo,
+                                bandwidth_gbps: float = 900.0,
+                                latency_us: float = 1.0) -> str:
+        """샤딩 분석 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║           SHARDING DIMENSION ANALYSIS REPORT                       ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        report += f"Tensor: {sharding_info.tensor_name}\n"
+        report += f"Sharding Dimension: {sharding_info.dimension.value}\n"
+        report += f"Number of Devices: {sharding_info.num_devices}\n\n"
+
+        report += f"Memory per Device: {sharding_info.local_memory_bytes / (1024**3):.3f} GB\n"
+        report += f"Communication Pattern: {sharding_info.communication_pattern.value}\n"
+        report += f"Communication Volume: {sharding_info.communication_volume_bytes / (1024**3):.3f} GB\n"
+
+        comm_time = self.estimate_communication_time_ms(
+            sharding_info, bandwidth_gbps, latency_us
+        )
+        report += f"Estimated Communication Time: {comm_time:.2f} ms\n"
+
+        report += "\n" + "─" * 68 + "\n"
+
+        return report
+
+    def export_to_json(self, sharding_infos: List[ShardingInfo]) -> str:
+        """샤딩 정보를 JSON으로 내보내기"""
+
+        data = {
+            "num_tensors": len(sharding_infos),
+            "sharding_analysis": [
+                {
+                    "tensor_name": info.tensor_name,
+                    "dimension": info.dimension.value,
+                    "num_devices": info.num_devices,
+                    "local_memory_gb": info.local_memory_bytes / (1024**3),
+                    "communication_pattern": info.communication_pattern.value,
+                    "communication_volume_gb": info.communication_volume_bytes / (1024**3)
+                }
+                for info in sharding_infos
+            ]
+        }
+
+        return json.dumps(data, indent=2)
+

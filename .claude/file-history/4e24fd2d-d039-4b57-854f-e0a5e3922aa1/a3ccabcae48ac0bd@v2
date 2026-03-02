@@ -1,0 +1,691 @@
+# Go 전공 401-4-3: runtime 패키지 소스 코드 분석 - 내부 로직의 해부
+
+> **경고**: 이 과정은 **소스 코드라는 성경**입니다.
+> Go의 설계 도면을 펼쳐 들고, 구글 엔지니어들의 치열한 고민을 직접 확인합니다.
+> 소스 코드 앞에서 우리는 모두 겸손합니다. (Your record is your proof.)
+
+---
+
+## 📚 목차
+
+1. [Go 런타임 개요](#섹션-1-go-런타임-개요)
+2. [고루틴의 탄생: proc.go](#섹션-2-고루틴의-탄생-procgo)
+3. [채널의 실체: chan.go](#섹션-3-채널의-실체-chango)
+4. [슬라이스의 동적 확장: slice.go](#섹션-4-슬라이스의-동적-확장-slicego)
+5. [mcall과 스택 스위칭](#섹션-5-mcall과-스택-스위칭)
+6. [//go: 컴파일러 지시자](#섹션-6-go-컴파일러-지시자)
+7. [런타임 핵심 구조체들](#섹션-7-런타임-핵심-구조체들)
+8. [Assignment 4-3: 소스 코드 분석](#섹션-8-assignment-43-소스-코드-분석)
+
+---
+
+## 섹션 1️⃣: Go 런타임 개요
+
+### 🎯 런타임이란?
+
+**Go 런타임**은 Go 프로그램이 실행되기 위한 "기반 시설"입니다.
+
+```
+Go 프로그램 구조:
+
+┌─────────────────────────────────────────┐
+│         Go 소스 코드                    │
+│  (go func, make, chan, for 등)          │
+└────────────────┬────────────────────────┘
+                 │ 컴파일
+                 ↓
+┌─────────────────────────────────────────┐
+│      Go 런타임 함수로 변환               │
+│  (newproc, chansend, growslice 등)     │
+└────────────────┬────────────────────────┘
+                 │ 컴파일
+                 ↓
+┌─────────────────────────────────────────┐
+│      기계어 (Binary)                    │
+│  실제 실행되는 코드                     │
+└─────────────────────────────────────────┘
+```
+
+### 📁 런타임 소스 위치
+
+```bash
+# Go 설치 경로 확인
+go env GOROOT
+# 출력: /usr/local/go
+
+# 런타임 소스 위치
+ls /usr/local/go/src/runtime/
+# 주요 파일:
+# - proc.go       (고루틴 스케줄링)
+# - chan.go       (채널 구현)
+# - slice.go      (슬라이스 동적 확장)
+# - malloc.go     (메모리 할당)
+# - mgc.go        (가비지 컬렉션)
+# - panic.go      (panic/recover)
+# - signal.go     (시그널 처리)
+```
+
+### 💡 런타임의 역할
+
+| 기능 | 파일 | 설명 |
+|------|------|------|
+| **고루틴 관리** | proc.go | G, M, P 객체와 스케줄러 |
+| **채널 구현** | chan.go | hchan 구조체와 송수신 로직 |
+| **메모리 관리** | malloc.go | 메모리 할당, 풀 관리 |
+| **가비지 컬렉션** | mgc.go | Tri-color Marking, STW |
+| **에러 처리** | panic.go | panic, recover, defer 체인 |
+| **시그널 처리** | signal.go | OS 시그널 핸들링 |
+
+---
+
+## 섹션 2️⃣: 고루틴의 탄생: proc.go
+
+### 🎯 고루틴 객체 (G)
+
+Go 문법:
+```go
+go func() {
+    fmt.Println("Hello from goroutine")
+}()
+```
+
+런타임에서 실행되는 코드:
+```go
+// $GOROOT/src/runtime/proc.go
+func newproc(fn *funcval) {
+    gp := getg()      // 현재 고루틴 구조체
+    pc := getcallerpc() // 호출자 주소
+    systemstack(func() {
+        newproc1(fn, gp, pc) // G 객체 생성 또는 풀에서 재사용
+    })
+}
+```
+
+### 📋 G (Goroutine) 구조체
+
+```go
+// $GOROOT/src/runtime/runtime2.go
+type g struct {
+    // 스택 정보
+    stack       stack   // 고루틴의 스택 범위
+    stackguard0 uintptr // 스택 오버플로 검사
+
+    // 상태 관리
+    _panic      *_panic // panic 체인
+    _defer      *_defer // defer 체인
+    m           *m      // 현재 실행 중인 M (스레드)
+
+    // 실행 상태
+    sched       gobuf   // 고루틴의 CPU 상태 저장 (PC, SP 등)
+    atomicstatus uint32 // 상태: running, runnable, waiting 등
+
+    // 메모리 할당 추적
+    alloc       *gclink // GC를 위한 링크
+}
+```
+
+### 🔄 고루틴 상태 전이
+
+```
+          newproc()
+            ↓
+    ┌─────────────────┐
+    │   runnable      │ 실행 대기 중
+    │  (Local Queue)  │
+    └────────┬────────┘
+             │ 스케줄러가 선택
+             ↓
+    ┌─────────────────┐
+    │   running       │ 현재 실행 중
+    └────┬──────┬─────┘
+         │      │
+         │      └─→ time.Sleep()
+         │           ↓
+         │    blocking (I/O 대기)
+         │
+         └─→ for {} // 시간 소비
+             ↓
+        runnable (다시 대기)
+```
+
+### 💡 runqput 함수
+
+```go
+// G를 로컬 실행 대기열에 넣음
+func runqput(_p_ *p, gp *g, next bool) {
+    if next {
+        // 다음 번에 실행할 G로 설정
+        _p_.runnext = gp
+    } else {
+        // 로컬 큐의 끝에 추가
+        h := atomic.LoadAcq(&_p_.runqhead)
+        t := _p_.runqtail
+        if t+1-h < uint32(len(_p_.runq)) {
+            _p_.runq[t%uint32(len(_p_.runq))] = gp
+            atomic.StoreRel(&_p_.runqtail, t+1)
+        } else {
+            // 로컬 큐가 가득 차면 Global Queue로 이동
+            runqputslow(_p_, gp, h, t)
+        }
+    }
+}
+```
+
+---
+
+## 섹션 3️⃣: 채널의 실체: chan.go
+
+### 🎯 채널 객체 (hchan)
+
+Go 문법:
+```go
+ch := make(chan int, 10)
+ch <- 42
+x := <-ch
+```
+
+런타임에서 실행되는 코드:
+```go
+// $GOROOT/src/runtime/chan.go
+func makechan(t *chantype, size int) *hchan {
+    elem := t.elem
+    mem, overflow := math.MulUintptr(elem.size, uintptr(size))
+
+    // hchan 구조체 + 버퍼 할당
+    c := (*hchan)(mallocgc(...))
+    c.dataqsiz = uint(size)
+
+    return c
+}
+```
+
+### 📋 hchan (Channel Header) 구조체
+
+```go
+// $GOROOT/src/runtime/chan.go
+type hchan struct {
+    qcount   uint           // 버퍼에 있는 원소 개수
+    dataqsiz uint           // 순환 버퍼 크기
+    buf      unsafe.Pointer // 순환 버퍼 포인터
+
+    elemsize uint16         // 원소 크기
+
+    closed   uint32         // 채널 닫혔나?
+    elemtype *_type         // 원소 타입
+
+    sendx    uint           // 송신 위치
+    recvx    uint           // 수신 위치
+
+    recvq    waitq          // 수신 대기 고루틴 리스트
+    sendq    waitq          // 송신 대기 고루틴 리스트
+
+    lock     mutex          // 뮤텍스 (동시성 보호!)
+}
+```
+
+### 💀 반전: 채널도 결국 뮤텍스다
+
+```
+채널의 신화:
+  "Go의 채널은 공유 메모리보다 안전하다"
+
+채널의 진실:
+  채널의 내부 구조는 결국:
+  - lock (뮤텍스)
+  - buf (공유 메모리, 순환 버퍼)
+  - recvq, sendq (대기 고루틴들)
+
+구글 엔지니어들의 위대함:
+  이 저수준의 뮤텍스와 공유 메모리 구조를
+  그렇게 우아한 문법으로 추상화했다는 것!
+```
+
+### 🔍 채널 송신 로직 (chansend)
+
+```go
+func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+    // 1️⃣ 닫힌 채널인지 확인
+    lock(&c.lock)
+    if c.closed != 0 {
+        unlock(&c.lock)
+        panic("send on closed channel")
+    }
+
+    // 2️⃣ 수신 대기 고루틴이 있는가?
+    if sg := c.recvq.dequeue(); sg != nil {
+        // 직접 전송 (버퍼 바이패스)
+        send(c, sg, ep, func() { unlock(&c.lock) })
+        return true
+    }
+
+    // 3️⃣ 버퍼가 가득 찼나?
+    if c.qcount < c.dataqsiz {
+        // 버퍼에 저장
+        qp := chanbuf(c, c.sendx)
+        typedmemmove(c.elemtype, qp, ep)
+        c.sendx++
+        if c.sendx == c.dataqsiz {
+            c.sendx = 0
+        }
+        c.qcount++
+        unlock(&c.lock)
+        return true
+    }
+
+    // 4️⃣ 차단 (고루틴을 대기 큐에 넣음)
+    gp := getg()
+    mysg := acquireSudog()
+    mysg.elem = ep
+    mysg.g = gp
+    mysg.c = c
+    c.sendq.enqueue(mysg)
+
+    // 현재 고루틴을 잠재우고 다른 고루틴 실행
+    gopark(...)
+}
+```
+
+---
+
+## 섹션 4️⃣: 슬라이스의 동적 확장: slice.go
+
+### 🎯 슬라이스 확장
+
+Go 문법:
+```go
+s := make([]int, 1, 1)
+s = append(s, 2, 3, 4, 5)  // 용량 부족 → 확장
+```
+
+런타임에서 실행되는 코드:
+```go
+// $GOROOT/src/runtime/slice.go
+func growslice(et *_type, old slice, cap int) slice {
+    // 1️⃣ 새 용량 계산
+    newcap := old.cap
+    doublecap := newcap + newcap
+    if cap > doublecap {
+        newcap = cap
+    } else {
+        const threshold = 256
+        if old.cap < threshold {
+            newcap = doublecap  // 256 미만: 2배
+        } else {
+            // 256 이상: 1.25배 (메모리 낭비 줄임)
+            for newcap < cap {
+                newcap += newcap / 4
+            }
+        }
+    }
+
+    // 2️⃣ 메모리 할당
+    var overflow bool
+    var lenmem, newlenmem, capmem uintptr
+
+    switch {
+    case et.size == 1:
+        lenmem = uintptr(old.len)
+        newlenmem = uintptr(cap)
+        capmem = roundupsize(uintptr(newcap))
+        overflow = capmem < uintptr(newcap)
+    case et.size == sys.PtrSize:
+        lenmem = uintptr(old.len) * sys.PtrSize
+        newlenmem = uintptr(cap) * sys.PtrSize
+        capmem = roundupsize(uintptr(newcap) * sys.PtrSize)
+        overflow = capmem/sys.PtrSize < uintptr(newcap)
+    // ... 더 많은 경우들 ...
+    }
+
+    // 3️⃣ 메모리 복사
+    if cap > old.cap {
+        p := mallocgc(capmem, et, false)
+        memmove(p, old.array, lenmem)
+
+        // 4️⃣ 이전 배열이 큰 경우 정리 (GC 도움)
+        if et.ptrdata != 0 {
+            memclrNoHeapPointers(add(p, newlenmem), capmem-newlenmem)
+        }
+    }
+}
+```
+
+### 📊 슬라이스 확장 전략
+
+| 용량 범위 | 확장 전략 | 이유 |
+|----------|---------|------|
+| < 256 | 2배 증가 | 빠른 성장 |
+| ≥ 256 | 1.25배 증가 | 메모리 효율 |
+
+### 💡 성능 임플리케이션
+
+```go
+// ❌ 나쁜 예: 반복적으로 append (10번 확장)
+s := []int{}
+for i := 0; i < 1000; i++ {
+    s = append(s, i)  // 메모리 재할당 + 복사 반복
+}
+// 비용: O(n²) (모든 데이터 여러 번 복사)
+
+// ✅ 좋은 예: 미리 용량 할당 (확장 없음)
+s := make([]int, 0, 1000)
+for i := 0; i < 1000; i++ {
+    s = append(s, i)  // 메모리 재할당 없음
+}
+// 비용: O(n) (데이터 한 번만 복사)
+```
+
+---
+
+## 섹션 5️⃣: mcall과 스택 스위칭
+
+### 🎯 mcall의 역할
+
+고루틴이 **blocked**(I/O 대기) 또는 **sleep** 상태가 되면, 런타임이 고루틴을 전환해야 합니다.
+
+```
+현재 고루틴:          고루틴 전환:         다른 고루틴:
+  실행 중                  ↓                시작
+    │                  mcall                  │
+    │              (스택 스위칭)              │
+    ↓                                        ↓
+ sleep()  ─────────→  g0 스택  ←────────  ready()
+   │                (스케줄러)               │
+   └── 현재 상태      goreleaseAndSchedule   ├── 선택됨
+       저장          고루틴 대기열 관리      └── 실행 시작
+```
+
+### 📋 g0 스택
+
+각 OS 스레드(M)는 **두 개의 스택**을 가집니다:
+
+```
+OS 스레드 (M)
+  ├─ 사용자 고루틴 스택 (G의 스택)
+  │  ├─ 사용자 코드 실행
+  │  ├─ 함수 호출 (로컬 변수)
+  │  └─ 빠르고 효율적
+  │
+  └─ g0 스택 (런타임 관리 스택)
+     ├─ 스케줄러 코드 실행
+     ├─ 메모리 할당 (malloc)
+     ├─ GC 로직
+     └─ 사용자 스택과 격리 (보호)
+```
+
+### 💻 mcall 호출 예제
+
+```go
+// $GOROOT/src/runtime/proc.go
+func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer,
+    reason waitReason, traceEvGoBlock byte, skip int) {
+
+    // 1️⃣ 현재 고루틴의 상태 저장 (sched 구조체에 PC, SP 저장)
+    gp := getg()
+    mp := acquirem()
+    gp.atomicstatus = _Gwaiting
+
+    // 2️⃣ g0 스택으로 전환하고 schedule() 실행
+    mcall(schedule)
+    // 이 줄 이후는 고루틴이 깨어났을 때 실행됨
+
+    releasem(mp)
+}
+```
+
+---
+
+## 섹션 6️⃣: //go: 컴파일러 지시자
+
+### 🎯 //go: 지시자들
+
+Go 런타임 소스에는 특수한 주석 지시자들이 있습니다:
+
+```go
+// 1️⃣ //go:nosplit
+// 스택 오버플로 검사를 하지 말라
+// (아주 빠르지만 위험함 - 런타임 내부에서만 사용)
+//go:nosplit
+func getcallerpc() uintptr {
+    // 스택 검사 없음 → 극도로 빠름
+}
+
+// 2️⃣ //go:noinline
+// 이 함수를 절대 인라이닝하지 말라
+// (디버깅 또는 성능 측정 시)
+//go:noinline
+func mySlowFunction() {
+    // ...
+}
+
+// 3️⃣ //go:linkname
+// Private 함수를 외부 패키지에서 강제로 사용
+// (대단히 위험한 "해킹" 도구)
+//go:linkname privateFunc runtime.doSomething
+func doSomething() {
+    // ...
+}
+
+// 4️⃣ //go:notinheap
+// 이 타입은 힙에 할당될 수 없다
+//go:notinheap
+type onHeap struct {
+    x int
+}
+
+// 5️⃣ //go:norace
+// 레이스 디텍터 무시 (성능 민감한 코드)
+//go:norace
+func fastPath() {
+    // ...
+}
+```
+
+### 📋 지시자 목록
+
+| 지시자 | 효과 | 사용 예 |
+|--------|------|--------|
+| `//go:nosplit` | 스택 검사 제거 | 런타임 hot path |
+| `//go:noinline` | 인라이닝 금지 | 디버깅 함수 |
+| `//go:linkname` | Private 함수 링크 | 테스트 코드 |
+| `//go:notinheap` | 힙 할당 금지 | 런타임 구조체 |
+| `//go:norace` | 레이스 검사 제외 | 성능 코드 |
+
+---
+
+## 섹션 7️⃣: 런타임 핵심 구조체들
+
+### 📋 G, M, P 삼각형
+
+```
+G (Goroutine)        M (Machine)         P (Processor)
+- 고루틴            - OS 스레드          - 로컬 스케줄러
+- 스택              - 실행 권한           - runq (큐)
+- 상태              - g0 스택            - allp[n]
+- 대기 이유         - curg (현재 G)      - 호선율
+
+
+    G1
+   / | \            다수의 G가
+  G2 G3 G4          하나의 M에서
+   \ | /            실행
+    M
+
+    M1 ← P1에 의해 관리
+    M2 ← P2에 의해 관리
+    M3 ← 유휴 (P 없음)
+```
+
+### 💡 구조체 정의
+
+```go
+// G: Goroutine
+type g struct {
+    stack       stack
+    atomicstatus uint32      // _Gidle, _Grunnable, _Grunning, etc
+    sched       gobuf        // CPU 상태
+    _panic      *_panic
+    _defer      *_defer
+    m           *m           // 현재 실행 M
+}
+
+// M: Machine (OS Thread)
+type m struct {
+    g0      *g              // 런타임 스택
+    curg    *g              // 현재 실행 중인 G
+    p       puintptr        // 연결된 P
+    nextp   puintptr        // 다음 P
+    mallocing int32         // malloc 중인가?
+}
+
+// P: Processor
+type p struct {
+    id          int32
+    runq        [256]*g     // 로컬 실행 큐
+    runnext     *g          // 다음에 실행할 G
+    gfree       *g          // free G 리스트
+}
+```
+
+---
+
+## 섹션 8️⃣: Assignment 4-3: 소스 코드 분석
+
+### 📝 과제 1: 채널 구조 분석
+
+```bash
+# Step 1: chan.go 파일 열기
+cat $GOROOT/src/runtime/chan.go | grep -A 20 "^type hchan"
+
+# Step 2: makechan 함수 찾기
+cat $GOROOT/src/runtime/chan.go | grep -A 30 "^func makechan"
+
+# Step 3: 분석
+# - hchan 구조체의 필드들
+# - lock 필드 존재 확인 (뮤텍스!)
+# - buf, sendx, recvx 순환 버퍼 관리
+# - recvq, sendq 대기 고루틴 리스트
+```
+
+### 📝 과제 2: Panic 원리 분석
+
+```bash
+# Step 1: panic.go 파일 열기
+cat $GOROOT/src/runtime/panic.go | grep -A 50 "^func gopanic"
+
+# Step 2: defer 체인 추적
+# gopanic 함수 내에서 _defer 리스트 순회
+# 각 defer 함수 실행
+
+# Step 3: 이해
+# - panic 발생 → defer 후진 순서 실행
+# - defer 중 panic 발생 가능
+# - 마지막에 프로그램 종료 (exit)
+```
+
+### 📝 과제 3: 고루틴 스케줄링 추적
+
+```bash
+# Step 1: proc.go 파일 열기
+cat $GOROOT/src/runtime/proc.go | grep -A 30 "^func newproc1"
+
+# Step 2: runqput 함수 찾기
+cat $GOROOT/src/runtime/proc.go | grep -A 20 "^func runqput"
+
+# Step 3: 스케줄링 로직 이해
+# - G 객체 생성 또는 재사용
+# - runq에 추가
+# - Global Queue와의 연동
+```
+
+### 📝 과제 4: 슬라이스 확장 검증
+
+```bash
+# Step 1: slice.go 파일 열기
+cat $GOROOT/src/runtime/slice.go | grep -A 50 "^func growslice"
+
+# Step 2: 용량 계산 로직 분석
+# - 256 미만: 2배
+# - 256 이상: 1.25배
+# - 메모리 정렬 (align)
+
+# Step 3: memmove 호출
+# 메모리 복사가 얼마나 비용이 많이 드는가?
+```
+
+---
+
+## 🎓 핵심 정리
+
+```
+【 Go 런타임 소스 코드 분석 요약 】
+
+1️⃣ proc.go: 고루틴 스케줄링
+   ✓ newproc: G 객체 생성/재사용
+   ✓ runqput: 실행 큐 관리
+   ✓ gopark: 고루틴 대기
+
+2️⃣ chan.go: 채널 구현
+   ✓ hchan: 채널 구조체 (lock + buffer)
+   ✓ chansend: 송신 로직
+   ✓ chanrecv: 수신 로직
+   ✓ 반전: 채널도 뮤텍스 기반!
+
+3️⃣ slice.go: 슬라이스 확장
+   ✓ growslice: 용량 계산 및 확장
+   ✓ 256 미만: 2배 증가
+   ✓ 256 이상: 1.25배 증가
+   ✓ 메모리 효율 vs 성능 균형
+
+4️⃣ mcall: 스택 스위칭
+   ✓ g0 스택: 런타임 관리 스택
+   ✓ 사용자 고루틴 스택과 격리
+   ✓ 고루틴 전환의 핵심
+
+5️⃣ //go: 컴파일러 지시자
+   ✓ nosplit: 스택 검사 제거
+   ✓ noinline: 인라이닝 금지
+   ✓ linkname: Private 함수 강제 링크
+   ✓ notinheap: 힙 할당 금지
+
+6️⃣ 핵심 구조체
+   ✓ G (Goroutine): 사용자 고루틴
+   ✓ M (Machine): OS 스레드
+   ✓ P (Processor): 로컬 스케줄러
+   ✓ G×M×P 삼각형
+
+7️⃣ 소스 코드 앞에서 우리는 겸손합니다.
+```
+
+---
+
+## 📚 주요 파일 위치
+
+```bash
+# Go 설치 경로
+$GOROOT/src/runtime/
+
+# 핵심 파일들
+- proc.go           (고루틴 스케줄링, 2000+ 줄)
+- chan.go           (채널 구현, 1000+ 줄)
+- slice.go          (슬라이스 관리, 400+ 줄)
+- malloc.go         (메모리 할당, 1500+ 줄)
+- mgc.go            (가비지 컬렉션, 1500+ 줄)
+- panic.go          (panic/recover, 700+ 줄)
+- signal.go         (시그널 처리, 400+ 줄)
+- runtime2.go       (구조체 정의, 500+ 줄)
+```
+
+---
+
+## 🎓 다음 학습
+
+- runtime/mgc.go: Tri-color Marking 상세 분석
+- runtime/malloc.go: TCMalloc 기반 메모리 할당 이해
+- runtime/signal.go: OS 시그널과의 상호작용
+
+---
+
+**소스 코드라는 성경을 기록합니다.** 📖
+**기록이 증명이다. (Your record is your proof.)** ✨
+
+마지막 업데이트: 2026-02-25

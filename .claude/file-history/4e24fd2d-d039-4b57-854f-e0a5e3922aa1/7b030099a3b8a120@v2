@@ -1,0 +1,185 @@
+"""
+Phase 3: LeaderElection - 리더 선출 프로세스
+선거 시작, 투표 수집, 하트비트 전송
+"""
+
+import asyncio
+import time
+from typing import Optional, List
+
+from .node import RaftNode, NodeState, VoteRequest
+
+
+class LeaderElection:
+    """
+    Raft 리더 선출 조율
+
+    프로세스:
+    1. 선거 타임아웃 → Candidate로 전환
+    2. term 증가 + 자기 투표
+    3. 모든 노드에 VoteRequest 병렬 브로드캐스트
+    4. 쿼럼(n//2 + 1) 투표 수집 → Leader 선출
+    5. Leader는 모든 Follower에게 주기적 AppendEntries (heartbeat) 전송
+    """
+
+    def __init__(self, network):
+        self.network = network
+
+    def _calculate_quorum(self, total_nodes: int) -> int:
+        """쿼럼 크기 계산 (n//2 + 1)"""
+        return total_nodes // 2 + 1
+
+    async def start_election(self, node: RaftNode) -> bool:
+        """
+        선거 시작
+
+        반환:
+        - True: 이 노드가 리더로 선출됨
+        - False: 선거 패배 또는 타임아웃
+        """
+        # 1. Candidate로 전환
+        await node._become_candidate()
+
+        # 2. VoteRequest 준비
+        request = VoteRequest(
+            term=node.current_term,
+            candidate_id=node.node_id,
+            last_log_index=node._get_last_log_index(),
+            last_log_term=node._get_last_log_term(),
+        )
+
+        # 3. 병렬 투표 수집 (자신의 투표는 이미 포함)
+        votes = 1  # 자기 자신 투표
+        total_nodes = len(self.network.nodes)
+        quorum = self._calculate_quorum(total_nodes)
+
+        vote_tasks = []
+        for node_id in self.network.nodes.keys():
+            if node_id != node.node_id and self.network.nodes[node_id].is_alive:
+                task = self.network.send_vote_request(node.node_id, node_id, request)
+                vote_tasks.append((node_id, task))
+
+        # 4. 투표 수집 (타임아웃 있음)
+        try:
+            for node_id, task in vote_tasks:
+                try:
+                    response = await asyncio.wait_for(task, timeout=0.5)
+                    if response and response.vote_granted:
+                        votes += 1
+                except asyncio.TimeoutError:
+                    pass
+                except Exception:
+                    pass
+
+        except Exception:
+            return False
+
+        # 5. 쿼럼 검증
+        if votes >= quorum:
+            await node._become_leader()
+            return True
+
+        return False
+
+    async def send_heartbeats(self, node: RaftNode) -> None:
+        """
+        Heartbeat 전송 (Leader 전용)
+
+        주기: 50ms마다
+        내용: 빈 AppendEntries RPC (리더의 term 브로드캐스트)
+        """
+        if node.state != NodeState.LEADER:
+            return
+
+        from .replication import LogReplication
+
+        heartbeat_interval = 0.05  # 50ms
+
+        try:
+            while node.is_alive and node.state == NodeState.LEADER:
+                await asyncio.sleep(heartbeat_interval)
+
+                # 모든 follower에게 하트비트 전송
+                tasks = []
+                for follower_id in self.network.nodes.keys():
+                    if follower_id != node.node_id:
+                        task = LogReplication(self.network).send_append_entries(
+                            node, follower_id
+                        )
+                        tasks.append(task)
+
+                # 병렬 전송
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+        except asyncio.CancelledError:
+            pass
+
+    async def election_timer_loop(self, node: RaftNode) -> None:
+        """
+        선거 타임아웃 루프 (모든 노드에서 실행)
+
+        로직:
+        1. 선거 타임아웃 설정
+        2. 하트비트 수신 없이 타임아웃 경과 → 선거 시작
+        3. 선거 패배 또는 리더 되면 타임아웃 재설정
+        """
+        try:
+            while node.is_alive:
+                # 타임아웃 설정
+                timeout = node._random_election_timeout()
+                timeout_secs = timeout / 1000.0
+
+                start_time = time.time()
+
+                try:
+                    # 타임아웃 대기 (더 이상 하트비트가 없으면 선거 시작)
+                    await asyncio.sleep(timeout_secs)
+
+                    # 타임아웃 경과 후 선거 시작
+                    if node.state != NodeState.LEADER:
+                        await self.start_election(node)
+
+                except asyncio.CancelledError:
+                    break
+
+        except Exception:
+            pass
+
+    async def run_election_cycle(
+        self, node: RaftNode, max_iterations: int = 100
+    ) -> Optional[str]:
+        """
+        선거 사이클 실행 (테스트용)
+
+        반환: 선출된 리더 ID 또는 None
+        """
+        tasks = []
+
+        # 1. 선거 타이머 시작
+        election_task = asyncio.create_task(self.election_timer_loop(node))
+        tasks.append(election_task)
+
+        # 2. heartbeat 태스크 시작 (Leader 전용)
+        heartbeat_task = None
+        if node.state == NodeState.LEADER:
+            heartbeat_task = asyncio.create_task(self.send_heartbeats(node))
+            tasks.append(heartbeat_task)
+
+        try:
+            # 최대 시간 동안 대기
+            max_wait_secs = max_iterations * 0.05
+            start = time.time()
+
+            while time.time() - start < max_wait_secs:
+                leader = self.network.get_current_leader()
+                if leader:
+                    return leader
+
+                await asyncio.sleep(0.01)
+
+        finally:
+            # 정리
+            for task in tasks:
+                if task and not task.done():
+                    task.cancel()

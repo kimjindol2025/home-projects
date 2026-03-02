@@ -1,0 +1,129 @@
+"""
+전체 파이프라인 통합 테스트
+자연어 → Intent → Pulse 코드 → 배포
+"""
+
+import pytest
+from src.nlu import FastNLU, CachedNLUProcessor
+from src.parser import PulseParser
+from src.runtime import PulseRuntime
+from src.llm_manager import LLMManager
+
+
+@pytest.mark.asyncio
+async def test_full_pipeline_dry_run(llm_manager, nlu_processor, runtime):
+    """전체 파이프라인: Dry-run"""
+    instruction = "매일 아침 9시에 뉴스 검색해서 이메일로 보내줘"
+
+    # 1단계: NLU
+    intent = await nlu_processor.analyze(instruction)
+    assert intent.role is not None
+    assert "news" in intent.goal.lower() or "뉴스" in intent.goal
+
+    # 2단계: Parser
+    parser = PulseParser()
+    pulse_code = parser.generate_pulse_code(intent)
+    assert "로서" in pulse_code
+    assert len(pulse_code) > 20
+
+    # 3단계: Runtime (dry-run)
+    result = await runtime.execute(pulse_code)
+    assert "✅" in result or "배포" in result
+
+
+@pytest.mark.asyncio
+async def test_pipeline_with_slack_intent(nlu_processor, runtime):
+    """Slack 배포 파이프라인"""
+    instruction = "슬랙 #support 채널에서 자동 답변 봇을 만들어 줄래?"
+
+    # NLU
+    intent = await nlu_processor.analyze(instruction)
+    assert "slack" in intent.tools
+    assert intent.deployment == "slack"
+
+    # Parser
+    parser = PulseParser()
+    pulse_code = parser.generate_pulse_code(intent)
+    assert "slack" in pulse_code.lower()
+
+    # Runtime
+    result = await runtime.execute(pulse_code)
+    assert len(result) > 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_with_scheduled_intent(nlu_processor, runtime):
+    """스케줄 배포 파이프라인"""
+    instruction = "매주 월요일 오전 10시에 주간 보고서를 이메일로 발송해 줄래?"
+
+    # NLU
+    intent = await nlu_processor.analyze(instruction)
+    assert intent.schedule is not None or "매주" in instruction
+
+    # Parser
+    parser = PulseParser()
+    pulse_code = parser.generate_pulse_code(intent)
+    assert len(pulse_code) > 0
+
+    # Runtime
+    result = await runtime.execute(pulse_code)
+    assert "✅" in result or "배포" in result
+
+
+@pytest.mark.asyncio
+async def test_cache_reuse_same_instruction(nlu_processor):
+    """캐싱: 같은 명령 재사용"""
+    instruction = "슬랙 봇을 만들어 줄래?"
+
+    # 첫 호출
+    intent1 = await nlu_processor.analyze(instruction)
+    role1 = intent1.role
+
+    # 두 번째 호출 (캐시 히트)
+    intent2 = await nlu_processor.analyze(instruction)
+    role2 = intent2.role
+
+    # 같은 결과 확인
+    assert role1 == role2
+
+
+@pytest.mark.asyncio
+async def test_constraint_parsing_pipeline(runtime):
+    """제약 조건 파싱"""
+    pulse_code = """로서 응답 최적화 에이전트
+사용 qwen2.5:7b
+해야할일 매우 빠른 응답 필요
+응답<0.5초"""
+
+    config = runtime._parse_pulse_code(pulse_code)
+    assert config["constraints"]["max_response_ms"] == 500
+
+
+@pytest.mark.asyncio
+async def test_multiple_tools_pipeline(nlu_processor, runtime):
+    """다중 도구 파이프라인"""
+    instruction = "슬랙에 메시지를 보내고, 깃허브 PR을 감시하고, 이메일로 알림을 줄래?"
+
+    intent = await nlu_processor.analyze(instruction)
+    assert len(intent.tools) >= 2
+
+    parser = PulseParser()
+    pulse_code = parser.generate_pulse_code(intent)
+    result = await runtime.execute(pulse_code)
+    assert len(result) > 0
+
+
+@pytest.mark.asyncio
+async def test_nlu_fast_fallback(nlu_processor):
+    """NLU 빠른 폴백"""
+    # 단순한 명령 (빠른 NLU 사용)
+    simple_instruction = "봇"
+    intent1 = await nlu_processor.analyze(simple_instruction)
+    assert intent1.nlu_method in ["FastNLU", "LLMBasedNLU"]
+
+    # 복잡한 명령 (LLM 사용)
+    complex_instruction = "슬랙에서 매일 3개의 서로 다른 채널을 감시하면서, " \
+                         "특정 키워드를 찾으면 GitHub에 이슈를 생성하고 " \
+                         "메인테이너들에게 이메일로 알려줄래?"
+    intent2 = await nlu_processor.analyze(complex_instruction)
+    assert intent2.nlu_method in ["FastNLU", "LLMBasedNLU"]

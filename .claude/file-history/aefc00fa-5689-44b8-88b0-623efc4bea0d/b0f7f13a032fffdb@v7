@@ -1,0 +1,306 @@
+// GRIE 3-A: Zig-Native Kernel
+// Zero-Abstraction, Lock-Free Computation Engine
+//
+// Architecture:
+// 1. Go dispatches job via SHM Header flag
+// 2. Zig spins on flag with <20ns latency
+// 3. Zig computes, updates header, returns to spin-loop
+//
+// Goal: Latency < 50ns (Go FFI call overhead eliminated)
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+// Import shared header definition
+const ShmHeader = @import("shm_header.zig");
+const EngineHeader = ShmHeader.EngineHeader;
+const State = ShmHeader.State;
+const HEADER_SIZE = ShmHeader.HEADER_SIZE;
+const DATA_OFFSET = ShmHeader.DATA_OFFSET;
+const MAGIC_NUMBER = ShmHeader.MAGIC_NUMBER;
+
+// Import SIMD module
+const Simd = @import("simd.zig");
+const Complex = Simd.Complex;
+const matmul4x4 = Simd.matmul4x4;
+const fft = Simd.fft;
+const readTimer = Simd.readTimer;
+const Vec64 = Simd.Vec64;
+
+// Configuration
+const SHM_SIZE: usize = 10 * 1024 * 1024; // 10MB for test
+const SHM_PATH: [*:0]const u8 = "/grie_shm_test";
+
+// Global state (single-threaded kernel)
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var allocator: std.mem.Allocator = undefined;
+var shm_fd: i32 = -1;
+var shm_base: [*]u8 = undefined;
+var header: *EngineHeader = undefined;
+var data_region: [*]u8 = undefined;
+
+// Metrics
+var ops_count: u64 = 0;
+var total_latency_ns: u64 = 0;
+
+/// Read nanosecond timer (ARM64 CNTVCT_EL0)
+pub fn readNanoTimer() u64 {
+    // Placeholder timer for cross-platform compatibility
+    // For accurate timing, use platform-specific counters in main benchmark
+    return 1;
+}
+
+/// Initialize shared memory mapping
+pub fn initShm() !void {
+    std.debug.print("🔧 Initializing SHM...\n", .{});
+
+    const shm_dir = "/dev/shm";
+    const shm_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ shm_dir, SHM_PATH });
+    defer allocator.free(shm_path);
+
+    // Flag constants for POSIX
+    const O_RDWR = 0o2;
+    const O_CREAT = 0o100;
+
+    // Try to open existing SHM file, create if doesn't exist
+    const flags_open = O_RDWR | O_CREAT;
+    shm_fd = try std.posix.open(shm_path, @as(std.posix.O, @bitCast(@as(u32, flags_open))), 0o666);
+
+    // Truncate to size (safe to call multiple times)
+    try std.posix.ftruncate(shm_fd, SHM_SIZE);
+
+    // mmap the shared memory
+    const prot = std.posix.PROT.READ | std.posix.PROT.WRITE;
+
+    const mapped = try std.posix.mmap(
+        null,
+        SHM_SIZE,
+        prot,
+        .{ .TYPE = .SHARED }, // MAP_SHARED (construct MAP struct with named fields)
+        shm_fd,
+        0,
+    );
+    shm_base = @as([*]u8, @ptrCast(mapped.ptr));
+
+    // Cast header pointer
+    header = @as(*EngineHeader, @ptrCast(@alignCast(shm_base)));
+
+    // Verify magic number
+    if (header.magic != MAGIC_NUMBER) {
+        std.debug.print("❌ Invalid magic number: {x:0>16}\n", .{header.magic});
+        return error.InvalidMagic;
+    }
+
+    // Data region starts at offset 128
+    data_region = shm_base + DATA_OFFSET;
+
+    std.debug.print("✅ SHM initialized: base={*}, header={*}, data={*}\n", .{ shm_base, header, data_region });
+}
+
+/// Cleanup shared memory
+pub fn deinitShm() void {
+    if (@intFromPtr(shm_base) != 0) {
+        // munmap expects pointer aligned to page size (4096)
+        // Create aligned slice by casting to []align(4096) u8
+        const ptr = @as([*]align(4096) u8, @alignCast(shm_base));
+        std.posix.munmap(ptr[0..SHM_SIZE]);
+    }
+    if (shm_fd >= 0) {
+        std.posix.close(shm_fd);
+    }
+}
+
+/// SIMD-optimized computation kernel
+/// Demonstrates Matrix Multiply with SIMD acceleration
+inline fn computeSimd(payload: [*]const u8, len: usize) u64 {
+    // Check for matrix multiplication request
+    // Format: [op_type: u8][matrix_data...]
+
+    if (len < 1) return 0;
+
+    const op_type = payload[0];
+
+    return switch (op_type) {
+        0 => {
+            // MatMul 4x4
+            if (len < 1 + 32 * 8) return 0; // Not enough data
+
+            var a: Simd.Mat4x4 = undefined;
+            var b: Simd.Mat4x4 = undefined;
+            var c: Simd.Mat4x4 = undefined;
+
+            // Parse input (little-endian f64)
+            var offset: usize = 1;
+            for (0..4) |i| {
+                for (0..4) |j| {
+                    const bytes = payload[offset..][0..8];
+                    a[i][j] = @as(f64, @bitCast(@as(u64, @bitCast(bytes[0..8].*))));
+                    offset += 8;
+                }
+            }
+
+            for (0..4) |i| {
+                for (0..4) |j| {
+                    const bytes = payload[offset..][0..8];
+                    b[i][j] = @as(f64, @bitCast(@as(u64, @bitCast(bytes[0..8].*))));
+                    offset += 8;
+                }
+            }
+
+            // SIMD computation
+            const start = readTimer();
+            matmul4x4(&a, &b, &c);
+            const elapsed = readTimer() - start;
+
+            std.debug.print("  🎯 MatMul 4x4 completed in {d}ns\n", .{elapsed});
+            total_latency_ns += elapsed;
+
+            return elapsed;
+        },
+        1 => {
+            // FFT (complex numbers)
+            if (len < 1 + 16 * 16) return 0; // Minimum 16 complex numbers
+
+            var data: [16]Complex = undefined;
+            var offset: usize = 1;
+
+            for (0..@min(16, (len - 1) / 16)) |i| {
+                const real_bytes = payload[offset..][0..8];
+                const imag_bytes = payload[offset + 8..][0..8];
+
+                data[i].real = @as(f64, @bitCast(@as(u64, @bitCast(real_bytes[0..8].*))));
+                data[i].imag = @as(f64, @bitCast(@as(u64, @bitCast(imag_bytes[0..8].*))));
+
+                offset += 16;
+            }
+
+            // FFT computation
+            const start = readTimer();
+            fft(data[0..16]);
+            const elapsed = readTimer() - start;
+
+            std.debug.print("  🎯 FFT-16 completed in {d}ns\n", .{elapsed});
+            total_latency_ns += elapsed;
+
+            return elapsed;
+        },
+        else => {
+            // Default: sum reduction
+            var sum: u64 = 0;
+            for (payload[1..len]) |byte| {
+                sum +%= byte;
+            }
+            return sum;
+        },
+    };
+}
+
+/// Spin-loop kernel: Wait for Go signal, process, return
+/// This is the main hot-loop that must run <20ns per cycle
+pub fn spinKernel() void {
+    std.debug.print("🚀 Zig Kernel started (spinning on SHM header)...\n", .{});
+    std.debug.print("📊 Waiting for Go signals (READY state)...\n", .{});
+    std.debug.print("⚡ SIMD Acceleration: ON\n\n", .{});
+
+    var cycle: u64 = 0;
+    const max_cycles = 10; // Limit for demo
+
+    while (cycle < max_cycles) : (cycle += 1) {
+        // Read state (volatile to prevent optimization)
+        const current_state = header.loadState();
+
+        // Spin until READY
+        if (current_state == State.Ready) {
+            const start_ns = readTimer();
+
+            std.debug.print(
+                "[{d}] 🔔 Signal received! state=READY, seq={d}, data_len={d}\n",
+                .{ cycle, header.seq_num, header.data_len },
+            );
+
+            // Transition to READING
+            if (header.casState(State.Ready, State.Reading)) {
+                std.debug.print("  → Acquired lock (READY → READING)\n", .{});
+
+                // Perform SIMD computation
+                const data_ptr = @as([*]const u8, @ptrCast(data_region));
+                const compute_latency = computeSimd(data_ptr, header.data_len);
+
+                std.debug.print("  ✓ SIMD computed: {d}ns\n", .{compute_latency});
+
+                // Update metrics
+                header.total_reads +%= 1;
+
+                // Transition back to IDLE
+                header.storeState(State.Idle);
+
+                const end_ns = readTimer();
+                const total_latency = if (end_ns > start_ns) end_ns - start_ns else 0;
+
+                std.debug.print("  ⏱️  Total latency: {d}ns (dispatch: {d}ns)\n", .{ total_latency, total_latency - compute_latency });
+
+                ops_count += 1;
+                total_latency_ns += total_latency;
+            }
+        } else if (cycle % 100 == 0) {
+            std.debug.print("[{d}] ⏳ Idle... (state={})\n", .{ cycle, current_state });
+        }
+
+        // Yield CPU periodically (not a true spin-lock in production)
+        std.time.sleep(100);
+    }
+
+    std.debug.print("\n✅ Kernel loop finished (max cycles reached)\n", .{});
+    if (ops_count > 0) {
+        const avg_latency = total_latency_ns / ops_count;
+        std.debug.print("📈 Stats: ops={d}, avg_latency_ns={d}\n", .{ ops_count, avg_latency });
+    }
+}
+
+/// Main entry point
+pub fn main() !void {
+    allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    std.debug.print("═══════════════════════════════════════════\n", .{});
+    std.debug.print("  GRIE 3-A: Zig Kernel Initialization\n", .{});
+    std.debug.print("  Target: ARM64 (aarch64-linux-android)\n", .{});
+    std.debug.print("═══════════════════════════════════════════\n", .{});
+
+    // Initialize SHM
+    try initShm();
+    defer deinitShm();
+
+    // Start main kernel loop
+    spinKernel();
+
+    std.debug.print("\n✨ Zig Kernel shutdown complete.\n", .{});
+}
+
+// Export for FFI: Called from Go
+export fn gqse_kernel_init() i32 {
+    initShm() catch |err| {
+        std.debug.print("❌ Failed to init SHM: {}\n", .{err});
+        return -1;
+    };
+    return 0;
+}
+
+export fn gqse_kernel_run(cycles: u32) i32 {
+    for (0..cycles) |_| {
+        const current_state = header.loadState();
+        if (current_state == State.Ready) {
+            if (header.casState(State.Ready, State.Reading)) {
+                // Stub computation
+                header.total_reads +%= 1;
+                header.storeState(State.Idle);
+                ops_count += 1;
+            }
+        }
+    }
+    return @intCast(ops_count);
+}
+
+export fn gqse_kernel_shutdown() void {
+    deinitShm();
+}

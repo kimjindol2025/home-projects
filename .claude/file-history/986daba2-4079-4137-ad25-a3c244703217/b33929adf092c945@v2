@@ -1,0 +1,544 @@
+# KimSearch Mini - Termux 최적화 검색엔진 설계서
+
+**상태**: 📋 설계 중
+**시작**: 2026-02-26
+**대상**: Termux (모바일) 환경
+**철학**: "작고, 빠르고, 효율적"
+
+---
+
+## 🎯 목표
+
+```
+경량성 (Lightweight)
+  ├─ 코드: 450줄 이하
+  ├─ 메모리: <20MB
+  ├─ 디스크: <5MB
+  └─ 로딩: <500ms
+
+성능 (Performance)
+  ├─ 검색: <100ms (캐시 히트<10ms)
+  ├─ 인덱싱: <5s (전체)
+  └─ 메모리: O(1) 상수 시간
+
+사용성 (Usability)
+  ├─ CLI 기반
+  ├─ 직관적 명령어
+  ├─ 컬러풀한 출력
+  └─ 오프라인 지원
+```
+
+---
+
+## 🏗️ 아키텍처
+
+### **계층 구조**
+
+```
+┌─────────────────────────────────────┐
+│  CLI Interface (cli.js - 150줄)     │
+│  ├─ 명령어 파싱                      │
+│  ├─ 옵션 처리                        │
+│  └─ 결과 포맷팅                      │
+├─────────────────────────────────────┤
+│  Search Engine (kimsearch-mini.js)  │
+│  ├─ grep 검색                       │
+│  ├─ 결과 필터링                      │
+│  ├─ 품질 평가 조회                   │
+│  └─ 정렬 & 페이지네이션              │
+├─────────────────────────────────────┤
+│  Local Cache (cache.js - 100줄)    │
+│  ├─ 검색 결과 캐싱                   │
+│  ├─ TTL 관리 (30초)                 │
+│  └─ 자동 정리                        │
+├─────────────────────────────────────┤
+│  Quality Manager (quality.js)       │
+│  ├─ JSON 로드                       │
+│  ├─ 평가 조회                        │
+│  └─ 요약 정보                        │
+├─────────────────────────────────────┤
+│  File System                         │
+│  ├─ repos-extract/kim/ (읽기)       │
+│  ├─ quality-assessment.json (읽기)  │
+│  └─ ~/.kimsearch-mini/ (캐시)       │
+└─────────────────────────────────────┘
+```
+
+---
+
+## 📁 파일 구조
+
+```
+kimsearch-mini/
+├── kimsearch-mini.js          (200줄) - 핵심 엔진
+├── cli.js                     (150줄) - CLI 인터페이스
+├── cache.js                   (100줄) - 로컬 캐시
+├── quality.js                 (80줄)  - 품질 매니저
+├── config.js                  (50줄)  - 설정
+├── bin/
+│   └── kimsearch              (10줄)  - 실행파일
+├── tests/
+│   └── mini.test.js           (150줄) - 테스트
+├── README-MINI.md             (100줄) - 사용 가이드
+└── package.json
+```
+
+**총 840줄 (테스트 포함)**
+
+---
+
+## 🔧 핵심 컴포넌트 설계
+
+### **1️⃣ kimsearch-mini.js (200줄) - 검색 엔진**
+
+```javascript
+class KimSearchMini {
+  constructor(dataPath, qualityPath) {
+    this.dataPath = dataPath;
+    this.qualityPath = qualityPath;
+    this.quality = new QualityManager(qualityPath);
+    this.cache = new Cache(30000);  // 30초 TTL
+  }
+
+  // 검색 (메인)
+  search(query, options = {}) {
+    // 1. 캐시 확인
+    const cacheKey = this.getCacheKey(query, options);
+    if (this.cache.has(cacheKey)) {
+      return { ...this.cache.get(cacheKey), cached: true };
+    }
+
+    // 2. grep 검색
+    const results = this.grepSearch(query, {
+      limit: options.limit || 10,
+      lang: options.lang,
+      type: options.type
+    });
+
+    // 3. 품질 정보 추가
+    const enriched = results.map(r => ({
+      ...r,
+      quality: this.quality.getQuick(r.repo)
+    }));
+
+    // 4. 필터링
+    const filtered = this.filter(enriched, options);
+
+    // 5. 정렬
+    const sorted = this.sort(filtered, options.sort);
+
+    // 6. 캐싱
+    this.cache.set(cacheKey, { ...sorted, cached: false });
+
+    return sorted;
+  }
+
+  // grep 실행 (네이티브)
+  grepSearch(query, options) {
+    const cmd = `grep -r "${query}" ${this.dataPath} \
+      ${options.lang ? `--include="*.${this.getLangExt(options.lang)}"` : ''} \
+      --include="*.{js,py,go,zig,ts,tsx,jsx}" \
+      -n --color=never 2>/dev/null | head -${options.limit}`;
+
+    // exec으로 실행 후 파싱
+  }
+
+  // 필터링
+  filter(results, options) {
+    return results.filter(r => {
+      if (options.stars && !options.stars.includes(r.quality?.stars)) return false;
+      if (options.category && r.quality?.category !== options.category) return false;
+      if (options.minQuality && r.quality?.stars < options.minQuality) return false;
+      return true;
+    });
+  }
+
+  // 정렬
+  sort(results, sortBy = 'relevance') {
+    switch(sortBy) {
+      case 'quality':
+        return results.sort((a, b) => (b.quality?.stars || 0) - (a.quality?.stars || 0));
+      case 'file':
+        return results.sort((a, b) => a.file.localeCompare(b.file));
+      default:  // 'relevance'
+        return results;
+    }
+  }
+
+  // 빠른 조회 (평가 없음)
+  quickSearch(query, limit = 5) {
+    return this.search(query, { limit, excludeQuality: true });
+  }
+}
+```
+
+---
+
+### **2️⃣ cli.js (150줄) - 명령어 인터페이스**
+
+```javascript
+const yargs = require('yargs');
+const KimSearchMini = require('./kimsearch-mini');
+const { formatResults, printStats } = require('./formatter');
+
+const searchEngine = new KimSearchMini(
+  process.env.KIMSEARCH_PATH || '/tmp/kimsearch-v2/repos-extract/kim',
+  process.env.QUALITY_PATH || '/tmp/kimsearch-v2/quality-assessment.json'
+);
+
+yargs
+  .command('search <query>', '코드 검색', (yargs) => {
+    return yargs
+      .positional('query', { describe: '검색어' })
+      .option('limit', {
+        alias: 'l',
+        describe: '결과 개수',
+        default: 10,
+        type: 'number'
+      })
+      .option('lang', {
+        alias: 'L',
+        describe: '언어 필터 (js, py, go, zig)',
+        type: 'string'
+      })
+      .option('stars', {
+        alias: 's',
+        describe: '별 필터 (5,4,3,2,1)',
+        type: 'string'
+      })
+      .option('sort', {
+        describe: '정렬 (relevance, quality, file)',
+        default: 'relevance',
+        type: 'string'
+      })
+      .option('color', {
+        describe: '컬러 출력',
+        default: true,
+        type: 'boolean'
+      })
+  }, (argv) => {
+    const results = searchEngine.search(argv.query, {
+      limit: argv.limit,
+      lang: argv.lang,
+      stars: argv.stars ? argv.stars.split(',').map(Number) : undefined,
+      sort: argv.sort
+    });
+
+    formatResults(results, { color: argv.color });
+  })
+  .command('quick <query>', '빠른 검색 (품질 정보 제외)', (yargs) => {
+    // 옵션 없음, 최대한 빠름
+  }, (argv) => {
+    const results = searchEngine.quickSearch(argv.query, 5);
+    formatResults(results, { minimal: true });
+  })
+  .command('stats', '통계', (yargs) => yargs, (argv) => {
+    printStats();
+  })
+  .command('clear-cache', '캐시 삭제', (yargs) => yargs, (argv) => {
+    searchEngine.cache.clear();
+    console.log('✅ 캐시 삭제됨');
+  })
+  .demandCommand()
+  .argv;
+```
+
+---
+
+### **3️⃣ cache.js (100줄) - 로컬 캐시**
+
+```javascript
+class Cache {
+  constructor(ttl = 30000) {
+    this.ttl = ttl;  // 30초
+    this.cache = new Map();
+    this.timers = new Map();
+  }
+
+  set(key, value) {
+    // 기존 타이머 취소
+    if (this.timers.has(key)) {
+      clearTimeout(this.timers.get(key));
+    }
+
+    // 새로 설정
+    this.cache.set(key, value);
+
+    // TTL 타이머
+    const timer = setTimeout(() => {
+      this.cache.delete(key);
+      this.timers.delete(key);
+    }, this.ttl);
+
+    this.timers.set(key, timer);
+  }
+
+  get(key) {
+    return this.cache.get(key);
+  }
+
+  has(key) {
+    return this.cache.has(key);
+  }
+
+  clear() {
+    for (const timer of this.timers.values()) {
+      clearTimeout(timer);
+    }
+    this.cache.clear();
+    this.timers.clear();
+  }
+
+  // 통계
+  stats() {
+    return {
+      size: this.cache.size,
+      keys: Array.from(this.cache.keys())
+    };
+  }
+}
+
+module.exports = Cache;
+```
+
+---
+
+### **4️⃣ quality.js (80줄) - 품질 매니저**
+
+```javascript
+class QualityManager {
+  constructor(qualityPath) {
+    this.data = new Map();
+    this.loadQuality(qualityPath);
+  }
+
+  loadQuality(path) {
+    try {
+      const json = require(path);
+      if (Array.isArray(json)) {
+        json.forEach(item => {
+          this.data.set(item.repo, item);
+        });
+      }
+    } catch (e) {
+      console.warn('⚠️ Quality data not loaded');
+    }
+  }
+
+  getQuick(repo) {
+    const item = this.data.get(repo);
+    if (!item) return null;
+
+    // 필수 정보만 반환 (빠름)
+    return {
+      stars: item.stars,
+      status: this.getStatus(item.stars),
+      category: item.category,
+      issues: item.issues?.length || 0
+    };
+  }
+
+  getStatus(stars) {
+    const statuses = {
+      5: '🟢',
+      4: '🟡',
+      3: '🟠',
+      2: '🔴',
+      1: '⛔'
+    };
+    return statuses[stars] || '⚪';
+  }
+}
+```
+
+---
+
+## 🎨 출력 포맷
+
+### **일반 검색**
+
+```bash
+$ kimsearch "gpt" -l 3
+
+🔍 검색: "gpt" (3개 결과)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ 🔴 kim/alex64-gin-api/gpt_chat_client.py:21
+   "model": "gpt-5-nano",
+
+   ⭐⭐ SECURITY_REVIEW | 45% | 3 issues
+
+2️⃣ 🟢 kim/freelang-v6/runtime.js:42
+   async function executeTask(...
+
+   ⭐⭐⭐⭐⭐ PRODUCTION_READY | 100%
+
+3️⃣ 🟢 kim/grie-engine/main.go:156
+   // async job processing
+
+   ⭐⭐⭐⭐⭐ PRODUCTION_READY | 100%
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⏱️ 시간: 45ms | 📦 캐시: miss | 🏷️ 별: 5+5+2
+```
+
+### **빠른 검색**
+
+```bash
+$ kimsearch quick "function"
+
+🔍 quick: "function" (5개)
+
+1. kim/freelang-v6/runtime.js:42
+2. kim/grie-engine/dispatcher.go:156
+3. kim/kimsearch-v2/main.js:200
+4. kim/alex64-gin-api/app.py:50
+5. kim/project-x/index.ts:30
+
+⏱️ 8ms | 📦 cached
+```
+
+---
+
+## 📊 성능 목표
+
+| 작업 | 목표 | 최적화 방법 |
+|------|------|-----------|
+| 검색 | <100ms | grep 네이티브 |
+| 캐시 히트 | <10ms | 메모리 Map |
+| 초기화 | <500ms | 지연 로드 |
+| 메모리 | <20MB | 최소 데이터만 |
+| 품질 조회 | <5ms | 인메모리 맵 |
+
+---
+
+## 🧪 테스트 계획 (150줄)
+
+```
+1️⃣ 검색 테스트 (5개)
+   ✅ 단순 검색
+   ✅ 필터링
+   ✅ 정렬
+   ✅ 캐싱
+   ✅ 언어 필터
+
+2️⃣ 캐시 테스트 (4개)
+   ✅ 저장/조회
+   ✅ TTL 만료
+   ✅ 자동 정리
+   ✅ 통계
+
+3️⃣ 품질 테스트 (3개)
+   ✅ 로드
+   ✅ 빠른 조회
+   ✅ 상태 매핑
+
+4️⃣ CLI 테스트 (3개)
+   ✅ 명령어 파싱
+   ✅ 출력 포맷
+   ✅ 옵션 처리
+```
+
+---
+
+## 🚀 배포 방식
+
+### **설치**
+
+```bash
+# 방식 1: npm global
+npm install -g kimsearch-mini
+
+# 방식 2: 로컬 symlink
+npm link ./
+
+# 방식 3: 직접 실행
+node kimsearch-mini/cli.js search "gpt"
+```
+
+### **설정**
+
+```bash
+# ~/.bashrc 또는 ~/.zshrc
+export KIMSEARCH_PATH="/tmp/kimsearch-v2/repos-extract/kim"
+export QUALITY_PATH="/tmp/kimsearch-v2/quality-assessment.json"
+
+# alias
+alias ks='kimsearch search'
+alias ksq='kimsearch quick'
+```
+
+---
+
+## 📋 구현 단계
+
+### **Phase A: 핵심 (Day 1)**
+- [ ] kimsearch-mini.js 구현
+- [ ] cli.js 기본 명령어
+- [ ] 색상 포맷팅
+
+### **Phase B: 최적화 (Day 2)**
+- [ ] cache.js 구현
+- [ ] quality.js 통합
+- [ ] 성능 벤치마크
+
+### **Phase C: 테스트 & 배포 (Day 3)**
+- [ ] mini.test.js (15개 테스트)
+- [ ] npm package.json
+- [ ] README 작성
+- [ ] Gogs 커밋
+
+---
+
+## 💾 예상 파일 크기
+
+```
+kimsearch-mini.js     ~8KB
+cli.js               ~6KB
+cache.js             ~4KB
+quality.js           ~3KB
+config.js            ~2KB
+tests/               ~8KB
+docs/                ~5KB
+────────────────────
+총합                 ~36KB (압축 시 ~12KB)
+
+메모리 사용:
+- 초기: ~5MB (Node.js)
+- 검색 후: ~15MB (grep + 캐시)
+- 최대: ~25MB
+```
+
+---
+
+## 🎯 성공 기준
+
+```
+✅ 450줄 이하 (테스트 제외)
+✅ <100ms 검색 응답
+✅ <10ms 캐시 히트
+✅ <20MB 메모리
+✅ 15개 테스트 모두 통과
+✅ CLI 완전 구현
+✅ Termux 환경 테스트 완료
+✅ npm으로 설치 가능
+```
+
+---
+
+## 📌 핵심 차별점
+
+| 전체 버전 | Mini 버전 |
+|---------|----------|
+| 905줄 | 450줄 |
+| 7개 API | 2개 명령어 |
+| 포트 필요 | CLI만 |
+| 전체 평가 | 빠른 조회 |
+| 실시간 | 30초 캐시 |
+| 복잡함 | 단순함 |
+
+---
+
+**작성**: Claude (Haiku 4.5)
+**날짜**: 2026-02-26
+**상태**: 📋 설계 완료 (구현 준비)

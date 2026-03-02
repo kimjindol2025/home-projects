@@ -1,0 +1,647 @@
+/**
+ * FreeLang v4 ORM Engine
+ * 인메모리 ORM: Model, CRUD, QueryBuilder, JOIN, Eager/Lazy, N+1 방지
+ */
+
+// ============================================================
+// 타입 정의
+// ============================================================
+
+export type FieldType = "string" | "i32" | "i64" | "f64" | "bool";
+
+export interface FieldSchema {
+  type: FieldType;
+  nullable?: boolean;
+}
+
+export interface TableSchema {
+  [field: string]: FieldSchema;
+}
+
+export interface Row {
+  id: number;
+  [field: string]: any;
+}
+
+interface Table {
+  name: string;
+  schema: TableSchema;
+  // Map<id, Row> — O(1) insert/findById/update/delete
+  rowMap: Map<number, Row>;
+  autoId: number;
+}
+
+export interface QueryDescriptor {
+  table: string;
+  filters: Array<{ field: string; op: string; value: any }>;
+  orderField: string | null;
+  orderDir: "asc" | "desc";
+  limitVal: number;   // -1 = 없음
+  offsetVal: number;
+}
+
+export interface RelationDef {
+  type: "belongs_to" | "has_many" | "has_one" | "belongs_to_many";
+  // belongs_to: child.fk → parent.id (N:1)
+  // has_many:   parent.id → child.fk (1:N)
+  // has_one:    parent.id → child.fk (1:1, child 쪽에 하나만)
+  // belongs_to_many: junction table (M:N)
+  childTable: string;
+  parentTable: string;
+  fk?: string;         // FK 컬럼 (child 쪽)
+  junctionTable?: string;  // M:N용 junction table
+  foreignKey?: string;     // M:N에서 parent의 FK
+  otherKey?: string;       // M:N에서 related의 FK
+  as: string;          // 로드 결과가 붙는 키 이름
+}
+
+// ============================================================
+// ORM Engine
+// ============================================================
+
+// 트랜잭션 스냅샷 타입
+interface TxSnapshot {
+  rowMaps: Map<string, Map<number, Row>>;  // tableName → rowMap 복사본
+  autoIds: Map<string, number>;            // tableName → autoId
+}
+
+export class ORMEngine {
+  private tables: Map<string, Table> = new Map();
+  private relations: RelationDef[] = [];
+
+  // 트랜잭션 상태
+  private txSnapshot: TxSnapshot | null = null;
+  private inTx: boolean = false;
+
+  // ----------------------------------------------------------
+  // 1. Model 정의
+  // ----------------------------------------------------------
+
+  define(tableName: string, schema: TableSchema): void {
+    if (this.tables.has(tableName)) {
+      throw new Error(`orm: table '${tableName}' already defined`);
+    }
+    this.tables.set(tableName, {
+      name: tableName,
+      schema,
+      rowMap: new Map(),
+      autoId: 1,
+    });
+  }
+
+  private getTable(name: string): Table {
+    const t = this.tables.get(name);
+    if (!t) throw new Error(`orm: table '${name}' not found`);
+    return t;
+  }
+
+  // rowMap을 순회 가능한 배열로 변환 (내부용)
+  private rows(table: Table): Row[] {
+    return Array.from(table.rowMap.values());
+  }
+
+  // ----------------------------------------------------------
+  // 2. CRUD — O(1) insert/findById/update/delete
+  // ----------------------------------------------------------
+
+  insert(tableName: string, data: Record<string, any>): Row {
+    const table = this.getTable(tableName);
+
+    // 스키마 검증
+    for (const [field, schema] of Object.entries(table.schema)) {
+      if (!(field in data)) {
+        if (!schema.nullable) {
+          throw new Error(`orm: missing field '${field}' in '${tableName}'`);
+        }
+        data[field] = null;
+      }
+    }
+
+    const row: Row = { id: table.autoId++, ...data };
+    table.rowMap.set(row.id, row);
+    return { ...row };
+  }
+
+  findById(tableName: string, id: number): Row | null {
+    const row = this.getTable(tableName).rowMap.get(id);
+    return row ? { ...row } : null;
+  }
+
+  findAll(tableName: string): Row[] {
+    return this.rows(this.getTable(tableName)).map((r) => ({ ...r }));
+  }
+
+  update(tableName: string, id: number, updates: Record<string, any>): boolean {
+    const table = this.getTable(tableName);
+    const row = table.rowMap.get(id);
+    if (!row) return false;
+    table.rowMap.set(id, { ...row, ...updates, id });
+    return true;
+  }
+
+  delete(tableName: string, id: number): boolean {
+    const table = this.getTable(tableName);
+    if (!table.rowMap.has(id)) return false;
+    table.rowMap.delete(id);
+    return true;
+  }
+
+  count(tableName: string): number {
+    return this.getTable(tableName).rowMap.size;
+  }
+
+  // ----------------------------------------------------------
+  // 3. Query Builder
+  // ----------------------------------------------------------
+
+  query(tableName: string): QueryDescriptor {
+    this.getTable(tableName); // 존재 확인
+    return {
+      table: tableName,
+      filters: [],
+      orderField: null,
+      orderDir: "asc",
+      limitVal: -1,
+      offsetVal: 0,
+    };
+  }
+
+  filter(q: QueryDescriptor, field: string, op: string, value: any): QueryDescriptor {
+    return { ...q, filters: [...q.filters, { field, op, value }] };
+  }
+
+  orderBy(q: QueryDescriptor, field: string, dir: "asc" | "desc"): QueryDescriptor {
+    return { ...q, orderField: field, orderDir: dir };
+  }
+
+  limit(q: QueryDescriptor, n: number): QueryDescriptor {
+    return { ...q, limitVal: n };
+  }
+
+  offset(q: QueryDescriptor, n: number): QueryDescriptor {
+    return { ...q, offsetVal: n };
+  }
+
+  exec(q: QueryDescriptor): Row[] {
+    const table = this.getTable(q.table);
+    let rows = this.rows(table).map((r) => ({ ...r }));
+
+    // 필터 적용
+    for (const f of q.filters) {
+      rows = rows.filter((r) => this.applyOp(r[f.field], f.op, f.value));
+    }
+
+    // 정렬
+    if (q.orderField) {
+      const field = q.orderField;
+      const dir = q.orderDir === "asc" ? 1 : -1;
+      rows.sort((a, b) => {
+        const av = a[field], bv = b[field];
+        if (av < bv) return -1 * dir;
+        if (av > bv) return 1 * dir;
+        return 0;
+      });
+    }
+
+    // offset / limit
+    if (q.offsetVal > 0) rows = rows.slice(q.offsetVal);
+    if (q.limitVal >= 0) rows = rows.slice(0, q.limitVal);
+
+    return rows;
+  }
+
+  private applyOp(fieldVal: any, op: string, value: any): boolean {
+    switch (op) {
+      case "=":  case "==": return fieldVal === value;
+      case "!=": case "<>": return fieldVal !== value;
+      case "<":  return fieldVal < value;
+      case ">":  return fieldVal > value;
+      case "<=": return fieldVal <= value;
+      case ">=": return fieldVal >= value;
+      case "like": return typeof fieldVal === "string" && fieldVal.includes(value);
+      default:   return true;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 4. WHERE 단축 (단일 조건)
+  // ----------------------------------------------------------
+
+  where(tableName: string, field: string, op: string, value: any): Row[] {
+    return this.exec(this.filter(this.query(tableName), field, op, value));
+  }
+
+  // ----------------------------------------------------------
+  // 5. JOIN
+  // ----------------------------------------------------------
+
+  /**
+   * INNER JOIN: leftTable.leftKey = rightTable.rightKey
+   * 결과: 각 left row에 right row 필드가 right__ 접두사로 병합
+   */
+  join(
+    leftTable: string,
+    rightTable: string,
+    leftKey: string,
+    rightKey: string
+  ): Array<Record<string, any>> {
+    const left = this.getTable(leftTable);
+    const right = this.getTable(rightTable);
+
+    // right 인덱스 구성 (rightKey → row)
+    const rightIdx = new Map<any, Row>();
+    for (const row of this.rows(right)) {
+      rightIdx.set(row[rightKey], row);
+    }
+
+    const result: Array<Record<string, any>> = [];
+    for (const lRow of this.rows(left)) {
+      const rRow = rightIdx.get(lRow[leftKey]);
+      if (rRow) {
+        const merged: Record<string, any> = { ...lRow };
+        for (const [k, v] of Object.entries(rRow)) {
+          merged[`${rightTable}__${k}`] = v;
+        }
+        result.push(merged);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * LEFT JOIN: left에 매칭 없는 경우도 포함 (right 필드 null)
+   */
+  leftJoin(
+    leftTable: string,
+    rightTable: string,
+    leftKey: string,
+    rightKey: string
+  ): Array<Record<string, any>> {
+    const left = this.getTable(leftTable);
+    const right = this.getTable(rightTable);
+
+    const rightIdx = new Map<any, Row>();
+    for (const row of this.rows(right)) {
+      rightIdx.set(row[rightKey], row);
+    }
+
+    const rightFields = Object.keys(right.schema);
+
+    const result: Array<Record<string, any>> = [];
+    for (const lRow of this.rows(left)) {
+      const merged: Record<string, any> = { ...lRow };
+      const rRow = rightIdx.get(lRow[leftKey]);
+      if (rRow) {
+        for (const [k, v] of Object.entries(rRow)) {
+          merged[`${rightTable}__${k}`] = v;
+        }
+      } else {
+        for (const f of rightFields) {
+          merged[`${rightTable}__${f}`] = null;
+        }
+        merged[`${rightTable}__id`] = null;
+      }
+      result.push(merged);
+    }
+    return result;
+  }
+
+  // ----------------------------------------------------------
+  // 6. Relation 정의 (Eager/Lazy 로딩)
+  // ----------------------------------------------------------
+
+  belongsTo(childTable: string, parentTable: string, fk: string, as?: string): void {
+    this.relations.push({
+      type: "belongs_to",
+      childTable,
+      parentTable,
+      fk,
+      as: as ?? parentTable,
+    });
+  }
+
+  hasMany(parentTable: string, childTable: string, fk: string, as?: string): void {
+    this.relations.push({
+      type: "has_many",
+      childTable,
+      parentTable,
+      fk,
+      as: as ?? childTable,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // 1:1 Relation (has_one)
+  // ----------------------------------------------------------
+
+  /**
+   * hasOne: parent.id → child.fk (1:1, child 쪽에 정확히 하나)
+   * 예: User hasOne Profile (한 사용자는 한 프로필만)
+   */
+  hasOne(parentTable: string, childTable: string, fk: string, as?: string): void {
+    this.relations.push({
+      type: "has_one",
+      childTable,
+      parentTable,
+      fk,
+      as: as ?? childTable,
+    });
+  }
+
+  /**
+   * belongsToOne: child.fk → parent.id (1:1 역방향)
+   * 예: Profile belongsToOne User (프로필은 한 사용자에 속함)
+   */
+  belongsToOne(childTable: string, parentTable: string, fk: string, as?: string): void {
+    this.relations.push({
+      type: "belongs_to",
+      childTable,
+      parentTable,
+      fk,
+      as: as ?? parentTable,
+    });
+  }
+
+  // ----------------------------------------------------------
+  // M:N Relation (belongs_to_many)
+  // ----------------------------------------------------------
+
+  /**
+   * belongsToMany: junction table를 통한 M:N 관계
+   * 예: Students belongsToMany Courses (학생은 여러 과정, 과정은 여러 학생)
+   */
+  belongsToMany(
+    parentTable: string,
+    relatedTable: string,
+    junctionTable: string,
+    foreignKey: string,
+    otherKey: string,
+    as?: string
+  ): void {
+    this.relations.push({
+      type: "belongs_to_many",
+      childTable: relatedTable,
+      parentTable,
+      junctionTable,
+      foreignKey,
+      otherKey,
+      as: as ?? relatedTable,
+    });
+  }
+
+  getRelation(childOrParent: string, relName: string): RelationDef | null {
+    return (
+      this.relations.find(
+        (r) =>
+          (r.childTable === childOrParent || r.parentTable === childOrParent) &&
+          r.as === relName
+      ) ?? null
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 7. Eager Loading (N+1 방지 핵심)
+  // ----------------------------------------------------------
+
+  /**
+   * Eager Load: 한 번의 배치 쿼리로 관련 레코드 로드
+   * N+1 문제 방지: records 당 하나씩 쿼리하는 대신 IN 연산자 사용
+   */
+  eagerLoad(
+    records: Row[],
+    relationName: string
+  ): Array<Record<string, any>> {
+    const rel = this.relations.find((r) => r.as === relationName);
+    if (!rel) throw new Error(`orm: relation '${relationName}' not defined`);
+
+    if (rel.type === "belongs_to") {
+      // belongs_to: records(child)의 fk 값 수집 → 배치 로드
+      const fkValues = [...new Set(records.map((r) => r[rel.fk!]).filter((v) => v != null))];
+      const parentRows = this.batchLoad(rel.parentTable, "id", fkValues);
+      const parentMap = new Map<any, Row>(parentRows.map((r) => [r.id, r]));
+
+      return records.map((r) => ({
+        ...r,
+        [rel.as]: parentMap.get(r[rel.fk!]) ?? null,
+      }));
+    } else if (rel.type === "has_many") {
+      // has_many: records(parent)의 id 값 수집 → 배치 로드
+      const parentIds = [...new Set(records.map((r) => r.id))];
+      const childRows = this.batchLoad(rel.childTable, rel.fk!, parentIds);
+
+      // parentId → childRows[] 매핑
+      const childMap = new Map<any, Row[]>();
+      for (const child of childRows) {
+        const key = child[rel.fk!];
+        if (!childMap.has(key)) childMap.set(key, []);
+        childMap.get(key)!.push(child);
+      }
+
+      return records.map((r) => ({
+        ...r,
+        [rel.as]: childMap.get(r.id) ?? [],
+      }));
+    } else if (rel.type === "has_one") {
+      // has_one: records(parent)의 id 값 수집 → 배치 로드 (하나씩)
+      const parentIds = [...new Set(records.map((r) => r.id))];
+      const childRows = this.batchLoad(rel.childTable, rel.fk!, parentIds);
+
+      // parentId → childRow 매핑 (첫 번째 것만)
+      const childMap = new Map<any, Row>();
+      for (const child of childRows) {
+        const key = child[rel.fk!];
+        if (!childMap.has(key)) childMap.set(key, child);
+      }
+
+      return records.map((r) => ({
+        ...r,
+        [rel.as]: childMap.get(r.id) ?? null,
+      }));
+    } else if (rel.type === "belongs_to_many") {
+      // belongs_to_many: junction table 통한 M:N 로드
+      const parentIds = [...new Set(records.map((r) => r.id))];
+      const junction = this.getTable(rel.junctionTable!);
+      const junctionRows = Array.from(junction.rowMap.values()).filter(
+        (r) => parentIds.includes(r[rel.foreignKey!])
+      );
+
+      const relatedIds = [...new Set(junctionRows.map((r) => r[rel.otherKey!]))];
+      const relatedRows = this.batchLoad(rel.childTable, "id", relatedIds);
+      const relatedMap = new Map<any, Row>(relatedRows.map((r) => [r.id, r]));
+
+      // parentId → relatedRows[] 매핑
+      const junctionMap = new Map<any, Row[]>();
+      for (const jr of junctionRows) {
+        const parentId = jr[rel.foreignKey!];
+        const relatedRow = relatedMap.get(jr[rel.otherKey!]);
+        if (!junctionMap.has(parentId)) junctionMap.set(parentId, []);
+        if (relatedRow) junctionMap.get(parentId)!.push(relatedRow);
+      }
+
+      return records.map((r) => ({
+        ...r,
+        [rel.as]: junctionMap.get(r.id) ?? [],
+      }));
+    } else {
+      throw new Error(`orm: unsupported relation type '${rel.type}'`);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 8. Lazy Loading (지연 로딩)
+  // ----------------------------------------------------------
+
+  /**
+   * lazyLoad: 단일 레코드의 관계를 지연 로드
+   * 예: const user = orm.lazyLoad(userRow, "profile")
+   */
+  lazyLoad(record: Row, relationName: string): Record<string, any> {
+    const rel = this.relations.find((r) => r.as === relationName);
+    if (!rel) throw new Error(`orm: relation '${relationName}' not defined`);
+
+    if (rel.type === "belongs_to") {
+      const parent = this.findById(rel.parentTable, record[rel.fk!]);
+      return { ...record, [rel.as]: parent };
+    } else if (rel.type === "has_many") {
+      const children = this.where(rel.childTable, rel.fk!, "=", record.id);
+      return { ...record, [rel.as]: children };
+    } else if (rel.type === "has_one") {
+      const children = this.where(rel.childTable, rel.fk!, "=", record.id);
+      return { ...record, [rel.as]: children.length > 0 ? children[0] : null };
+    } else if (rel.type === "belongs_to_many") {
+      const junction = this.getTable(rel.junctionTable!);
+      const junctionRows = Array.from(junction.rowMap.values()).filter(
+        (r) => r[rel.foreignKey!] === record.id
+      );
+      const relatedIds = junctionRows.map((r) => r[rel.otherKey!]);
+      const related = this.batchLoad(rel.childTable, "id", relatedIds);
+      return { ...record, [rel.as]: related };
+    } else {
+      throw new Error(`orm: unsupported relation type '${rel.type}'`);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // 9. Batch Load (N+1 방지 기반)
+  // ----------------------------------------------------------
+
+  /**
+   * 배치 로드: field IN (values) — 단일 쿼리로 여러 레코드 로드
+   * ORM Eager Loading의 핵심 연산
+   */
+  batchLoad(tableName: string, field: string, values: any[]): Row[] {
+    if (values.length === 0) return [];
+    const table = this.getTable(tableName);
+    const valueSet = new Set(values);
+    return this.rows(table).filter((r) => valueSet.has(r[field])).map((r) => ({ ...r }));
+  }
+
+  // ----------------------------------------------------------
+  // 9. 트랜잭션
+  // ----------------------------------------------------------
+
+  /**
+   * 트랜잭션 시작: 현재 모든 테이블 상태를 스냅샷으로 저장
+   */
+  begin(): void {
+    if (this.inTx) throw new Error("orm: already in transaction");
+    const rowMaps = new Map<string, Map<number, Row>>();
+    const autoIds = new Map<string, number>();
+    for (const [name, table] of this.tables) {
+      // 깊은 복사: 각 row를 스프레드로 복제
+      const copy = new Map<number, Row>();
+      for (const [id, row] of table.rowMap) copy.set(id, { ...row });
+      rowMaps.set(name, copy);
+      autoIds.set(name, table.autoId);
+    }
+    this.txSnapshot = { rowMaps, autoIds };
+    this.inTx = true;
+  }
+
+  /**
+   * 커밋: 변경 사항 확정, 스냅샷 삭제
+   */
+  commit(): void {
+    if (!this.inTx) throw new Error("orm: not in transaction");
+    this.txSnapshot = null;
+    this.inTx = false;
+  }
+
+  /**
+   * 롤백: 스냅샷으로 모든 테이블 복원
+   */
+  rollback(): void {
+    if (!this.inTx) throw new Error("orm: not in transaction");
+    if (this.txSnapshot) {
+      for (const [name, savedRowMap] of this.txSnapshot.rowMaps) {
+        const table = this.tables.get(name);
+        if (!table) continue;
+        table.rowMap = savedRowMap;
+        table.autoId = this.txSnapshot.autoIds.get(name) ?? 1;
+      }
+    }
+    this.txSnapshot = null;
+    this.inTx = false;
+  }
+
+  get isInTransaction(): boolean {
+    return this.inTx;
+  }
+
+  // ----------------------------------------------------------
+  // 10. Bulk Insert (스트레스 테스트 / 성능용)
+  // ----------------------------------------------------------
+
+  /**
+   * 대량 삽입: 단일 루프로 N개 레코드 한번에 삽입
+   */
+  bulkInsert(tableName: string, records: Record<string, any>[]): Row[] {
+    const table = this.getTable(tableName);
+    const result: Row[] = [];
+    for (const data of records) {
+      const row: Row = { id: table.autoId++, ...data };
+      table.rowMap.set(row.id, row);
+      result.push({ ...row });
+    }
+    return result;
+  }
+
+  // ----------------------------------------------------------
+  // 11. 유틸
+  // ----------------------------------------------------------
+
+  tableNames(): string[] {
+    return [...this.tables.keys()];
+  }
+
+  stats(tableName: string): { table: string; rows: number; relations: string[] } {
+    const table = this.getTable(tableName);
+    const rels = this.relations
+      .filter((r) => r.childTable === tableName || r.parentTable === tableName)
+      .map((r) => `${r.type}(${r.as})`);
+    return { table: tableName, rows: table.rowMap.size, relations: rels };
+  }
+
+  /** 테이블 전체 초기화 (테스트용) */
+  truncate(tableName: string): void {
+    const table = this.getTable(tableName);
+    table.rowMap = new Map();
+    table.autoId = 1;
+  }
+}
+
+// ============================================================
+// 🆕 ORM Factory Namespace Object (Phase 3.1)
+// ============================================================
+
+/**
+ * ORM Factory — ORMEngine 인스턴스 생성 및 유틸리티
+ * 각 호출마다 새로운 독립적인 ORM 인스턴스 생성
+ */
+export const ORM = {
+  /**
+   * 새로운 ORM 인스턴스 생성
+   * @returns 독립적인 ORMEngine 인스턴스
+   */
+  create: (): ORMEngine => new ORMEngine(),
+} as const;

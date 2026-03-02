@@ -1,0 +1,406 @@
+// ============================================================================
+// 평가기 (Evaluator): 트리 워킹 인터프리터의 핵심
+// ============================================================================
+// AST의 노드를 재귀적으로 순회하며 실제 값으로 평가합니다.
+
+use crate::ast::{Expression, Statement, Program, InfixOp, PrefixOp};
+use crate::object::{GogsObject, TRUE, FALSE, NULL};
+use crate::environment::Environment;
+use std::rc::Rc;
+use std::cell::RefCell;
+
+/// 평가기: AST를 실행하고 결과를 반환합니다.
+pub struct Evaluator {
+    /// 현재 실행 환경 (변수 저장소)
+    pub env: Rc<RefCell<Environment>>,
+}
+
+impl Evaluator {
+    /// 새로운 평가기 생성
+    pub fn new() -> Self {
+        Evaluator {
+            env: Rc::new(RefCell::new(Environment::new())),
+        }
+    }
+
+    /// 특정 환경으로 평가기 생성
+    pub fn with_env(env: Rc<RefCell<Environment>>) -> Self {
+        Evaluator { env }
+    }
+
+    /// 프로그램 평가 (메인 진입점)
+    pub fn eval_program(&mut self, program: Program) -> GogsObject {
+        let mut result = NULL;
+
+        for statement in program.statements {
+            result = self.eval_statement(&statement);
+
+            // Return 문을 만나면 즉시 반환
+            if let GogsObject::ReturnValue(_) = result {
+                return result.unwrap_return_value();
+            }
+
+            // Error를 만나면 즉시 반환
+            if result.is_error() {
+                return result;
+            }
+        }
+
+        result
+    }
+
+    /// 문장 평가
+    pub fn eval_statement(&mut self, statement: &Statement) -> GogsObject {
+        match statement {
+            Statement::Let { name, value } => {
+                let val = self.eval_expression(value);
+                if val.is_error() {
+                    return val;
+                }
+                self.env.borrow_mut().set(name.clone(), val.clone());
+                val
+            }
+
+            Statement::Expression(expr) => self.eval_expression(expr),
+
+            Statement::Return(expr) => {
+                let val = self.eval_expression(expr);
+                if val.is_error() {
+                    return val;
+                }
+                GogsObject::ReturnValue(Box::new(val))
+            }
+
+            Statement::Block(statements) => {
+                let mut result = NULL;
+                for stmt in statements {
+                    result = self.eval_statement(stmt);
+
+                    // Return을 만나면 블록을 탈출
+                    if let GogsObject::ReturnValue(_) = result {
+                        return result;
+                    }
+
+                    // Error를 만나면 블록을 탈출
+                    if result.is_error() {
+                        return result;
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    /// 표현식 평가 (핵심 로직)
+    pub fn eval_expression(&mut self, expr: &Expression) -> GogsObject {
+        match expr {
+            // 정수 리터럴: 42
+            Expression::IntegerLiteral(value) => GogsObject::Integer(*value),
+
+            // 불리언 리터럴: true, false
+            Expression::BooleanLiteral(value) => {
+                if *value {
+                    TRUE
+                } else {
+                    FALSE
+                }
+            }
+
+            // 문자열 리터럴: "hello"
+            Expression::StringLiteral(value) => GogsObject::String(value.clone()),
+
+            // 식별자: x, y, foo
+            Expression::Identifier(name) => {
+                match self.env.borrow().get(name) {
+                    Some(value) => value,
+                    None => GogsObject::Error(format!("Undefined variable: {}", name)),
+                }
+            }
+
+            // 단항 연산: -5, !true
+            Expression::Prefix { operator, operand } => {
+                let operand_val = self.eval_expression(operand);
+                if operand_val.is_error() {
+                    return operand_val;
+                }
+                self.eval_prefix_expression(operator, operand_val)
+            }
+
+            // 이항 연산: 5 + 10, x > y
+            Expression::Infix { left, operator, right } => {
+                let left_val = self.eval_expression(left);
+                if left_val.is_error() {
+                    return left_val;
+                }
+
+                let right_val = self.eval_expression(right);
+                if right_val.is_error() {
+                    return right_val;
+                }
+
+                self.eval_infix_expression(left_val, operator, right_val)
+            }
+
+            // 조건식: if condition { consequence } else { alternative }
+            Expression::If { condition, consequence, alternative } => {
+                let condition_val = self.eval_expression(condition);
+                if condition_val.is_error() {
+                    return condition_val;
+                }
+
+                if condition_val.is_truthy() {
+                    self.eval_statement(consequence)
+                } else if let Some(alt) = alternative {
+                    self.eval_statement(alt)
+                } else {
+                    NULL
+                }
+            }
+
+            // 함수 리터럴: fn(x, y) { x + y }
+            Expression::FunctionLiteral { parameters, body } => {
+                GogsObject::Function {
+                    parameters: parameters.clone(),
+                    body: body.clone(),
+                    env: self.env.clone(),
+                }
+            }
+
+            // 함수 호출: add(1, 2)
+            Expression::Call { function, arguments } => {
+                let func = self.eval_expression(function);
+                if func.is_error() {
+                    return func;
+                }
+
+                let mut args = Vec::new();
+                for arg in arguments {
+                    let arg_val = self.eval_expression(arg);
+                    if arg_val.is_error() {
+                        return arg_val;
+                    }
+                    args.push(arg_val);
+                }
+
+                self.eval_function_call(func, args)
+            }
+
+            // 배열 리터럴: [1, 2, 3]
+            Expression::ArrayLiteral(elements) => {
+                let mut arr = Vec::new();
+                for elem in elements {
+                    let val = self.eval_expression(elem);
+                    if val.is_error() {
+                        return val;
+                    }
+                    arr.push(val);
+                }
+                GogsObject::Array(arr)
+            }
+
+            // 배열 인덱싱: arr[0]
+            Expression::Index { left, index } => {
+                let left_val = self.eval_expression(left);
+                if left_val.is_error() {
+                    return left_val;
+                }
+
+                let index_val = self.eval_expression(index);
+                if index_val.is_error() {
+                    return index_val;
+                }
+
+                self.eval_index_expression(left_val, index_val)
+            }
+
+            // 해시 맵 리터럴: {"name": "Alice"}
+            Expression::HashLiteral(pairs) => {
+                let mut hash = std::collections::HashMap::new();
+                for (key, val_expr) in pairs {
+                    let val = self.eval_expression(val_expr);
+                    if val.is_error() {
+                        return val;
+                    }
+                    hash.insert(key.clone(), val);
+                }
+                GogsObject::HashMap(Rc::new(RefCell::new(hash)))
+            }
+
+            // Null
+            Expression::Null => NULL,
+        }
+    }
+
+    /// 단항 연산 평가
+    fn eval_prefix_expression(&self, operator: &PrefixOp, operand: GogsObject) -> GogsObject {
+        match operator {
+            PrefixOp::Bang => {
+                // 논리 부정
+                GogsObject::Boolean(!operand.is_truthy())
+            }
+            PrefixOp::Minus => {
+                // 음수
+                match operand {
+                    GogsObject::Integer(n) => GogsObject::Integer(-n),
+                    _ => GogsObject::Error(format!(
+                        "Unknown prefix operator: -{} (type: {})",
+                        operand,
+                        operand.type_name()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// 이항 연산 평가
+    fn eval_infix_expression(
+        &self,
+        left: GogsObject,
+        operator: &InfixOp,
+        right: GogsObject,
+    ) -> GogsObject {
+        match (&left, &right) {
+            // 정수 + 정수
+            (GogsObject::Integer(l), GogsObject::Integer(r)) => {
+                self.eval_integer_infix_expression(*l, operator, *r)
+            }
+
+            // 문자열 + 문자열 (연결)
+            (GogsObject::String(l), GogsObject::String(r)) => {
+                match operator {
+                    InfixOp::Plus => GogsObject::String(format!("{}{}", l, r)),
+                    _ => GogsObject::Error(format!(
+                        "Unknown operator: {} {} {}",
+                        left, operator, right
+                    )),
+                }
+            }
+
+            // 비교 연산
+            _ => self.eval_comparison(left, operator, right),
+        }
+    }
+
+    /// 정수 이항 연산 평가
+    fn eval_integer_infix_expression(
+        &self,
+        left: i64,
+        operator: &InfixOp,
+        right: i64,
+    ) -> GogsObject {
+        match operator {
+            InfixOp::Plus => GogsObject::Integer(left + right),
+            InfixOp::Minus => GogsObject::Integer(left - right),
+            InfixOp::Asterisk => GogsObject::Integer(left * right),
+            InfixOp::Slash => {
+                if right == 0 {
+                    GogsObject::Error("Division by zero".to_string())
+                } else {
+                    GogsObject::Integer(left / right)
+                }
+            }
+            InfixOp::Modulo => {
+                if right == 0 {
+                    GogsObject::Error("Modulo by zero".to_string())
+                } else {
+                    GogsObject::Integer(left % right)
+                }
+            }
+            InfixOp::Less => GogsObject::Boolean(left < right),
+            InfixOp::Greater => GogsObject::Boolean(left > right),
+            InfixOp::LessEqual => GogsObject::Boolean(left <= right),
+            InfixOp::GreaterEqual => GogsObject::Boolean(left >= right),
+            InfixOp::Equal => GogsObject::Boolean(left == right),
+            InfixOp::NotEqual => GogsObject::Boolean(left != right),
+            _ => GogsObject::Error(format!(
+                "Unknown operator: INTEGER {} INTEGER",
+                operator
+            )),
+        }
+    }
+
+    /// 비교 연산 평가
+    fn eval_comparison(
+        &self,
+        left: GogsObject,
+        operator: &InfixOp,
+        right: GogsObject,
+    ) -> GogsObject {
+        match operator {
+            InfixOp::Equal => GogsObject::Boolean(left == right),
+            InfixOp::NotEqual => GogsObject::Boolean(left != right),
+            _ => GogsObject::Error(format!(
+                "Type mismatch: {} {} {}",
+                left.type_name(),
+                operator,
+                right.type_name()
+            )),
+        }
+    }
+
+    /// 함수 호출 평가
+    fn eval_function_call(&mut self, function: GogsObject, arguments: Vec<GogsObject>) -> GogsObject {
+        match function {
+            GogsObject::Function { parameters, body, env } => {
+                // 매개변수 개수 확인
+                if parameters.len() != arguments.len() {
+                    return GogsObject::Error(format!(
+                        "Function expects {} arguments, got {}",
+                        parameters.len(),
+                        arguments.len()
+                    ));
+                }
+
+                // 새로운 함수 스코프 환경 생성
+                let mut func_env = Environment::with_outer(env);
+
+                // 매개변수를 함수 환경에 바인딩
+                for (param, arg) in parameters.iter().zip(arguments.iter()) {
+                    func_env.set(param.clone(), arg.clone());
+                }
+
+                // 함수 본체를 새로운 환경에서 실행
+                let mut func_evaluator = Evaluator::with_env(Rc::new(RefCell::new(func_env)));
+                let result = func_evaluator.eval_statement(&body);
+
+                // 반환값 언래핑
+                result.unwrap_return_value()
+            }
+
+            _ => GogsObject::Error(format!("Not a function: {}", function.type_name())),
+        }
+    }
+
+    /// 배열 인덱싱 평가
+    fn eval_index_expression(&self, left: GogsObject, index: GogsObject) -> GogsObject {
+        match (&left, &index) {
+            (GogsObject::Array(arr), GogsObject::Integer(idx)) => {
+                let idx = *idx as usize;
+                if idx < arr.len() {
+                    arr[idx].clone()
+                } else {
+                    GogsObject::Error("Array index out of bounds".to_string())
+                }
+            }
+
+            (GogsObject::HashMap(hash), GogsObject::String(key)) => {
+                match hash.borrow().get(key) {
+                    Some(value) => value.clone(),
+                    None => NULL,
+                }
+            }
+
+            _ => GogsObject::Error(format!(
+                "Index not supported: {}[{}]",
+                left.type_name(),
+                index.type_name()
+            )),
+        }
+    }
+}
+
+impl Default for Evaluator {
+    fn default() -> Self {
+        Self::new()
+    }
+}

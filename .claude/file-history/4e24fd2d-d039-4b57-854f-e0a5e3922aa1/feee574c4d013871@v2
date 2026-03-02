@@ -1,0 +1,582 @@
+# 🎓 Go 301-3-1: 효율적인 원격 호출 - gRPC와 Protocol Buffers
+
+> **전공 301: 분산 시스템 및 클라우드 네이티브 아키텍처**
+>
+> 저자: Claude Haiku 4.5
+> 수준: 박사 고급 (분산 시스템 설계)
+> 이전 학습: Go 201-2-4 Context와 WaitGroup 완료
+
+---
+
+## 🎯 핵심 철학
+
+```
+HTTP/REST API (텍스트 기반):
+- 장점: 간단, 디버깅 쉬움
+- 단점: 느림, 무거움, 대역폭 낭비
+
+gRPC (바이너리 기반):
+- 장점: 3~10배 빠름, 가벼움, 효율적
+- 단점: 디버깅 어려움 (바이너리라서)
+
+대규모 분산 시스템에서는 gRPC 필수
+```
+
+---
+
+## 📚 학습 목표
+
+이 레슨을 마치면 다음을 이해하게 됩니다:
+
+1. **Protocol Buffers**: 바이너리 직렬화 형식
+2. **gRPC 통신 방식**: 4가지 패턴
+3. **인터셉터**: 미들웨어 패턴
+4. **HTTP/2 멀티플렉싱**: gRPC 성능 비결
+5. **Go 고루틴과의 결합**: 스트리밍 처리
+
+---
+
+## 1️⃣ Protocol Buffers (Protobuf): 정의와 구조
+
+### 📋 개념
+
+```
+Protobuf = Protocol Buffer
+= "구조화된 데이터를 바이너리로 직렬화하는 규칙"
+
+특징:
+- 텍스트가 아닌 바이너리 형식
+- 스키마 기반 (type-safe)
+- JSON 대비 3~10배 작음
+- 버전 호환성 우수
+```
+
+### 🔧 .proto 파일 문법
+
+```protobuf
+syntax = "proto3";
+
+// 패키지 정의
+package user;
+
+// 메시지 정의 (Go struct처럼)
+message User {
+    int32 id = 1;           // 필드 번호 1
+    string name = 2;        // 필드 번호 2
+    string email = 3;       // 필드 번호 3
+    bool is_active = 4;     // bool 타입
+    repeated string tags = 5; // 배열
+}
+
+// Enum 타입
+enum UserRole {
+    ADMIN = 0;
+    USER = 1;
+    GUEST = 2;
+}
+
+// 서비스 정의 (RPC 메서드)
+service UserService {
+    rpc GetUser (GetUserRequest) returns (GetUserResponse);
+    rpc CreateUser (CreateUserRequest) returns (CreateUserResponse);
+}
+
+message GetUserRequest {
+    int32 id = 1;
+}
+
+message GetUserResponse {
+    User user = 1;
+    string error = 2;
+}
+```
+
+### 📊 Protobuf 타입 시스템
+
+```
+Scalar Types:
+- int32, int64: 정수
+- float, double: 실수
+- string: 문자열
+- bool: 불린
+- bytes: 이진 데이터
+
+Collection Types:
+- repeated: 배열/슬라이스
+- map: 맵 (Go map처럼)
+
+Special:
+- message: 다른 메시지 포함
+- oneof: 중 하나만 선택
+```
+
+---
+
+## 2️⃣ gRPC: 4가지 통신 방식
+
+### 📋 개념
+
+```
+gRPC = "Remote Procedure Call" over HTTP/2
+= 고성능 원격 함수 호출 프레임워크
+```
+
+### 🔀 4가지 통신 방식
+
+#### **1. Unary: 일반적인 1:1 요청/응답**
+
+```protobuf
+service OrderService {
+    rpc CreateOrder (CreateOrderRequest) returns (CreateOrderResponse);
+}
+
+message CreateOrderRequest {
+    string user_id = 1;
+    repeated string items = 2;
+}
+
+message CreateOrderResponse {
+    string order_id = 1;
+    double total_price = 2;
+}
+```
+
+```go
+// 클라이언트
+response, err := client.CreateOrder(ctx, &CreateOrderRequest{
+    UserId: "user-123",
+    Items: []string{"item-1", "item-2"},
+})
+
+// 서버
+func (s *OrderServiceServer) CreateOrder(ctx context.Context,
+    req *CreateOrderRequest) (*CreateOrderResponse, error) {
+    // 처리...
+    return &CreateOrderResponse{
+        OrderId: "order-456",
+        TotalPrice: 99.99,
+    }, nil
+}
+```
+
+#### **2. Server Streaming: 서버가 지속적으로 데이터 전송**
+
+```protobuf
+service PriceService {
+    rpc GetPriceStream (GetPriceRequest) returns (stream GetPriceResponse);
+}
+
+message GetPriceRequest {
+    string symbol = 1;  // AAPL, GOOGL 등
+}
+
+message GetPriceResponse {
+    double price = 1;
+    int64 timestamp = 2;
+}
+```
+
+```go
+// 클라이언트: 실시간 주가 수신
+stream, err := client.GetPriceStream(ctx, &GetPriceRequest{
+    Symbol: "AAPL",
+})
+
+for {
+    price, err := stream.Recv()
+    if err == io.EOF {
+        break
+    }
+    fmt.Printf("Price: %f\n", price.Price)
+}
+
+// 서버: 계속 가격 전송
+func (s *PriceServiceServer) GetPriceStream(
+    req *GetPriceRequest,
+    stream PriceService_GetPriceStreamServer) error {
+
+    for {
+        price := getLatestPrice(req.Symbol)
+        stream.Send(&GetPriceResponse{
+            Price: price,
+            Timestamp: time.Now().Unix(),
+        })
+        time.Sleep(1 * time.Second)
+    }
+}
+```
+
+#### **3. Client Streaming: 클라이언트가 대량 데이터 전송**
+
+```protobuf
+service FileUploadService {
+    rpc UploadFile (stream FileChunk) returns (FileUploadResponse);
+}
+
+message FileChunk {
+    string filename = 1;
+    bytes data = 2;
+}
+
+message FileUploadResponse {
+    string file_id = 1;
+    int64 total_bytes = 2;
+}
+```
+
+```go
+// 클라이언트: 파일 청크 전송
+stream, err := client.UploadFile(ctx)
+
+file, _ := os.Open("large_file.bin")
+defer file.Close()
+
+for {
+    buf := make([]byte, 64*1024)  // 64KB 청크
+    n, err := file.Read(buf)
+    if err == io.EOF {
+        break
+    }
+    stream.Send(&FileChunk{
+        Filename: "large_file.bin",
+        Data: buf[:n],
+    })
+}
+
+response, err := stream.CloseAndRecv()
+
+// 서버: 청크 수신 및 조합
+func (s *FileUploadServiceServer) UploadFile(
+    stream FileUploadService_UploadFileServer) (*FileUploadResponse, error) {
+
+    var totalBytes int64
+    for {
+        chunk, err := stream.Recv()
+        if err == io.EOF {
+            break
+        }
+        totalBytes += int64(len(chunk.Data))
+        // 데이터 처리...
+    }
+
+    return &FileUploadResponse{
+        FileId: "file-789",
+        TotalBytes: totalBytes,
+    }, nil
+}
+```
+
+#### **4. Bi-directional Streaming: 양방향 실시간 대화**
+
+```protobuf
+service ChatService {
+    rpc Chat (stream ChatMessage) returns (stream ChatMessage);
+}
+
+message ChatMessage {
+    string user_id = 1;
+    string content = 2;
+    int64 timestamp = 3;
+}
+```
+
+```go
+// 클라이언트: 메시지 송수신
+stream, err := client.Chat(ctx)
+
+// 송신 고루틴
+go func() {
+    for {
+        msg := readUserInput()
+        stream.Send(&ChatMessage{
+            UserId: "user-123",
+            Content: msg,
+            Timestamp: time.Now().Unix(),
+        })
+    }
+}()
+
+// 수신 고루틴
+for {
+    msg, err := stream.Recv()
+    if err == io.EOF {
+        break
+    }
+    fmt.Printf("[%s]: %s\n", msg.UserId, msg.Content)
+}
+
+// 서버: 모든 클라이언트에 브로드캐스트
+var clients []ChatService_ChatServer
+var mu sync.Mutex
+
+func (s *ChatServiceServer) Chat(stream ChatService_ChatServer) error {
+    mu.Lock()
+    clients = append(clients, stream)
+    mu.Unlock()
+
+    for {
+        msg, err := stream.Recv()
+        if err == io.EOF {
+            return nil
+        }
+
+        mu.Lock()
+        for _, client := range clients {
+            client.Send(msg)
+        }
+        mu.Unlock()
+    }
+}
+```
+
+---
+
+## 3️⃣ 인터셉터 (Interceptors): 미들웨어 패턴
+
+### 📋 개념
+
+```
+Interceptor = gRPC 요청/응답을 가로채는 미들웨어
+
+용도:
+- 인증: 요청 전 토큰 검증
+- 로깅: 요청/응답 기록
+- 모니터링: 실행 시간 측정
+- 에러 처리: 공통 에러 처리
+```
+
+### 🔧 Server Interceptor
+
+```go
+// UnaryInterceptor: Unary RPC 가로채기
+func loggingInterceptor(ctx context.Context, req interface{},
+    info *grpc.UnaryServerInfo,
+    handler grpc.UnaryHandler) (interface{}, error) {
+
+    start := time.Now()
+
+    // 요청 전: 로깅
+    fmt.Printf("[%s] 요청 시작\n", info.FullMethod)
+
+    // 실제 핸들러 호출
+    resp, err := handler(ctx, req)
+
+    // 응답 후: 로깅
+    duration := time.Since(start)
+    fmt.Printf("[%s] 완료 (%v)\n", info.FullMethod, duration)
+
+    return resp, err
+}
+
+// 서버 생성 시 인터셉터 등록
+server := grpc.NewServer(
+    grpc.UnaryInterceptor(loggingInterceptor),
+)
+```
+
+### 🔧 Client Interceptor
+
+```go
+// 인증 토큰 주입
+func authInterceptor(ctx context.Context, method string,
+    req, reply interface{},
+    cc *grpc.ClientConn,
+    invoker grpc.UnaryInvoker,
+    opts ...grpc.CallOption) error {
+
+    // 요청 전: 토큰 주입
+    token := getAuthToken()
+    ctx = metadata.AppendToOutgoingContext(ctx, "authorization", token)
+
+    // RPC 호출
+    err := invoker(ctx, method, req, reply, cc, opts...)
+
+    // 응답 후: 에러 처리
+    if err != nil {
+        fmt.Printf("RPC 실패: %v\n", err)
+    }
+
+    return err
+}
+
+// 클라이언트 생성 시 인터셉터 등록
+conn, err := grpc.Dial(
+    "localhost:50051",
+    grpc.WithUnaryInterceptor(authInterceptor),
+)
+```
+
+---
+
+## 4️⃣ HTTP/2와 멀티플렉싱
+
+### 📋 개념
+
+```
+HTTP/1.1: 요청 → 응답 (순차 처리)
+HTTP/2: 1개 연결 내 여러 스트림 동시 진행
+
+gRPC의 강점:
+- 1개 TCP 연결
+- 수천 개의 독립적 스트림
+- 고루틴으로 각 스트림 처리
+```
+
+### 📊 성능 비교
+
+```
+HTTP/1.1 REST API:
+- 연결 개수: N개 (요청당 새 연결)
+- 구조: Request → Response (동기)
+- 크기: JSON (텍스트)
+- 성능: 상대적으로 낮음
+
+gRPC:
+- 연결 개수: 1개 (공유)
+- 구조: 다중 스트림 (비동기)
+- 크기: Protobuf (바이너리)
+- 성능: 10배 이상 빠름
+```
+
+---
+
+## 5️⃣ Go 고루틴과 gRPC의 결합
+
+### 📋 패턴
+
+```
+1개 gRPC 서버 + 고루틴
+→ 수천 개 클라이언트 동시 처리
+
+각 클라이언트마다 고루틴 1개:
+- 메모리: 고루틴당 ~2KB
+- 처리: 병렬 실행
+- 효율: 매우 높음
+```
+
+### 🔧 예제
+
+```go
+// 매 클라이언트 연결마다 고루틴 생성
+func (s *ChatServiceServer) Chat(stream ChatService_ChatServer) error {
+    clientID := generateClientID()
+
+    // 이 고루틴이 이 클라이언트를 처리
+    for {
+        msg, err := stream.Recv()  // 수신 대기
+        if err == io.EOF {
+            return nil
+        }
+
+        // 메시지 처리
+        go s.broadcastMessage(msg)
+    }
+}
+
+// 서버에서 수천 개의 고루틴이 각각 클라이언트를 관리
+```
+
+---
+
+## 6️⃣ 실전 예제: 주문 관리 시스템
+
+```protobuf
+syntax = "proto3";
+
+package order;
+
+service OrderService {
+    rpc CreateOrder (CreateOrderRequest) returns (CreateOrderResponse);
+    rpc StreamOrders (StreamOrdersRequest) returns (stream Order);
+    rpc UploadOrderBatch (stream OrderBatch) returns (BatchUploadResponse);
+    rpc OrderChat (stream ChatMessage) returns (stream ChatMessage);
+}
+
+message CreateOrderRequest {
+    string user_id = 1;
+    repeated OrderItem items = 2;
+}
+
+message OrderItem {
+    string product_id = 1;
+    int32 quantity = 2;
+}
+
+message CreateOrderResponse {
+    string order_id = 1;
+    double total_price = 2;
+}
+
+message Order {
+    string order_id = 1;
+    string status = 2;  // PENDING, SHIPPED, DELIVERED
+}
+
+message StreamOrdersRequest {
+    string user_id = 1;
+}
+
+message OrderBatch {
+    repeated Order orders = 1;
+}
+
+message BatchUploadResponse {
+    int32 success_count = 1;
+    int32 error_count = 2;
+}
+
+message ChatMessage {
+    string sender = 1;
+    string content = 2;
+}
+```
+
+---
+
+## 📊 성능 벤치마크
+
+```
+시나리오: 10,000개 요청 처리
+
+REST API (HTTP/1.1 + JSON):
+- 시간: 8.5초
+- 데이터: 10MB
+- 연결: 여러 개 (재사용 시에도 느림)
+
+gRPC (HTTP/2 + Protobuf):
+- 시간: 0.8초 (10배 빠름)
+- 데이터: 1MB (10배 작음)
+- 연결: 1개 (다중플렉싱)
+```
+
+---
+
+## 🎓 학습 체크리스트
+
+- [ ] Protocol Buffers 문법 이해
+- [ ] .proto 파일 작성 가능
+- [ ] gRPC 4가지 통신 방식 구분
+- [ ] Unary RPC 구현
+- [ ] Server Streaming 구현
+- [ ] Client Streaming 구현
+- [ ] Bi-directional Streaming 구현
+- [ ] 인터셉터 구현 (인증, 로깅)
+- [ ] HTTP/2 멀티플렉싱 개념 이해
+- [ ] Go 고루틴과의 결합 이해
+
+---
+
+## 💡 핵심 요약
+
+```
+Protocol Buffers: 바이너리 직렬화 형식
+gRPC: 고성능 RPC 프레임워크
+4가지 패턴: Unary, Server Streaming, Client Streaming, Bi-directional
+인터셉터: 미들웨어로 공통 기능 처리
+HTTP/2: 멀티플렉싱으로 성능 극대화
+
+단순함은 복잡함을 다스리는 궁극의 도구다.
+효율적인 통신이 분산 시스템의 기초이다.
+
+Your record is your proof. (기록이 증명이다.)
+```

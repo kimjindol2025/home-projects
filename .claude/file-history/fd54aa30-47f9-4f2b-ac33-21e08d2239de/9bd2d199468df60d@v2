@@ -1,0 +1,514 @@
+#!/usr/bin/env node
+
+/**
+ * 저장소 전수검사 - 특이점 감지 분석
+ *
+ * 54개 저장소를 분석하여:
+ * - 파일 수 이상
+ * - 언어 구성 이상
+ * - 위험도 이상
+ * - 구조 이상
+ * - 의존성 이상
+ */
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+class AnomalyDetector {
+  constructor() {
+    this.dbDir = path.join(__dirname, "db");
+    this.repos = this.loadAllRepos();
+  }
+
+  loadAllRepos() {
+    const repos = [];
+    const files = fs.readdirSync(this.dbDir);
+
+    for (const file of files) {
+      if (file.endsWith(".json") && file !== "repos.json") {
+        const repoName = file.replace(".json", "");
+        const filePath = path.join(this.dbDir, file);
+        try {
+          const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+          repos.push(data);
+        } catch (e) {
+          console.warn(`⚠️ ${file} 파싱 실패`);
+        }
+      }
+    }
+
+    return repos;
+  }
+
+  /**
+   * 통계 계산
+   */
+  calculateStats() {
+    const files = this.repos.map((r) => r.files || 0);
+    const apis = this.repos.map((r) => r.summary?.publicAPI?.length || 0);
+    const deps = this.repos.map((r) => r.summary?.externalDeps?.length || 0);
+
+    return {
+      files: this.getStatistics(files),
+      apis: this.getStatistics(apis),
+      deps: this.getStatistics(deps)
+    };
+  }
+
+  getStatistics(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const median = sorted[Math.floor(sorted.length / 2)];
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const std = Math.sqrt(
+      values.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) /
+        values.length
+    );
+
+    return { mean, median, min, max, std };
+  }
+
+  /**
+   * 파일 수 이상 감지
+   */
+  detectFileSizeAnomalies() {
+    const stats = this.calculateStats();
+    const anomalies = [];
+
+    for (const repo of this.repos) {
+      const files = repo.files || 0;
+      const zScore = Math.abs((files - stats.files.mean) / stats.files.std);
+
+      // Z-score > 3 (이상치로 간주)
+      if (zScore > 2.5 || files < 5 || files > 3000) {
+        anomalies.push({
+          repo: repo.name,
+          files,
+          mean: Math.round(stats.files.mean),
+          zScore: zScore.toFixed(2),
+          category: files > stats.files.mean + 2 * stats.files.std ? "거대 저장소" :
+                   files < stats.files.mean - 2 * stats.files.std ? "소형 저장소" :
+                   files < 5 ? "매우 작음" : "일반"
+        });
+      }
+    }
+
+    return anomalies.sort((a, b) => parseFloat(b.zScore) - parseFloat(a.zScore));
+  }
+
+  /**
+   * 언어 구성 이상 감지
+   */
+  detectLanguageAnomalies() {
+    const anomalies = [];
+
+    for (const repo of this.repos) {
+      const metadata = repo.metadata || {};
+      const languages = metadata.languages || {};
+      const totalFiles = repo.files || 0;
+
+      if (totalFiles === 0) continue;
+
+      const langArray = Object.entries(languages);
+
+      // 단일 언어만 사용
+      if (langArray.length === 1) {
+        const [lang, count] = langArray[0];
+        anomalies.push({
+          repo: repo.name,
+          type: "단일 언어",
+          language: lang,
+          count,
+          percentage: ((count / totalFiles) * 100).toFixed(1),
+          note: "단일 언어만 사용"
+        });
+      }
+
+      // 너무 많은 언어 사용
+      if (langArray.length >= 5) {
+        anomalies.push({
+          repo: repo.name,
+          type: "다중 언어",
+          languages: langArray.length,
+          detail: langArray.map((l) => `${l[0]}(${l[1]})`).join(", "),
+          note: "5개 이상의 언어 혼합"
+        });
+      }
+
+      // 언어 비율 이상
+      const ratios = langArray.map(([lang, count]) => ({
+        language: lang,
+        ratio: (count / totalFiles) * 100
+      }));
+
+      const maxRatio = Math.max(...ratios.map((r) => r.ratio));
+      if (maxRatio > 95) {
+        anomalies.push({
+          repo: repo.name,
+          type: "언어 불균형",
+          dominant: ratios.find((r) => r.ratio === maxRatio).language,
+          ratio: maxRatio.toFixed(1),
+          note: "한 언어가 95% 이상 차지"
+        });
+      }
+    }
+
+    return anomalies;
+  }
+
+  /**
+   * 위험도 이상 감지
+   */
+  detectRiskAnomalies() {
+    const unsafeRepos = [];
+    const ffiRepos = [];
+    const safeRepos = [];
+
+    for (const repo of this.repos) {
+      const risks = repo.summary?.risks || {};
+      const hasUnsafe = risks.unsafe || false;
+      const hasFfi = risks.ffi || false;
+
+      if (hasUnsafe && hasFfi) {
+        unsafeRepos.push({
+          repo: repo.name,
+          files: repo.files,
+          risk: "CRITICAL (unsafe + FFI)",
+          recommendations: ["보안 검토 필수", "의존성 감사", "테스트 강화"]
+        });
+      } else if (hasUnsafe) {
+        unsafeRepos.push({
+          repo: repo.name,
+          files: repo.files,
+          risk: "HIGH (unsafe)",
+          recommendations: ["안전성 검증"]
+        });
+      } else if (hasFfi) {
+        ffiRepos.push({
+          repo: repo.name,
+          files: repo.files,
+          risk: "MEDIUM (FFI)",
+          recommendations: ["버전 호환성 확인"]
+        });
+      } else {
+        safeRepos.push({
+          repo: repo.name,
+          files: repo.files
+        });
+      }
+    }
+
+    return {
+      unsafe: unsafeRepos,
+      ffi: ffiRepos,
+      safe: safeRepos,
+      summary: {
+        unsafeCount: unsafeRepos.length,
+        ffiCount: ffiRepos.length,
+        safeCount: safeRepos.length
+      }
+    };
+  }
+
+  /**
+   * API 분포 이상 감지
+   */
+  detectAPIAnomalies() {
+    const stats = this.calculateStats();
+    const anomalies = [];
+
+    for (const repo of this.repos) {
+      const apiCount = repo.summary?.publicAPI?.length || 0;
+      const zScore = Math.abs((apiCount - stats.apis.mean) / stats.apis.std);
+
+      if (zScore > 2 || apiCount === 0 || apiCount > 30) {
+        anomalies.push({
+          repo: repo.name,
+          apiCount,
+          mean: Math.round(stats.apis.mean),
+          zScore: zScore.toFixed(2),
+          category:
+            apiCount === 0 ? "API 없음" :
+            apiCount > stats.apis.mean + 2 * stats.apis.std ? "과도한 API" : "기타"
+        });
+      }
+    }
+
+    return anomalies.sort((a, b) => parseFloat(b.zScore) - parseFloat(a.zScore));
+  }
+
+  /**
+   * 디렉토리 구조 이상 감지
+   */
+  detectStructureAnomalies() {
+    const anomalies = [];
+
+    for (const repo of this.repos) {
+      const structure = repo.summary?.structure || {};
+      const dirs = Object.entries(structure);
+
+      // 파일이 일부 디렉토리에만 집중
+      if (dirs.length > 0) {
+        const totalFiles = Object.values(structure).reduce((a, b) => a + b, 0);
+        const maxDir = Math.max(...Object.values(structure));
+        const concentration = (maxDir / totalFiles) * 100;
+
+        if (concentration > 80) {
+          const dirName = Object.entries(structure).find(
+            ([, count]) => count === maxDir
+          )[0];
+
+          anomalies.push({
+            repo: repo.name,
+            type: "구조 집중화",
+            concentrated: dirName,
+            percentage: concentration.toFixed(1),
+            maxFiles: maxDir,
+            note: "한 디렉토리에 파일 집중"
+          });
+        }
+      }
+
+      // 깊은 구조
+      if (dirs.length > 10) {
+        anomalies.push({
+          repo: repo.name,
+          type: "복잡한 구조",
+          directories: dirs.length,
+          detail: Object.keys(structure).join(", "),
+          note: "10개 이상의 주요 디렉토리"
+        });
+      }
+
+      // 매우 평탄한 구조
+      if (dirs.length === 0 || (dirs.length === 1 && Object.keys(structure)[0] === "src")) {
+        anomalies.push({
+          repo: repo.name,
+          type: "평탄한 구조",
+          directories: dirs.length,
+          note: "구조화되지 않음"
+        });
+      }
+    }
+
+    return anomalies;
+  }
+
+  /**
+   * 의존성 이상 감지
+   */
+  detectDependencyAnomalies() {
+    const anomalies = [];
+    const stats = this.calculateStats();
+
+    for (const repo of this.repos) {
+      const depCount = repo.summary?.externalDeps?.length || 0;
+      const zScore = Math.abs((depCount - stats.deps.mean) / stats.deps.std);
+
+      if (zScore > 2.5 || depCount > 20) {
+        anomalies.push({
+          repo: repo.name,
+          depCount,
+          mean: Math.round(stats.deps.mean),
+          zScore: zScore.toFixed(2),
+          category:
+            depCount > 20 ? "과도한 의존성" :
+            depCount === 0 ? "의존성 없음" : "기타",
+          deps: repo.summary?.externalDeps?.slice(0, 5).join(", ") || "N/A"
+        });
+      }
+    }
+
+    return anomalies.sort((a, b) => parseFloat(b.zScore) - parseFloat(a.zScore));
+  }
+
+  /**
+   * 종합 점검 리포트
+   */
+  generateReport() {
+    console.log("\n" + "=".repeat(80));
+    console.log(
+      "🔍 Gogs 저장소 전수검사 - 특이점 분석 리포트".padStart(50)
+    );
+    console.log("=".repeat(80));
+    console.log(`📊 대상: 54개 저장소, ${this.repos.length}개 분석 완료\n`);
+
+    // 1. 파일 수 이상
+    console.log("\n1️⃣  파일 수 이상 (Z-score > 2.5)");
+    console.log("-".repeat(80));
+    const fileSizeAnomalies = this.detectFileSizeAnomalies();
+    if (fileSizeAnomalies.length > 0) {
+      fileSizeAnomalies.forEach((a) => {
+        console.log(
+          `\n  ${a.repo.padEnd(30)} | ${a.files} 파일 (평균: ${a.mean}, Z: ${a.zScore})`
+        );
+        console.log(`  └─ ${a.category}`);
+      });
+    } else {
+      console.log("  ✅ 파일 수 이상 없음");
+    }
+
+    // 2. 위험도
+    console.log("\n\n2️⃣  위험도 분석");
+    console.log("-".repeat(80));
+    const riskAnomalies = this.detectRiskAnomalies();
+    console.log(
+      `  안전: ${riskAnomalies.summary.safeCount}개 ✅ | unsafe: ${riskAnomalies.summary.unsafeCount}개 ⚠️ | FFI: ${riskAnomalies.summary.ffiCount}개 ⚠️`
+    );
+
+    if (riskAnomalies.unsafe.length > 0) {
+      console.log(`\n  ⚠️  CRITICAL (unsafe 코드):`);
+      riskAnomalies.unsafe.slice(0, 5).forEach((r) => {
+        console.log(`     - ${r.repo} (${r.files} 파일)`);
+        console.log(`       → ${r.recommendations.join(", ")}`);
+      });
+    }
+
+    if (riskAnomalies.ffi.length > 0) {
+      console.log(`\n  ⚠️  FFI 의존성:`);
+      riskAnomalies.ffi.slice(0, 5).forEach((r) => {
+        console.log(`     - ${r.repo} (${r.files} 파일)`);
+      });
+    }
+
+    // 3. 언어 구성
+    console.log("\n\n3️⃣  언어 구성 이상");
+    console.log("-".repeat(80));
+    const langAnomalies = this.detectLanguageAnomalies();
+    if (langAnomalies.length > 0) {
+      const byType = {};
+      langAnomalies.forEach((a) => {
+        if (!byType[a.type]) byType[a.type] = [];
+        byType[a.type].push(a);
+      });
+
+      Object.entries(byType).forEach(([type, items]) => {
+        console.log(`\n  ${type} (${items.length}개):`);
+        items.slice(0, 3).forEach((a) => {
+          console.log(`    - ${a.repo}`);
+        });
+        if (items.length > 3) console.log(`    ... 그 외 ${items.length - 3}개`);
+      });
+    } else {
+      console.log("  ✅ 언어 구성 정상");
+    }
+
+    // 4. API 분포
+    console.log("\n\n4️⃣  API 분포 이상");
+    console.log("-".repeat(80));
+    const apiAnomalies = this.detectAPIAnomalies();
+    if (apiAnomalies.length > 0) {
+      apiAnomalies.slice(0, 5).forEach((a) => {
+        console.log(
+          `\n  ${a.repo.padEnd(30)} | API: ${a.apiCount}개 (평균: ${a.mean}, Z: ${a.zScore})`
+        );
+        console.log(`  └─ ${a.category}`);
+      });
+    } else {
+      console.log("  ✅ API 분포 정상");
+    }
+
+    // 5. 구조
+    console.log("\n\n5️⃣  디렉토리 구조 이상");
+    console.log("-".repeat(80));
+    const structAnomalies = this.detectStructureAnomalies();
+    if (structAnomalies.length > 0) {
+      const byType = {};
+      structAnomalies.forEach((a) => {
+        if (!byType[a.type]) byType[a.type] = [];
+        byType[a.type].push(a);
+      });
+
+      Object.entries(byType).forEach(([type, items]) => {
+        console.log(`\n  ${type} (${items.length}개):`);
+        items.slice(0, 3).forEach((a) => {
+          console.log(`    - ${a.repo}: ${a.note}`);
+        });
+        if (items.length > 3) console.log(`    ... 그 외 ${items.length - 3}개`);
+      });
+    } else {
+      console.log("  ✅ 구조 정상");
+    }
+
+    // 6. 의존성
+    console.log("\n\n6️⃣  의존성 이상");
+    console.log("-".repeat(80));
+    const depAnomalies = this.detectDependencyAnomalies();
+    if (depAnomalies.length > 0) {
+      depAnomalies.slice(0, 5).forEach((a) => {
+        console.log(
+          `\n  ${a.repo.padEnd(30)} | 의존성: ${a.depCount}개 (평균: ${a.mean}, Z: ${a.zScore})`
+        );
+        console.log(`  └─ ${a.category}`);
+        if (a.deps) console.log(`  └─ 예: ${a.deps}`);
+      });
+    } else {
+      console.log("  ✅ 의존성 정상");
+    }
+
+    // 7. 통계
+    console.log("\n\n7️⃣  통계 요약");
+    console.log("-".repeat(80));
+    const stats = this.calculateStats();
+    console.log(`\n  파일 수 (개):`);
+    console.log(
+      `    평균: ${Math.round(stats.files.mean)} | 중위수: ${Math.round(stats.files.median)} | 범위: ${stats.files.min}-${stats.files.max}`
+    );
+    console.log(`    표준편차: ${Math.round(stats.files.std)}`);
+
+    console.log(`\n  API 개수:`);
+    console.log(
+      `    평균: ${Math.round(stats.apis.mean)} | 중위수: ${Math.round(stats.apis.median)} | 범위: ${stats.apis.min}-${stats.apis.max}`
+    );
+    console.log(`    표준편차: ${Math.round(stats.apis.std)}`);
+
+    console.log(`\n  외부 의존성 개수:`);
+    console.log(
+      `    평균: ${Math.round(stats.deps.mean)} | 중위수: ${Math.round(stats.deps.median)} | 범위: ${stats.deps.min}-${stats.deps.max}`
+    );
+    console.log(`    표준편차: ${Math.round(stats.deps.std)}`);
+
+    console.log("\n" + "=".repeat(80));
+    console.log("✅ 검사 완료\n");
+
+    // 최종 권장사항
+    const totalAnomalies =
+      fileSizeAnomalies.length +
+      langAnomalies.length +
+      apiAnomalies.length +
+      structAnomalies.length +
+      depAnomalies.length;
+
+    console.log(`📋 발견된 이상: ${totalAnomalies}개`);
+    if (totalAnomalies === 0) {
+      console.log("  🎉 모든 저장소가 정상입니다!");
+    } else {
+      console.log("  ⚠️  우선순위 체크리스트:");
+      if (riskAnomalies.unsafe.length > 0) {
+        console.log(
+          `     1. unsafe 코드 검증 (${riskAnomalies.unsafe.length}개 저장소)`
+        );
+      }
+      if (fileSizeAnomalies.length > 0) {
+        console.log(
+          `     2. 거대 저장소 모듈화 검토 (${fileSizeAnomalies.filter((a) => a.category === "거대 저장소").length}개)`
+        );
+      }
+      if (depAnomalies.length > 0) {
+        console.log(
+          `     3. 과도한 의존성 감소 (${depAnomalies.filter((a) => a.category === "과도한 의존성").length}개)`
+        );
+      }
+    }
+
+    console.log("\n");
+  }
+}
+
+// 메인 실행
+const detector = new AnomalyDetector();
+detector.generateReport();

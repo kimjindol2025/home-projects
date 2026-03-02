@@ -1,0 +1,237 @@
+# v10: 분산 머신러닝 인프라 구현 계획
+
+## Context
+Python University Post-Doctoral(v9.4) 완료 후 다음 단계.
+v8.2(MapReduce) 분산 처리 철학을 머신러닝에 적용하여,
+표준 라이브러리만으로 선형모델 → MLP → Federated Learning 구현.
+
+## 파일 위치
+- **메인**: `university_v10_DISTRIBUTED_ML.py` (~1,350줄)
+- **테스트**: `test_v10_distributed_ml.py` (~420줄)
+
+## 참조 파일 (패턴 기준)
+- `university_v9_4_QUANTUM_INTERNET.py` — PART 0~8 구조, SECTION 1~7 main()
+- `test_v9_4_quantum_internet.py` — Group A~E 테스트 패턴
+- `university_v8_2_DISTRIBUTED_DATA_LAKE.py` — 분산 처리 철학
+
+## Import (표준 라이브러리만, Termux 호환)
+```python
+import math
+import random
+import time
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import List, Dict, Tuple, Any, Optional
+from collections import defaultdict
+```
+
+---
+
+## PART 0: Enum & Dataclass
+
+### Enum 4개
+| 이름 | 값 |
+|------|---|
+| `LayerType` | INPUT / HIDDEN / OUTPUT |
+| `ActivationType` | RELU / SIGMOID / TANH / LINEAR |
+| `OptimizerType` | SGD / MINI_BATCH / MOMENTUM |
+| `AggregationMethod` | FED_AVG / FED_PROX / WEIGHTED |
+
+### Dataclass 5개
+| 이름 | 핵심 필드 |
+|------|---------|
+| `Sample` | `features: List[float]`, `label: float`, `weight: float = 1.0` |
+| `LayerSpec` | `layer_type: LayerType`, `num_neurons: int`, `activation: ActivationType`, `dropout_rate: float = 0.0` |
+| `ModelWeights` | `weights: List[List[List[float]]]`, `biases: List[List[float]]`, `layer_specs: List[LayerSpec]`, `version: int = 0`, `client_id: str = ""` |
+| `TrainingResult` | `loss_history: List[float]`, `accuracy_history: List[float]`, `final_loss: float`, `final_accuracy: float`, `epochs_trained: int` |
+| `FederatedRound` | `round_number: int`, `num_clients: int`, `global_loss: float`, `global_accuracy: float`, `gradient_compression_ratio: float`, `client_losses: List[float]` |
+
+---
+
+## PART 1~8: 클래스 목록
+
+### PART 1: DataGenerator
+역할: 표준 라이브러리로 데이터셋 합성 생성 (numpy 불가)
+
+| 메서드 | 설명 | 핵심 수학 |
+|--------|------|---------|
+| `make_linear_regression(n, noise)` | y = 2x1 - x2 + 0.5x3 + noise | Box-Muller 정규분포 |
+| `make_binary_classification(n)` | 2-클러스터 가우시안 (labels 0/1) | 클러스터 mean=(±2,±2) |
+| `make_xor_problem(n)` | XOR 패턴 (선형 분리 불가) | noise 추가 |
+| `train_test_split(data, ratio)` | 셔플 후 ratio 분리 | - |
+| `normalize(data)` | z-score 정규화 | (x - μ) / σ |
+
+---
+
+### PART 2: LinearModel
+역할: 경사하강법 기반 선형/로지스틱 회귀
+
+| 메서드 | 설명 |
+|--------|------|
+| `predict(x)` | regression: dot+b / logistic: sigmoid(dot+b) |
+| `compute_loss(samples)` | MSE 또는 BCE |
+| `compute_gradients(samples)` | dL/dw, dL/db |
+| `fit(samples, lr, epochs)` | Full-batch GD 루프 → TrainingResult |
+| `get_weights()` | ModelWeights 반환 |
+
+핵심 수학:
+```
+sigmoid: σ(z) = 1 / (1 + e^{-z})
+MSE grad: ∂L/∂w = (2/n) X^T(Xw - y)
+갱신: w ← w - lr·∂L/∂w
+```
+
+---
+
+### PART 3: SGDOptimizer
+역할: SGD / 미니배치 / 모멘텀 최적화 + 학습률 스케줄
+
+| 메서드 | 설명 |
+|--------|------|
+| `get_mini_batches(data, batch_size)` | 셔플 후 배치 분할 |
+| `compute_batch_gradient(model, batch)` | 배치 평균 그래디언트 |
+| `step(weights, gradients, name)` | SGD/Momentum 갱신 |
+| `lr_schedule(epoch, decay=0.95)` | η_t = η_0 · γ^epoch |
+| `run_mini_batch_training(model, data, ...)` | 미니배치 학습 루프 |
+
+핵심 수학: Momentum `v_{t+1} = β·v_t + η·g`, `w -= v`
+
+---
+
+### PART 4: NeuralLayer
+역할: MLP 단일 레이어 (순전파 + 역전파 + 드롭아웃)
+
+| 메서드 | 설명 |
+|--------|------|
+| `activate(z)` | ReLU / Sigmoid / Tanh / Linear |
+| `forward(x, training)` | z = W·x + b → activate → dropout |
+| `backward(delta, x)` | dW, db, dx 계산 |
+| `apply_dropout(activations)` | Bernoulli 마스크, scale/(1-p) |
+
+핵심 수학:
+```
+He 초기화: w ~ N(0, sqrt(2/fan_in))
+역전파 델타: δ_l = (W_{l+1}^T · δ_{l+1}) ⊙ f'(z_l)
+드롭아웃: mask ~ Bernoulli(1-p), a *= mask/(1-p)
+```
+
+---
+
+### PART 5: MLPNetwork
+역할: NeuralLayer 조합 — 순전파/역전파/배치 학습
+
+| 메서드 | 설명 |
+|--------|------|
+| `forward(x, training)` | 레이어 chain forward() |
+| `backward(y_hat, y)` | 출력층→입력층 역전파 |
+| `update_weights(lr)` | 각 레이어 dW, db 갱신 |
+| `compute_loss(samples)` | MSE / BCE |
+| `fit(samples, lr, epochs, batch_size)` | 미니배치 학습 루프 → TrainingResult |
+| `predict_batch(samples)` | 전체 배치 예측 |
+
+핵심 수학: 출력층 `δ_L = (ŷ - y)·f'(z_L)`
+
+---
+
+### PART 6: GradientCompressor
+역할: FL 통신 효율화 — Top-k 희소화 + 8-bit 양자화
+
+| 메서드 | 설명 |
+|--------|------|
+| `top_k_sparsification(gradients)` | 절대값 상위 k개 → {idx: val} |
+| `quantize(gradients, bits=8)` | 실수 → 8-bit 정수 |
+| `dequantize(quantized, min, scale)` | 역양자화 |
+| `compress(gradients)` | Top-k + 양자화 → (압축, 압축률) |
+| `decompress(compressed, size)` | 희소 표현 → 전체 복원 |
+
+핵심 수학: `scale = (max-min) / (2^8 - 1)`
+
+---
+
+### PART 7: FederatedClient
+역할: 로컬 데이터 학습 → 가중치 델타 전송
+
+| 메서드 | 설명 |
+|--------|------|
+| `local_train(global_weights, lr, epochs)` | 글로벌 가중치 로드 → 로컬 학습 |
+| `get_model_delta(global_weights)` | delta = local - global |
+| `compress_update(delta)` | 그래디언트 압축 |
+| `simulate_data_heterogeneity(skew)` | Non-IID 시뮬레이션 |
+| `report_stats()` | 손실, 데이터 수 반환 |
+
+---
+
+### PART 8: FederatedServer
+역할: FedAvg 집계 → 글로벌 모델 관리
+
+| 메서드 | 설명 |
+|--------|------|
+| `broadcast_weights()` | 글로벌 가중치 배포 |
+| `aggregate_fed_avg(updates)` | FedAvg: Σ(n_k/n)·w_k |
+| `select_clients(clients, fraction)` | 클라이언트 무작위 선택 |
+| `run_round(clients, lr, local_epochs)` | 1라운드 FL → FederatedRound |
+| `evaluate_global_model(test_data)` | (loss, accuracy) |
+| `run_federation(clients, test, rounds, lr)` | 전체 FL 루프 |
+
+핵심 수학: FedAvg `w^{t+1} = Σ_{k}(n_k/n)·w_k^{t+1}`
+
+---
+
+## PART 9: main() SECTION 1~7
+
+| SECTION | 내용 |
+|---------|------|
+| 1 | 데이터 생성 & 전처리 (1000 샘플, z-score, 80/20 분리) |
+| 2 | 선형 회귀 Full-batch GD (100 에폭, RMSE 출력) |
+| 3 | 로지스틱 회귀 이진 분류 (정확도 + 혼동 행렬) |
+| 4 | SGD / 미니배치 / 모멘텀 비교 (수렴 속도 표) |
+| 5 | MLP XOR 문제 해결 (학습 전/후 + 가중치 JSON) |
+| 6 | 그래디언트 압축 데모 (90% 압축, 복원 오차) |
+| 7 | Federated Learning (5 클라이언트, 10 라운드) |
+
+---
+
+## 테스트 계획 (총 20개)
+
+| Group | 클래스 | 테스트 | 수 |
+|-------|--------|--------|---|
+| A | `TestDataGenerator` | test_01~04 | 4개 |
+| B | `TestLinearModel` | test_05~08 | 4개 |
+| C | `TestSGDOptimizer` | test_09~11 | 3개 |
+| D | `TestMLPNetwork` | test_12~15 | 4개 |
+| E | `TestFederatedLearning` | test_16~20 | 5개 |
+
+| 번호 | 검증 내용 |
+|------|---------|
+| 01 | 회귀 데이터: 1000샘플, 3특성 |
+| 02 | 분류 데이터: label ∈ {0,1}, 균형 |
+| 03 | 분리: 80/20, 누락 없음 |
+| 04 | 정규화: 평균≈0, std≈1 |
+| 05 | predict() → float |
+| 06 | 학습 후 손실 감소 |
+| 07 | logistic: 0 < output < 1 |
+| 08 | 로지스틱 정확도 > 60% |
+| 09 | batch_size=32, 경계 배치 확인 |
+| 10 | momentum v_1, v_2 검증 |
+| 11 | epoch=10: lr < initial_lr |
+| 12 | 레이어 출력 크기, ReLU 음수 없음 |
+| 13 | dropout training=False → 결정론적 |
+| 14 | XOR 정확도 > 70% |
+| 15 | JSON 직렬화/역직렬화 일치 |
+| 16 | Top-k 압축, 복원 검증 |
+| 17 | 클라이언트 학습 후 손실 감소 |
+| 18 | FedAvg 동일 가중치 = 원본 |
+| 19 | FL 마지막 라운드 < 첫 라운드 손실 |
+| 20 | 전체 파이프라인 통합 실행 |
+
+---
+
+## 검증 방법
+```bash
+python university_v10_DISTRIBUTED_ML.py
+python test_v10_distributed_ml.py
+# 기대: Ran 20 tests in X.XXXs — OK
+git add -A && git commit -m "v10: 분산 머신러닝 인프라 (Federated Learning)"
+git push origin master
+```

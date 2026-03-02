@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""
+멀티 디바이스 다이얼렉트 (Multi-Device Dialect)
+
+MLIR의 장치 불가지론적(Device-Agnostic) 연산 정의
+"""
+
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Literal
+from enum import Enum
+import json
+
+
+class DeviceType(Enum):
+    """장치 종류"""
+    GPU = "gpu"
+    TPU = "tpu"
+    CPU = "cpu"
+    NPU = "npu"
+    UNKNOWN = "unknown"
+
+
+class MemoryKind(Enum):
+    """메모리 종류"""
+    DEVICE_GLOBAL = "device_global"
+    DEVICE_SHARED = "device_shared"
+    HOST = "host"
+    PINNED = "pinned"
+    UMA = "uma"  # Unified Memory Architecture
+
+
+class TopologyType(Enum):
+    """네트워크 토폴로지"""
+    NVLINK_TREE = "nvlink_tree"
+    ETHERNET_RING = "ethernet_ring"
+    HYBRID = "hybrid"
+    CUSTOM = "custom"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class DeviceSpec:
+    """개별 장치 명세"""
+    device_id: int
+    device_type: DeviceType
+    model_name: str  # "h100", "l40", "tpu_v4" 등
+
+    # 성능 지표
+    peak_flops: float  # TFLOPS
+    memory_bandwidth_gbps: float  # GB/s
+    max_memory_gb: float
+
+    # 지원 정밀도
+    supported_dtypes: List[str]  # ["f32", "f16", "bf16", "int8"]
+
+    # 캐시 정보
+    l1_cache_kb: Optional[int] = None
+    l2_cache_mb: Optional[int] = None
+    shared_memory_kb: Optional[int] = None
+
+
+@dataclass
+class DeviceGroup:
+    """논리적 장치 그룹"""
+    group_id: str
+    device_type: DeviceType
+    device_ids: List[int]  # 포함된 장치 ID 목록
+
+    # 그룹 특성
+    total_flops: float  # 합산 FLOPS
+    total_memory_gb: float  # 합산 메모리
+
+    # 토폴로지
+    topology: TopologyType
+    topology_info: Dict  # 토폴로지 상세 정보
+
+    # 통신 특성
+    inter_device_bandwidth_gbps: float
+    intra_group_latency_us: float
+
+
+@dataclass
+class MemorySpace:
+    """메모리 공간 추상화"""
+    space_id: str
+    kind: MemoryKind
+
+    # 용량 정보
+    total_capacity_bytes: int
+    available_bytes: int
+
+    # 성능 정보
+    bandwidth_gbps: float
+    latency_ns: float
+
+    # 접근 패턴
+    is_cache_coherent: bool
+    supports_atomic_ops: bool
+
+
+@dataclass
+class MultiDeviceOp:
+    """멀티 디바이스 연산 기본 정의"""
+    op_name: str
+    op_type: Literal["launch", "send", "collective", "memory", "barrier"]
+
+    # 관련 장치
+    target_device_group: DeviceGroup
+
+    # 입출력
+    inputs: List[str]  # 입력 텐서 이름
+    outputs: List[str]  # 출력 텐서 이름
+
+    # 메모리
+    memory_spaces: List[MemorySpace]
+
+    # 동기화
+    dependencies: List[str] = None  # 선행 연산
+
+    def __post_init__(self):
+        if self.dependencies is None:
+            self.dependencies = []
+
+
+class MultiDeviceDialect:
+    """멀티 디바이스 다이얼렉트 - MLIR의 "방언" 정의"""
+
+    def __init__(self):
+        self.devices: Dict[int, DeviceSpec] = {}
+        self.device_groups: Dict[str, DeviceGroup] = {}
+        self.memory_spaces: Dict[str, MemorySpace] = {}
+        self.operations: List[MultiDeviceOp] = []
+
+    def register_device(self, device_spec: DeviceSpec) -> None:
+        """장치 등록"""
+        self.devices[device_spec.device_id] = device_spec
+        print(f"[MultiDeviceDialect] Device registered: "
+              f"{device_spec.model_name} (ID: {device_spec.device_id}, "
+              f"{device_spec.peak_flops:.0f} TFLOPS)")
+
+    def create_device_group(self,
+                           group_id: str,
+                           device_ids: List[int],
+                           device_type: DeviceType,
+                           topology: TopologyType,
+                           topology_info: Dict) -> DeviceGroup:
+        """장치 그룹 생성"""
+
+        # 그룹 내 장치 정보 검증
+        group_devices = [self.devices[did] for did in device_ids
+                        if did in self.devices]
+
+        if not group_devices:
+            raise ValueError(f"No valid devices for group {group_id}")
+
+        # 통계 계산
+        total_flops = sum(d.peak_flops for d in group_devices)
+        total_memory = sum(d.max_memory_gb for d in group_devices)
+
+        # 그룹 내 대역폭 결정 (토폴로지 기반)
+        if topology == TopologyType.NVLINK_TREE:
+            inter_bandwidth = 900.0  # NVLink: 900 GB/s
+            latency = 0.5  # microseconds
+        elif topology == TopologyType.ETHERNET_RING:
+            inter_bandwidth = 100.0  # Ethernet: 100 GB/s
+            latency = 100.0
+        else:
+            inter_bandwidth = 50.0
+            latency = 200.0
+
+        group = DeviceGroup(
+            group_id=group_id,
+            device_type=device_type,
+            device_ids=device_ids,
+            total_flops=total_flops,
+            total_memory_gb=total_memory,
+            topology=topology,
+            topology_info=topology_info,
+            inter_device_bandwidth_gbps=inter_bandwidth,
+            intra_group_latency_us=latency
+        )
+
+        self.device_groups[group_id] = group
+        print(f"[MultiDeviceDialect] Group created: {group_id}")
+        print(f"  Devices: {device_ids}")
+        print(f"  Total FLOPS: {total_flops:.0f} TFLOPS")
+        print(f"  Total Memory: {total_memory:.1f} GB")
+        print(f"  Topology: {topology.value}")
+
+        return group
+
+    def create_memory_space(self,
+                           space_id: str,
+                           kind: MemoryKind,
+                           capacity_bytes: int,
+                           bandwidth_gbps: float,
+                           latency_ns: int) -> MemorySpace:
+        """메모리 공간 정의"""
+
+        space = MemorySpace(
+            space_id=space_id,
+            kind=kind,
+            total_capacity_bytes=capacity_bytes,
+            available_bytes=capacity_bytes,
+            bandwidth_gbps=bandwidth_gbps,
+            latency_ns=latency_ns,
+            is_cache_coherent=(kind in [MemoryKind.UMA, MemoryKind.PINNED]),
+            supports_atomic_ops=(kind != MemoryKind.PINNED)
+        )
+
+        self.memory_spaces[space_id] = space
+        print(f"[MultiDeviceDialect] Memory space created: {space_id}")
+        print(f"  Kind: {kind.value}")
+        print(f"  Capacity: {capacity_bytes / (1024**3):.1f} GB")
+        print(f"  Bandwidth: {bandwidth_gbps:.0f} GB/s")
+
+        return space
+
+    def create_launch_op(self,
+                        op_name: str,
+                        device_group: DeviceGroup,
+                        inputs: List[str],
+                        outputs: List[str],
+                        memory_space: MemorySpace) -> MultiDeviceOp:
+        """Launch 연산 생성"""
+
+        op = MultiDeviceOp(
+            op_name=op_name,
+            op_type="launch",
+            target_device_group=device_group,
+            inputs=inputs,
+            outputs=outputs,
+            memory_spaces=[memory_space]
+        )
+
+        self.operations.append(op)
+        return op
+
+    def create_send_op(self,
+                      op_name: str,
+                      from_group: DeviceGroup,
+                      to_group: DeviceGroup,
+                      data_name: str) -> MultiDeviceOp:
+        """Send 연산 생성 (장치 간 데이터 전송)"""
+
+        op = MultiDeviceOp(
+            op_name=op_name,
+            op_type="send",
+            target_device_group=from_group,
+            inputs=[data_name],
+            outputs=[f"{data_name}_transferred"],
+            memory_spaces=[]
+        )
+
+        self.operations.append(op)
+        return op
+
+    def create_all_reduce_op(self,
+                            op_name: str,
+                            device_group: DeviceGroup,
+                            operation: str,  # "sum", "max", "min"
+                            input_data: str) -> MultiDeviceOp:
+        """AllReduce 연산 생성 (집합 통신)"""
+
+        op = MultiDeviceOp(
+            op_name=op_name,
+            op_type="collective",
+            target_device_group=device_group,
+            inputs=[input_data],
+            outputs=[f"{input_data}_reduced"],
+            memory_spaces=[]
+        )
+
+        self.operations.append(op)
+        return op
+
+    def create_barrier_op(self,
+                         op_name: str,
+                         device_group: DeviceGroup) -> MultiDeviceOp:
+        """Barrier 연산 생성 (동기화)"""
+
+        op = MultiDeviceOp(
+            op_name=op_name,
+            op_type="barrier",
+            target_device_group=device_group,
+            inputs=[],
+            outputs=[],
+            memory_spaces=[]
+        )
+
+        self.operations.append(op)
+        return op
+
+    def get_device_capabilities(self, device_id: int) -> Dict:
+        """장치 능력 조회"""
+
+        if device_id not in self.devices:
+            return {}
+
+        dev = self.devices[device_id]
+        return {
+            "device_id": device_id,
+            "model": dev.model_name,
+            "type": dev.device_type.value,
+            "peak_flops_tflops": dev.peak_flops,
+            "memory_bandwidth_gbps": dev.memory_bandwidth_gbps,
+            "max_memory_gb": dev.max_memory_gb,
+            "supported_dtypes": dev.supported_dtypes
+        }
+
+    def get_group_info(self, group_id: str) -> Dict:
+        """그룹 정보 조회"""
+
+        if group_id not in self.device_groups:
+            return {}
+
+        group = self.device_groups[group_id]
+        return {
+            "group_id": group_id,
+            "device_type": group.device_type.value,
+            "device_ids": group.device_ids,
+            "num_devices": len(group.device_ids),
+            "total_flops_tflops": group.total_flops,
+            "total_memory_gb": group.total_memory_gb,
+            "topology": group.topology.value,
+            "inter_device_bandwidth_gbps": group.inter_device_bandwidth_gbps,
+            "intra_group_latency_us": group.intra_group_latency_us
+        }
+
+    def estimate_op_time_ms(self,
+                           op: MultiDeviceOp,
+                           work_size_flops: float) -> float:
+        """연산 소요 시간 추정"""
+
+        if op.op_type == "launch":
+            # Compute time = Work / FLOPS
+            compute_time_ms = (work_size_flops / (op.target_device_group.total_flops * 1e12)) * 1000
+            return compute_time_ms
+
+        elif op.op_type == "send":
+            # Transfer time = Data Size / Bandwidth
+            # 가정: 데이터 크기는 work_size_flops와 관련
+            data_size_gb = work_size_flops / 1e12  # 대략적 추정
+            transfer_time_ms = (data_size_gb / op.target_device_group.inter_device_bandwidth_gbps) * 1000
+            return transfer_time_ms
+
+        elif op.op_type == "barrier":
+            # Barrier = 그룹 내 장치 수에 로그 비례
+            import math
+            return math.log2(len(op.target_device_group.device_ids)) * 0.5
+
+        else:
+            return 0.0
+
+    def export_to_json(self) -> str:
+        """다이얼렉트 상태를 JSON으로 내보내기"""
+
+        data = {
+            "dialect_name": "multidevice",
+            "num_devices": len(self.devices),
+            "num_groups": len(self.device_groups),
+            "num_memory_spaces": len(self.memory_spaces),
+            "num_operations": len(self.operations),
+            "devices": {
+                str(did): self.get_device_capabilities(did)
+                for did in self.devices.keys()
+            },
+            "groups": {
+                gid: self.get_group_info(gid)
+                for gid in self.device_groups.keys()
+            }
+        }
+
+        return json.dumps(data, indent=2)
+

@@ -1,0 +1,289 @@
+#!/usr/bin/env node
+
+/**
+ * Reuse Suggester
+ *
+ * 기능: 당신이 필요한 기능을 말하면
+ * "이 저장소에 이미 있고, 이렇게 재활용하면 된다"를 자동으로 제안
+ */
+
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+class ReuseSuggester {
+  constructor(indexes) {
+    this.indexes = indexes; // {repoName: analysis}
+    this.cache = {};
+  }
+
+  /**
+   * 필요한 기능이 어디에 있는지 찾기
+   */
+  async suggestForFeature(feature) {
+    console.log(`\n🔎 검색: "${feature}"`);
+    console.log("=".repeat(60));
+
+    // 모든 저장소에서 매칭되는 코드 찾기
+    const candidates = [];
+
+    for (const [repoName, analysis] of Object.entries(this.indexes)) {
+      const match = this.findMatch(feature, analysis);
+      if (match.score > 0) {
+        candidates.push({
+          repo: repoName,
+          ...match
+        });
+      }
+    }
+
+    // 점수 순 정렬
+    candidates.sort((a, b) => b.score - a.score);
+
+    if (candidates.length === 0) {
+      console.log("❌ 일치하는 코드 없음");
+      return null;
+    }
+
+    console.log(`✅ ${candidates.length}개 후보 발견\n`);
+
+    // 상위 3개만 상세 분석
+    const recommendations = [];
+    for (const candidate of candidates.slice(0, 3)) {
+      const detail = await this.analyzeCandidate(feature, candidate);
+      recommendations.push(detail);
+    }
+
+    return {
+      feature,
+      candidates: recommendations,
+      timestamp: new Date().toISOString()
+    };
+  }
+
+  /**
+   * 저장소에서 기능 매칭
+   */
+  findMatch(feature, analysis) {
+    const featureLower = feature.toLowerCase();
+    const apis = (analysis.summary.publicAPI || []).map(a => a.toLowerCase());
+    const keywords = (analysis.summary.externalDeps || []).map(d => d.toLowerCase());
+
+    // 점수 계산
+    let score = 0;
+    let matchedItems = [];
+
+    for (const api of apis) {
+      // "garbage collection" 검색 시
+      // "gc" "collect" 등 부분 매칭
+      const featureWords = featureLower.split(/[\s\-_]/);
+      for (const word of featureWords) {
+        if (api.includes(word) || word.length > 2) {
+          score += 10;
+          matchedItems.push(api);
+        }
+      }
+    }
+
+    // 파일명에서도 검색
+    const files = analysis.sourceFiles || [];
+    for (const file of files) {
+      const fileName = file.toLowerCase();
+      const featureWords = featureLower.split(/[\s\-_]/);
+      for (const word of featureWords) {
+        if (fileName.includes(word)) {
+          score += 5;
+          matchedItems.push(`file: ${file}`);
+        }
+      }
+    }
+
+    return {
+      score,
+      matchedItems: [...new Set(matchedItems)],
+      risks: analysis.summary.risks
+    };
+  }
+
+  /**
+   * 후보 상세 분석
+   */
+  async analyzeCandidate(feature, candidate) {
+    const prompt = `
+    요청: "${feature}"
+
+    발견: ${candidate.repo}
+    매칭 항목: ${candidate.matchedItems.join(", ")}
+    위험 요소: unsafe=${candidate.risks.unsafe}, ffi=${candidate.risks.ffi}
+
+    다음을 JSON으로 분석:
+    {
+      "reuseability": "HIGH|MEDIUM|LOW",
+      "difficulty": "EASY|MEDIUM|HARD",
+      "effort": "1-3일",
+      "warnings": ["주의할 점"],
+      "howToReuse": "구체적 방법",
+      "risks": ["잠재적 위험"],
+      "recommendation": "추천 여부"
+    }
+    `;
+
+    try {
+      const response = await client.messages.create({
+        model: "claude-opus-4-6",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }]
+      });
+
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+
+      if (jsonMatch) {
+        return {
+          repo: candidate.repo,
+          matched: candidate.matchedItems,
+          ...JSON.parse(jsonMatch[0])
+        };
+      }
+
+      return {
+        repo: candidate.repo,
+        matched: candidate.matchedItems,
+        analysis: text
+      };
+    } catch (e) {
+      console.warn(`⚠️ 분석 실패:`, e.message);
+      return {
+        repo: candidate.repo,
+        error: e.message
+      };
+    }
+  }
+
+  /**
+   * 두 저장소 간의 재활용 제안
+   */
+  async suggestForRepositories(sourceRepo, targetRepo, purpose) {
+    console.log(`\n🔄 검토: ${sourceRepo} → ${targetRepo}`);
+    console.log(`📌 목적: ${purpose}`);
+    console.log("=".repeat(60));
+
+    const source = this.indexes[sourceRepo];
+    const target = this.indexes[targetRepo];
+
+    if (!source || !target) {
+      console.error("❌ 저장소를 찾을 수 없습니다");
+      return null;
+    }
+
+    const prompt = `
+    소스 저장소: ${sourceRepo}
+    대상 저장소: ${targetRepo}
+    목적: ${purpose}
+
+    소스의 API:
+    ${JSON.stringify(source.summary.publicAPI, null, 2)}
+
+    소스의 위험 요소:
+    ${JSON.stringify(source.summary.risks, null, 2)}
+
+    대상의 구조:
+    ${target.summary.publicAPI.slice(0, 10).join(", ")}
+
+    재활용 가능성 평가:
+    {
+      "feasible": true/false,
+      "reuseableModules": ["모듈1", "모듈2"],
+      "interfaces": {
+        "match": ["호환되는 인터페이스"],
+        "conflict": ["충돌 가능 부분"]
+      },
+      "riskAssessment": "위험도 평가",
+      "estimatedEffort": "시간",
+      "recommendations": ["구체적 제안"],
+      "decideToProcceed": true/false
+    }
+    `;
+
+    try {
+      const response = await client.messages.create({
+        model: "claude-opus-4-6",
+        max_tokens: 1500,
+        messages: [{ role: "user", content: prompt }]
+      });
+
+      const text = response.content[0].text;
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+
+      if (jsonMatch) {
+        return {
+          source: sourceRepo,
+          target: targetRepo,
+          purpose,
+          evaluation: JSON.parse(jsonMatch[0]),
+          timestamp: new Date().toISOString()
+        };
+      }
+
+      return {
+        source: sourceRepo,
+        target: targetRepo,
+        analysis: text
+      };
+    } catch (e) {
+      console.error(`❌ 평가 실패:`, e.message);
+      return null;
+    }
+  }
+
+  /**
+   * 저장소의 특징 추출 (벡터 임베딩 대신 단순 키워드)
+   */
+  getRepositorySignature(repoName) {
+    const analysis = this.indexes[repoName];
+    if (!analysis) return null;
+
+    return {
+      name: repoName,
+      hasGC: this.hasKeyword(analysis, "gc", "garbage"),
+      hasVM: this.hasKeyword(analysis, "vm", "virtual"),
+      hasFFI: analysis.summary.risks.ffi,
+      hasUnsafe: analysis.summary.risks.unsafe,
+      language: this.detectLanguage(analysis),
+      apis: analysis.summary.publicAPI.slice(0, 10)
+    };
+  }
+
+  /**
+   * 키워드 검색
+   */
+  hasKeyword(analysis, ...keywords) {
+    const allText = JSON.stringify(analysis).toLowerCase();
+    return keywords.some(k => allText.includes(k.toLowerCase()));
+  }
+
+  /**
+   * 언어 감지
+   */
+  detectLanguage(analysis) {
+    const files = (analysis.sourceFiles || []).map(f => f.toLowerCase());
+    if (files.some(f => f.endsWith(".rs"))) return "Rust";
+    if (files.some(f => f.endsWith(".js"))) return "JavaScript";
+    if (files.some(f => f.endsWith(".ts"))) return "TypeScript";
+    if (files.some(f => f.endsWith(".py"))) return "Python";
+    return "Unknown";
+  }
+
+  /**
+   * 모든 저장소의 서명 추출 (빠른 비교용)
+   */
+  getAllSignatures() {
+    const signatures = {};
+    for (const [repoName] of Object.entries(this.indexes)) {
+      signatures[repoName] = this.getRepositorySignature(repoName);
+    }
+    return signatures;
+  }
+}
+
+export default ReuseSuggester;

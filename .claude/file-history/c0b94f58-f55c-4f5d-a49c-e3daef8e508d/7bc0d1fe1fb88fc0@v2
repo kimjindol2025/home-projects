@@ -1,0 +1,441 @@
+"""
+에이전트 모듈
+Pulse 에이전트 - Slack, Email, 스케줄 배포
+"""
+
+import uuid
+import asyncio
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+import logging
+
+from .tools import ToolManager
+from .scheduler import SchedulerManager
+from .llm_manager import LLMManager
+from .nlu import Intent
+
+logger = logging.getLogger(__name__)
+
+
+class Agent:
+    """Pulse 에이전트 - 다양한 플랫폼 배포 지원"""
+
+    def __init__(self, intent: Intent, llm_manager: Optional[LLMManager] = None):
+        """
+        에이전트 초기화
+
+        Args:
+            intent: NLU 분석 결과
+            llm_manager: LLM 매니저 (선택)
+        """
+        self.id = str(uuid.uuid4())[:8]
+        self.intent = intent
+        self.role = intent.role
+        self.goal = intent.goal
+        self.tools = intent.tools
+        self.deployment = intent.deployment
+        self.schedule = intent.schedule
+
+        self.llm_manager = llm_manager
+        self.tool_manager = ToolManager()
+        self.scheduler = SchedulerManager()
+
+        self.status = "initialized"
+        self.created_at = datetime.now()
+        self.started_at: Optional[datetime] = None
+        self.tasks: Dict[str, asyncio.Task] = {}
+
+        self.logger = logger
+
+    async def deploy(self) -> Dict[str, Any]:
+        """
+        의도에 따라 적절한 배포 방식 선택
+
+        Returns:
+            배포 결과
+        """
+        self.logger.info(f"🚀 에이전트 배포 시작: {self.id} ({self.role})")
+
+        try:
+            deployment_method = self.deployment or "realtime"
+
+            if deployment_method == "slack":
+                return await self.deploy_to_slack()
+            elif deployment_method == "email":
+                return await self.deploy_to_email()
+            elif deployment_method == "scheduled":
+                return await self.deploy_scheduled()
+            else:
+                return await self.deploy_immediate()
+
+        except Exception as e:
+            self.logger.error(f"❌ 배포 실패: {e}")
+            self.status = "failed"
+            return {"success": False, "error": str(e), "agent_id": self.id}
+
+    async def deploy_to_slack(self) -> Dict[str, Any]:
+        """
+        Slack 채널 감시 + 자동 응답 배포
+
+        Returns:
+            배포 결과
+        """
+        try:
+            self.logger.info(f"📱 Slack 배포 시작: {self.role}")
+
+            # 채널명 추출 (기본값: #general)
+            channel = self._extract_channel_from_goal()
+            if not channel:
+                channel = "#general"
+
+            async def slack_message_handler(message: Dict):
+                """Slack 메시지 핸들러"""
+                text = message.get("text", "")
+                user_id = message.get("user", "")
+                thread_ts = message.get("ts", "")
+
+                self.logger.info(f"💬 Slack 메시지 수신: {text[:50]}")
+
+                # LLM으로 응답 생성
+                response = await self._generate_response(text)
+
+                # 응답 전송
+                await self.tool_manager.slack.send_message(
+                    channel=channel,
+                    message=response,
+                    thread_ts=thread_ts
+                )
+
+            # 백그라운드 감시 시작
+            task = asyncio.create_task(
+                self.tool_manager.slack.listen_channel(
+                    channel,
+                    slack_message_handler,
+                    timeout=300  # 5분
+                )
+            )
+            self.tasks["slack_listener"] = task
+
+            self.status = "running"
+            self.started_at = datetime.now()
+
+            return {
+                "success": True,
+                "agent_id": self.id,
+                "method": "slack",
+                "channel": channel,
+                "status": "running"
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ Slack 배포 실패: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def deploy_to_email(self) -> Dict[str, Any]:
+        """
+        이메일 감시 + 자동 응답 배포
+
+        Returns:
+            배포 결과
+        """
+        try:
+            self.logger.info(f"📧 이메일 배포 시작: {self.role}")
+
+            async def email_handler(msg_data):
+                """이메일 핸들러"""
+                self.logger.info(f"📩 이메일 수신")
+
+                # 이메일 내용 파싱 (간단한 버전)
+                # 실제로는 email.parser 사용
+                text = str(msg_data)[:200]
+
+                # LLM으로 응답 생성
+                response = await self._generate_response(text)
+
+                # 응답 이메일 전송
+                await self.tool_manager.email.send_email(
+                    to="sender@example.com",  # 발신자에게 회신
+                    subject=f"Re: {text[:30]}",
+                    body=response
+                )
+
+            # 백그라운드 감시 시작
+            task = asyncio.create_task(
+                self.tool_manager.email.listen_inbox(
+                    email_handler,
+                    poll_interval=30,
+                    timeout=300
+                )
+            )
+            self.tasks["email_listener"] = task
+
+            self.status = "running"
+            self.started_at = datetime.now()
+
+            return {
+                "success": True,
+                "agent_id": self.id,
+                "method": "email",
+                "status": "running"
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ 이메일 배포 실패: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def deploy_scheduled(self) -> Dict[str, Any]:
+        """
+        스케줄 기반 배포 (일일, 주일, 반복)
+
+        Returns:
+            배포 결과
+        """
+        try:
+            self.logger.info(f"📅 스케줄 배포 시작: {self.role}")
+
+            if not self.schedule:
+                return {"success": False, "error": "스케줄 정보 없음"}
+
+            await self.scheduler.start()
+
+            schedule_type = self.schedule.get("type", "daily")
+            job_id = None
+
+            if schedule_type == "daily":
+                time_str = self.schedule.get("time", "09:00")
+                job_id = self.scheduler.schedule_daily(
+                    time_str,
+                    self._execute_scheduled_task,
+                    job_id=f"agent_{self.id}_daily"
+                )
+
+            elif schedule_type == "weekly":
+                day = self.schedule.get("day", "mon")
+                cron_expr = f"0 9 * * {self._day_to_cron(day)}"
+                job_id = self.scheduler.schedule_cron(
+                    cron_expr,
+                    self._execute_scheduled_task,
+                    job_id=f"agent_{self.id}_weekly"
+                )
+
+            elif schedule_type == "interval":
+                seconds = self.schedule.get("seconds", 3600)
+                job_id = self.scheduler.schedule_interval(
+                    seconds,
+                    self._execute_scheduled_task,
+                    job_id=f"agent_{self.id}_interval"
+                )
+
+            self.status = "scheduled"
+            self.started_at = datetime.now()
+
+            return {
+                "success": True,
+                "agent_id": self.id,
+                "method": "scheduled",
+                "schedule": schedule_type,
+                "job_id": job_id,
+                "status": "scheduled"
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ 스케줄 배포 실패: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def deploy_immediate(self) -> Dict[str, Any]:
+        """
+        즉시 실행 배포
+
+        Returns:
+            실행 결과
+        """
+        try:
+            self.logger.info(f"⚡ 즉시 실행: {self.role}")
+
+            result = await self._execute_scheduled_task()
+
+            return {
+                "success": True,
+                "agent_id": self.id,
+                "method": "immediate",
+                "result": result
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ 즉시 실행 실패: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _execute_scheduled_task(self) -> str:
+        """스케줄 작업 실행"""
+        try:
+            self.logger.info(f"🔄 스케줄 작업 실행: {self.role}")
+
+            # 목표에 따른 작업 수행
+            result = await self._perform_task()
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"❌ 스케줄 작업 실행 실패: {e}")
+            return f"오류: {str(e)}"
+
+    async def _perform_task(self) -> str:
+        """에이전트의 실제 작업 수행"""
+        # 도구 목록에 따라 적절한 작업 수행
+        results = []
+
+        for tool in self.tools:
+            if tool == "web_search":
+                search_result = await self.tool_manager.execute_tool(
+                    "web_search",
+                    "search",
+                    query=self.goal,
+                    num_results=5
+                )
+                if search_result.get("success"):
+                    results.append(f"🔍 검색 결과: {len(search_result.get('results', []))}개")
+
+            elif tool == "slack":
+                # Slack 기본 채널로 결과 전송
+                message = f"✅ {self.role}: {self.goal} 완료"
+                await self.tool_manager.execute_tool(
+                    "slack",
+                    "send_message",
+                    channel="#general",
+                    message=message
+                )
+                results.append("✅ Slack 메시지 전송 완료")
+
+            elif tool == "email":
+                # 이메일로 결과 전송
+                await self.tool_manager.execute_tool(
+                    "email",
+                    "send_email",
+                    to="user@example.com",
+                    subject=f"{self.role} 실행 결과",
+                    body=f"✅ {self.goal} 완료"
+                )
+                results.append("✅ 이메일 전송 완료")
+
+        return "\n".join(results) if results else "✅ 작업 완료"
+
+    async def _generate_response(self, user_input: str) -> str:
+        """사용자 입력에 대한 응답 생성"""
+        if not self.llm_manager:
+            return f"✅ {self.role}이 처리했습니다: {user_input[:50]}"
+
+        prompt = f"""
+당신은 {self.role}입니다.
+목표: {self.goal}
+
+사용자 요청: {user_input}
+
+간결한 한 문장 또는 두 문장 응답을 하세요."""
+
+        response, metadata = await self.llm_manager.generate(
+            prompt,
+            context={"complexity": 0.3},
+            max_tokens=200
+        )
+
+        return response
+
+    def _extract_channel_from_goal(self) -> Optional[str]:
+        """목표에서 채널명 추출"""
+        import re
+        match = re.search(r'#\w+', self.goal)
+        return match.group(0) if match else None
+
+    def _day_to_cron(self, day: str) -> str:
+        """요일을 cron 표현으로 변환"""
+        day_map = {"mon": "1", "tue": "2", "wed": "3", "thu": "4", "fri": "5", "sat": "6", "sun": "0"}
+        return day_map.get(day, "1")
+
+    async def stop(self):
+        """에이전트 중지"""
+        try:
+            self.logger.info(f"🛑 에이전트 중지: {self.id}")
+
+            # 모든 백그라운드 작업 취소
+            for task_name, task in self.tasks.items():
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+            # 스케줄러 중지
+            await self.scheduler.stop()
+
+            self.status = "stopped"
+            self.logger.info(f"✅ 에이전트 중지됨: {self.id}")
+
+        except Exception as e:
+            self.logger.error(f"❌ 에이전트 중지 실패: {e}")
+
+    def get_status(self) -> Dict[str, Any]:
+        """에이전트 상태 조회"""
+        uptime = None
+        if self.started_at:
+            uptime = (datetime.now() - self.started_at).total_seconds()
+
+        return {
+            "id": self.id,
+            "role": self.role,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "uptime_seconds": uptime,
+            "deployment": self.deployment,
+            "tools": self.tools,
+            "active_tasks": len(self.tasks)
+        }
+
+    async def healthcheck(self) -> Dict[str, Any]:
+        """에이전트 헬스 체크"""
+        return {
+            "agent_id": self.id,
+            "status": self.status,
+            "timestamp": datetime.now().isoformat(),
+            "tasks_running": len([t for t in self.tasks.values() if not t.done()])
+        }
+
+
+class AgentPool:
+    """에이전트 풀 - 여러 에이전트 중앙 관리"""
+
+    def __init__(self, llm_manager: Optional[LLMManager] = None):
+        self.agents: Dict[str, Agent] = {}
+        self.llm_manager = llm_manager
+        self.logger = logger
+
+    def create_agent(self, intent: Intent) -> Agent:
+        """새 에이전트 생성"""
+        agent = Agent(intent, self.llm_manager)
+        self.agents[agent.id] = agent
+        self.logger.info(f"✨ 에이전트 생성: {agent.id}")
+        return agent
+
+    async def deploy_agent(self, intent: Intent) -> Dict[str, Any]:
+        """에이전트 생성 및 배포"""
+        agent = self.create_agent(intent)
+        result = await agent.deploy()
+        return result
+
+    def get_agent(self, agent_id: str) -> Optional[Agent]:
+        """에이전트 조회"""
+        return self.agents.get(agent_id)
+
+    async def stop_agent(self, agent_id: str) -> bool:
+        """에이전트 중지"""
+        agent = self.agents.get(agent_id)
+        if agent:
+            await agent.stop()
+            del self.agents[agent_id]
+            return True
+        return False
+
+    def list_agents(self) -> List[Dict[str, Any]]:
+        """모든 에이전트 상태 조회"""
+        return [agent.get_status() for agent in self.agents.values()]

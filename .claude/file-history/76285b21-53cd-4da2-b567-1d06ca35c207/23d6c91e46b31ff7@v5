@@ -1,0 +1,750 @@
+// Phase 5: TypeChecker - 정적 타입 검증
+
+import { Expr, Stmt, Program, CapabilityAnnotation, Param } from "./ast"
+import {
+  Type,
+  PrimitiveType,
+  TypeCheckError,
+  TypeCheckResult,
+  typesCompatible,
+  typeToString,
+  getOperationResultType,
+  inferTypeFromValue,
+  BUILTIN_TYPES,
+  Capability,
+  CapabilityKind,
+  parseType,  // Phase 5.5.3: 어노테이션 문자열 → Type 변환
+} from "./type-system"
+
+/**
+ * TypeChecker: AST 기반 정적 타입 검증
+ */
+export class TypeChecker {
+  private env: Map<string, Type> = new Map()
+  private functionTypes: Map<string, Type> = new Map()
+  private errors: TypeCheckError[] = []
+  private currentFunctionReturnTypes: Type[] = []
+  private currentCapabilities: Capability[] = []
+
+  // Phase 6: Built-in 함수 required capability
+  private readonly BUILTIN_REQUIRED_CAPABILITIES: Map<string, CapabilityKind> = new Map([
+    ["file_read", "read_file"],
+    ["file_write", "write_file"],
+    ["http_request", "network"],
+    ["http_get", "network"],
+    ["process_spawn", "spawn_process"],
+    ["eval", "execute_code"],
+  ])
+
+  /**
+   * 전체 프로그램 타입 검사
+   */
+  public check(program: Program): TypeCheckResult {
+    this.errors = []
+    this.env.clear()
+    this.functionTypes.clear()
+
+    // First pass: 함수 정의 수집
+    for (const stmt of program.stmts) {
+      if (stmt.kind === "fn") {
+        this.registerFunctionType(stmt)
+      }
+    }
+
+    // Second pass: 함수 본문 및 다른 명령문 검사
+    for (const stmt of program.stmts) {
+      this.checkStmt(stmt)
+    }
+
+    return {
+      success: this.errors.length === 0,
+      errors: this.errors,
+      types: new Map(this.env),
+    }
+  }
+
+  /**
+   * 수집된 return 타입들로부터 함수의 반환 타입 추론
+   */
+  private inferReturnType(types: Type[]): Type {
+    if (types.length === 0) return BUILTIN_TYPES.UNKNOWN
+    const first = types[0]
+    if (types.every(t => JSON.stringify(t) === JSON.stringify(first)))
+      return first
+    return BUILTIN_TYPES.UNKNOWN
+  }
+
+  /**
+   * 함수 타입 등록
+   */
+  private registerFunctionType(stmt: Stmt): void {
+    if (stmt.kind === "fn") {
+      const fnStmt = stmt as any
+      // Phase 5.5.3: 어노테이션이 있으면 해당 타입, 없으면 UNKNOWN
+      const paramTypes: Type[] = (fnStmt.params || []).map((p: any) =>
+        parseType(p.typeAnnotation ?? "unknown")
+      )
+
+      const returnType: Type = {
+        kind: "primitive",
+        type: PrimitiveType.UNKNOWN,
+      }
+
+      // Phase 6: annotations → capabilities 변환
+      const capabilities: Capability[] = (fnStmt.annotations || [])
+        .filter((a: any) => a.kind === "allow")
+        .map((a: any) => ({ cap: a.cap, arg: a.arg }))
+
+      const fnType: Type = {
+        kind: "fn",
+        paramTypes,
+        returnType,
+        capabilities,
+      }
+
+      this.functionTypes.set(fnStmt.name, fnType)
+    }
+  }
+
+  /**
+   * 명령문 타입 검사
+   */
+  private checkStmt(stmt: Stmt): void {
+    switch (stmt.kind) {
+      case "print": {
+        const printStmt = stmt as any
+        this.checkExpr(printStmt.expr)
+        break
+      }
+
+      case "expr": {
+        const exprStmt = stmt as any
+        this.checkExpr(exprStmt.expr)
+        break
+      }
+
+      case "let": {
+        const letStmt = stmt as any
+        if (letStmt.init) {
+          const valueType = this.checkExpr(letStmt.init)
+          this.env.set(letStmt.name, valueType)
+        } else {
+          this.env.set(letStmt.name, BUILTIN_TYPES.UNKNOWN)
+        }
+        break
+      }
+
+      case "fn": {
+        const fnStmt = stmt as any
+        const savedEnv = new Map(this.env)
+        const savedReturnTypes = this.currentFunctionReturnTypes
+        const savedCapabilities = this.currentCapabilities
+
+        // Phase 6: 현재 함수의 선언 capability로 컨텍스트 설정
+        const fnType = this.functionTypes.get(fnStmt.name)
+        this.currentCapabilities = fnType?.kind === "fn"
+          ? (fnType.capabilities ?? [])
+          : []
+
+        this.currentFunctionReturnTypes = []
+
+        // Phase 5.5.3: 파라미터 어노테이션 기반 타입 등록
+        for (const param of fnStmt.params || []) {
+          this.env.set(param.name, parseType(param.typeAnnotation ?? "unknown"))
+        }
+
+        // 함수 본문 검사
+        for (const s of fnStmt.body || []) {
+          this.checkStmt(s)
+        }
+
+        // return 타입 추론 후 functionTypes 갱신
+        const inferredReturn = this.inferReturnType(
+          this.currentFunctionReturnTypes
+        )
+        const existingFnType = this.functionTypes.get(fnStmt.name)
+        if (existingFnType && existingFnType.kind === "fn") {
+          this.functionTypes.set(fnStmt.name, {
+            kind: "fn",
+            paramTypes: existingFnType.paramTypes,
+            returnType: inferredReturn,
+            capabilities: existingFnType.capabilities, // Phase 6: 보존
+          })
+        }
+
+        this.currentCapabilities = savedCapabilities
+        this.currentFunctionReturnTypes = savedReturnTypes
+        this.env = savedEnv
+        break
+      }
+
+      case "if": {
+        const ifStmt = stmt as any
+        this.checkExpr(ifStmt.cond)
+        for (const s of ifStmt.then || []) {
+          this.checkStmt(s)
+        }
+        if (ifStmt.else) {
+          for (const s of ifStmt.else) {
+            this.checkStmt(s)
+          }
+        }
+        break
+      }
+
+      case "for": {
+        const forStmt = stmt as any
+        this.checkExpr(forStmt.iter)
+        // 루프 변수를 환경에 추가
+        this.env.set(forStmt.name, BUILTIN_TYPES.UNKNOWN)
+        for (const s of forStmt.body || []) {
+          this.checkStmt(s)
+        }
+        break
+      }
+
+      case "while": {
+        const whileStmt = stmt as any
+        this.checkExpr(whileStmt.cond)
+        for (const s of whileStmt.body || []) {
+          this.checkStmt(s)
+        }
+        break
+      }
+
+      case "return": {
+        const returnStmt = stmt as any
+        if (returnStmt.value) {
+          const retType = this.checkExpr(returnStmt.value)
+          this.currentFunctionReturnTypes.push(retType)
+        }
+        break
+      }
+
+      case "block": {
+        const blockStmt = stmt as any
+        for (const s of blockStmt.body || []) {
+          this.checkStmt(s)
+        }
+        break
+      }
+
+      case "try": {
+        const tryStmt = stmt as any
+        for (const s of tryStmt.body || []) {
+          this.checkStmt(s)
+        }
+        if (tryStmt.catchVar) {
+          this.env.set(tryStmt.catchVar, BUILTIN_TYPES.UNKNOWN)
+        }
+        for (const s of tryStmt.catchBody || []) {
+          this.checkStmt(s)
+        }
+        for (const s of tryStmt.finallyBody || []) {
+          this.checkStmt(s)
+        }
+        break
+      }
+
+      case "throw": {
+        const throwStmt = stmt as any
+        this.checkExpr(throwStmt.expr)
+        break
+      }
+
+      case "if-let": {
+        const ifLetStmt = stmt as any
+        this.checkExpr(ifLetStmt.value)
+        // 패턴 바인딩
+        if (ifLetStmt.pattern.kind === "ident") {
+          this.env.set(ifLetStmt.pattern.name, BUILTIN_TYPES.UNKNOWN)
+        }
+        for (const s of ifLetStmt.body || []) {
+          this.checkStmt(s)
+        }
+        if (ifLetStmt.else) {
+          for (const s of ifLetStmt.else) {
+            this.checkStmt(s)
+          }
+        }
+        break
+      }
+
+      case "while-let": {
+        const whileLetStmt = stmt as any
+        this.checkExpr(whileLetStmt.value)
+        if (whileLetStmt.pattern.kind === "ident") {
+          this.env.set(whileLetStmt.pattern.name, BUILTIN_TYPES.UNKNOWN)
+        }
+        for (const s of whileLetStmt.body || []) {
+          this.checkStmt(s)
+        }
+        break
+      }
+
+      case "match": {
+        const matchStmt = stmt as any
+        this.checkExpr(matchStmt.subject)
+        for (const arm of matchStmt.arms || []) {
+          if (arm.pattern) {
+            this.checkExpr(arm.pattern)
+          }
+          if (arm.guard) {
+            this.checkExpr(arm.guard)
+          }
+          for (const s of arm.body || []) {
+            this.checkStmt(s)
+          }
+        }
+        break
+      }
+    }
+  }
+
+  /**
+   * 표현식 타입 검사
+   */
+  public checkExpr(expr: Expr): Type {
+    switch (expr.kind) {
+      case "number":
+        return { kind: "primitive", type: PrimitiveType.NUM }
+
+      case "string":
+        return { kind: "primitive", type: PrimitiveType.STR }
+
+      case "bool":
+        return { kind: "primitive", type: PrimitiveType.BOOL }
+
+      case "null":
+        return { kind: "primitive", type: PrimitiveType.NULL }
+
+      case "ident": {
+        const identExpr = expr as any
+        const type = this.env.get(identExpr.name)
+        if (!type) {
+          this.addError(
+            `Undefined variable '${identExpr.name}'`,
+            undefined,
+            undefined
+          )
+          return BUILTIN_TYPES.UNKNOWN
+        }
+        return type
+      }
+
+      case "assign": {
+        const assignExpr = expr as any
+        const valueType = this.checkExpr(assignExpr.value)
+
+        // target이 ident인 경우 할당
+        if (assignExpr.target.kind === "ident") {
+          this.env.set(assignExpr.target.name, valueType)
+        }
+        return valueType
+      }
+
+      case "binary": {
+        const binExpr = expr as any
+        const leftType = this.checkExpr(binExpr.left)
+        const rightType = this.checkExpr(binExpr.right)
+
+        // 타입 호환성 검사
+        const resultType = getOperationResultType(
+          binExpr.op,
+          leftType,
+          rightType
+        )
+
+        // Add 연산 검증
+        if (binExpr.op === "+" || binExpr.op === "Add") {
+          if (leftType.kind === "primitive" && rightType.kind === "primitive") {
+            const left = leftType.type
+            const right = rightType.type
+
+            if (
+              !(
+                (left === PrimitiveType.NUM && right === PrimitiveType.NUM) ||
+                (left === PrimitiveType.STR || right === PrimitiveType.STR) ||
+                (left === PrimitiveType.UNKNOWN ||
+                  right === PrimitiveType.UNKNOWN)
+              )
+            ) {
+              this.addError(
+                `Cannot add ${typeToString(leftType)} and ${typeToString(rightType)}`,
+                undefined,
+                undefined,
+                undefined,
+                leftType,
+                rightType
+              )
+            }
+          }
+        }
+
+        return resultType
+      }
+
+      case "unary": {
+        const unaryExpr = expr as any
+        const operandType = this.checkExpr(unaryExpr.expr)
+
+        if (unaryExpr.op === "!") {
+          if (
+            operandType.kind !== "primitive" ||
+            operandType.type !== PrimitiveType.BOOL
+          ) {
+            this.addError(
+              `Cannot apply ! to ${typeToString(operandType)}`,
+              undefined,
+              undefined
+            )
+          }
+          return BUILTIN_TYPES.BOOL
+        }
+
+        if (unaryExpr.op === "-") {
+          if (
+            operandType.kind !== "primitive" ||
+            operandType.type !== PrimitiveType.NUM
+          ) {
+            this.addError(
+              `Cannot negate ${typeToString(operandType)}`,
+              undefined,
+              undefined
+            )
+          }
+          return BUILTIN_TYPES.NUM
+        }
+
+        return operandType
+      }
+
+      case "call": {
+        const callExpr = expr as any
+
+        // callee에서 함수 이름 추출
+        let fnName = ""
+        if (callExpr.callee.kind === "ident") {
+          fnName = callExpr.callee.name
+        }
+
+        // Phase 6: Built-in 함수 required capability 검사
+        const builtinRequired = this.BUILTIN_REQUIRED_CAPABILITIES.get(fnName)
+        if (builtinRequired) {
+          const callerHas = this.currentCapabilities.some(c => c.cap === builtinRequired)
+          if (!callerHas) {
+            this.addError(
+              `'${fnName}' requires capability '${builtinRequired}', not declared`,
+              undefined,
+              undefined
+            )
+          }
+        }
+
+        const fnType = this.functionTypes.get(fnName)
+
+        if (!fnType) {
+          this.addError(
+            `Undefined function '${fnName}'`,
+            undefined,
+            undefined
+          )
+          return BUILTIN_TYPES.UNKNOWN
+        }
+
+        if (fnType.kind === "fn") {
+          // 인자 개수 확인
+          if ((callExpr.args || []).length !== fnType.paramTypes.length) {
+            this.addError(
+              `Function '${fnName}' expects ${fnType.paramTypes.length} arguments, got ${(callExpr.args || []).length}`,
+              undefined,
+              undefined
+            )
+          }
+
+          // 인자 타입 검사
+          for (let i = 0; i < (callExpr.args || []).length; i++) {
+            const argType = this.checkExpr(callExpr.args[i])
+            const paramType = fnType.paramTypes[i] || BUILTIN_TYPES.UNKNOWN
+
+            if (!typesCompatible(argType, paramType)) {
+              this.addError(
+                `Argument ${i} of '${fnName}': expected ${typeToString(paramType)}, got ${typeToString(argType)}`,
+                undefined,
+                undefined,
+                undefined,
+                paramType,
+                argType
+              )
+            }
+          }
+
+          // Phase 6: Capability Propagation 검증
+          // Strict: callee.capabilities ⊆ caller.capabilities
+          if (fnType.capabilities && fnType.capabilities.length > 0) {
+            for (const required of fnType.capabilities) {
+              const callerHas = this.currentCapabilities.some(
+                c => c.cap === required.cap && this.capabilityCovers(c, required)
+              )
+              if (!callerHas) {
+                this.addError(
+                  `Call to '${fnName}' requires capability '${required.cap}' ` +
+                  `${required.arg ? `(${required.arg})` : ""}, ` +
+                  `but caller does not declare it`,
+                  undefined,
+                  undefined
+                )
+              }
+            }
+          }
+
+          return fnType.returnType
+        }
+
+        return BUILTIN_TYPES.UNKNOWN
+      }
+
+      case "array": {
+        const arrayExpr = expr as any
+        if ((arrayExpr.elements || []).length === 0) {
+          return {
+            kind: "array",
+            elementType: BUILTIN_TYPES.UNKNOWN,
+          }
+        }
+
+        const elementTypes = (arrayExpr.elements || []).map((e: any) =>
+          this.checkExpr(e)
+        )
+
+        // 모든 요소 타입이 같은지 확인
+        const firstType = elementTypes[0]
+        for (let i = 1; i < elementTypes.length; i++) {
+          if (!typesCompatible(elementTypes[i], firstType)) {
+            this.addError(
+              `Array elements have inconsistent types: ${typeToString(firstType)} and ${typeToString(elementTypes[i])}`,
+              undefined,
+              undefined
+            )
+          }
+        }
+
+        return {
+          kind: "array",
+          elementType: firstType,
+        }
+      }
+
+      case "index": {
+        const indexExpr = expr as any
+        const objectType = this.checkExpr(indexExpr.object)
+        this.checkExpr(indexExpr.index)
+
+        if (objectType.kind === "array") {
+          return objectType.elementType
+        }
+        return BUILTIN_TYPES.UNKNOWN
+      }
+
+      case "member": {
+        const memberExpr = expr as any
+        const objectType = this.checkExpr(memberExpr.object)
+
+        if (objectType.kind === "object") {
+          const propType = objectType.properties.get(memberExpr.property)
+          return propType || BUILTIN_TYPES.UNKNOWN
+        }
+        return BUILTIN_TYPES.UNKNOWN
+      }
+
+      case "object": {
+        const objExpr = expr as any
+        const properties = new Map<string, Type>()
+
+        for (const entry of objExpr.entries || []) {
+          properties.set(entry.key, this.checkExpr(entry.value))
+        }
+
+        return {
+          kind: "object",
+          properties,
+        }
+      }
+
+      case "fn": {
+        const fnExpr = expr as any
+        const savedEnv = new Map(this.env)
+        const savedReturnTypes = this.currentFunctionReturnTypes
+
+        this.currentFunctionReturnTypes = []
+
+        // Phase 5.5.3: fn 표현식 파라미터도 어노테이션 적용
+        for (const param of fnExpr.params || []) {
+          this.env.set(param.name, parseType(param.typeAnnotation ?? "unknown"))
+        }
+
+        // 함수 본문 검사
+        for (const stmt of fnExpr.body || []) {
+          this.checkStmt(stmt)
+        }
+
+        const inferredReturn = this.inferReturnType(
+          this.currentFunctionReturnTypes
+        )
+        // Phase 5.5.3: fn 표현식도 어노테이션 기반 paramTypes
+        const paramTypes: Type[] = (fnExpr.params || []).map((p: any) =>
+          parseType(p.typeAnnotation ?? "unknown")
+        )
+
+        this.currentFunctionReturnTypes = savedReturnTypes
+        this.env = savedEnv
+
+        return {
+          kind: "fn",
+          paramTypes,
+          returnType: inferredReturn,
+        }
+      }
+
+      case "ternary": {
+        const ternaryExpr = expr as any
+        this.checkExpr(ternaryExpr.cond)
+        const thenType = this.checkExpr(ternaryExpr.then)
+        const elseType = this.checkExpr(ternaryExpr.else)
+
+        // then과 else 타입이 호환 가능해야 함
+        if (!typesCompatible(thenType, elseType)) {
+          this.addError(
+            `Ternary branch types incompatible: ${typeToString(thenType)} vs ${typeToString(elseType)}`,
+            undefined,
+            undefined
+          )
+        }
+
+        return thenType
+      }
+
+      case "if": {
+        const ifExpr = expr as any
+        this.checkExpr(ifExpr.cond)
+        for (const s of ifExpr.then || []) {
+          this.checkStmt(s)
+        }
+        for (const s of ifExpr.else || []) {
+          this.checkStmt(s)
+        }
+        return BUILTIN_TYPES.UNKNOWN
+      }
+
+      case "match": {
+        const matchExpr = expr as any
+        this.checkExpr(matchExpr.subject)
+        for (const arm of matchExpr.arms || []) {
+          if (arm.pattern) {
+            this.checkExpr(arm.pattern)
+          }
+          if (arm.guard) {
+            this.checkExpr(arm.guard)
+          }
+          for (const s of arm.body || []) {
+            this.checkStmt(s)
+          }
+        }
+        return BUILTIN_TYPES.UNKNOWN
+      }
+
+      default:
+        return BUILTIN_TYPES.UNKNOWN
+    }
+  }
+
+  /**
+   * 오류 추가
+   */
+  private addError(
+    message: string,
+    line?: number,
+    column?: number,
+    variable?: string,
+    expected?: Type,
+    actual?: Type
+  ): void {
+    this.errors.push({
+      message,
+      line,
+      column,
+      variable,
+      expected,
+      actual,
+    })
+  }
+
+  /**
+   * 환경 조회
+   */
+  public getEnv(): Map<string, Type> {
+    return new Map(this.env)
+  }
+
+  /**
+   * 함수 타입 조회
+   */
+  public getFunctionType(name: string): Type | undefined {
+    return this.functionTypes.get(name)
+  }
+
+  /**
+   * 오류 개수
+   */
+  public getErrorCount(): number {
+    return this.errors.length
+  }
+
+  /**
+   * 오류 목록
+   */
+  public getErrors(): TypeCheckError[] {
+    return [...this.errors]
+  }
+
+  /**
+   * Phase 6: Capability 헬퍼 함수들
+   */
+  private capabilityCovers(caller: Capability, callee: Capability): boolean {
+    if (caller.cap !== callee.cap) return false
+    if (!callee.arg) return true // callee가 경로 무관하면 OK
+    if (!caller.arg) return false
+
+    // Path: /tmp → /tmp/file.txt OK, /tmp → /etc NG
+    if (caller.cap === "read_file" || caller.cap === "write_file") {
+      return this.pathIsUnder(callee.arg, caller.arg)
+    }
+
+    // Network: api.openai.com → api.openai.com OK, *.openai.com → sub.openai.com OK
+    if (caller.cap === "network") {
+      return this.hostMatches(callee.arg, caller.arg)
+    }
+
+    return caller.arg === callee.arg
+  }
+
+  private pathIsUnder(target: string, allowedPrefix: string): boolean {
+    // ".." 즉시 거부
+    if (target.includes("..")) return false
+    const normalized = target.replace(/\/+/g, "/").replace(/\/$/, "")
+    const prefix = allowedPrefix.replace(/\/+/g, "/").replace(/\/$/, "")
+    return normalized === prefix || normalized.startsWith(prefix + "/")
+  }
+
+  private hostMatches(target: string, pattern: string): boolean {
+    if (pattern === target) return true
+    if (pattern.startsWith("*.")) {
+      const base = pattern.slice(2)
+      return (
+        target.endsWith("." + base) &&
+        !target.slice(0, -base.length - 1).includes(".")
+      )
+    }
+    return false
+  }
+}

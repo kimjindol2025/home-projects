@@ -1,0 +1,353 @@
+/**
+ * 기본 트랜잭션 구현
+ *
+ * ACID 보장, Savepoint 지원
+ */
+
+import type {
+  IsolationLevel,
+  TransactionMode,
+  TransactionOptions,
+  SavepointInfo,
+  TransactionStats,
+  RollbackReason
+} from '../types/transaction.types';
+
+export class Transaction {
+  private _id: string;
+  private _db: any;
+  private _isolationLevel: IsolationLevel;
+  private _mode: TransactionMode;
+  private _timeout: number;
+  private _readOnly: boolean;
+  private _name?: string;
+
+  private _startTime: number;
+  private _endTime: number | null = null;
+  private _readCount = 0;
+  private _writeCount = 0;
+  private _rollbackCount = 0;
+  private _status: 'ACTIVE' | 'COMMITTED' | 'ROLLED_BACK' | 'FAILED' = 'ACTIVE';
+
+  private _savepoints: Map<string, SavepointInfo> = new Map();
+  private _savepointStack: string[] = [];
+
+  constructor(db: any, options: TransactionOptions = {}) {
+    this._id = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    this._db = db;
+    this._isolationLevel = options.isolationLevel || 'READ_COMMITTED';
+    this._mode = options.mode || 'DEFERRED';
+    this._timeout = options.timeout || 30000;
+    this._readOnly = options.readOnly || false;
+    this._name = options.name;
+    this._startTime = Date.now();
+
+    this._begin();
+  }
+
+  /**
+   * 트랜잭션 시작
+   */
+  private _begin(): void {
+    const mode = this._mode;
+    const isolation = this._isolationLevelToSql(this._isolationLevel);
+
+    try {
+      this._db.exec(`BEGIN ${mode}`);
+      if (isolation) {
+        this._db.exec(isolation);
+      }
+    } catch (error) {
+      this._status = 'FAILED';
+      throw new Error(`Failed to begin transaction: ${error}`);
+    }
+  }
+
+  /**
+   * SQL 쿼리 실행
+   */
+  async run(sql: string, ...params: any[]): Promise<any> {
+    if (this._status !== 'ACTIVE') {
+      throw new Error(`Transaction is ${this._status}`);
+    }
+
+    this._checkTimeout();
+
+    const isWrite = /^(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)/i.test(sql.trim());
+    if (isWrite) {
+      if (this._readOnly) {
+        throw new Error('Cannot write in read-only transaction');
+      }
+      this._writeCount++;
+    } else {
+      this._readCount++;
+    }
+
+    try {
+      return this._db.run(sql, ...params);
+    } catch (error) {
+      throw this._handleExecutionError(error as Error, sql);
+    }
+  }
+
+  /**
+   * 쿼리 실행 (결과 반환)
+   */
+  async query<T = any>(sql: string, ...params: any[]): Promise<T | undefined> {
+    if (this._status !== 'ACTIVE') {
+      throw new Error(`Transaction is ${this._status}`);
+    }
+
+    this._checkTimeout();
+    this._readCount++;
+
+    try {
+      return this._db.query<T>(sql, ...params);
+    } catch (error) {
+      throw this._handleExecutionError(error as Error, sql);
+    }
+  }
+
+  /**
+   * 쿼리 실행 (모든 결과)
+   */
+  async queryAll<T = any>(sql: string, ...params: any[]): Promise<T[]> {
+    if (this._status !== 'ACTIVE') {
+      throw new Error(`Transaction is ${this._status}`);
+    }
+
+    this._checkTimeout();
+    this._readCount++;
+
+    try {
+      return this._db.queryAll<T>(sql, ...params);
+    } catch (error) {
+      throw this._handleExecutionError(error as Error, sql);
+    }
+  }
+
+  /**
+   * Savepoint 생성
+   */
+  async savepoint(name: string): Promise<SavepointInfo> {
+    if (this._status !== 'ACTIVE') {
+      throw new Error(`Cannot create savepoint: transaction is ${this._status}`);
+    }
+
+    if (this._savepoints.has(name)) {
+      throw new Error(`Savepoint "${name}" already exists`);
+    }
+
+    try {
+      this._db.exec(`SAVEPOINT ${this._escapeName(name)}`);
+
+      const info: SavepointInfo = {
+        name,
+        createdAt: Date.now(),
+        depth: this._savepointStack.length,
+        committed: false
+      };
+
+      this._savepoints.set(name, info);
+      this._savepointStack.push(name);
+
+      return info;
+    } catch (error) {
+      throw new Error(`Failed to create savepoint "${name}": ${error}`);
+    }
+  }
+
+  /**
+   * Savepoint로 롤백
+   */
+  async rollbackTo(nameOrInfo: string | SavepointInfo): Promise<void> {
+    const name = typeof nameOrInfo === 'string' ? nameOrInfo : nameOrInfo.name;
+
+    if (!this._savepoints.has(name)) {
+      throw new Error(`Savepoint "${name}" does not exist`);
+    }
+
+    try {
+      this._db.exec(`ROLLBACK TO ${this._escapeName(name)}`);
+
+      // 스택에서 제거
+      const idx = this._savepointStack.indexOf(name);
+      if (idx !== -1) {
+        this._savepointStack.splice(idx + 1);
+      }
+
+      this._rollbackCount++;
+    } catch (error) {
+      throw new Error(`Failed to rollback to savepoint "${name}": ${error}`);
+    }
+  }
+
+  /**
+   * Savepoint 릴리스
+   */
+  async release(name: string): Promise<void> {
+    if (!this._savepoints.has(name)) {
+      throw new Error(`Savepoint "${name}" does not exist`);
+    }
+
+    try {
+      this._db.exec(`RELEASE ${this._escapeName(name)}`);
+
+      const info = this._savepoints.get(name)!;
+      info.committed = true;
+
+      // 스택에서 제거
+      const idx = this._savepointStack.indexOf(name);
+      if (idx !== -1) {
+        this._savepointStack.splice(idx);
+      }
+    } catch (error) {
+      throw new Error(`Failed to release savepoint "${name}": ${error}`);
+    }
+  }
+
+  /**
+   * 커밋
+   */
+  async commit(): Promise<void> {
+    if (this._status !== 'ACTIVE') {
+      throw new Error(`Cannot commit: transaction is ${this._status}`);
+    }
+
+    try {
+      this._db.exec('COMMIT');
+      this._status = 'COMMITTED';
+      this._endTime = Date.now();
+    } catch (error) {
+      this._status = 'FAILED';
+      throw new Error(`Failed to commit transaction: ${error}`);
+    }
+  }
+
+  /**
+   * 롤백
+   */
+  async rollback(reason?: RollbackReason): Promise<void> {
+    if (this._status === 'ROLLED_BACK') {
+      return; // 이미 롤백됨
+    }
+
+    try {
+      this._db.exec('ROLLBACK');
+      this._status = 'ROLLED_BACK';
+      this._endTime = Date.now();
+      this._rollbackCount++;
+
+      if (reason) {
+        console.log(`Transaction rolled back: ${reason.reason} - ${reason.description}`);
+      }
+    } catch (error) {
+      this._status = 'FAILED';
+      throw new Error(`Failed to rollback transaction: ${error}`);
+    }
+  }
+
+  /**
+   * 트랜잭션 통계
+   */
+  getStats(): TransactionStats {
+    const now = Date.now();
+    const duration = (this._endTime || now) - this._startTime;
+
+    return {
+      id: this._id,
+      startTime: this._startTime,
+      endTime: this._endTime,
+      duration,
+      readCount: this._readCount,
+      writeCount: this._writeCount,
+      rollbackCount: this._rollbackCount,
+      savepointCount: this._savepoints.size,
+      status: this._status
+    };
+  }
+
+  /**
+   * 상태 조회
+   */
+  getStatus(): string {
+    return this._status;
+  }
+
+  /**
+   * 격리 레벨을 SQL로 변환
+   */
+  private _isolationLevelToSql(level: IsolationLevel): string | null {
+    // SQLite는 기본적으로 SERIALIZABLE 격리 수준을 사용
+    // 하지만 설정을 통해 다른 수준을 구현할 수 있음
+    switch (level) {
+      case 'READ_UNCOMMITTED':
+        return 'PRAGMA read_uncommitted = 1';
+      case 'SERIALIZABLE':
+        return 'PRAGMA read_uncommitted = 0';
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * 타임아웃 체크
+   */
+  private _checkTimeout(): void {
+    const elapsed = Date.now() - this._startTime;
+    if (elapsed > this._timeout) {
+      throw new Error(`Transaction timeout after ${elapsed}ms`);
+    }
+  }
+
+  /**
+   * 실행 에러 처리
+   */
+  private _handleExecutionError(error: Error, sql: string): Error {
+    const message = error.message;
+
+    if (message.includes('database is locked')) {
+      return new Error(`Database locked during execution: ${sql}`);
+    }
+
+    if (message.includes('UNIQUE constraint failed')) {
+      return new Error(`Unique constraint violation: ${message}`);
+    }
+
+    if (message.includes('FOREIGN KEY constraint failed')) {
+      return new Error(`Foreign key constraint violation: ${message}`);
+    }
+
+    return error;
+  }
+
+  /**
+   * 이름 이스케이프 (SQL 인젝션 방지)
+   */
+  private _escapeName(name: string): string {
+    return `"${name.replace(/"/g, '""')}"`;
+  }
+
+  /**
+   * 트랜잭션 ID 조회
+   */
+  getId(): string {
+    return this._id;
+  }
+
+  /**
+   * 격리 레벨 조회
+   */
+  getIsolationLevel(): IsolationLevel {
+    return this._isolationLevel;
+  }
+
+  /**
+   * Savepoint 목록
+   */
+  getSavepoints(): SavepointInfo[] {
+    return Array.from(this._savepoints.values());
+  }
+}
+
+export default Transaction;

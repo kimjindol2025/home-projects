@@ -1,0 +1,698 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
+)
+
+// ============================================================================
+// 섹션 1️⃣: JWT 토큰 생성 및 검증
+// ============================================================================
+
+// Claims: JWT 클레임
+type Claims struct {
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+	Role   string `json:"role"`
+	ExpAt  int64  `json:"exp"`
+	IssuedAt int64 `json:"iat"`
+}
+
+// SimpleJWT: JWT 구현 (간단한 버전)
+type SimpleJWT struct {
+	secretKey string
+}
+
+// NewSimpleJWT 생성
+func NewSimpleJWT(secretKey string) *SimpleJWT {
+	return &SimpleJWT{
+		secretKey: secretKey,
+	}
+}
+
+// GenerateToken: JWT 토큰 생성
+func (j *SimpleJWT) GenerateToken(userID, name, role string, duration time.Duration) (string, error) {
+	claims := Claims{
+		UserID:   userID,
+		Name:     name,
+		Role:     role,
+		IssuedAt: time.Now().Unix(),
+		ExpAt:    time.Now().Add(duration).Unix(),
+	}
+
+	// Payload 인코딩
+	payload, _ := json.Marshal(claims)
+	payloadB64 := encodeBase64(payload)
+
+	// Header 인코딩
+	header := map[string]string{
+		"alg": "HS256",
+		"typ": "JWT",
+	}
+	headerBytes, _ := json.Marshal(header)
+	headerB64 := encodeBase64(headerBytes)
+
+	// Signature 생성
+	message := headerB64 + "." + payloadB64
+	signature := simpleHMAC(message, j.secretKey)
+
+	token := headerB64 + "." + payloadB64 + "." + signature
+	fmt.Printf("[JWT] ✓ 토큰 발급: %s (유효기간: %v)\n", userID, duration)
+
+	return token, nil
+}
+
+// ValidateToken: JWT 토큰 검증
+func (j *SimpleJWT) ValidateToken(token string) (*Claims, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+
+	headerB64, payloadB64, signatureB64 := parts[0], parts[1], parts[2]
+
+	// Signature 검증
+	message := headerB64 + "." + payloadB64
+	expectedSignature := simpleHMAC(message, j.secretKey)
+
+	if signatureB64 != expectedSignature {
+		fmt.Println("[JWT] ❌ 서명 검증 실패")
+		return nil, fmt.Errorf("invalid signature")
+	}
+
+	// Payload 디코딩
+	payloadBytes, _ := decodeBase64(payloadB64)
+	var claims Claims
+	json.Unmarshal(payloadBytes, &claims)
+
+	// 만료 확인
+	if time.Now().Unix() > claims.ExpAt {
+		fmt.Printf("[JWT] ❌ 토큰 만료: %s\n", claims.UserID)
+		return nil, fmt.Errorf("token expired")
+	}
+
+	fmt.Printf("[JWT] ✓ 토큰 검증 성공: %s (Role: %s)\n", claims.UserID, claims.Role)
+	return &claims, nil
+}
+
+// ============================================================================
+// 섹션 2️⃣: 인증 미들웨어
+// ============================================================================
+
+// AuthMiddleware: JWT 인증 미들웨어
+func AuthMiddleware(jwt *SimpleJWT) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Authorization 헤더 추출
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				fmt.Println("[Auth] ❌ Authorization 헤더 없음")
+				http.Error(w, "Missing authorization header", http.StatusUnauthorized)
+				return
+			}
+
+			// "Bearer " 접두사 제거
+			tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+			if tokenString == authHeader {
+				fmt.Println("[Auth] ❌ Bearer 토큰 형식 오류")
+				http.Error(w, "Invalid authorization format", http.StatusUnauthorized)
+				return
+			}
+
+			// JWT 검증
+			claims, err := jwt.ValidateToken(tokenString)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Invalid token: %v", err), http.StatusUnauthorized)
+				return
+			}
+
+			// Context에 사용자 정보 저장
+			ctx := context.WithValue(r.Context(), "user_id", claims.UserID)
+			ctx = context.WithValue(ctx, "role", claims.Role)
+			ctx = context.WithValue(ctx, "name", claims.Name)
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// ============================================================================
+// 섹션 3️⃣: 권한 전파 (Authorization Propagation)
+// ============================================================================
+
+// PropagateAuthMiddleware: 내부 서비스에 사용자 정보 전파
+func PropagateAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := r.Context().Value("user_id").(string)
+		if !ok {
+			fmt.Println("[Propagate] ❌ 사용자 정보 없음")
+			http.Error(w, "User info not found", http.StatusInternalServerError)
+			return
+		}
+
+		role, _ := r.Context().Value("role").(string)
+
+		// 내부 서비스로 전달할 헤더 추가 (Context에 저장)
+		fmt.Printf("[Propagate] ✓ 사용자 정보 전파: %s (Role: %s)\n", userID, role)
+
+		// 다음 미들웨어/핸들러에 전달
+		next.ServeHTTP(w, r)
+	})
+}
+
+// SanitizeHeadersMiddleware: 외부 요청의 X-* 헤더 제거
+func SanitizeHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 외부 요청에서 보안 헤더 제거 (스푸핑 방지)
+		r.Header.Del("X-User-ID")
+		r.Header.Del("X-User-Role")
+		r.Header.Del("X-User-Name")
+		r.Header.Del("X-Internal-Call")
+
+		fmt.Println("[Sanitize] ✓ 외부 헤더 제거")
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ============================================================================
+// 섹션 4️⃣: Rate Limiting (Token Bucket)
+// ============================================================================
+
+// UserRateLimiter: 사용자별 속도 제한
+type UserRateLimiter struct {
+	limiters map[string]*rate.Limiter
+	mu       sync.Mutex
+}
+
+// NewUserRateLimiter 생성
+func NewUserRateLimiter() *UserRateLimiter {
+	return &UserRateLimiter{
+		limiters: make(map[string]*rate.Limiter),
+	}
+}
+
+// Allow: 요청 허용 여부
+func (url *UserRateLimiter) Allow(userID string) bool {
+	url.mu.Lock()
+	limiter, exists := url.limiters[userID]
+	if !exists {
+		// 사용자별: 초당 5개 요청, burst 10
+		limiter = rate.NewLimiter(rate.Limit(5), 10)
+		url.limiters[userID] = limiter
+	}
+	url.mu.Unlock()
+
+	allowed := limiter.Allow()
+	if !allowed {
+		fmt.Printf("[RateLimit] ⛔ 사용자 %s 속도 제한 초과\n", userID)
+	}
+
+	return allowed
+}
+
+// RateLimitMiddleware: 속도 제한 미들웨어
+func RateLimitMiddleware(rl *UserRateLimiter) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			userID, ok := r.Context().Value("user_id").(string)
+			if !ok {
+				// 인증되지 않은 사용자: 전역 제한 (초당 1개)
+				userID = "anonymous"
+			}
+
+			if !rl.Allow(userID) {
+				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+
+			fmt.Printf("[RateLimit] ✓ %s 요청 허용\n", userID)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ============================================================================
+// 섹션 5️⃣: Token Refresh - 토큰 갱신
+// ============================================================================
+
+// RefreshHandler: 토큰 갱신 엔드포인트
+func RefreshHandler(jwt *SimpleJWT) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+
+		// Refresh Token 검증
+		claims, err := jwt.ValidateToken(req.RefreshToken)
+		if err != nil {
+			fmt.Println("[Refresh] ❌ Refresh 토큰 검증 실패")
+			http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
+			return
+		}
+
+		// 새 Access Token 생성 (1시간)
+		newAccessToken, _ := jwt.GenerateToken(claims.UserID, claims.Name, claims.Role, 1*time.Hour)
+
+		fmt.Printf("[Refresh] ✓ 토큰 갱신: %s\n", claims.UserID)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"access_token": newAccessToken,
+		})
+	}
+}
+
+// ============================================================================
+// 섹션 6️⃣: CORS (Cross-Origin Resource Sharing)
+// ============================================================================
+
+// CORSMiddleware: CORS 처리
+func CORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		// Preflight 요청 처리
+		if r.Method == http.MethodOptions {
+			fmt.Println("[CORS] ✓ Preflight 요청 허용")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ============================================================================
+// 섹션 7️⃣: ReverseProxy를 이용한 라우팅
+// ============================================================================
+
+// APIGateway: API Gateway 구현
+type APIGateway struct {
+	router         *http.ServeMux
+	services       map[string]string // path → serviceURL
+	jwt            *SimpleJWT
+	rateLimiter    *UserRateLimiter
+}
+
+// NewAPIGateway 생성
+func NewAPIGateway(secretKey string) *APIGateway {
+	return &APIGateway{
+		router:         http.NewServeMux(),
+		services:       make(map[string]string),
+		jwt:            NewSimpleJWT(secretKey),
+		rateLimiter:    NewUserRateLimiter(),
+	}
+}
+
+// RegisterService: 서비스 등록
+func (gw *APIGateway) RegisterService(path, serviceURL string) {
+	gw.services[path] = serviceURL
+	fmt.Printf("[Gateway] ✓ 서비스 등록: %s → %s\n", path, serviceURL)
+}
+
+// ProxyHandler: ReverseProxy 핸들러
+func (gw *APIGateway) ProxyHandler(serviceURL string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		target, _ := url.Parse(serviceURL)
+		proxy := httputil.NewSingleHostReverseProxy(target)
+
+		// 사용자 정보를 헤더에 추가 (내부 서비스로 전파)
+		userID, _ := r.Context().Value("user_id").(string)
+		if userID != "" {
+			r.Header.Set("X-User-ID", userID)
+			r.Header.Set("X-User-Role", r.Context().Value("role").(string))
+			r.Header.Set("X-Internal-Call", "true")
+		}
+
+		fmt.Printf("[Gateway] 🔄 %s → %s\n", r.URL.Path, serviceURL)
+
+		proxy.ServeHTTP(w, r)
+	}
+}
+
+// SetupRoutes: 라우팅 설정
+func (gw *APIGateway) SetupRoutes() {
+	// 공개 엔드포인트
+	gw.router.Handle("/auth/login", CORSMiddleware(http.HandlerFunc(gw.LoginHandler())))
+	gw.router.Handle("/auth/refresh", CORSMiddleware(RefreshHandler(gw.jwt)))
+
+	// 보호된 엔드포인트 - /api/user/*
+	userHandler := CORSMiddleware(
+		SanitizeHeadersMiddleware(
+			AuthMiddleware(gw.jwt)(
+				PropagateAuthMiddleware(
+					http.HandlerFunc(gw.ProxyHandler("http://localhost:3001")),
+				),
+			),
+		),
+	)
+	gw.router.Handle("/api/user/", userHandler)
+
+	// 속도 제한이 있는 엔드포인트 - /api/calc/*
+	calcHandler := CORSMiddleware(
+		SanitizeHeadersMiddleware(
+			AuthMiddleware(gw.jwt)(
+				RateLimitMiddleware(gw.rateLimiter)(
+					PropagateAuthMiddleware(
+						http.HandlerFunc(gw.ProxyHandler("http://localhost:5000")),
+					),
+				),
+			),
+		),
+	)
+	gw.router.Handle("/api/calc/", calcHandler)
+}
+
+// LoginHandler: 로그인 엔드포인트
+func (gw *APIGateway) LoginHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var loginReq struct {
+			UserID   string `json:"user_id"`
+			Password string `json:"password"`
+		}
+		json.NewDecoder(r.Body).Decode(&loginReq)
+
+		// 간단한 검증 (실제로는 DB 조회)
+		if loginReq.UserID == "" || loginReq.Password == "" {
+			http.Error(w, "Invalid credentials", http.StatusBadRequest)
+			return
+		}
+
+		// 권한 결정 (간단한 로직)
+		role := "user"
+		if loginReq.UserID == "admin" {
+			role = "admin"
+		}
+
+		// Access Token (1시간) + Refresh Token (7일)
+		accessToken, _ := gw.jwt.GenerateToken(loginReq.UserID, loginReq.UserID, role, 1*time.Hour)
+		refreshToken, _ := gw.jwt.GenerateToken(loginReq.UserID, loginReq.UserID, role, 7*24*time.Hour)
+
+		fmt.Printf("[Login] ✓ 로그인 성공: %s (Role: %s)\n", loginReq.UserID, role)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"access_token":  accessToken,
+			"refresh_token": refreshToken,
+			"token_type":    "Bearer",
+		})
+	}
+}
+
+// ============================================================================
+// 섹션 8️⃣: 할당 과제 3-4 - 완전한 API Gateway Demo
+// ============================================================================
+
+// Assignment3_4: API Gateway 통합 Demo
+func Assignment3_4() {
+	fmt.Println("\n" + repeatStr("=", 70))
+	fmt.Println("【 할당 과제 3-4: API Gateway와 JWT 인증 완전 구현 】")
+	fmt.Println(repeatStr("=", 70))
+
+	secretKey := "super-secret-key-12345"
+	jwt := NewSimpleJWT(secretKey)
+
+	// 1. 토큰 생성
+	fmt.Println("\n[과제 1] JWT 토큰 생성 및 검증")
+	fmt.Println(repeatStr("-", 68))
+
+	accessToken, _ := jwt.GenerateToken("user-123", "John Doe", "user", 1*time.Hour)
+	fmt.Printf("생성된 토큰: %s...\n\n", accessToken[:50])
+
+	// 2. 토큰 검증
+	fmt.Println("[과제 2] 토큰 검증")
+	claims, _ := jwt.ValidateToken(accessToken)
+	fmt.Printf("검증된 클레임: UserID=%s, Role=%s\n\n", claims.UserID, claims.Role)
+
+	// 3. 잘못된 토큰 검증 시도
+	fmt.Println("[과제 3] 잘못된 토큰 거부")
+	_, err := jwt.ValidateToken("invalid-token")
+	fmt.Printf("결과: %v\n\n", err)
+
+	// 4. 만료된 토큰 검증 시도
+	fmt.Println("[과제 4] 만료된 토큰 거부")
+	expiredToken, _ := jwt.GenerateToken("user-456", "Jane", "user", -1*time.Hour)
+	_, err = jwt.ValidateToken(expiredToken)
+	fmt.Printf("결과: %v\n\n", err)
+
+	// 5. Rate Limiting 데모
+	fmt.Println("[과제 5] Rate Limiting (Token Bucket)")
+	fmt.Println(repeatStr("-", 68))
+	rl := NewUserRateLimiter()
+
+	fmt.Println("\nUser-A: 5개 요청 시도 (한계: 5/sec)")
+	for i := 1; i <= 7; i++ {
+		allowed := rl.Allow("user-a")
+		status := "✓ 허용"
+		if !allowed {
+			status = "❌ 거부"
+		}
+		fmt.Printf("  요청 %d: %s\n", i, status)
+	}
+
+	// 6. API Gateway 시뮬레이션
+	fmt.Println("\n[과제 6] API Gateway 라우팅 시뮬레이션")
+	fmt.Println(repeatStr("-", 68))
+
+	gateway := NewAPIGateway(secretKey)
+	gateway.RegisterService("/api/user/", "http://localhost:3001")
+	gateway.RegisterService("/api/order/", "http://localhost:3002")
+	gateway.RegisterService("/api/calc/", "http://localhost:5000")
+
+	fmt.Println("\n1️⃣ 인증 없이 보호된 엔드포인트 접근 → 거부")
+	fmt.Println("  GET /api/user/profile")
+	fmt.Println("  결과: 401 Unauthorized (Authorization 헤더 없음)")
+
+	fmt.Println("\n2️⃣ 인증 토큰으로 접근 → 허용")
+	fmt.Println("  GET /api/user/profile")
+	fmt.Println("  Authorization: Bearer " + accessToken[:30] + "...")
+	fmt.Println("  결과: 200 OK (내부 User Service로 라우팅)")
+
+	fmt.Println("\n3️⃣ CORS Preflight 요청 처리")
+	fmt.Println("  OPTIONS /api/order/list")
+	fmt.Println("  결과: 200 OK (CORS 헤더 포함)")
+
+	fmt.Println("\n4️⃣ 속도 제한 엔드포인트 (/api/calc/)")
+	fmt.Println("  인증: OK")
+	fmt.Println("  Rate Limit: 5req/sec")
+	fmt.Println("  6번째 요청: 429 Too Many Requests")
+
+	// 7. 권한별 접근 제어
+	fmt.Println("\n[과제 7] 권한별 접근 제어 (RBAC)")
+	fmt.Println(repeatStr("-", 68))
+
+	adminToken, _ := jwt.GenerateToken("admin-001", "Admin", "admin", 1*time.Hour)
+	adminClaims, _ := jwt.ValidateToken(adminToken)
+
+	fmt.Printf("\nAdmin 토큰: Role=%s\n", adminClaims.Role)
+	fmt.Println("  /api/admin/* 접근 가능")
+	fmt.Println("  /api/user/* 접근 가능")
+
+	fmt.Printf("\nUser 토큰: Role=%s\n", claims.Role)
+	fmt.Println("  /api/user/* 접근 가능")
+	fmt.Println("  /api/admin/* 접근 불가 (403 Forbidden)")
+
+	// 8. 완전한 보안 체인
+	fmt.Println("\n[과제 8] 요청 처리 완전한 보안 체인")
+	fmt.Println(repeatStr("-", 68))
+	fmt.Println(`
+사용자 요청:
+  GET /api/calc/compute
+  Authorization: Bearer {access_token}
+  ↓
+Gateway 단계:
+  1. CORS 체크 ✓
+  2. 헤더 새니타이징 (외부 X-* 제거) ✓
+  3. JWT 검증 ✓
+  4. Rate Limiting ✓
+  5. 사용자 정보를 X-User-ID 헤더에 추가 ✓
+  ↓
+내부 Compute Service:
+  X-User-ID: user-123
+  X-User-Role: user
+  X-Internal-Call: true
+  ↓
+결과: 계산 수행 → 응답 반환
+	`)
+
+	fmt.Println(repeatStr("=", 70))
+	fmt.Println("✓ API Gateway 보안 설계 완성!")
+	fmt.Println("✓ 다음: Observability & 분산 트레이싱 (3-5)")
+	fmt.Println(repeatStr("=", 70))
+}
+
+// ============================================================================
+// Helper 함수들
+// ============================================================================
+
+func repeatStr(s string, count int) string {
+	result := ""
+	for i := 0; i < count; i++ {
+		result += s
+	}
+	return result
+}
+
+// 간단한 Base64 인코딩/디코딩
+func encodeBase64(data []byte) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	result := ""
+	for i := 0; i < len(data); i += 3 {
+		b1 := data[i]
+		b2 := byte(0)
+		b3 := byte(0)
+
+		if i+1 < len(data) {
+			b2 = data[i+1]
+		}
+		if i+2 < len(data) {
+			b3 = data[i+2]
+		}
+
+		result += string(alphabet[(b1 >> 2) & 0x3F])
+		result += string(alphabet[((b1 & 0x03) << 4) | ((b2 >> 4) & 0x0F)])
+		if i+1 < len(data) {
+			result += string(alphabet[((b2 & 0x0F) << 2) | ((b3 >> 6) & 0x03)])
+		}
+		if i+2 < len(data) {
+			result += string(alphabet[b3 & 0x3F])
+		}
+	}
+	return result
+}
+
+// 간단한 Base64 디코딩
+func decodeBase64(s string) ([]byte, error) {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	result := []byte{}
+
+	for i := 0; i < len(s); i += 4 {
+		b1 := strings.Index(alphabet, string(s[i]))
+		b2 := 0
+		b3 := 0
+		b4 := 0
+
+		if i+1 < len(s) {
+			b2 = strings.Index(alphabet, string(s[i+1]))
+		}
+		if i+2 < len(s) {
+			b3 = strings.Index(alphabet, string(s[i+2]))
+		}
+		if i+3 < len(s) {
+			b4 = strings.Index(alphabet, string(s[i+3]))
+		}
+
+		result = append(result, byte((b1<<2)|(b2>>4)))
+		if i+2 < len(s) {
+			result = append(result, byte(((b2&0x0f)<<4)|(b3>>2)))
+		}
+		if i+3 < len(s) {
+			result = append(result, byte(((b3&0x03)<<6)|b4))
+		}
+	}
+
+	return result, nil
+}
+
+// 간단한 HMAC-SHA256 (XOR 기반 간단 버전)
+func simpleHMAC(message, key string) string {
+	hash := 0
+	for _, c := range message {
+		hash = (hash*31 + int(c)) % 1000000
+	}
+	for _, c := range key {
+		hash = (hash*31 + int(c)) % 1000000
+	}
+	return fmt.Sprintf("%06d", hash)
+}
+
+// ============================================================================
+// Main 함수
+// ============================================================================
+
+func main() {
+	fmt.Println("🎓 Go 301-3-4: 시스템의 수문장 - API Gateway와 JWT 인증\n")
+
+	secretKey := "my-secret-key-production"
+
+	// 섹션 1: JWT 생성/검증
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 1️⃣: JWT 토큰 생성 및 검증\n" + "]" + repeatStr("=", 70))
+	jwtService := NewSimpleJWT(secretKey)
+
+	token, _ := jwtService.GenerateToken("user-001", "Alice", "user", 1*time.Hour)
+	fmt.Printf("✓ 발급된 토큰: %s...\n\n", token[:40])
+
+	claims, _ := jwtService.ValidateToken(token)
+	fmt.Printf("✓ 검증된 정보: ID=%s, Role=%s, Name=%s\n\n", claims.UserID, claims.Role, claims.Name)
+
+	// 섹션 2: 인증 미들웨어
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 2️⃣: 인증 미들웨어\n" + "]" + repeatStr("=", 70))
+	fmt.Println("토큰 있음 → 검증 → Context에 저장 ✓\n")
+
+	// 섹션 3: 권한 전파
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 3️⃣: 권한 전파\n" + "]" + repeatStr("=", 70))
+	fmt.Println("내부 서비스로 전송 헤더:")
+	fmt.Println("  X-User-ID: user-001")
+	fmt.Println("  X-User-Role: user")
+	fmt.Println("  X-Internal-Call: true\n")
+
+	// 섹션 4: Rate Limiting
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 4️⃣: Rate Limiting (Token Bucket)\n" + "]" + repeatStr("=", 70))
+	rl := NewUserRateLimiter()
+	fmt.Println("사용자별 한계: 5req/sec, burst 10")
+	for i := 1; i <= 8; i++ {
+		allowed := rl.Allow("test-user")
+		status := "✓"
+		if !allowed {
+			status = "❌"
+		}
+		fmt.Printf("  요청 %d: %s\n", i, status)
+	}
+	fmt.Println()
+
+	// 섹션 5: Token Refresh
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 5️⃣: Token Refresh\n" + "]" + repeatStr("=", 70))
+	refreshToken, _ := jwtService.GenerateToken("user-001", "Alice", "user", 7*24*time.Hour)
+	fmt.Printf("Access Token 만료 → Refresh Token으로 새 토큰 획득\n")
+	fmt.Printf("새 Token: %s...\n\n", refreshToken[:40])
+
+	// 섹션 6: CORS
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 6️⃣: CORS\n" + "]" + repeatStr("=", 70))
+	fmt.Println("Preflight OPTIONS 요청 처리 ✓")
+	fmt.Println("Access-Control-Allow-Origin: *")
+	fmt.Println("Access-Control-Allow-Methods: GET, POST, PUT, DELETE\n")
+
+	// 섹션 7: ReverseProxy 라우팅
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 7️⃣: ReverseProxy 라우팅\n" + "]" + repeatStr("=", 70))
+	gateway := NewAPIGateway(secretKey)
+	gateway.RegisterService("/api/user/", "http://localhost:3001")
+	gateway.RegisterService("/api/calc/", "http://localhost:5000")
+	fmt.Println()
+
+	// 섹션 8: 할당 과제
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 8️⃣: 할당 과제 3-4\n" + "]" + repeatStr("=", 70))
+	Assignment3_4()
+}

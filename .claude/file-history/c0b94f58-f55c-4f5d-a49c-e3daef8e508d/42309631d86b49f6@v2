@@ -1,0 +1,242 @@
+"""
+Pytest 설정 및 픽스처
+"""
+
+import pytest
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+from typing import AsyncGenerator
+
+# 시스템 경로 추가
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+# ==================== Mock 클래스 ====================
+
+class MockRedis:
+    """Redis 모의 객체"""
+
+    def __init__(self):
+        self.data = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    async def set(self, key: str, value: str):
+        self.data[key] = value
+
+    async def setex(self, key: str, ttl: int, value: str):
+        self.data[key] = value
+
+    async def delete(self, key: str) -> int:
+        if key in self.data:
+            del self.data[key]
+            return 1
+        return 0
+
+    async def info(self) -> dict:
+        return {
+            "used_memory": 1024 * 1024,
+            "db0": {"keys": len(self.data)},
+        }
+
+    async def clear(self):
+        self.data.clear()
+
+
+class MockOllama:
+    """Ollama 모의 객체"""
+
+    @staticmethod
+    def generate(model: str, prompt: str, **kwargs) -> dict:
+        return {
+            "response": f"Mock response for: {prompt[:50]}...",
+            "eval_count": 10,
+        }
+
+
+class MockAnthropic:
+    """Anthropic API 모의 객체"""
+
+    def __init__(self, api_key: str = ""):
+        self.api_key = api_key
+
+    async def messages_create(self, **kwargs) -> dict:
+        class Message:
+            def __init__(self):
+                self.content = [MagicMock(text="Mock Claude response")]
+                self.usage = MagicMock(output_tokens=50, input_tokens=30)
+
+        return Message()
+
+    def __getattr__(self, name):
+        return MagicMock()
+
+
+class MockSlackClient:
+    """Slack SDK 모의 객체"""
+
+    async def chat_postMessage(self, **kwargs) -> dict:
+        return {"ok": True, "ts": "1234567890.000100"}
+
+    async def conversations_history(self, **kwargs) -> dict:
+        return {"messages": [{"text": "Mock message", "user": "U12345"}]}
+
+    async def close(self):
+        pass
+
+
+# ==================== Pytest 픽스처 ====================
+
+@pytest.fixture
+def event_loop():
+    """이벤트 루프 픽스처"""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
+
+
+@pytest.fixture
+async def mock_redis() -> MockRedis:
+    """Mock Redis 클라이언트"""
+    redis = MockRedis()
+    yield redis
+    await redis.clear()
+
+
+@pytest.fixture
+def mock_ollama():
+    """Mock Ollama 클라이언트"""
+    return MockOllama()
+
+
+@pytest.fixture
+def mock_anthropic():
+    """Mock Anthropic API 클라이언트"""
+    return MockAnthropic()
+
+
+@pytest.fixture
+def mock_slack():
+    """Mock Slack 클라이언트"""
+    return MockSlackClient()
+
+
+@pytest.fixture
+async def llm_manager(mock_redis):
+    """LLM 매니저 (Mock Redis 포함)"""
+    from src.llm_manager import LLMManager
+
+    manager = LLMManager()
+    # Mock Redis 주입은 필요시
+    return manager
+
+
+@pytest.fixture
+async def cache(mock_redis):
+    """캐시 인스턴스"""
+    from src.cache import PulseCache
+
+    cache = PulseCache(redis_client=mock_redis)
+    return cache
+
+
+@pytest.fixture
+async def registry(cache):
+    """에이전트 레지스트리"""
+    from src.registry import AgentRegistry
+
+    registry = AgentRegistry(cache=cache)
+    return registry
+
+
+@pytest.fixture
+async def nlu_processor(llm_manager, mock_redis):
+    """NLU 프로세서"""
+    from src.nlu import CachedNLUProcessor
+
+    processor = CachedNLUProcessor(llm_manager, redis_client=mock_redis)
+    return processor
+
+
+@pytest.fixture
+async def runtime(llm_manager, nlu_processor):
+    """Pulse 런타임"""
+    from src.runtime import PulseRuntime
+
+    runtime = PulseRuntime(llm_manager, nlu_processor)
+    return runtime
+
+
+@pytest.fixture
+async def agent_pool(llm_manager):
+    """에이전트 풀"""
+    from src.agent import AgentPool
+
+    pool = AgentPool(llm_manager)
+    return pool
+
+
+@pytest.fixture
+async def gateway(llm_manager, cache, registry):
+    """Pulse 게이트웨이"""
+    from src.gateway import PulseGateway
+
+    gateway = PulseGateway()
+    gateway.cache = cache
+    gateway.registry = registry
+    gateway.llm_manager = llm_manager
+    return gateway
+
+
+# ==================== 테스트 데이터 ====================
+
+@pytest.fixture
+def sample_instruction() -> str:
+    """샘플 자연어 지시"""
+    return "매일 아침 9시에 뉴스 검색해서 이메일로 보내줘"
+
+
+@pytest.fixture
+def sample_intent():
+    """샘플 Intent"""
+    from src.nlu import Intent
+
+    return Intent(
+        role="뉴스 큐레이션 에이전트",
+        models=["qwen2.5:7b"],
+        tools=["web_search", "email"],
+        goal="매일 아침 뉴스 검색 및 이메일 발송",
+        deployment="scheduled",
+        schedule={"type": "daily", "time": "09:00"},
+        constraints={"max_response_ms": 2000},
+        confidence=0.95,
+        nlu_method="test"
+    )
+
+
+@pytest.fixture
+def sample_pulse_code() -> str:
+    """샘플 Pulse 코드"""
+    return """로서 뉴스 큐레이션 에이전트
+사용 qwen2.5:7b web_search email 응답<2초
+해야할일 매일 아침 뉴스 검색 및 이메일 발송
+실행 스케줄 자동복구 로깅활성화"""
+
+
+# ==================== 동기/비동기 헬퍼 ====================
+
+def run_async(coro):
+    """비동기 코루틴을 동기로 실행"""
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
+
+
+# ==================== 마크 ====================
+
+pytestmark = [
+    pytest.mark.asyncio,  # 모든 테스트가 비동기
+]

@@ -1,0 +1,719 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"math/rand"
+	"os"
+	"sync"
+	"time"
+)
+
+// ============================================================================
+// 섹션 1️⃣: 분산 트레이싱 (Distributed Tracing)
+// ============================================================================
+
+// TraceID: 고유한 요청 추적 ID
+type TraceID string
+
+// GenerateTraceID: Trace ID 생성
+func GenerateTraceID() TraceID {
+	return TraceID(fmt.Sprintf("trace-%d-%d", time.Now().Unix(), rand.Int63()))
+}
+
+// Span: 각 서비스의 처리 시간 기록
+type Span struct {
+	TraceID   TraceID       `json:"trace_id"`
+	SpanID    string        `json:"span_id"`
+	Service   string        `json:"service"`
+	Operation string        `json:"operation"`
+	StartTime time.Time     `json:"start_time"`
+	EndTime   time.Time     `json:"end_time"`
+	Duration  time.Duration `json:"duration_ms"`
+	Status    string        `json:"status"` // "success", "error"
+}
+
+// SpanRecorder: Span 기록 저장소
+type SpanRecorder struct {
+	spans []*Span
+	mu    sync.Mutex
+}
+
+// NewSpanRecorder 생성
+func NewSpanRecorder() *SpanRecorder {
+	return &SpanRecorder{
+		spans: make([]*Span, 0),
+	}
+}
+
+// RecordSpan: Span 기록
+func (sr *SpanRecorder) RecordSpan(span *Span) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	span.Duration = span.EndTime.Sub(span.StartTime)
+	sr.spans = append(sr.spans, span)
+
+	fmt.Printf("[Span] %s → %s: %v (%dms)\n",
+		span.Service, span.Operation, span.Status, span.Duration.Milliseconds())
+}
+
+// GetTrace: Trace ID로 모든 Span 조회
+func (sr *SpanRecorder) GetTrace(traceID TraceID) []*Span {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+
+	var result []*Span
+	for _, span := range sr.spans {
+		if span.TraceID == traceID {
+			result = append(result, span)
+		}
+	}
+	return result
+}
+
+// ============================================================================
+// 섹션 2️⃣: Context와 Trace ID 결합
+// ============================================================================
+
+// ContextKey: Context에서 사용할 키
+type ContextKey string
+
+const (
+	TraceIDKey ContextKey = "trace_id"
+	SpanIDKey  ContextKey = "span_id"
+)
+
+// ContextWithTraceID: Context에 Trace ID 저장
+func ContextWithTraceID(ctx context.Context, traceID TraceID) context.Context {
+	return context.WithValue(ctx, TraceIDKey, traceID)
+}
+
+// GetTraceID: Context에서 Trace ID 추출
+func GetTraceID(ctx context.Context) TraceID {
+	traceID, ok := ctx.Value(TraceIDKey).(TraceID)
+	if !ok {
+		return "unknown"
+	}
+	return traceID
+}
+
+// ContextWithSpanID: Context에 Span ID 저장
+func ContextWithSpanID(ctx context.Context, spanID string) context.Context {
+	return context.WithValue(ctx, SpanIDKey, spanID)
+}
+
+// ============================================================================
+// 섹션 3️⃣: Prometheus 메트릭 (Counter, Gauge, Histogram)
+// ============================================================================
+
+// SimpleMetrics: 간단한 메트릭 수집 (Prometheus 대체)
+type SimpleMetrics struct {
+	requestCount      int64
+	errorCount        int64
+	requestDurations  []time.Duration
+	activeConnections int64
+	mu                sync.Mutex
+}
+
+// NewSimpleMetrics 생성
+func NewSimpleMetrics() *SimpleMetrics {
+	return &SimpleMetrics{
+		requestDurations: make([]time.Duration, 0),
+	}
+}
+
+// Counter: 요청 수 증가
+func (sm *SimpleMetrics) IncCounter() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.requestCount++
+}
+
+// Counter: 에러 수 증가
+func (sm *SimpleMetrics) IncErrors() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.errorCount++
+}
+
+// Gauge: 활성 연결 증가
+func (sm *SimpleMetrics) IncConnections() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.activeConnections++
+}
+
+// Gauge: 활성 연결 감소
+func (sm *SimpleMetrics) DecConnections() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.activeConnections > 0 {
+		sm.activeConnections--
+	}
+}
+
+// Histogram: 요청 시간 기록
+func (sm *SimpleMetrics) RecordDuration(d time.Duration) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.requestDurations = append(sm.requestDurations, d)
+}
+
+// GetMetrics: 메트릭 조회
+func (sm *SimpleMetrics) GetMetrics() map[string]interface{} {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	var avgDuration time.Duration
+	if len(sm.requestDurations) > 0 {
+		totalDuration := time.Duration(0)
+		for _, d := range sm.requestDurations {
+			totalDuration += d
+		}
+		avgDuration = totalDuration / time.Duration(len(sm.requestDurations))
+	}
+
+	errorRate := 0.0
+	if sm.requestCount > 0 {
+		errorRate = float64(sm.errorCount) / float64(sm.requestCount) * 100
+	}
+
+	return map[string]interface{}{
+		"request_count":       sm.requestCount,
+		"error_count":         sm.errorCount,
+		"error_rate_percent":  errorRate,
+		"avg_duration_ms":     avgDuration.Milliseconds(),
+		"active_connections":  sm.activeConnections,
+		"total_request_sizes": len(sm.requestDurations),
+	}
+}
+
+// ============================================================================
+// 섹션 4️⃣: 구조화된 로깅 (slog)
+// ============================================================================
+
+// StructuredLogger: slog 래퍼
+type StructuredLogger struct {
+	logger *slog.Logger
+}
+
+// NewStructuredLogger 생성
+func NewStructuredLogger() *StructuredLogger {
+	handler := slog.NewJSONHandler(os.Stdout, nil)
+	logger := slog.New(handler)
+
+	return &StructuredLogger{
+		logger: logger,
+	}
+}
+
+// Info: 정보 레벨 로그
+func (sl *StructuredLogger) Info(ctx context.Context, msg string, args ...interface{}) {
+	traceID := GetTraceID(ctx)
+	allArgs := []interface{}{"trace_id", traceID}
+	allArgs = append(allArgs, args...)
+
+	sl.logger.Info(msg, allArgs...)
+	fmt.Printf("[INFO] %s: %s\n", traceID, msg)
+}
+
+// Error: 에러 레벨 로그
+func (sl *StructuredLogger) Error(ctx context.Context, msg string, err error, args ...interface{}) {
+	traceID := GetTraceID(ctx)
+	allArgs := []interface{}{"trace_id", traceID}
+	if err != nil {
+		allArgs = append(allArgs, "error", err.Error())
+	}
+	allArgs = append(allArgs, args...)
+
+	sl.logger.Error(msg, allArgs...)
+	fmt.Printf("[ERROR] %s: %s (error: %v)\n", traceID, msg, err)
+}
+
+// ============================================================================
+// 섹션 5️⃣: Golden Signals 수집
+// ============================================================================
+
+// GoldenSignals: 시스템 건강도 4가지 신호
+type GoldenSignals struct {
+	Latency   time.Duration // 평균 레이턴시
+	Errors    float64       // 에러율 (%)
+	Traffic   int64         // 초당 요청 수
+	Saturation float64      // 포화도 (%)
+}
+
+// RequestMetrics: 요청별 메트릭
+type RequestMetrics struct {
+	StartTime time.Time
+	EndTime   time.Time
+	Success   bool
+	DataSize  int
+}
+
+// GoldenSignalCollector: Golden Signals 수집기
+type GoldenSignalCollector struct {
+	metrics []*RequestMetrics
+	mu      sync.Mutex
+}
+
+// NewGoldenSignalCollector 생성
+func NewGoldenSignalCollector() *GoldenSignalCollector {
+	return &GoldenSignalCollector{
+		metrics: make([]*RequestMetrics, 0),
+	}
+}
+
+// RecordRequest: 요청 메트릭 기록
+func (gsc *GoldenSignalCollector) RecordRequest(rm *RequestMetrics) {
+	gsc.mu.Lock()
+	defer gsc.mu.Unlock()
+	gsc.metrics = append(gsc.metrics, rm)
+}
+
+// CalculateSignals: Golden Signals 계산
+func (gsc *GoldenSignalCollector) CalculateSignals() GoldenSignals {
+	gsc.mu.Lock()
+	defer gsc.mu.Unlock()
+
+	if len(gsc.metrics) == 0 {
+		return GoldenSignals{}
+	}
+
+	// Latency (평균)
+	totalLatency := time.Duration(0)
+	for _, m := range gsc.metrics {
+		totalLatency += m.EndTime.Sub(m.StartTime)
+	}
+	avgLatency := totalLatency / time.Duration(len(gsc.metrics))
+
+	// Errors (에러율)
+	errorCount := 0
+	for _, m := range gsc.metrics {
+		if !m.Success {
+			errorCount++
+		}
+	}
+	errorRate := float64(errorCount) / float64(len(gsc.metrics)) * 100
+
+	// Traffic (초당 요청 수)
+	now := time.Now()
+	recentCount := int64(0)
+	for _, m := range gsc.metrics {
+		if now.Sub(m.StartTime) < 1*time.Second {
+			recentCount++
+		}
+	}
+
+	// Saturation (간단한 시뮬레이션: 요청 수로 계산)
+	saturation := float64(len(gsc.metrics)) / 100.0 * 100.0 // 최대 100개 기준
+	if saturation > 100 {
+		saturation = 100
+	}
+
+	return GoldenSignals{
+		Latency:    avgLatency,
+		Errors:     errorRate,
+		Traffic:    recentCount,
+		Saturation: saturation,
+	}
+}
+
+// ============================================================================
+// 섹션 6️⃣: Observable Service 구현
+// ============================================================================
+
+// ObservableService: 관찰 가능한 서비스
+type ObservableService struct {
+	name           string
+	logger         *StructuredLogger
+	metrics        *SimpleMetrics
+	spanRecorder   *SpanRecorder
+	signalCollector *GoldenSignalCollector
+}
+
+// NewObservableService 생성
+func NewObservableService(name string) *ObservableService {
+	return &ObservableService{
+		name:            name,
+		logger:          NewStructuredLogger(),
+		metrics:         NewSimpleMetrics(),
+		spanRecorder:    NewSpanRecorder(),
+		signalCollector: NewGoldenSignalCollector(),
+	}
+}
+
+// ProcessRequest: 요청 처리 (관찰 가능성 포함)
+func (os *ObservableService) ProcessRequest(ctx context.Context, requestID string) (bool, error) {
+	start := time.Now()
+	os.metrics.IncCounter()
+	os.metrics.IncConnections()
+	defer os.metrics.DecConnections()
+
+	traceID := GetTraceID(ctx)
+
+	// 요청 처리 시작 로깅
+	os.logger.Info(ctx, fmt.Sprintf("%s 요청 처리 시작", os.name),
+		"request_id", requestID,
+		"service", os.name,
+	)
+
+	// Span 기록 시작
+	spanID := fmt.Sprintf("span-%d", time.Now().Unix())
+	ctx = ContextWithSpanID(ctx, spanID)
+
+	// 비즈니스 로직 시뮬레이션
+	time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+
+	// 성공/실패 시뮬레이션
+	success := rand.Float32() > 0.1 // 90% 성공
+	if !success {
+		os.metrics.IncErrors()
+		os.logger.Error(ctx, fmt.Sprintf("%s 요청 처리 실패", os.name), nil,
+			"request_id", requestID,
+			"service", os.name,
+		)
+	}
+
+	// Span 기록
+	duration := time.Now().Sub(start)
+	os.metrics.RecordDuration(duration)
+
+	status := "success"
+	if !success {
+		status = "error"
+	}
+
+	span := &Span{
+		TraceID:   traceID,
+		SpanID:    spanID,
+		Service:   os.name,
+		Operation: "ProcessRequest",
+		StartTime: start,
+		EndTime:   time.Now(),
+		Status:    status,
+	}
+	os.spanRecorder.RecordSpan(span)
+
+	// 요청 메트릭 기록
+	os.signalCollector.RecordRequest(&RequestMetrics{
+		StartTime: start,
+		EndTime:   time.Now(),
+		Success:   success,
+		DataSize:  rand.Intn(1000),
+	})
+
+	os.logger.Info(ctx, fmt.Sprintf("%s 요청 처리 완료", os.name),
+		"request_id", requestID,
+		"duration_ms", duration.Milliseconds(),
+		"service", os.name,
+	)
+
+	return success, nil
+}
+
+// GetMetrics: 메트릭 조회
+func (os *ObservableService) GetMetrics() map[string]interface{} {
+	return os.metrics.GetMetrics()
+}
+
+// ============================================================================
+// 섹션 7️⃣: 에러 추적 및 로깅
+// ============================================================================
+
+// ErrorTracker: 에러 추적
+type ErrorTracker struct {
+	errors map[string]int
+	mu     sync.Mutex
+}
+
+// NewErrorTracker 생성
+func NewErrorTracker() *ErrorTracker {
+	return &ErrorTracker{
+		errors: make(map[string]int),
+	}
+}
+
+// TrackError: 에러 추적
+func (et *ErrorTracker) TrackError(ctx context.Context, errorType string, logger *StructuredLogger) {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+
+	et.errors[errorType]++
+
+	logger.Error(ctx, "에러 발생",
+		fmt.Errorf(errorType),
+		"error_type", errorType,
+		"count", et.errors[errorType],
+		"file", "service.go",
+		"line", 42,
+	)
+}
+
+// GetErrorStats: 에러 통계
+func (et *ErrorTracker) GetErrorStats() map[string]int {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+
+	result := make(map[string]int)
+	for k, v := range et.errors {
+		result[k] = v
+	}
+	return result
+}
+
+// ============================================================================
+// 섹션 8️⃣: 할당 과제 3-5 - 완전한 Observability Demo
+// ============================================================================
+
+// Assignment3_5: Observability 통합 Demo
+func Assignment3_5() {
+	fmt.Println("\n" + repeatStr("=", 70))
+	fmt.Println("【 할당 과제 3-5: 관찰 가능성(Observability) 완전 구현 】")
+	fmt.Println(repeatStr("=", 70))
+
+	// 1. 트레이싱 설정
+	fmt.Println("\n[과제 1] 분산 트레이싱 (Trace ID 추적)")
+	fmt.Println(repeatStr("-", 68))
+
+	traceID := GenerateTraceID()
+	fmt.Printf("Trace ID 생성: %s\n\n", traceID)
+
+	// 2. Context와 로깅 설정
+	fmt.Println("[과제 2] Context와 Trace ID 결합")
+	fmt.Println(repeatStr("-", 68))
+
+	ctx := context.Background()
+	ctx = ContextWithTraceID(ctx, traceID)
+	logger := NewStructuredLogger()
+
+	logger.Info(ctx, "시스템 시작", "version", "1.0.0", "mode", "production")
+
+	// 3. 마이크로서비스 구성
+	fmt.Println("\n[과제 3] 3-tier 마이크로서비스 구성")
+	fmt.Println(repeatStr("-", 68))
+
+	gatewayService := NewObservableService("gateway")
+	authService := NewObservableService("auth-service")
+	businessService := NewObservableService("business-service")
+
+	// 4. 요청 처리 시뮬레이션
+	fmt.Println("\n[과제 4] 요청 처리 (Trace 전파)")
+	fmt.Println(repeatStr("-", 68))
+
+	fmt.Println("\n요청 1:")
+	gatewayService.ProcessRequest(ctx, "req-001")
+	authService.ProcessRequest(ctx, "req-001")
+	businessService.ProcessRequest(ctx, "req-001")
+
+	fmt.Println("\n요청 2:")
+	traceID2 := GenerateTraceID()
+	ctx2 := ContextWithTraceID(context.Background(), traceID2)
+	gatewayService.ProcessRequest(ctx2, "req-002")
+	authService.ProcessRequest(ctx2, "req-002")
+	businessService.ProcessRequest(ctx2, "req-002")
+
+	// 5. 메트릭 조회
+	fmt.Println("\n[과제 5] 메트릭 수집 (Prometheus)")
+	fmt.Println(repeatStr("-", 68))
+
+	metricsData := gatewayService.GetMetrics()
+	metricsJSON, _ := json.MarshalIndent(metricsData, "", "  ")
+	fmt.Printf("Gateway 메트릭:\n%s\n\n", string(metricsJSON))
+
+	// 6. Golden Signals 계산
+	fmt.Println("[과제 6] Golden Signals 분석")
+	fmt.Println(repeatStr("-", 68))
+
+	signals := gatewayService.signalCollector.CalculateSignals()
+	fmt.Printf("Latency (평균): %dms\n", signals.Latency.Milliseconds())
+	fmt.Printf("Errors (에러율): %.1f%%\n", signals.Errors)
+	fmt.Printf("Traffic (RPS): %d\n", signals.Traffic)
+	fmt.Printf("Saturation (포화도): %.1f%%\n\n", signals.Saturation)
+
+	// 7. Trace 조회
+	fmt.Println("[과제 7] 분산 트레이싱 결과 조회")
+	fmt.Println(repeatStr("-", 68))
+
+	trace := gatewayService.spanRecorder.GetTrace(traceID)
+	fmt.Printf("Trace ID %s의 Span 수: %d\n", traceID, len(trace))
+	for i, span := range trace {
+		fmt.Printf("  Span %d: %s → %s (%dms)\n",
+			i+1, span.Service, span.Operation, span.Duration.Milliseconds())
+	}
+
+	// 8. 에러 추적
+	fmt.Println("\n[과제 8] 에러 추적 및 로깅")
+	fmt.Println(repeatStr("-", 68))
+
+	errorTracker := NewErrorTracker()
+
+	for i := 0; i < 3; i++ {
+		errorTracker.TrackError(ctx, "database_connection_error", logger)
+		errorTracker.TrackError(ctx, "timeout_error", logger)
+	}
+
+	errorStats := errorTracker.GetErrorStats()
+	fmt.Printf("\n에러 통계:\n")
+	for errType, count := range errorStats {
+		fmt.Printf("  %s: %d회\n", errType, count)
+	}
+
+	// 9. 시스템 건강도 판단
+	fmt.Println("\n[과제 9] 시스템 건강도 판단")
+	fmt.Println(repeatStr("-", 68))
+
+	allSignals := gatewayService.signalCollector.CalculateSignals()
+
+	health := "정상"
+	if allSignals.Errors > 5 {
+		health = "경고"
+	}
+	if allSignals.Errors > 10 {
+		health = "심각"
+	}
+
+	fmt.Printf("\n시스템 상태: %s\n", health)
+	fmt.Printf("- Latency: %dms (목표: < 100ms)\n", allSignals.Latency.Milliseconds())
+	fmt.Printf("- Errors: %.1f%% (목표: < 1%%)\n", allSignals.Errors)
+	fmt.Printf("- Saturation: %.1f%% (목표: < 70%%)\n", allSignals.Saturation)
+
+	// 10. 최종 요약
+	fmt.Println("\n[과제 10] Observability 완전 구현 요약")
+	fmt.Println(repeatStr("-", 68))
+	fmt.Println(`
+【 Three Pillars of Observability 】
+
+1️⃣ Logging (구조화된 로깅)
+   - slog를 사용한 JSON 형태 로그
+   - Trace ID 포함으로 요청 추적 가능
+   - 에러 발생 시 파일명, 라인 번호 기록
+
+2️⃣ Metrics (메트릭 수집)
+   - Counter: 요청 수, 에러 수
+   - Gauge: 활성 연결 수
+   - Histogram: 요청 시간 분포
+   - Prometheus /metrics 엔드포인트
+
+3️⃣ Tracing (분산 트레이싱)
+   - Trace ID로 요청 경로 추적
+   - Context로 정보 전파
+   - 각 서비스마다 Span 기록
+   - 전체 요청 흐름 시각화
+
+【 Golden Signals 】
+✓ Latency: 평균 응답 시간 측정
+✓ Traffic: 초당 요청 수 모니터링
+✓ Errors: 에러율 추적
+✓ Saturation: 자원 사용 현황 파악
+
+이 세 가지를 결합하면:
+분산 시스템의 모든 것이 투명하게 보인다!
+	`)
+
+	fmt.Println(repeatStr("=", 70))
+	fmt.Println("✓ Go 301-3-5 관찰 가능성 완성!")
+	fmt.Println("✓ Go 301 전체 과정 완수!")
+	fmt.Println("✓ 다음: Go 401 커널 수준 최적화")
+	fmt.Println(repeatStr("=", 70))
+}
+
+// ============================================================================
+// Helper 함수
+// ============================================================================
+
+func repeatStr(s string, count int) string {
+	result := ""
+	for i := 0; i < count; i++ {
+		result += s
+	}
+	return result
+}
+
+// ============================================================================
+// Main 함수
+// ============================================================================
+
+func main() {
+	fmt.Println("🎓 Go 301-3-5: 시스템의 명탐정 - 관찰 가능성(Observability)\n")
+
+	rand.Seed(time.Now().UnixNano())
+
+	// 섹션 1-2: 트레이싱과 Context
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 1-2️⃣: 분산 트레이싱 & Context\n" + "]" + repeatStr("=", 70))
+	traceID := GenerateTraceID()
+	fmt.Printf("✓ Trace ID 생성: %s\n\n", traceID)
+
+	ctx := context.Background()
+	ctx = ContextWithTraceID(ctx, traceID)
+	fmt.Printf("✓ Context에 Trace ID 저장\n\n")
+
+	// 섹션 3: 메트릭
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 3️⃣: Prometheus 메트릭\n" + "]" + repeatStr("=", 70))
+	metrics := NewSimpleMetrics()
+
+	for i := 0; i < 5; i++ {
+		metrics.IncCounter()
+		metrics.RecordDuration(time.Duration(rand.Intn(100)) * time.Millisecond)
+	}
+
+	metrics.IncErrors()
+	metrics.IncConnections()
+
+	metricsData := metrics.GetMetrics()
+	for k, v := range metricsData {
+		fmt.Printf("  %s: %v\n", k, v)
+	}
+	fmt.Println()
+
+	// 섹션 4: 구조화된 로깅
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 4️⃣: 구조화된 로깅 (slog)\n" + "]" + repeatStr("=", 70))
+	logger := NewStructuredLogger()
+
+	logger.Info(ctx, "애플리케이션 시작",
+		"version", "1.0.0",
+		"environment", "production",
+	)
+
+	logger.Error(ctx, "데이터베이스 연결 실패", nil,
+		"database", "postgres",
+		"host", "localhost",
+	)
+	fmt.Println()
+
+	// 섹션 5: Golden Signals
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 5️⃣: Golden Signals\n" + "]" + repeatStr("=", 70))
+	collector := NewGoldenSignalCollector()
+
+	for i := 0; i < 10; i++ {
+		collector.RecordRequest(&RequestMetrics{
+			StartTime: time.Now().Add(-time.Duration(rand.Intn(100)) * time.Millisecond),
+			EndTime:   time.Now(),
+			Success:   rand.Float32() > 0.1,
+		})
+	}
+
+	signals := collector.CalculateSignals()
+	fmt.Printf("Latency: %dms\n", signals.Latency.Milliseconds())
+	fmt.Printf("Errors: %.1f%%\n", signals.Errors)
+	fmt.Printf("Saturation: %.1f%%\n\n", signals.Saturation)
+
+	// 섹션 6: Observable Service
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 6️⃣: Observable Service\n" + "]" + repeatStr("=", 70))
+	service := NewObservableService("api-service")
+	service.ProcessRequest(ctx, "req-001")
+	fmt.Println()
+
+	// 섹션 7: 에러 추적
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 7️⃣: 에러 추적\n" + "]" + repeatStr("=", 70))
+	errorTracker := NewErrorTracker()
+	errorTracker.TrackError(ctx, "timeout_error", logger)
+	errorTracker.TrackError(ctx, "timeout_error", logger)
+	fmt.Println()
+
+	// 섹션 8: 할당 과제
+	fmt.Println("[" + repeatStr("=", 70) + "\n섹션 8️⃣: 할당 과제 3-5\n" + "]" + repeatStr("=", 70))
+	Assignment3_5()
+}

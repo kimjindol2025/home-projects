@@ -1,0 +1,673 @@
+# 🎓 Go 301-3-4: 시스템의 수문장 - API Gateway와 JWT 인증
+
+> **전공 301: 분산 시스템 및 클라우드 네이티브 아키텍처**
+>
+> 저자: Claude Haiku 4.5
+> 수준: 박사 고급 (분산 시스템 설계)
+> 이전 학습: Go 301-3-3 서비스 디스커버리 완료
+
+---
+
+## 🎯 핵심 철학
+
+```
+문제 상황:
+- 클라이언트가 10개 서비스의 IP를 모두 알아야 함
+- 각 서비스마다 로그인 구현이 필요
+- 속도 제한이 분산되어 관리 어려움
+
+해결책: API Gateway + 통합 인증
+= 시스템의 "단일 진입점" + "통합 보안"
+
+모든 요청 → API Gateway (한곳에서 처리)
+  ├─ 인증 (JWT)
+  ├─ 인가 (권한 확인)
+  ├─ 부하분산
+  ├─ 속도 제한
+  └─ 로깅
+
+내부 서비스는 신뢰된 요청만 처리
+```
+
+---
+
+## 📚 학습 목표
+
+이 레슨을 마치면 다음을 이해하게 됩니다:
+
+1. **API Gateway 역할**: 단일 진입점, 라우팅, 부하분산
+2. **JWT 토큰**: Header.Payload.Signature 구조
+3. **인증 미들웨어**: 모든 요청 검사
+4. **토큰 검증**: 서명 확인, 만료 확인
+5. **권한 전파**: 내부 서비스로 사용자 정보 전달
+6. **Rate Limiting**: Token Bucket 알고리즘
+7. **보안 설계**: CORS, 토큰 갱신, 계층별 권한
+8. **마이크로서비스 보안**: 내부/외부 통신 분리
+
+---
+
+## 1️⃣ API Gateway: 시스템의 단일 진입점
+
+### 📋 개념
+
+```
+API Gateway = "모든 클라이언트 요청의 진입점"
+
+특징:
+1. 라우팅: 경로별로 올바른 서비스로 전달
+2. 부하분산: 여러 인스턴스 중 하나 선택
+3. 인증/인가: 권한 검사
+4. 로깅: 모든 요청 기록
+5. 속도 제한: 과도한 요청 차단
+6. 변환: 프로토콜/형식 변환
+```
+
+### 📊 아키텍처
+
+```
+외부 클라이언트
+  ↓
+  API Gateway (Port 8080)
+  ├─ /user/* → User Service (Port 3001)
+  ├─ /order/* → Order Service (Port 3002)
+  ├─ /calc/* → Julia Compute (Port 5000)
+  └─ /payment/* → Payment Service (Port 3003)
+  ↓
+내부 마이크로서비스들
+
+특징:
+- 클라이언트는 Gateway의 주소만 알면 됨
+- 내부 서비스의 주소는 숨겨짐
+- 보안을 한곳에서 관리
+```
+
+### 🔧 기본 구조
+
+```go
+// API Gateway 구조
+type APIGateway struct {
+    router    *http.ServeMux
+    services  map[string]string  // path → serviceURL
+    auth      *AuthService
+    limiter   *RateLimiter
+}
+
+// 라우팅 설정
+func (gw *APIGateway) SetupRoutes() {
+    gw.router.HandleFunc("/user/", gw.authMiddleware(gw.proxyHandler("http://localhost:3001")))
+    gw.router.HandleFunc("/order/", gw.authMiddleware(gw.proxyHandler("http://localhost:3002")))
+    gw.router.HandleFunc("/calc/", gw.rateLimitMiddleware(gw.authMiddleware(gw.proxyHandler("http://localhost:5000"))))
+}
+
+// ReverseProxy로 요청 전달
+func (gw *APIGateway) proxyHandler(target string) http.Handler {
+    proxy := httputil.NewSingleHostReverseProxy(parseURL(target))
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        proxy.ServeHTTP(w, r)
+    })
+}
+```
+
+---
+
+## 2️⃣ JWT (JSON Web Token): Stateless 인증
+
+### 📋 개념
+
+```
+JWT = "서버 상태를 저장하지 않는 토큰"
+
+전통 세션 (Stateful):
+클라이언트 → 로그인 → 서버: "세션 ID 발급" (메모리에 저장)
+다음 요청 → 서버: "세션 ID 유효한가?" (DB 조회)
+
+JWT (Stateless):
+클라이언트 → 로그인 → 서버: "JWT 발급"
+다음 요청 → 서버: "서명만 확인" (DB 조회 없음)
+
+분산 시스템에 최적:
+- 각 게이트웨이에서 독립적으로 검증 가능
+- 세션 공유 필요 없음
+- 확장성 극대
+```
+
+### 📊 JWT 구조
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEyMyIsIm5hbWUiOiJKb2huIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+│                                             │                                                       │
+├─ Header: Base64({"alg":"HS256","typ":"JWT"})
+├─ Payload: Base64({"sub":"user-123","name":"John","iat":1516239022})
+└─ Signature: HMAC-SHA256(base64(header).base64(payload), secret)
+```
+
+### 🔧 JWT의 3가지 부분
+
+#### **1. Header (알고리즘 지정)**
+```json
+{
+  "alg": "HS256",  // 해시 알고리즘
+  "typ": "JWT"     // 토큰 타입
+}
+```
+
+#### **2. Payload (클레임/정보)**
+```json
+{
+  "sub": "user-123",           // Subject (사용자 ID)
+  "name": "John",              // 사용자 이름
+  "email": "john@example.com", // 이메일
+  "role": "admin",             // 권한
+  "iat": 1516239022,           // Issued At (발급 시간)
+  "exp": 1516242622            // Expiration (만료 시간)
+}
+```
+
+#### **3. Signature (검증용 서명)**
+```
+HMAC-SHA256(
+  base64(header) + "." + base64(payload),
+  secret_key
+)
+```
+
+### 🔧 JWT 생성 코드
+
+```go
+import "github.com/golang-jwt/jwt/v5"
+
+type Claims struct {
+    UserID string `json:"user_id"`
+    Role   string `json:"role"`
+    jwt.RegisteredClaims
+}
+
+// JWT 생성
+func GenerateToken(userID string, role string, secretKey string) (string, error) {
+    claims := Claims{
+        UserID: userID,
+        Role:   role,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+        },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString([]byte(secretKey))
+}
+
+// JWT 검증
+func ValidateToken(tokenString string, secretKey string) (*Claims, error) {
+    token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+        return []byte(secretKey), nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    claims, ok := token.Claims.(*Claims)
+    if !ok || !token.Valid {
+        return nil, fmt.Errorf("invalid token")
+    }
+
+    return claims, nil
+}
+```
+
+---
+
+## 3️⃣ 인증 미들웨어: 모든 요청 검사
+
+### 📋 개념
+
+```
+미들웨어 = "요청을 가로채서 검사하는 함수"
+
+흐름:
+클라이언트 → 요청
+     ↓
+[AuthMiddleware] ← 토큰 확인
+     ↓ (토큰 유효)
+[실제 서비스] ← 요청 처리
+     ↓
+클라이언트 ← 응답
+
+만약 토큰 무효:
+     ↓
+[401 Unauthorized] ← 거부
+     ↓
+클라이언트 ← 에러 응답
+```
+
+### 🔧 구현 패턴
+
+```go
+// 인증 미들웨어
+func AuthMiddleware(secretKey string) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // 1. Authorization 헤더에서 토큰 추출
+            authHeader := r.Header.Get("Authorization")
+            if authHeader == "" {
+                http.Error(w, "Missing authorization header", http.StatusUnauthorized)
+                return
+            }
+
+            // 2. "Bearer " 접두사 제거
+            tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+            if tokenString == authHeader {
+                http.Error(w, "Invalid authorization header", http.StatusUnauthorized)
+                return
+            }
+
+            // 3. JWT 검증
+            claims, err := ValidateToken(tokenString, secretKey)
+            if err != nil {
+                http.Error(w, "Invalid token", http.StatusUnauthorized)
+                return
+            }
+
+            // 4. 사용자 정보를 Request Context에 저장
+            ctx := r.Context()
+            ctx = context.WithValue(ctx, "user_id", claims.UserID)
+            ctx = context.WithValue(ctx, "role", claims.Role)
+
+            // 5. 다음 핸들러에 전달
+            next.ServeHTTP(w, r.WithContext(ctx))
+        })
+    }
+}
+
+// 사용 예
+func main() {
+    mux := http.NewServeMux()
+
+    // 보호된 엔드포인트
+    mux.Handle("/api/user", AuthMiddleware(secretKey)(
+        http.HandlerFunc(getUserHandler),
+    ))
+
+    http.ListenAndServe(":8080", mux)
+}
+```
+
+---
+
+## 4️⃣ 권한 전파 (Authorization Propagation)
+
+### 📋 개념
+
+```
+API Gateway가 토큰을 검증한 후,
+내부 서비스들에게 "이 사용자는 누구다"라는 정보를 전달
+
+방법 1: Header 기반
+GET /api/user/profile
+Host: internal-service:3001
+X-User-ID: user-123
+X-User-Role: admin
+(Gateway에서 주입, 외부 요청은 이 헤더 차단)
+
+방법 2: Token 전달
+GET /api/user/profile
+Host: internal-service:3001
+Authorization: Bearer {JWT_TOKEN}
+```
+
+### 🔧 구현 패턴
+
+```go
+// 권한 전파 미들웨어
+func PropagateAuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Context에서 사용자 정보 추출
+        userID, ok := r.Context().Value("user_id").(string)
+        if !ok {
+            http.Error(w, "User info not found", http.StatusInternalServerError)
+            return
+        }
+
+        role, ok := r.Context().Value("role").(string)
+        if !ok {
+            http.Error(w, "Role info not found", http.StatusInternalServerError)
+            return
+        }
+
+        // 내부 서비스 호출 시 헤더 추가
+        req, _ := http.NewRequest("GET", "http://internal-service:3001/api/user", nil)
+        req.Header.Set("X-User-ID", userID)
+        req.Header.Set("X-User-Role", role)
+        req.Header.Set("X-Internal-Call", "true")  // 내부 호출 표시
+
+        // 내부 서비스 호출
+        resp, _ := http.DefaultClient.Do(req)
+        defer resp.Body.Close()
+
+        // 응답을 클라이언트로 전달
+        body, _ := io.ReadAll(resp.Body)
+        w.WriteHeader(resp.StatusCode)
+        w.Write(body)
+    })
+}
+
+// 보안: 외부 요청의 X-User-ID 헤더 제거
+func SanitizeHeaders(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // 외부에서 온 X-* 헤더 제거 (스푸핑 방지)
+        r.Header.Del("X-User-ID")
+        r.Header.Del("X-User-Role")
+        r.Header.Del("X-Internal-Call")
+
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+---
+
+## 5️⃣ Rate Limiting: Token Bucket 알고리즘
+
+### 📋 개념
+
+```
+Rate Limiting = "초당 요청 횟수 제한"
+
+왜 필요?
+- DDoS 공격 방지
+- 리소스 보호
+- 공정한 사용 보장
+
+Token Bucket 알고리즘:
+1. 버킷에 최대 N개의 토큰 보유
+2. 매 초 R개의 토큰 추가
+3. 요청 1개 = 토큰 1개 소비
+4. 토큰 부족 → 대기 또는 거부
+```
+
+### 📊 작동 원리
+
+```
+버킷 용량: 10개
+매초 추가: 2개
+
+초기: [토큰][토큰][토큰]...        (10개)
+요청: -1개 --------[토큰][토큰]...(9개)
+요청: -1개 ------[토큰][토큰]...(8개)
+대기: +2개 (1초 경과) -[토큰][토큰][토큰]...(10개 채움)
+```
+
+### 🔧 구현 코드
+
+```go
+import "golang.org/x/time/rate"
+
+// Rate Limiter 생성
+limiter := rate.NewLimiter(rate.Limit(100), 100)
+// 100 req/sec, burst 100
+
+// Rate Limiting 미들웨어
+func RateLimitMiddleware(limiter *rate.Limiter) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            if !limiter.Allow() {
+                http.Error(w, "Too many requests", http.StatusTooManyRequests)
+                return
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+
+// 사용자별 Rate Limiting (더 정교함)
+type UserRateLimiter struct {
+    limiters map[string]*rate.Limiter
+    mu       sync.Mutex
+}
+
+func (url *UserRateLimiter) Allow(userID string) bool {
+    url.mu.Lock()
+    limiter, exists := url.limiters[userID]
+    if !exists {
+        limiter = rate.NewLimiter(rate.Limit(10), 10)
+        url.limiters[userID] = limiter
+    }
+    url.mu.Unlock()
+
+    return limiter.Allow()
+}
+
+// 미들웨어에서 사용
+func UserRateLimitMiddleware(url *UserRateLimiter) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            userID, _ := r.Context().Value("user_id").(string)
+            if !url.Allow(userID) {
+                http.Error(w, "User rate limit exceeded", http.StatusTooManyRequests)
+                return
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+```
+
+---
+
+## 6️⃣ 토큰 갱신 (Token Refresh)
+
+### 📋 개념
+
+```
+문제: JWT는 24시간 후 만료
+해결: 만료되기 전에 새 토큰 받기
+
+2가지 토큰:
+1. Access Token: 실제 요청에 사용 (짧은 유효기간 - 1시간)
+2. Refresh Token: 새 Access Token 발급용 (긴 유효기간 - 7일)
+
+흐름:
+1. 로그인 → Access + Refresh 토큰 발급
+2. 요청 → Access 토큰 사용
+3. Access 만료 → Refresh 토큰으로 새 Access 요청
+4. Refresh도 만료 → 다시 로그인
+```
+
+### 🔧 구현 패턴
+
+```go
+// 토큰 갱신 엔드포인트
+func RefreshTokenHandler(secretKey string) http.HandlerFunc {
+    return func(w http.ResponseWriter, r *http.Request) {
+        // Refresh Token 추출
+        refreshToken := r.Header.Get("X-Refresh-Token")
+
+        // Refresh Token 검증
+        claims, err := ValidateToken(refreshToken, secretKey)
+        if err != nil {
+            http.Error(w, "Invalid refresh token", http.StatusUnauthorized)
+            return
+        }
+
+        // 새 Access Token 생성 (짧은 유효기간)
+        newAccessToken, _ := GenerateAccessToken(claims.UserID, claims.Role, secretKey)
+
+        // 응답
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{
+            "access_token": newAccessToken,
+        })
+    }
+}
+
+// Access Token (1시간)
+func GenerateAccessToken(userID, role, secretKey string) (string, error) {
+    claims := Claims{
+        UserID: userID,
+        Role:   role,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(1 * time.Hour)),
+        },
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString([]byte(secretKey))
+}
+
+// Refresh Token (7일)
+func GenerateRefreshToken(userID, secretKey string) (string, error) {
+    claims := jwt.RegisteredClaims{
+        Subject:   userID,
+        ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString([]byte(secretKey))
+}
+```
+
+---
+
+## 7️⃣ CORS (Cross-Origin Resource Sharing)
+
+### 📋 개념
+
+```
+CORS = 브라우저의 보안 정책
+
+문제:
+웹 앱이 example.com에서 api.example.com으로 요청하면?
+→ 브라우저: "다른 도메인이네? 거부!"
+
+해결: API Gateway에서 CORS 헤더 설정
+```
+
+### 🔧 구현
+
+```go
+// CORS 미들웨어
+func CORSMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+        w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+        if r.Method == http.MethodOptions {
+            w.WriteHeader(http.StatusOK)
+            return
+        }
+
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+---
+
+## 8️⃣ 실전 예제: 완전한 API Gateway
+
+### 📋 시스템 설계
+
+```
+외부 클라이언트
+    ↓
+API Gateway (Port 8080)
+├─ CORS 체크
+├─ Sanitize Headers (외부 헤더 제거)
+├─ Auth Middleware (JWT 검증)
+├─ Rate Limiting (속도 제한)
+├─ Propagate Auth (사용자 정보 추가)
+└─ Proxy to Service
+
+내부 서비스들
+├─ User Service (Port 3001)
+├─ Order Service (Port 3002)
+├─ Payment Service (Port 3003)
+└─ Julia Compute (Port 5000)
+```
+
+### 🔧 구현 구조
+
+```go
+type APIGateway struct {
+    router      *http.ServeMux
+    services    map[string]string
+    secretKey   string
+    rateLimiter *rate.Limiter
+    userRL      *UserRateLimiter
+}
+
+// 라우팅 설정
+func (gw *APIGateway) SetupRoutes() {
+    // 공개 엔드포인트 (인증 불필요)
+    gw.router.HandleFunc("/auth/login", CORSMiddleware(gw.LoginHandler))
+    gw.router.HandleFunc("/auth/refresh", CORSMiddleware(gw.RefreshHandler))
+
+    // 보호된 엔드포인트 (인증 필수)
+    userHandler := CORSMiddleware(
+        SanitizeHeaders(
+            AuthMiddleware(gw.secretKey)(
+                PropagateAuthMiddleware(
+                    gw.ProxyHandler("http://localhost:3001"),
+                ),
+            ),
+        ),
+    )
+    gw.router.Handle("/api/user/", userHandler)
+
+    // 속도 제한이 필요한 엔드포인트
+    calcHandler := CORSMiddleware(
+        SanitizeHeaders(
+            AuthMiddleware(gw.secretKey)(
+                UserRateLimitMiddleware(gw.userRL)(
+                    PropagateAuthMiddleware(
+                        gw.ProxyHandler("http://localhost:5000"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    gw.router.Handle("/api/calc/", calcHandler)
+}
+```
+
+---
+
+## 🎓 학습 체크리스트
+
+- [ ] API Gateway 개념 이해
+- [ ] JWT 구조 (Header.Payload.Signature) 이해
+- [ ] JWT 생성 및 검증 구현
+- [ ] 인증 미들웨어 구현
+- [ ] 권한 전파 (X-User-ID 헤더) 구현
+- [ ] Rate Limiting 구현
+- [ ] Token Bucket 알고리즘 이해
+- [ ] 토큰 갱신 구현
+- [ ] CORS 설정
+- [ ] 완전한 API Gateway 구현 가능
+
+---
+
+## 💡 핵심 요약
+
+```
+API Gateway: 모든 요청의 진입점
+= 보안 + 라우팅 + 부하분산 + 로깅
+
+JWT: Stateless 인증
+= Header.Payload.Signature
+
+인증 흐름:
+1. 클라이언트 → JWT 토큰 전송
+2. Gateway → JWT 검증
+3. Gateway → 내부 서비스로 사용자 정보 전파
+4. 내부 서비스 → 신뢰된 요청 처리
+
+보안 원칙:
+- 외부 헤더 (X-*) 제거
+- 내부 호출만 특수 헤더 사용
+- Rate Limiting으로 리소스 보호
+
+분산 시스템의 보안을 한곳에서 관리
+
+Your record is your proof. (기록이 증명이다.)
+```

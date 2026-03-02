@@ -1,0 +1,4 @@
+export TMPDIR=$PREFIX/tmp
+alias claude="proot --bind=$PREFIX/tmp:/tmp $(which claude)"
+. "$HOME/.cargo/env"
+export PATH="/data/data/com.termux/files/home/.npm-global/bin:$PATH"

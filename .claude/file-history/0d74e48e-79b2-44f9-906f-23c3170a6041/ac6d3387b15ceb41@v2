@@ -1,0 +1,371 @@
+# ============================================================================
+# handlers/todo.fl - Todo API 핸들러 구현
+# ============================================================================
+# Phase B 구현
+# 작성: 2026-03-02
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /todos - 모든 Todo 조회 (페이지네이션 지원)
+# ─────────────────────────────────────────────────────────────────────────
+
+fn handleGetTodos
+  input: (store: TodoStore, request: HttpRequest)
+  output: Result<HttpResponse, ApiError>
+  intent: "모든 Todo를 페이지네이션과 함께 반환"
+  do
+    # 1. 쿼리 매개변수 파싱 (기본값: page=1, size=10)
+    let pageStr = request.queryParams.get("page")
+    let page = match pageStr
+      Some(p) => stringToNumber(p).getOrElse(1)
+      None => 1
+
+    let sizeStr = request.queryParams.get("size")
+    let pageSize = match sizeStr
+      Some(s) => stringToNumber(s).getOrElse(10)
+      None => 10
+
+    # 2. 모든 Todo 가져오기
+    let allTodos = mapToArray(store.todos)
+
+    # 3. 전체 개수
+    let total = arrayLen(allTodos)
+
+    # 4. 페이지네이션 계산
+    let start = (page - 1) * pageSize
+    let end = start + pageSize
+    let paged = arraySlice(allTodos, start, end)
+
+    # 5. 페이지 수 계산
+    let totalPages = (total + pageSize - 1) / pageSize
+
+    # 6. JSON 응답 생성
+    let jsonBody = buildSuccessResponse(
+      buildTodoListJson(paged, page, pageSize, total, totalPages)
+    )
+
+    return Ok({
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+      body: jsonBody
+    })
+
+# ─────────────────────────────────────────────────────────────────────────
+# POST /todos - 새 Todo 생성
+# ─────────────────────────────────────────────────────────────────────────
+
+fn handleCreateTodo
+  input: (store: TodoStore, request: HttpRequest)
+  output: Result<(TodoStore, HttpResponse), ApiError>
+  intent: "새로운 Todo를 생성하고 저장"
+  do
+    # 1. 요청 본문 검증
+    if request.body == ""
+      return Err(ApiError::InvalidJson("Request body is empty"))
+
+    # 2. 제목 추출 (간단한 파싱)
+    let title = extractJsonField(request.body, "title")
+    match title
+      None => return Err(ApiError::InvalidJson("Missing 'title' field"))
+      Some(t) => {
+        # 3. 입력 검증
+        if t == ""
+          return Err(ApiError::ValidationError("title cannot be empty"))
+
+        if stringLen(t) > 255
+          return Err(ApiError::ValidationError("title too long (max 255)"))
+
+        # 4. 설명 추출
+        let description = extractJsonField(request.body, "description")
+        let desc = match description
+          Some(d) => d
+          None => ""
+
+        # 5. 새 Todo 생성
+        let now = getCurrentTime()
+        let newId = store.nextId
+        let newTodo = {
+          id: newId,
+          title: t,
+          description: desc,
+          completed: false,
+          createdAt: now,
+          updatedAt: now
+        }
+
+        # 6. 저장소에 추가
+        let newStore = {
+          todos: mapSet(store.todos, newId, newTodo),
+          nextId: store.nextId + 1
+        }
+
+        # 7. 응답 생성
+        let jsonBody = buildSuccessResponse(buildTodoJson(newTodo))
+        let responseBody = jsonBody
+
+        return Ok((newStore, {
+          status: 201,
+          headers: {
+            "Content-Type": "application/json",
+            "Location": "/todos/" + str(newId)
+          },
+          body: responseBody
+        }))
+      }
+
+# ─────────────────────────────────────────────────────────────────────────
+# GET /todos/:id - 특정 Todo 조회
+# ─────────────────────────────────────────────────────────────────────────
+
+fn handleGetTodoById
+  input: (store: TodoStore, request: HttpRequest)
+  output: Result<HttpResponse, ApiError>
+  intent: "특정 ID의 Todo를 조회"
+  do
+    # 1. ID 파싱
+    let idOpt = extractIdFromPath(request.path)
+    match idOpt
+      None => return Err(ApiError::ValidationError("Invalid ID in path"))
+      Some(todoId) => {
+        # 2. Todo 조회
+        let todoOpt = mapGet(store.todos, todoId)
+        match todoOpt
+          None => {
+            return Err(ApiError::NotFound(
+              "Todo not found with id: " + str(todoId)
+            ))
+          }
+          Some(todo) => {
+            # 3. 응답 생성
+            let jsonBody = buildSuccessResponse(buildTodoJson(todo))
+
+            return Ok({
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+              body: jsonBody
+            })
+          }
+      }
+
+# ─────────────────────────────────────────────────────────────────────────
+# PUT /todos/:id - Todo 수정
+# ─────────────────────────────────────────────────────────────────────────
+
+fn handleUpdateTodo
+  input: (store: TodoStore, request: HttpRequest)
+  output: Result<(TodoStore, HttpResponse), ApiError>
+  intent: "기존 Todo를 부분 또는 전체 업데이트"
+  do
+    # 1. ID 파싱
+    let idOpt = extractIdFromPath(request.path)
+    match idOpt
+      None => return Err(ApiError::ValidationError("Invalid ID in path"))
+      Some(todoId) => {
+        # 2. Todo 존재 확인
+        let todoOpt = mapGet(store.todos, todoId)
+        match todoOpt
+          None => {
+            return Err(ApiError::NotFound("Todo not found"))
+          }
+          Some(todo) => {
+            # 3. 요청 본문 검증
+            if request.body == ""
+              return Err(ApiError::InvalidJson("Request body is empty"))
+
+            # 4. 필드 업데이트
+            let title = extractJsonField(request.body, "title")
+            let description = extractJsonField(request.body, "description")
+            let completedStr = extractJsonField(request.body, "completed")
+
+            let updated = {
+              id: todo.id,
+              title: match title
+                Some(t) => t
+                None => todo.title,
+              description: match description
+                Some(d) => d
+                None => todo.description,
+              completed: match completedStr
+                Some(c) => c == "true"
+                None => todo.completed,
+              createdAt: todo.createdAt,
+              updatedAt: getCurrentTime()
+            }
+
+            # 5. 저장
+            let newStore = {
+              todos: mapSet(store.todos, todoId, updated),
+              nextId: store.nextId
+            }
+
+            # 6. 응답
+            let jsonBody = buildSuccessResponse(buildTodoJson(updated))
+
+            return Ok((newStore, {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+              body: jsonBody
+            }))
+          }
+      }
+
+# ─────────────────────────────────────────────────────────────────────────
+# DELETE /todos/:id - Todo 삭제
+# ─────────────────────────────────────────────────────────────────────────
+
+fn handleDeleteTodo
+  input: (store: TodoStore, request: HttpRequest)
+  output: Result<TodoStore, ApiError>
+  intent: "특정 ID의 Todo를 삭제"
+  do
+    # 1. ID 파싱
+    let idOpt = extractIdFromPath(request.path)
+    match idOpt
+      None => return Err(ApiError::ValidationError("Invalid ID in path"))
+      Some(todoId) => {
+        # 2. Todo 존재 확인
+        if !mapContains(store.todos, todoId)
+          return Err(ApiError::NotFound("Todo not found"))
+
+        # 3. 삭제 (새로운 맵 생성)
+        let newTodos = mapRemove(store.todos, todoId)
+        let newStore = {
+          todos: newTodos,
+          nextId: store.nextId
+        }
+
+        # 4. 응답
+        return Ok(newStore)
+      }
+
+# ─────────────────────────────────────────────────────────────────────────
+# JSON 빌더 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn buildTodoJson
+  input: todo: Todo
+  output: string
+  intent: "Todo를 JSON으로 변환"
+  do
+    return "{\"id\":" + str(todo.id) +
+           ",\"title\":\"" + todo.title +
+           "\",\"description\":\"" + todo.description +
+           "\",\"completed\":" + boolToString(todo.completed) +
+           ",\"createdAt\":\"" + todo.createdAt +
+           "\",\"updatedAt\":\"" + todo.updatedAt + "\"}"
+
+fn buildTodoListJson
+  input: (todos: array<Todo>, page: number, pageSize: number, total: number, totalPages: number)
+  output: string
+  intent: "Todo 목록을 JSON으로 변환"
+  do
+    let todoJsons = todoArrayToJsonArray(todos)
+    let todoString = joinJsonArray(todoJsons)
+
+    return "{\"items\":[" + todoString +
+           "],\"pagination\":{\"page\":" + str(page) +
+           ",\"pageSize\":" + str(pageSize) +
+           ",\"total\":" + str(total) +
+           ",\"totalPages\":" + str(totalPages) + "}}"
+
+fn buildSuccessResponse
+  input: dataJson: string
+  output: string
+  intent: "성공 응답을 JSON으로 생성"
+  do
+    let now = getCurrentTime()
+    return "{\"success\":true,\"data\":" + dataJson +
+           ",\"timestamp\":\"" + now + "\"}"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+fn extractJsonField
+  input: (json: string, field: string)
+  output: Option<string>
+  intent: "JSON 문자열에서 필드 추출"
+  do
+    # 간단한 JSON 파싱 (Phase B에서 proper JSON 라이브러리 사용)
+    # \"title\":\"value\" 패턴 찾기
+    let key = "\"" + field + "\":\""
+    let index = findString(json, key)
+
+    if index < 0
+      return None
+
+    let startIndex = index + stringLen(key)
+    let endIndex = findStringFrom(json, "\"", startIndex)
+
+    if endIndex < 0
+      return None
+
+    let value = subString(json, startIndex, endIndex)
+    return Some(value)
+
+fn findString
+  input: (haystack: string, needle: string)
+  output: number
+  intent: "문자열에서 부분문자열 위치 찾기"
+  do
+    # Phase B 런타임에서 구현
+    return -1
+
+fn findStringFrom
+  input: (haystack: string, needle: string, from: number)
+  output: number
+  intent: "특정 위치부터 부분문자열 찾기"
+  do
+    # Phase B 런타임에서 구현
+    return -1
+
+fn subString
+  input: (str: string, start: number, end: number)
+  output: string
+  intent: "부분문자열 추출"
+  do
+    # Phase B 런타임에서 구현
+    return ""
+
+fn boolToString
+  input: b: bool
+  output: string
+  intent: "불린을 JSON 문자열로 변환"
+  do
+    if b
+      return "true"
+    else
+      return "false"
+
+fn todoArrayToJsonArray
+  input: todos: array<Todo>
+  output: array<string>
+  intent: "Todo 배열을 JSON 문자열 배열로 변환"
+  do
+    # Phase B 런타임에서 구현
+    return []
+
+fn joinJsonArray
+  input: items: array<string>
+  output: string
+  intent: "JSON 배열 요소를 쉼표로 연결"
+  do
+    # Phase B 런타임에서 구현
+    if arrayLen(items) == 0
+      return ""
+    return ""
+
+fn mapToArray
+  input: todos: map<number, Todo>
+  output: array<Todo>
+  intent: "맵을 배열로 변환"
+  do
+    # Phase B 런타임에서 구현
+    return []
+
+fn mapRemove
+  input: (m: map<number, Todo>, key: number)
+  output: map<number, Todo>
+  intent: "맵에서 키 제거"
+  do
+    # Phase B 런타임에서 구현
+    return m

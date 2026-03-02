@@ -1,0 +1,530 @@
+"""
+v6.1 Design Patterns Advanced - Test Suite
+===========================================
+
+25개 이상의 테스트로 모든 패턴 검증
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../src'))
+
+import pytest
+from datetime import datetime
+from v6_1_design_patterns.enterprise_patterns import (
+    InMemoryResearcherRepository,
+    UnitOfWork,
+    ResearcherService,
+    ExperimentCommandHandler,
+    ExperimentQueryHandler,
+    ExperimentEventStore,
+    DomainEvent,
+)
+from v6_1_design_patterns.ddd_patterns import (
+    Email,
+    ExperimentScore,
+    Researcher,
+    ExperimentAggregate,
+    ExperimentStatus,
+)
+from v6_1_design_patterns.functional_patterns import (
+    Pipeline,
+    CompletedExperimentSpec,
+    HighScoreSpec,
+    SpecificResearcherSpec,
+    Result,
+    Specification,
+)
+
+
+# =============================================================================
+# Enterprise Patterns Tests
+# =============================================================================
+
+class TestRepositoryPattern:
+    """Repository 패턴 테스트"""
+
+    def test_repository_save_and_retrieve(self):
+        """저장 후 조회"""
+        repo = InMemoryResearcherRepository()
+        researcher = repo.save({'name': 'Alice', 'email': 'alice@gogs.io', 'role': 'ADMIN'})
+
+        retrieved = repo.find_by_id(researcher['id'])
+        assert retrieved is not None
+        assert retrieved['name'] == 'Alice'
+
+    def test_repository_find_all(self):
+        """전체 조회"""
+        repo = InMemoryResearcherRepository()
+        repo.save({'name': 'Alice', 'email': 'alice@gogs.io'})
+        repo.save({'name': 'Bob', 'email': 'bob@gogs.io'})
+
+        all_researchers = repo.find_all()
+        assert len(all_researchers) == 2
+
+    def test_repository_delete(self):
+        """삭제"""
+        repo = InMemoryResearcherRepository()
+        researcher = repo.save({'name': 'Alice', 'email': 'alice@gogs.io'})
+
+        repo.delete(researcher['id'])
+        assert repo.find_by_id(researcher['id']) is None
+
+    def test_repository_can_be_replaced(self):
+        """인터페이스 교체 가능성"""
+        # 테스트에서 InMemory 사용
+        repo = InMemoryResearcherRepository()
+        repo.save({'name': 'Test', 'email': 'test@gogs.io'})
+
+        # 프로덕션에서는 DB 저장소 사용 가능
+        # 코드 변경 없음!
+        assert len(repo.find_all()) == 1
+
+    def test_repository_find_by_spec(self):
+        """Specification으로 조회"""
+        repo = InMemoryResearcherRepository()
+        repo.save({'name': 'Alice', 'email': 'alice@gogs.io', 'role': 'ADMIN'})
+        repo.save({'name': 'Bob', 'email': 'bob@gogs.io', 'role': 'RESEARCHER'})
+
+        # ADMIN만 찾는 spec
+        class AdminSpec(Specification):
+            def is_satisfied_by(self, candidate):
+                return candidate.get('role') == 'ADMIN'
+
+        admins = repo.find_by_spec(AdminSpec())
+        assert len(admins) == 1
+        assert admins[0]['name'] == 'Alice'
+
+
+class TestServiceLayer:
+    """Service Layer 패턴 테스트"""
+
+    def test_service_registers_researcher(self):
+        """연구자 등록 서비스"""
+        repo = InMemoryResearcherRepository()
+        uow = UnitOfWork.__new__(UnitOfWork)
+        uow.researchers = repo
+        service = ResearcherService(uow)
+
+        researcher = service.register_researcher('Alice', 'alice@gogs.io', 'RESEARCHER')
+        assert researcher['name'] == 'Alice'
+
+    def test_service_prevents_duplicate_email(self):
+        """중복 이메일 검사"""
+        repo = InMemoryResearcherRepository()
+        uow = UnitOfWork.__new__(UnitOfWork)
+        uow.researchers = repo
+        service = ResearcherService(uow)
+
+        service.register_researcher('Alice', 'alice@gogs.io', 'RESEARCHER')
+
+        with pytest.raises(ValueError):
+            service.register_researcher('Bob', 'alice@gogs.io', 'RESEARCHER')
+
+    def test_service_generates_events(self):
+        """이벤트 생성"""
+        repo = InMemoryResearcherRepository()
+        uow = UnitOfWork.__new__(UnitOfWork)
+        uow.researchers = repo
+        service = ResearcherService(uow)
+
+        service.register_researcher('Alice', 'alice@gogs.io', 'ADMIN')
+        events = service.get_events()
+
+        assert len(events) > 0
+        assert events[0]['type'] == 'ResearcherRegistered'
+
+    def test_service_updates_researcher(self):
+        """연구자 수정"""
+        repo = InMemoryResearcherRepository()
+        uow = UnitOfWork.__new__(UnitOfWork)
+        uow.researchers = repo
+        service = ResearcherService(uow)
+
+        researcher = service.register_researcher('Alice', 'alice@gogs.io', 'RESEARCHER')
+        updated = service.update_researcher(researcher['id'], 'Alice Updated', 'alice@gogs.io')
+
+        assert updated['name'] == 'Alice Updated'
+
+    def test_service_retrieves_all(self):
+        """모든 연구자 조회"""
+        repo = InMemoryResearcherRepository()
+        uow = UnitOfWork.__new__(UnitOfWork)
+        uow.researchers = repo
+        service = ResearcherService(uow)
+
+        service.register_researcher('Alice', 'alice@gogs.io', 'ADMIN')
+        service.register_researcher('Bob', 'bob@gogs.io', 'RESEARCHER')
+
+        all_researchers = service.get_all_researchers()
+        assert len(all_researchers) == 2
+
+
+class TestEventSourcing:
+    """Event Sourcing 패턴 테스트"""
+
+    def test_event_store_append(self):
+        """이벤트 저장"""
+        store = ExperimentEventStore()
+        event = DomainEvent('TestEvent', datetime.now(), 1, {'data': 'value'})
+
+        store.append(event)
+        events = store.get_events(1)
+
+        assert len(events) == 1
+        assert events[0].event_type == 'TestEvent'
+
+    def test_event_store_replay(self):
+        """이벤트 재생"""
+        store = ExperimentEventStore()
+
+        store.append(DomainEvent('ExperimentCreated', datetime.now(), 1,
+                                  {'subject': '테스트', 'description': '설명'}))
+        store.append(DomainEvent('ExperimentStarted', datetime.now(), 1, {}))
+        store.append(DomainEvent('ExperimentCompleted', datetime.now(), 1,
+                                  {'result': 95.5}))
+
+        state = store.replay(1)
+        assert state['status'] == 'completed'
+        assert state['result'] == 95.5
+
+    def test_event_store_get_all_events(self):
+        """모든 이벤트 조회"""
+        store = ExperimentEventStore()
+
+        store.append(DomainEvent('Event1', datetime.now(), 1, {}))
+        store.append(DomainEvent('Event2', datetime.now(), 2, {}))
+
+        all_events = store.get_all_events()
+        assert len(all_events) == 2
+        assert 1 in all_events
+        assert 2 in all_events
+
+
+# =============================================================================
+# DDD Tests
+# =============================================================================
+
+class TestValueObjects:
+    """Value Object 테스트"""
+
+    def test_email_creation(self):
+        """이메일 생성"""
+        email = Email("alice@gogs.io")
+        assert email.value == "alice@gogs.io"
+
+    def test_email_validation(self):
+        """이메일 유효성 검사"""
+        with pytest.raises(ValueError):
+            Email("invalid-email")
+
+    def test_email_equality(self):
+        """이메일 동등성 (값으로 비교)"""
+        email1 = Email("alice@gogs.io")
+        email2 = Email("alice@gogs.io")
+        assert email1 == email2
+
+    def test_score_creation(self):
+        """점수 생성"""
+        score = ExperimentScore(95.5)
+        assert score.value == 95.5
+
+    def test_score_range_validation(self):
+        """점수 범위 검증"""
+        with pytest.raises(ValueError):
+            ExperimentScore(150.0)
+
+    def test_score_immutability(self):
+        """점수 불변성"""
+        score = ExperimentScore(95.0)
+        with pytest.raises(AttributeError):
+            score.value = 50  # frozen=True로 인해 실패
+
+
+class TestEntities:
+    """Entity 테스트"""
+
+    def test_researcher_creation(self):
+        """연구자 생성"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        assert researcher.name == "Alice"
+
+    def test_researcher_identity_equality(self):
+        """연구자 정체성 비교 (ID로만!)"""
+        email = Email("alice@gogs.io")
+        researcher1 = Researcher(1, "Alice", email, "ADMIN")
+        researcher2 = Researcher(1, "Alice Modified", email, "RESEARCHER")
+
+        # ID가 같으면 같은 사람 (속성이 달라도)
+        assert researcher1 == researcher2
+
+    def test_researcher_update(self):
+        """연구자 정보 수정"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "RESEARCHER")
+
+        researcher.update("Alice Updated", "ADMIN")
+        assert researcher.name == "Alice Updated"
+        assert researcher.role == "ADMIN"
+
+
+class TestAggregateRoot:
+    """Aggregate Root 테스트"""
+
+    def test_aggregate_creation(self):
+        """Aggregate 생성"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+        assert experiment.id == 1
+        assert experiment.status == ExperimentStatus.PENDING
+
+    def test_aggregate_add_log(self):
+        """로그 추가"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+        experiment.start()
+        log = experiment.add_log("첫 로그")
+
+        assert len(experiment.logs) == 1
+
+    def test_aggregate_invariant_no_log_after_completion(self):
+        """불변식: 완료 후 로그 추가 불가"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+        experiment.start()
+        experiment.complete(ExperimentScore(95.0))
+
+        with pytest.raises(ValueError):
+            experiment.add_log("불가능한 로그")
+
+    def test_aggregate_start_transition(self):
+        """상태 전이: pending → in_progress"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+        assert experiment.status == ExperimentStatus.PENDING
+        experiment.start()
+        assert experiment.status == ExperimentStatus.IN_PROGRESS
+
+    def test_aggregate_completion(self):
+        """실험 완료"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+        experiment.start()
+        experiment.complete(ExperimentScore(92.5))
+
+        assert experiment.status == ExperimentStatus.COMPLETED
+        assert experiment.score.value == 92.5
+
+    def test_aggregate_generates_events(self):
+        """도메인 이벤트 생성"""
+        email = Email("alice@gogs.io")
+        researcher = Researcher(1, "Alice", email, "ADMIN")
+        experiment = ExperimentAggregate(1, researcher, "패턴 연구")
+
+        experiment.start()
+        experiment.add_log("로그")
+        experiment.complete(ExperimentScore(95.0))
+
+        events = experiment.get_events()
+        assert len(events) >= 3
+
+
+# =============================================================================
+# Functional Patterns Tests
+# =============================================================================
+
+class TestPipeline:
+    """Pipeline 패턴 테스트"""
+
+    def test_pipeline_single_transformation(self):
+        """단일 변환"""
+        result = Pipeline(10).pipe(lambda x: x * 2).execute()
+        assert result == 20
+
+    def test_pipeline_multiple_transformations(self):
+        """다중 변환"""
+        result = (
+            Pipeline(10)
+            .pipe(lambda x: x * 2)
+            .pipe(lambda x: x + 5)
+            .pipe(lambda x: x / 3)
+            .execute()
+        )
+        assert abs(result - 8.333) < 0.01
+
+    def test_pipeline_with_data_transformation(self):
+        """데이터 변환 파이프라인"""
+        data = [
+            {'id': 1, 'value': 100},
+            {'id': 2, 'value': 50},
+        ]
+
+        result = (
+            Pipeline(data)
+            .pipe(lambda items: [item for item in items if item['value'] > 60])
+            .pipe(lambda items: sorted(items, key=lambda x: x['value']))
+            .execute()
+        )
+
+        assert len(result) == 1
+        assert result[0]['id'] == 1
+
+
+class TestSpecification:
+    """Specification 패턴 테스트"""
+
+    def test_specification_single_condition(self):
+        """단일 조건"""
+        spec = HighScoreSpec(80)
+        experiment = {'status': 'completed', 'result': 95}
+
+        assert spec.is_satisfied_by(experiment)
+
+    def test_specification_and_combination(self):
+        """AND 조합"""
+        completed_spec = CompletedExperimentSpec()
+        high_score_spec = HighScoreSpec(80)
+        combined = completed_spec.and_spec(high_score_spec)
+
+        experiment = {'status': 'completed', 'result': 85}
+        assert combined.is_satisfied_by(experiment)
+
+        bad_experiment = {'status': 'pending', 'result': 95}
+        assert not combined.is_satisfied_by(bad_experiment)
+
+    def test_specification_or_combination(self):
+        """OR 조합"""
+        spec1 = CompletedExperimentSpec()
+        spec2 = HighScoreSpec(90)
+        combined = spec1.or_spec(spec2)
+
+        assert combined.is_satisfied_by({'status': 'completed', 'result': 50})
+        assert combined.is_satisfied_by({'status': 'pending', 'result': 95})
+
+
+class TestResultMonad:
+    """Result Monad 테스트"""
+
+    def test_result_ok(self):
+        """성공 결과"""
+        result = Result.ok(42)
+        assert result.is_success()
+        assert result.get() == 42
+
+    def test_result_err(self):
+        """실패 결과"""
+        result = Result.err("에러 발생")
+        assert result.is_failure()
+        assert result.get_error() == "에러 발생"
+
+    def test_result_map_success(self):
+        """성공 시 map 적용"""
+        result = Result.ok(5).map(lambda x: x * 2)
+        assert result.get() == 10
+
+    def test_result_map_failure(self):
+        """실패 시 map은 그대로 전파"""
+        result = Result.err("에러").map(lambda x: x * 2)
+        assert result.is_failure()
+
+    def test_result_flat_map(self):
+        """flat_map으로 Result 반환 함수 연결"""
+        def divide(a, b):
+            if b == 0:
+                return Result.err("0으로 나눌 수 없음")
+            return Result.ok(a / b)
+
+        result = Result.ok(10).flat_map(lambda x: divide(x, 2))
+        assert result.get() == 5.0
+
+    def test_result_get_or_else(self):
+        """값 또는 기본값"""
+        assert Result.ok(42).get_or_else(0) == 42
+        assert Result.err("에러").get_or_else(0) == 0
+
+
+# =============================================================================
+# Integration Tests
+# =============================================================================
+
+class TestIntegration:
+    """통합 테스트"""
+
+    def test_full_workflow(self):
+        """전체 워크플로우"""
+        # Repository 생성
+        repo = InMemoryResearcherRepository()
+
+        # 연구자 저장
+        researcher_data = repo.save({'name': 'Alice', 'email': 'alice@gogs.io', 'role': 'ADMIN'})
+        researcher = Researcher(
+            researcher_data['id'],
+            researcher_data['name'],
+            Email(researcher_data['email']),
+            researcher_data['role']
+        )
+
+        # Aggregate 생성
+        experiment = ExperimentAggregate(1, researcher, "고급 패턴 연구")
+
+        # 상태 전이
+        experiment.start()
+        experiment.add_log("분석 1: Repository 패턴")
+        experiment.add_log("분석 2: DDD 패턴")
+        experiment.complete(ExperimentScore(96.5))
+
+        # 검증
+        assert experiment.status == ExperimentStatus.COMPLETED
+        assert len(experiment.logs) == 2
+        assert experiment.score.is_passing_score()
+
+    def test_repository_service_integration(self):
+        """Repository + Service 통합"""
+        repo = InMemoryResearcherRepository()
+        uow = UnitOfWork.__new__(UnitOfWork)
+        uow.researchers = repo
+        service = ResearcherService(uow)
+
+        # 서비스를 통한 등록
+        researcher = service.register_researcher('Bob', 'bob@gogs.io', 'RESEARCHER')
+
+        # Repository로 직접 조회
+        found = repo.find_by_id(researcher['id'])
+        assert found['name'] == 'Bob'
+
+    def test_event_sourcing_full_replay(self):
+        """Event Sourcing 전체 흐름"""
+        store = ExperimentEventStore()
+
+        events = [
+            DomainEvent('ExperimentCreated', datetime.now(), 1,
+                        {'subject': '연구', 'description': '설명'}),
+            DomainEvent('ExperimentStarted', datetime.now(), 1, {}),
+            DomainEvent('LogAdded', datetime.now(), 1, {'message': '로그 1'}),
+            DomainEvent('LogAdded', datetime.now(), 1, {'message': '로그 2'}),
+            DomainEvent('ExperimentCompleted', datetime.now(), 1, {'result': 88.0}),
+        ]
+
+        for event in events:
+            store.append(event)
+
+        # 재생
+        state = store.replay(1)
+        assert state['status'] == 'completed'
+        assert state['result'] == 88.0
+        assert len(state['history']) == 2
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

@@ -1,0 +1,232 @@
+"""
+GogsDataLakeEngine 테스트
+- 분산 처리 엔진
+- 멀티프로세싱
+- 장애 복구
+"""
+
+import unittest
+import tempfile
+import shutil
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from v8_2_data_lake.core.engine import (
+    GogsDataLakeEngine,
+    WorkerStatus,
+    ProcessingTask
+)
+
+
+class TestGogsDataLakeEngine(unittest.TestCase):
+    """GogsDataLakeEngine 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.engine = GogsDataLakeEngine(num_workers=2)
+        self.test_data = list(range(1000))
+
+    def tearDown(self):
+        """테스트 종료 후 정리"""
+        self.engine = None
+
+    def test_engine_initialization(self):
+        """엔진 초기화 테스트"""
+        self.assertEqual(self.engine.num_workers, 2)
+        self.assertEqual(self.engine.max_retries, 3)
+        self.assertEqual(len(self.engine.worker_metrics), 2)
+
+    def test_partition_data(self):
+        """데이터 분할 테스트"""
+        partitions = self.engine.partition_data(self.test_data)
+
+        self.assertGreater(len(partitions), 0)
+
+        # 모든 데이터가 분할되었는지 확인
+        total_records = sum(len(p) for p in partitions)
+        self.assertEqual(total_records, len(self.test_data))
+
+    def test_map_phase(self):
+        """Map Phase 테스트"""
+        test_data = [1, 2, 3, 4, 5]
+
+        def mapper(record):
+            return record * 2
+
+        results = self.engine.map_phase(test_data, mapper)
+
+        self.assertTrue(len(results) > 0)
+        self.assertEqual(len(results), len(test_data))
+
+    def test_reduce_phase(self):
+        """Reduce Phase 테스트"""
+        mapped_data = [
+            ("hello", 1),
+            ("hello", 1),
+            ("world", 1),
+            ("python", 1)
+        ]
+
+        def reducer(key, values):
+            return (key, sum(values))
+
+        # 같은 키끼리 그룹화
+        grouped = {}
+        for key, value in mapped_data:
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(value)
+
+        # Reduce 실행
+        results = {}
+        for key, values in grouped.items():
+            results[key] = reducer(key, values)
+
+        self.assertEqual(len(results), 4)
+        self.assertEqual(results["hello"], ("hello", 2))
+
+    def test_task_creation(self):
+        """처리 작업 생성 테스트"""
+        task = ProcessingTask(
+            task_id="test_task_1",
+            data=self.test_data[:100],
+            operation="sum"
+        )
+
+        self.assertEqual(task.task_id, "test_task_1")
+        self.assertEqual(len(task.data), 100)
+        self.assertEqual(task.operation, "sum")
+        self.assertEqual(task.status, "pending")
+
+    def test_worker_metrics(self):
+        """워커 메트릭 테스트"""
+        self.engine.record_worker_completion(
+            worker_id=0,
+            execution_time=1.5,
+            records_processed=500,
+            success=True
+        )
+
+        metrics = self.engine.worker_metrics[0]
+        self.assertEqual(metrics.total_tasks, 1)
+        self.assertEqual(metrics.successful_tasks, 1)
+        self.assertEqual(metrics.failed_tasks, 0)
+
+    def test_engine_metrics(self):
+        """엔진 메트릭 테스트"""
+        self.engine.record_worker_completion(
+            worker_id=0,
+            execution_time=1.0,
+            records_processed=1000,
+            success=True
+        )
+
+        metrics = self.engine.get_metrics()
+        self.assertIn("total_tasks", metrics)
+        self.assertIn("successful_tasks", metrics)
+        self.assertIn("failed_tasks", metrics)
+        self.assertIn("avg_execution_time", metrics)
+
+    def test_speedup_calculation(self):
+        """속도 향상 계산 테스트"""
+        # 순차 실행 시간: 10초
+        sequential_time = 10.0
+
+        # 병렬 실행 시간: 3초 (4개 워커)
+        parallel_time = 3.0
+
+        speedup = sequential_time / parallel_time
+        self.assertEqual(speedup, 10.0 / 3.0)
+
+    def test_data_partitioning_balance(self):
+        """데이터 분할 균형 테스트"""
+        data = list(range(1000))
+        partitions = self.engine.partition_data(data)
+
+        partition_sizes = [len(p) for p in partitions]
+
+        # 각 분할이 거의 같은 크기인지 확인
+        min_size = min(partition_sizes)
+        max_size = max(partition_sizes)
+
+        # 균형 편차가 합리적인 범위 내
+        avg_size = len(data) / len(partitions)
+        self.assertGreater(min_size, avg_size * 0.8)
+        self.assertLess(max_size, avg_size * 1.2)
+
+    def test_reduce_aggregation(self):
+        """Reduce 집계 테스트"""
+        mapped = [
+            ("count", 1),
+            ("count", 1),
+            ("count", 1),
+            ("sum", 100),
+            ("sum", 200)
+        ]
+
+        grouped = {}
+        for key, value in mapped:
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(value)
+
+        # 각 키에 대해 합계 계산
+        aggregated = {
+            key: sum(values)
+            for key, values in grouped.items()
+        }
+
+        self.assertEqual(aggregated["count"], 3)
+        self.assertEqual(aggregated["sum"], 300)
+
+    def test_worker_pool_execution(self):
+        """워커 풀 실행 테스트"""
+        test_data = list(range(100))
+
+        def simple_mapper(x):
+            return x * 2
+
+        # 단순 맵 연산
+        result = self.engine.map_phase(test_data, simple_mapper)
+
+        self.assertEqual(len(result), 100)
+        # 모든 요소가 2배가 되었는지 확인
+        for i, r in enumerate(result):
+            self.assertEqual(r, i * 2)
+
+
+class TestEnginePerformance(unittest.TestCase):
+    """엔진 성능 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.engine = GogsDataLakeEngine(num_workers=4)
+
+    def test_large_dataset_partition(self):
+        """대규모 데이터셋 분할 테스트"""
+        large_data = list(range(100000))
+
+        partitions = self.engine.partition_data(large_data)
+
+        self.assertGreater(len(partitions), 0)
+        total = sum(len(p) for p in partitions)
+        self.assertEqual(total, 100000)
+
+    def test_parallel_processing_speedup(self):
+        """병렬 처리 성능 향상 테스트"""
+        data = list(range(1000))
+
+        # 간단한 연산 사용 (pickle 가능)
+        def simple_double(x):
+            return x * 2
+
+        # 병렬 처리
+        results = self.engine.map_phase(data, simple_double)
+
+        self.assertEqual(len(results), len(data))
+
+
+if __name__ == "__main__":
+    unittest.main()

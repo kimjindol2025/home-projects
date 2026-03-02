@@ -1,0 +1,372 @@
+# 📊 Phase 2: AI-Guided Mutation Selection Design
+
+**Status**: 🏗️ Design Phase
+**Timeline**: May 2026 (2개월)
+**Target**: 50% 빠른 수렴 (5000 → 2500 반복)
+
+---
+
+## 1. 목표
+
+Phase 1에서 구현한 **uniform random mutation** (모든 변형 등확률)의 한계:
+- 1000회 반복에서 단 1회 개선 발생
+- 5000회 반복 필요 → 약 5시간 소요
+- 비효율적인 변형 시간 낭비
+
+**Phase 2의 해결책**: Neural Network를 사용한 성능 예측
+```
+Baseline (Random):     1000회 반복 → 1.18배
+AI-Guided (우리):      500회 반복  → 1.25배+ (예상)
+```
+
+---
+
+## 2. 아키텍처
+
+### 2.1 시스템 구조
+
+```
+┌─────────────────────────────────────────────┐
+│  Stochastic Code Optimizer (Phase 2)        │
+├─────────────────────────────────────────────┤
+│                                             │
+│  1️⃣ Code Feature Extractor                 │
+│     ↓ (코드 특성 추출)                      │
+│     - Code Length, Loop Depth               │
+│     - Memory Access Pattern                 │
+│     - Vectorization Potential               │
+│                                             │
+│  2️⃣ Performance Predictor (NN)             │
+│     ↓ (예측 모델: PyTorch/ONNX)             │
+│     - Input: [features] ∈ ℝⁿ               │
+│     - Output: [speedup_1, ..., speedup_5] │
+│     - Architecture: Dense → ReLU → Output  │
+│                                             │
+│  3️⃣ Weighted Mutation Selection            │
+│     ↓ (가중치 기반 샘플링)                  │
+│     - P(mutation_i) ∝ predicted_speedup_i  │
+│     - Sampling: softmax + categorical      │
+│                                             │
+│  4️⃣ Stochastic Search Loop (기존)         │
+│     - Mutate → Verify → Evaluate → Update  │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Component 세부 설계
+
+### 3.1 Code Feature Extractor
+
+**목적**: 코드의 특성을 수치 벡터로 변환
+
+**입력**: MLIR Operation
+```mlir
+scf.for %i = %c0 to %c1024 step %c1 {
+  %0 = memref.load %arg0[%i] : memref<1024xf32>
+  %1 = arith.addf %0, %cst : f32
+  memref.store %1, %arg0[%i] : memref<1024xf32>
+}
+```
+
+**추출 특성** (10-15차원):
+
+| 특성 | 범위 | 설명 |
+|------|------|------|
+| `code_length` | 1-10000 | 코드 라인 수 (정규화) |
+| `loop_depth` | 0-10 | 루프 중첩 깊이 |
+| `loop_count` | 0-100 | 루프 총 개수 |
+| `mem_access_count` | 0-1000 | 메모리 접근 횟수 |
+| `read_write_ratio` | 0-1 | 읽기/(읽기+쓰기) 비율 |
+| `vector_width_hint` | 0-1 | Vectorization 가능성 |
+| `has_reduction` | 0-1 | Reduction 연산 여부 |
+| `arithmetic_intensity` | 0-1 | 연산/메모리 비율 |
+| `data_reuse` | 0-1 | 데이터 재사용도 |
+| `parallelizable` | 0-1 | 병렬화 가능성 |
+
+**구현** (Python):
+```python
+class CodeFeatureExtractor:
+    def extract(self, operation: Operation) -> np.ndarray:
+        features = {
+            'code_length': self._count_operations(operation),
+            'loop_depth': self._compute_loop_depth(operation),
+            'mem_access_count': self._count_memory_accesses(operation),
+            ...
+        }
+        return self._normalize(features)
+```
+
+---
+
+### 3.2 Performance Predictor (Neural Network)
+
+**목표**: 주어진 코드 특성에 대해 각 변형의 예상 성능 향상도 예측
+
+**아키텍처**:
+```
+Input Layer (n=10-15)
+  ↓
+Dense(128) + ReLU
+  ↓
+Dropout(0.2)
+  ↓
+Dense(64) + ReLU
+  ↓
+Dropout(0.2)
+  ↓
+Dense(32) + ReLU
+  ↓
+Output Layer (5)  ← [speedup_tiling, speedup_unroll, speedup_vec, speedup_interchange, speedup_const]
+```
+
+**학습 데이터 생성**:
+```
+Training Dataset Construction:
+  1. Phase 1 실행 결과 수집 (1000개 코드 샘플)
+  2. 각 코드에 대해:
+     - 특성 추출 (CodeFeatureExtractor)
+     - 5가지 변형 각각 성능 측정 (PerformanceEvaluator)
+     - (특성, 변형타입, 측정된_속도향상) 저장
+  3. Dataset shape: (5000, 10 + 5) = (5000 examples, 10 features + 5 outputs)
+```
+
+**학습 프로세스**:
+```python
+class PerformancePredictorNN:
+    def __init__(self, input_dim=10, output_dim=5):
+        self.model = Sequential([
+            Dense(128, activation='relu', input_dim=input_dim),
+            Dropout(0.2),
+            Dense(64, activation='relu'),
+            Dropout(0.2),
+            Dense(32, activation='relu'),
+            Dense(output_dim, activation='relu')  # speedup is non-negative
+        ])
+        self.model.compile(optimizer='adam', loss='mse')
+
+    def train(self, X_train, y_train, epochs=100):
+        self.model.fit(X_train, y_train, epochs=epochs, validation_split=0.2)
+
+    def predict(self, features):
+        # features: shape (10,)
+        # returns: shape (5,) = [speedup for each mutation type]
+        return self.model.predict(features.reshape(1, -1))[0]
+```
+
+**예측 예시**:
+```
+Input: [code_length=0.5, loop_depth=3, mem_accesses=100, ...]
+Output: [1.12, 1.08, 1.18, 1.06, 1.02]
+        [Tiling, Unroll, Vectorization, Interchange, ConstProp]
+```
+
+---
+
+### 3.3 Weighted Mutation Selection
+
+**기존 (Phase 1)**: 모든 변형 등확률
+```
+P(LoopTiling) = 1/5 = 0.20
+P(Vectorization) = 1/5 = 0.20
+...
+```
+
+**개선 (Phase 2)**: 예측된 성능에 비례하는 확률
+```
+predicted = [1.12, 1.08, 1.18, 1.06, 1.02]
+
+softmax(predicted) = [
+  0.25,  ← LoopTiling
+  0.20,  ← LoopUnrolling
+  0.35,  ← Vectorization ⭐ 가장 높음
+  0.12,  ← LoopInterchange
+  0.08   ← ConstProp
+]
+
+P(Vectorization) = 0.35 (1.75배 높음!)
+```
+
+**구현**:
+```python
+class WeightedMutationSelector:
+    def __init__(self, predictor: PerformancePredictorNN):
+        self.predictor = predictor
+
+    def select_mutation(self, code_features):
+        # 1. 성능 예측
+        predicted_speedups = self.predictor.predict(code_features)
+
+        # 2. Softmax로 확률 계산
+        weights = np.exp(predicted_speedups) / np.sum(np.exp(predicted_speedups))
+
+        # 3. 확률에 따라 변형 선택
+        mutation_idx = np.random.choice(5, p=weights)
+
+        return MutationType(mutation_idx), weights
+```
+
+---
+
+## 4. 학습 데이터셋 구성
+
+### 4.1 데이터 수집
+
+**Phase 2 실행 프로세스**:
+
+```
+Week 1-2: Data Collection
+  ├─ Phase 1 데모 1000회 실행 (다양한 코드)
+  ├─ 각 실행마다:
+  │  ├─ 코드 특성 추출
+  │  └─ 변형 5개 각각 성능 측정
+  └─ CSV 저장: (code_id, feature_1, ..., feature_10, speedup_1, ..., speedup_5)
+
+Week 3-4: Model Training
+  ├─ TensorFlow/PyTorch로 NN 학습
+  ├─ Training/Validation 분할: 80/20
+  ├─ 손실 함수: MSE (Mean Squared Error)
+  └─ 정확도 목표: R² > 0.85
+
+Week 5-6: Integration & Testing
+  ├─ ONNX 포맷으로 변환 (C++ 호환)
+  ├─ 기존 optimizer와 통합
+  ├─ 성능 비교:
+  │  ├─ Phase 1: 1000반복 → 1.18배 (15시간 소요)
+  │  └─ Phase 2: 500반복 → 1.25배+ (7시간 소요)
+  └─ 분석 & 보고서 작성
+```
+
+### 4.2 데이터 분포
+
+**예상 데이터셋** (1000 코드 샘플):
+```
+┌─────────────────────────────────────────┐
+│ Training Dataset (5000 examples)        │
+├─────────────────────────────────────────┤
+│ Features (10D):                         │
+│  - code_length: 0.1 ~ 1.0               │
+│  - loop_depth: 1 ~ 10                   │
+│  - mem_accesses: 10 ~ 1000              │
+│  - ...                                  │
+│                                         │
+│ Targets (5D):                           │
+│  - speedup values: 0.95 ~ 2.50          │
+│  - avg speedup: ~1.15                   │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## 5. 예상 성과
+
+### 5.1 성능 개선
+
+| 메트릭 | Phase 1 | Phase 2 | 개선도 |
+|--------|---------|---------|--------|
+| **반복 횟수** | 5000 | 2500 | 50% ⬇️ |
+| **실행 시간** | 5시간 | 2.5시간 | 50% ⬇️ |
+| **최종 속도향상** | 1.18x | 1.28x+ | +8% ⬆️ |
+| **성공 변형 수** | 1 | 50+ | 50배 ⬆️ |
+| **모델 정확도** | N/A | >85% | - |
+
+### 5.2 수렴 속도 비교
+
+```
+Speedup vs Iterations
+
+Phase 1 (Random):
+  1.10x │        ●
+  1.05x │  ●
+  1.00x │●──────────────────
+       └─ 0    2000   5000
+
+Phase 2 (AI-Guided):
+  1.25x │        ●
+  1.20x │    ●
+  1.15x │  ●
+  1.10x │●
+  1.00x │●─────────────────
+       └─ 0    1000   2500
+```
+
+---
+
+## 6. 구현 로드맵
+
+### Week 1-2: Code Feature Extractor
+- [ ] Operation 순회 로직
+- [ ] 10가지 특성 추출
+- [ ] 정규화 (0-1 범위)
+- [ ] 단위 테스트
+
+### Week 3-4: Performance Predictor
+- [ ] 데이터 수집 스크립트
+- [ ] PyTorch 모델 정의
+- [ ] 학습 파이프라인
+- [ ] 검증 및 평가
+
+### Week 5-6: Weighted Selection & Integration
+- [ ] WeightedMutationSelector 구현
+- [ ] ONNX 변환
+- [ ] 기존 optimizer 통합
+- [ ] E2E 테스트
+
+### Week 7-8: Evaluation & Documentation
+- [ ] Phase 1 vs 2 성능 비교
+- [ ] 수렴 곡선 분석
+- [ ] 논문에 삽입할 그래프/표
+- [ ] Phase 2 완료 보고서
+
+---
+
+## 7. 기술 스택
+
+| 컴포넌트 | 기술 | 버전 |
+|----------|------|------|
+| Feature Extractor | C++ (MLIR) | C++17 |
+| NN Framework | PyTorch | 1.13+ |
+| Model Export | ONNX | 1.12+ |
+| C++ Inference | ONNX Runtime | 1.15+ |
+| Visualization | Matplotlib | 3.5+ |
+
+---
+
+## 8. 위험요소 및 대응
+
+| 위험 | 확률 | 영향 | 대응 |
+|------|------|------|------|
+| 모델 과적합 | 중간 | 실제 성능 저하 | Early stopping + Cross-validation |
+| 데이터 불충분 | 낮음 | 모델 정확도 ⬇️ | Phase 1 결과 활용 + 합성 데이터 |
+| 추론 속도 느림 | 낮음 | 전체 소요 시간 증가 | Model quantization + 캐싱 |
+| ONNX 호환성 | 낮음 | C++ 통합 실패 | PyTorch → ONNX → TensorRT |
+
+---
+
+## 9. 성공 기준
+
+✅ **Phase 2는 다음 조건을 만족할 때 완료:**
+
+1. 모델 정확도 R² > 0.85 (검증 데이터)
+2. 추론 시간 < 1ms/예측
+3. Phase 1 대비 50% 이상 반복 감소
+4. 최종 성능 1.25배 이상 달성
+5. C++ 코드에 성공적으로 통합
+6. 논문에 삽입 가능한 결과 생성
+
+---
+
+## 10. Phase 3로의 연결
+
+Phase 2 완료 후 Phase 3:
+- SPEC CPU 2017 벤치마크 대규모 평가
+- 다양한 하드웨어 플랫폼 테스트
+- STOKE/TVM Ansor와의 비교
+- 논문 초안 작성
+
+---
+
+**Created**: 2026-02-27
+**Status**: 🟢 Design Complete, Ready for Implementation
+**Next Step**: Week 1 데이터 수집 시작

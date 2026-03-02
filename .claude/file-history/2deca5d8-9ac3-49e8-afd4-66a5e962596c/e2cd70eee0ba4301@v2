@@ -1,0 +1,357 @@
+// ============================================================================
+// Compiler: AST를 바이트코드로 변환 (v15.2 - 백필링 완성)
+// ============================================================================
+
+use crate::ast::{Expression, Program, Statement};
+use crate::bytecode::Bytecode;
+use crate::opcode::OpCode;
+
+/// ============================================================================
+/// 컴파일러 - AST → 바이트코드 변환의 핵심
+/// ============================================================================
+pub struct Compiler {
+    bytecode: Bytecode,
+    pub debug_mode: bool,
+}
+
+impl Compiler {
+    /// 새로운 컴파일러 생성
+    pub fn new() -> Self {
+        Compiler {
+            bytecode: Bytecode::new(),
+            debug_mode: false,
+        }
+    }
+
+    /// 디버그 모드 활성화
+    pub fn with_debug(mut self, debug: bool) -> Self {
+        self.debug_mode = debug;
+        self
+    }
+
+    /// 프로그램 컴파일 (메인 진입점)
+    pub fn compile(&mut self, program: &Program) -> Result<(), String> {
+        for statement in &program.statements {
+            self.compile_statement(statement)?;
+        }
+        Ok(())
+    }
+
+    /// 문장 컴파일
+    fn compile_statement(&mut self, stmt: &Statement) -> Result<(), String> {
+        match stmt {
+            Statement::Let { name: _, value } => {
+                // 값을 먼저 컴파일 (변수 할당은 후위 순서로)
+                self.compile_expression(value)?;
+            }
+
+            Statement::Expression(expr) => {
+                self.compile_expression(expr)?;
+            }
+
+            Statement::Return(expr) => {
+                self.compile_expression(expr)?;
+                self.emit(OpCode::OpReturnValue);
+            }
+
+            Statement::Block(stmts) => {
+                for stmt in stmts {
+                    self.compile_statement(stmt)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// ============================================================================
+    /// [핵심] 표현식 컴파일 - 후위 순회(Post-order)로 바이트코드 생성
+    /// ============================================================================
+    fn compile_expression(&mut self, expr: &Expression) -> Result<(), String> {
+        match expr {
+            // 정수: 상수 풀에 추가하고 OpConstant 방출
+            Expression::Integer(value) => {
+                let idx = self.bytecode.add_constant(*value);
+                self.emit_with_operand(OpCode::OpConstant, idx as u16);
+            }
+
+            // 불리언
+            Expression::Boolean(true) => {
+                self.emit(OpCode::OpTrue);
+            }
+            Expression::Boolean(false) => {
+                self.emit(OpCode::OpFalse);
+            }
+
+            // null
+            Expression::Null => {
+                self.emit(OpCode::OpNull);
+            }
+
+            // 전위 연산: -x, !x
+            Expression::Prefix(op, right) => {
+                // 1. 오른쪽 먼저 컴파일
+                self.compile_expression(right)?;
+                // 2. 연산자 방출
+                match op.as_str() {
+                    "-" => self.emit(OpCode::OpMinus),
+                    "!" => self.emit(OpCode::OpBang),
+                    _ => return Err(format!("Unknown prefix operator: {}", op)),
+                }
+            }
+
+            // 중위 연산: x + y, x - y 등
+            Expression::Infix(op, left, right) => {
+                // 1. 왼쪽 피연산자 컴파일 (스택에 푸시)
+                self.compile_expression(left)?;
+                // 2. 오른쪽 피연산자 컴파일 (스택에 푸시)
+                self.compile_expression(right)?;
+                // 3. 연산자 방출 (스택에서 두 값을 팝하고 결과 푸시)
+                match op.as_str() {
+                    "+" => self.emit(OpCode::OpAdd),
+                    "-" => self.emit(OpCode::OpSub),
+                    "*" => self.emit(OpCode::OpMul),
+                    "/" => self.emit(OpCode::OpDiv),
+                    "==" => self.emit(OpCode::OpEqual),
+                    "!=" => self.emit(OpCode::OpNotEqual),
+                    "<" => self.emit(OpCode::OpLessThan),
+                    ">=" => self.emit(OpCode::OpGreaterThanOrEqual),
+                    _ => return Err(format!("Unknown infix operator: {}", op)),
+                }
+            }
+
+            // if 표현식 - 백필링 완성
+            Expression::If {
+                condition,
+                consequence,
+                alternative,
+            } => {
+                // 1. 조건 컴파일
+                self.compile_expression(condition)?;
+
+                // 2. 점프 명령어 방출 (목적지는 아직 모름)
+                let jump_not_truthy_pos = self.emit_placeholder(OpCode::OpJumpNotTruthy);
+
+                // 3. consequence 블록 컴파일
+                for stmt in consequence {
+                    self.compile_statement(stmt)?;
+                }
+
+                // 4. else 블록 처리
+                if let Some(alt) = alternative {
+                    // else가 있으면: jump를 else 끝으로, jump_not_truthy를 else 시작으로 백필
+                    let jump_pos = self.emit_placeholder(OpCode::OpJump);
+                    self.fix_jump(jump_not_truthy_pos);
+                    for stmt in alt {
+                        self.compile_statement(stmt)?;
+                    }
+                    self.fix_jump(jump_pos);
+                } else {
+                    // else가 없으면: jump_not_truthy를 if 이후로 백필
+                    self.fix_jump(jump_not_truthy_pos);
+                }
+            }
+
+            // while 루프 - 후방 점프 (주소 미리 알고 있음)
+            Expression::While { condition, body } => {
+                let loop_start = self.bytecode.len() as u16;
+
+                // 1. 조건 컴파일
+                self.compile_expression(condition)?;
+
+                // 2. 거짓이면 루프 탈출
+                let jump_not_truthy_pos = self.emit_placeholder(OpCode::OpJumpNotTruthy);
+
+                // 3. 루프 본체 컴파일
+                for stmt in body {
+                    self.compile_statement(stmt)?;
+                }
+
+                // 4. 루프 시작으로 다시 점프 (주소 이미 알고 있음)
+                self.emit_with_operand(OpCode::OpJump, loop_start);
+
+                // 5. 루프 탈출 위치로 백필
+                self.fix_jump(jump_not_truthy_pos);
+            }
+
+            // 함수 호출
+            Expression::Call { function, arguments } => {
+                // 1. 함수 컴파일
+                self.compile_expression(function)?;
+
+                // 2. 인자들 컴파일
+                for arg in arguments {
+                    self.compile_expression(arg)?;
+                }
+
+                // 3. Call 명령어 (인자 개수 지정)
+                self.emit_with_operand(OpCode::OpCall, arguments.len() as u16);
+            }
+
+            // 배열
+            Expression::Array(elements) => {
+                // 1. 각 요소 컴파일
+                for elem in elements {
+                    self.compile_expression(elem)?;
+                }
+                // 2. Array 명령어 (요소 개수)
+                self.emit_with_operand(OpCode::OpArray, elements.len() as u16);
+            }
+
+            // 인덱싱
+            Expression::Index(left, index) => {
+                // 1. 왼쪽(배열/해시) 컴파일
+                self.compile_expression(left)?;
+                // 2. 인덱스 컴파일
+                self.compile_expression(index)?;
+                // 3. Index 명령어
+                self.emit(OpCode::OpIndex);
+            }
+
+            // 식별자 (추후 구현)
+            Expression::Identifier(_) => {
+                return Err("Identifiers not yet implemented".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 단일 바이트 명령어 방출
+    fn emit(&mut self, op: OpCode) {
+        self.bytecode.add_instruction(op.as_byte());
+    }
+
+    /// 피연산자(u16 = 2바이트)를 포함한 명령어 방출
+    fn emit_with_operand(&mut self, op: OpCode, operand: u16) {
+        self.emit(op);
+        // u16을 [high_byte, low_byte]로 분해
+        let high = (operand >> 8) as u8;
+        let low = (operand & 0xFF) as u8;
+        self.bytecode.add_instruction(high);
+        self.bytecode.add_instruction(low);
+    }
+
+    /// 점프 명령어를 방출하지만 목적지는 아직 모름 (나중에 수정) - 3바이트
+    fn emit_placeholder(&mut self, op: OpCode) -> usize {
+        let pos = self.bytecode.len();
+        self.bytecode.add_instruction(op.as_byte());      // OpJumpNotTruthy
+        self.bytecode.add_instruction(0x00);              // operand high byte
+        self.bytecode.add_instruction(0x00);              // operand low byte
+        pos
+    }
+
+    /// 이전에 방출한 점프의 목적지를 수정 (백필링)
+    fn change_operand(&mut self, pos: usize, operand: u16) {
+        let bytes = operand.to_be_bytes();
+        self.bytecode.instructions[pos + 1] = bytes[0];
+        self.bytecode.instructions[pos + 2] = bytes[1];
+
+        if self.debug_mode {
+            eprintln!(
+                "[BACKFILL] @{}: operand=0x{:04x} ({})",
+                pos, operand, operand
+            );
+        }
+    }
+
+    /// fix_jump는 change_operand에 위임
+    fn fix_jump(&mut self, pos: usize) {
+        let target = self.bytecode.len() as u16;
+        self.change_operand(pos, target);
+    }
+
+    /// 컴파일된 바이트코드 반환
+    pub fn bytecode(&self) -> Bytecode {
+        self.bytecode.clone()
+    }
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compile_integer_literal() {
+        let mut compiler = Compiler::new();
+        let program = Program::new(vec![Statement::Expression(Expression::Integer(42))]);
+
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        assert!(!bytecode.instructions.is_empty());
+        assert_eq!(bytecode.constants.len(), 1);
+        assert_eq!(bytecode.constants[0], 42);
+    }
+
+    #[test]
+    fn test_compile_boolean() {
+        let mut compiler = Compiler::new();
+        let program = Program::new(vec![
+            Statement::Expression(Expression::Boolean(true)),
+            Statement::Expression(Expression::Boolean(false)),
+        ]);
+
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        assert!(!bytecode.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_infix_expression() {
+        let mut compiler = Compiler::new();
+        let program = Program::new(vec![Statement::Expression(Expression::Infix(
+            "+".to_string(),
+            Box::new(Expression::Integer(5)),
+            Box::new(Expression::Integer(3)),
+        ))]);
+
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        // PUSH 5, PUSH 3, ADD
+        assert_eq!(bytecode.constants.len(), 2);
+        assert_eq!(bytecode.constants[0], 5);
+        assert_eq!(bytecode.constants[1], 3);
+    }
+
+    #[test]
+    fn test_emit_placeholder_is_3_bytes() {
+        let mut compiler = Compiler::new();
+
+        let program = Program::new(vec![Statement::Expression(Expression::If {
+            condition: Box::new(Expression::Boolean(true)),
+            consequence: vec![Statement::Expression(Expression::Integer(10))],
+            alternative: None,
+        })]);
+
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        // If 표현식: Boolean + JumpNotTruthy(3) + Constant(3)
+        // = 1 + 3 + 3 = 7
+        assert!(bytecode.len() >= 7);
+    }
+
+    #[test]
+    fn test_compile_while_loop() {
+        let mut compiler = Compiler::new();
+        let program = Program::new(vec![Statement::Expression(Expression::While {
+            condition: Box::new(Expression::Boolean(true)),
+            body: vec![Statement::Expression(Expression::Integer(1))],
+        })]);
+
+        compiler.compile(&program).unwrap();
+        let bytecode = compiler.bytecode();
+
+        assert!(!bytecode.instructions.is_empty());
+        // Boolean(1) + JumpNotTruthy(3) + Constant(3) + Jump(3) = 10
+        assert!(bytecode.len() >= 10);
+    }
+}

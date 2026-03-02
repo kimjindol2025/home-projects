@@ -1,0 +1,222 @@
+// GRIE 3-A: Zig-Native Kernel
+// Zero-Abstraction, Lock-Free Computation Engine
+//
+// Architecture:
+// 1. Go dispatches job via SHM Header flag
+// 2. Zig spins on flag with <20ns latency
+// 3. Zig computes, updates header, returns to spin-loop
+//
+// Goal: Latency < 50ns (Go FFI call overhead eliminated)
+
+const std = @import("std");
+const os = std.os;
+const mem = std.mem;
+const builtin = @import("builtin");
+
+// Import shared header definition
+const ShmHeader = @import("shm_header.zig");
+const EngineHeader = ShmHeader.EngineHeader;
+const State = ShmHeader.State;
+const HEADER_SIZE = ShmHeader.HEADER_SIZE;
+const DATA_OFFSET = ShmHeader.DATA_OFFSET;
+const MAGIC_NUMBER = ShmHeader.MAGIC_NUMBER;
+
+// Configuration
+const SHM_SIZE: usize = 10 * 1024 * 1024; // 10MB for test
+const SHM_PATH: [*:0]const u8 = "/grie_shm_test";
+
+// Global state (single-threaded kernel)
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var allocator: std.mem.Allocator = undefined;
+var shm_fd: i32 = -1;
+var shm_base: [*]u8 = undefined;
+var header: *EngineHeader = undefined;
+var data_region: [*]u8 = undefined;
+
+// Metrics
+var ops_count: u64 = 0;
+var total_latency_ns: u64 = 0;
+
+/// Read nanosecond timer (ARM64 CNTVCT_EL0)
+pub fn readNanoTimer() u64 {
+    if (builtin.cpu.arch == .aarch64) {
+        // ARM64: System timer in nanoseconds
+        // Note: Requires Linux to export CNTVCT_EL0, fallback to clock_gettime
+        var ts: std.os.timespec = undefined;
+        _ = std.os.clock_gettime(std.os.CLOCK.MONOTONIC, &ts) catch {
+            return 0;
+        };
+        return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    }
+    return 0;
+}
+
+/// Initialize shared memory mapping
+pub fn initShm() !void {
+    std.debug.print("🔧 Initializing SHM...\n", .{});
+
+    // Try to open existing SHM
+    shm_fd = os.shm_open(SHM_PATH, os.O.RDWR, 0) catch |err| {
+        std.debug.print("⚠️  SHM not found, creating... (error: {})\n", .{err});
+
+        // Create new SHM for testing
+        shm_fd = try os.shm_open(SHM_PATH, os.O.RDWR | os.O.CREAT, 0o666);
+        defer os.close(shm_fd);
+
+        // Truncate to size
+        try os.ftruncate(shm_fd, SHM_SIZE);
+
+        // Re-open for mmap
+        shm_fd = try os.shm_open(SHM_PATH, os.O.RDWR, 0o666);
+    };
+
+    // mmap the shared memory
+    const flags = os.MAP.SHARED | os.MAP.POPULATE;
+    const prot = os.PROT.READ | os.PROT.WRITE;
+
+    shm_base = @as([*]u8, @ptrCast(try os.mmap(
+        null,
+        SHM_SIZE,
+        prot,
+        flags,
+        shm_fd,
+        0,
+    )));
+
+    // Cast header pointer
+    header = @as(*EngineHeader, @ptrCast(@alignCast(shm_base)));
+
+    // Verify magic number
+    if (header.magic != MAGIC_NUMBER) {
+        std.debug.print("❌ Invalid magic number: {x:0>16}\n", .{header.magic});
+        return error.InvalidMagic;
+    }
+
+    // Data region starts at offset 128
+    data_region = shm_base + DATA_OFFSET;
+
+    std.debug.print("✅ SHM initialized: base={*}, header={*}, data={*}\n", .{ shm_base, header, data_region });
+}
+
+/// Cleanup shared memory
+pub fn deinitShm() void {
+    if (shm_base != undefined) {
+        os.munmap(shm_base[0..SHM_SIZE]);
+    }
+    if (shm_fd >= 0) {
+        os.close(shm_fd);
+    }
+    _ = os.shm_unlink(SHM_PATH) catch {};
+}
+
+/// Spin-loop kernel: Wait for Go signal, process, return
+/// This is the main hot-loop that must run <20ns per cycle
+pub fn spinKernel() void {
+    std.debug.print("🚀 Zig Kernel started (spinning on SHM header)...\n", .{});
+    std.debug.print("📊 Waiting for Go signals (lock_flag == 1)...\n", .{});
+
+    var cycle: u64 = 0;
+    const max_cycles = 10; // Limit for demo
+
+    while (cycle < max_cycles) : (cycle += 1) {
+        // Read state (volatile to prevent optimization)
+        const current_state = header.loadState();
+
+        // Spin until READY
+        if (current_state == State.Ready) {
+            const start_ns = readNanoTimer();
+
+            std.debug.print(
+                "[{d}] 🔔 Signal received! state=READY, seq={d}, data_len={d}\n",
+                .{ cycle, header.seq_num, header.data_len },
+            );
+
+            // Transition to READING
+            if (header.casState(State.Ready, State.Reading)) {
+                std.debug.print("  → Acquired lock (READY → READING)\n", .{});
+
+                // Perform computation (stub: just read data)
+                var sum: u64 = 0;
+                const data_ptr = @as([*]u8, @ptrCast(data_region));
+                for (0..header.data_len) |i| {
+                    sum += data_ptr[i];
+                }
+
+                std.debug.print("  ✓ Computed: sum={d}\n", .{sum});
+
+                // Update metrics
+                header.total_reads +%= 1;
+
+                // Transition back to IDLE
+                header.storeState(State.Idle);
+
+                const end_ns = readNanoTimer();
+                const latency_ns = if (end_ns > start_ns) end_ns - start_ns else 0;
+
+                std.debug.print("  ⏱️  Latency: {d}ns\n", .{latency_ns});
+
+                ops_count += 1;
+                total_latency_ns += latency_ns;
+            }
+        } else if (cycle % 100 == 0) {
+            std.debug.print("[{d}] ⏳ Idle... (state={})\n", .{ cycle, current_state });
+        }
+
+        // Yield CPU periodically (not a true spin-lock in production)
+        std.time.sleep(100);
+    }
+
+    std.debug.print("\n✅ Kernel loop finished (max cycles reached)\n", .{});
+    if (ops_count > 0) {
+        const avg_latency = total_latency_ns / ops_count;
+        std.debug.print("📈 Stats: ops={d}, avg_latency={d}ns\n", .{ ops_count, avg_latency });
+    }
+}
+
+/// Main entry point
+pub fn main() !void {
+    allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    std.debug.print("═══════════════════════════════════════════\n", .{});
+    std.debug.print("  GRIE 3-A: Zig Kernel Initialization\n", .{});
+    std.debug.print("  Target: ARM64 (aarch64-linux-android)\n", .{});
+    std.debug.print("═══════════════════════════════════════════\n", .{});
+
+    // Initialize SHM
+    try initShm();
+    defer deinitShm();
+
+    // Start main kernel loop
+    spinKernel();
+
+    std.debug.print("\n✨ Zig Kernel shutdown complete.\n", .{});
+}
+
+// Export for FFI: Called from Go
+export fn gqse_kernel_init() i32 {
+    initShm() catch |err| {
+        std.debug.print("❌ Failed to init SHM: {}\n", .{err});
+        return -1;
+    };
+    return 0;
+}
+
+export fn gqse_kernel_run(cycles: u32) i32 {
+    for (0..cycles) |_| {
+        const current_state = header.loadState();
+        if (current_state == State.Ready) {
+            if (header.casState(State.Ready, State.Reading)) {
+                // Stub computation
+                header.total_reads +%= 1;
+                header.storeState(State.Idle);
+                ops_count += 1;
+            }
+        }
+    }
+    return @intCast(ops_count);
+}
+
+export fn gqse_kernel_shutdown() void {
+    deinitShm();
+}

@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""
+고급 의존성 분석 (Advanced Dependency Analysis)
+
+루프 변수 간의 데이터 의존성을 정교하게 분석합니다.
+
+핵심 개념:
+  1. Distance vector: 의존성의 방향과 거리
+                     예: [1, 0] = i+1 번째 반복에서 읽음
+  2. Dependence levels: 어느 루프 레벨에서 의존성이 생기는가?
+  3. Parallelizable: 특정 루프를 병렬화 가능한가?
+  4. Reuse distance: 같은 데이터를 다시 접근하는 반복 수
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+from enum import Enum
+import z3
+
+
+class DependenceType(Enum):
+    """의존성 유형"""
+    FLOW = "flow"              # Read-After-Write (RAW)
+    ANTI = "anti"              # Write-After-Read (WAR)
+    OUTPUT = "output"          # Write-After-Write (WAW)
+    CONTROL = "control"        # 조건부 의존성
+
+
+class DependenceLevel(Enum):
+    """의존성이 발생하는 루프 레벨"""
+    LOOP_INDEPENDENT = "loop_independent"  # 루프와 무관
+    LOOP_CARRIED = "loop_carried"          # 같은 루프의 서로 다른 반복 간
+    INTER_LOOP = "inter_loop"              # 중첩 루프의 다른 레벨
+
+
+@dataclass
+class DistanceVector:
+    """거리 벡터: 의존성의 방향과 거리"""
+    distances: List[int]           # 각 루프 차원의 거리
+    loop_variables: List[str]       # 루프 변수명 (i, j, k, ...)
+    dependence_type: DependenceType # 의존성 유형
+    level: DependenceLevel          # 의존성 레벨
+    is_uniform: bool = True         # 모든 iteration에서 같은 거리인가?
+
+    def __str__(self) -> str:
+        parts = []
+        for var, dist in zip(self.loop_variables, self.distances):
+            if dist != 0:
+                parts.append(f"{var}+{dist}" if dist > 0 else f"{var}{dist}")
+        return f"[{', '.join(parts)}] ({self.dependence_type.value})"
+
+    def is_parallelizable_at_loop(self, loop_idx: int) -> bool:
+        """특정 루프에서 병렬화 가능한가?"""
+        # loop_idx 이상의 모든 거리가 0이면 병렬화 가능
+        return all(d == 0 for d in self.distances[loop_idx:])
+
+    def is_forward_dependence(self) -> bool:
+        """의존성이 '앞'을 향하는가? (i → i+1)"""
+        return any(d > 0 for d in self.distances)
+
+    def is_backward_dependence(self) -> bool:
+        """의존성이 '뒤'를 향하는가? (i+1 → i)"""
+        return any(d < 0 for d in self.distances)
+
+
+@dataclass
+class MemoryAccessPair:
+    """메모리 접근 쌍: (읽기, 쓰기) 또는 (쓰기, 쓰기)"""
+    access1_location: str           # 첫 번째 접근 위치 (예: A[i, j])
+    access2_location: str           # 두 번째 접근 위치 (예: A[i+1, j])
+    iteration1: Dict[str, int]      # 첫 번째 iteration
+    iteration2: Dict[str, int]      # 두 번째 iteration
+    dependence_type: DependenceType
+
+    def __str__(self) -> str:
+        return f"{self.access1_location} → {self.access2_location} ({self.dependence_type.value})"
+
+
+@dataclass
+class DependencyAnalysisResult:
+    """분석 결과"""
+    distance_vectors: List[DistanceVector] = field(default_factory=list)
+    parallelizable_loops: Set[int] = field(default_factory=set)
+    sequential_levels: Set[int] = field(default_factory=set)  # 병렬화 불가능
+    max_reuse_distance: Dict[str, int] = field(default_factory=dict)  # 데이터 재사용 거리
+    strongly_connected: bool = False  # 모든 반복이 모두 의존하는가?
+
+
+class DependencyAnalyzer:
+    """의존성 분석 엔진"""
+
+    def __init__(self, ctx: Optional[z3.Context] = None):
+        self.ctx = ctx or z3.Context()
+
+    def compute_distance_vector(
+        self,
+        src_access: str,  # "A[i, j]"
+        tgt_access: str,  # "A[i+1, j]"
+        loop_variables: List[str]  # ["i", "j"]
+    ) -> Optional[DistanceVector]:
+        """두 메모리 접근 간의 거리 벡터 계산"""
+        # 간단한 구현: 인덱스 식에서 루프 변수의 계수 추출
+
+        distances = []
+        for var in loop_variables:
+            # src와 tgt에서 var의 계수를 추출하는 간단한 방식
+            # 실제로는 symbolic execution 필요
+
+            # 예: "A[i, j]" → coefficient of i is 1
+            src_coef = self._extract_coefficient(src_access, var)
+            tgt_coef = self._extract_coefficient(tgt_access, var)
+
+            distance = tgt_coef - src_coef
+            distances.append(distance)
+
+        return DistanceVector(
+            distances=distances,
+            loop_variables=loop_variables,
+            dependence_type=DependenceType.FLOW,
+            level=self._determine_level(distances)
+        )
+
+    def _extract_coefficient(self, access: str, variable: str) -> int:
+        """접근 식에서 특정 변수의 계수 추출"""
+        # 간단한 구현: 정규식으로 추출
+        import re
+
+        # A[i+1, j] → i의 계수는 1, j의 계수는 0
+        pattern = rf"{variable}([+\-]\d+)?"
+        match = re.search(pattern, access)
+
+        if match:
+            if match.group(1):
+                return int(match.group(1)[1:]) * (1 if match.group(1)[0] == '+' else -1)
+            else:
+                return 1  # i (계수 1)
+
+        return 0
+
+    def _determine_level(self, distances: List[int]) -> DependenceLevel:
+        """거리 벡터로부터 의존성 레벨 결정"""
+        if all(d == 0 for d in distances):
+            return DependenceLevel.LOOP_INDEPENDENT
+        elif distances[0] != 0:  # 첫 루프에서 의존성
+            return DependenceLevel.LOOP_CARRIED
+        else:
+            return DependenceLevel.INTER_LOOP
+
+    def analyze_parallelizability(
+        self,
+        distance_vectors: List[DistanceVector],
+        loop_depth: int
+    ) -> DependencyAnalysisResult:
+        """루프의 병렬화 가능성 분석"""
+        result = DependencyAnalysisResult()
+
+        for dv in distance_vectors:
+            result.distance_vectors.append(dv)
+
+        # 각 루프 레벨에서 병렬화 가능한지 확인
+        parallelizable = set()
+        sequential_levels = set()
+
+        for level in range(loop_depth):
+            # level 번째 루프가 병렬화 가능한가?
+            can_parallelize = True
+
+            for dv in distance_vectors:
+                if not dv.is_parallelizable_at_loop(level):
+                    can_parallelize = False
+                    break
+
+            if can_parallelize:
+                parallelizable.add(level)
+            else:
+                sequential_levels.add(level)
+
+        result.parallelizable_loops = parallelizable
+        result.sequential_levels = sequential_levels
+
+        return result
+
+    def compute_reuse_distance(
+        self,
+        access_sequence: List[str],  # ["A[i]", "A[i+1]", "A[i]", ...]
+        iteration_counts: Dict[str, int]  # {"i": 100}
+    ) -> Dict[str, int]:
+        """데이터 재사용 거리 계산"""
+        reuse_distances = {}
+        access_history = {}  # {access_expr: last_iteration}
+
+        iteration = 0
+        for access in access_sequence:
+            if access in access_history:
+                distance = iteration - access_history[access]
+                if access not in reuse_distances:
+                    reuse_distances[access] = distance
+                else:
+                    # 최대 거리 기록
+                    reuse_distances[access] = max(
+                        reuse_distances[access], distance
+                    )
+
+            access_history[access] = iteration
+            iteration += 1
+
+        return reuse_distances
+
+    def find_strongly_connected_components(
+        self,
+        distance_vectors: List[DistanceVector]
+    ) -> List[Set[str]]:
+        """강연결 성분 찾기: 모두 서로 의존하는 변수 집합"""
+        # 그래프 구성: 변수 → 변수 (의존성)
+        graph: Dict[str, Set[str]] = {}
+
+        for dv in distance_vectors:
+            # 의존성이 있는 변수들을 그래프에 추가
+            if len(dv.loop_variables) >= 2:
+                for i, var in enumerate(dv.loop_variables):
+                    if var not in graph:
+                        graph[var] = set()
+                    # 같은 distance vector에 있는 다른 변수로 간선 추가
+                    for other_var in dv.loop_variables:
+                        if other_var != var:
+                            graph[var].add(other_var)
+
+        # 간단한 SCC 찾기 (Tarjan 알고리즘)
+        sccs = []
+        visited = set()
+
+        def dfs(node: str, component: Set[str]):
+            if node in visited:
+                return
+            visited.add(node)
+            component.add(node)
+            for neighbor in graph.get(node, set()):
+                dfs(neighbor, component)
+
+        for var in graph:
+            if var not in visited:
+                component = set()
+                dfs(var, component)
+                if len(component) > 1:
+                    sccs.append(component)
+
+        return sccs
+
+    def detect_reduction_patterns(
+        self,
+        distance_vectors: List[DistanceVector]
+    ) -> List[Tuple[str, str, str]]:
+        """축약(Reduction) 패턴 감지"""
+        # 축약: S(i) = S(i-1) op e(i)
+        # 같은 변수에 대한 RAW와 WAW 의존성
+
+        reductions = []
+
+        for dv in distance_vectors:
+            if dv.dependence_type == DependenceType.OUTPUT:
+                # WAW: 쓰기-쓰기 의존성
+                # 이것이 축약의 신호
+                reductions.append(("reduction", str(dv), "output_dependence"))
+
+            elif dv.dependence_type == DependenceType.FLOW:
+                # RAW: 읽기-쓰기 의존성
+                if dv.is_backward_dependence():
+                    # i에서 쓴 값을 i-1에서 읽음? → 축약 패턴
+                    reductions.append(("reduction", str(dv), "flow_dependence"))
+
+        return reductions
+
+    def analyze_loop_fusion_feasibility(
+        self,
+        loop1_name: str,
+        loop2_name: str,
+        distance_vectors_between: List[DistanceVector]
+    ) -> bool:
+        """두 루프의 fusion 가능성 분석"""
+        # 두 루프 사이에 loop-carried 의존성이 없으면 fusion 가능
+
+        for dv in distance_vectors_between:
+            if dv.level == DependenceLevel.LOOP_CARRIED:
+                # Loop-carried 의존성이 있음 → fusion 불가능
+                return False
+
+        return True
+
+    def analyze_loop_interchange_feasibility(
+        self,
+        distance_vectors: List[DistanceVector],
+        loop_order: Tuple[int, int]  # (i, j) → interchange to (j, i)?
+    ) -> bool:
+        """루프 interchange 가능성 분석"""
+        # loop_order = (0, 1)은 첫 번째와 두 번째 루프 교환
+
+        src_idx, tgt_idx = loop_order
+
+        for dv in distance_vectors:
+            # interchange 후에 distance vector의 순서가 바뀜
+            if src_idx < tgt_idx:
+                # forward → backward 가능성
+                # 예: [1, -1]을 [-1, 1]로 변환 → 역방향 의존성 생김 → 불가능
+                if dv.distances[src_idx] > 0 and dv.distances[tgt_idx] < 0:
+                    return False
+
+        return True
+
+    def get_dependency_summary(
+        self,
+        result: DependencyAnalysisResult,
+        loop_depth: int
+    ) -> str:
+        """의존성 분석 요약"""
+        summary = f"Dependency Analysis Summary\n"
+        summary += f"{'='*50}\n"
+        summary += f"Loop depth: {loop_depth}\n"
+        summary += f"Total distance vectors: {len(result.distance_vectors)}\n"
+        summary += f"\nParallelizable loops: {sorted(result.parallelizable_loops)}\n"
+        summary += f"Sequential levels: {sorted(result.sequential_levels)}\n"
+        summary += f"\nDistance vectors:\n"
+
+        for dv in result.distance_vectors:
+            summary += f"  {dv}\n"
+
+        return summary
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Dependency Analyzer Demo")
+    print("="*70)
+
+    # 예제 1: 간단한 의존성 분석
+    print("\n[Example 1] Basic Dependency Analysis")
+    print("-"*70)
+
+    analyzer = DependencyAnalyzer()
+
+    # A[i] → A[i+1] 의존성
+    dv1 = analyzer.compute_distance_vector("A[i]", "A[i+1]", ["i"])
+    print(f"Distance vector 1: {dv1}")
+
+    # A[i, j] → A[i, j+1] 의존성
+    dv2 = analyzer.compute_distance_vector("A[i,j]", "A[i,j+1]", ["i", "j"])
+    print(f"Distance vector 2: {dv2}")
+
+    # 예제 2: 병렬화 가능성 분석
+    print("\n[Example 2] Parallelizability Analysis")
+    print("-"*70)
+
+    distance_vectors = [dv1, dv2]
+    result = analyzer.analyze_parallelizability(distance_vectors, 2)
+
+    print(f"Analysis result:")
+    print(f"  Parallelizable loops: {result.parallelizable_loops}")
+    print(f"  Sequential levels: {result.sequential_levels}")
+
+    # 예제 3: 축약 패턴 감지
+    print("\n[Example 3] Reduction Pattern Detection")
+    print("-"*70)
+
+    # 축약 의존성: sum = sum + A[i]
+    dv_reduction = DistanceVector(
+        distances=[1],
+        loop_variables=["i"],
+        dependence_type=DependenceType.OUTPUT,
+        level=DependenceLevel.LOOP_CARRIED
+    )
+
+    reductions = analyzer.detect_reduction_patterns([dv_reduction])
+    print(f"Detected reductions: {reductions}")
+
+    # 예제 4: 루프 fusion 가능성
+    print("\n[Example 4] Loop Fusion Feasibility")
+    print("-"*70)
+
+    can_fuse = analyzer.analyze_loop_fusion_feasibility("loop1", "loop2", [dv1])
+    print(f"Can fuse loop1 and loop2? {can_fuse}")
+
+    # 예제 5: 종합 요약
+    print("\n[Example 5] Dependency Summary")
+    print("-"*70)
+
+    summary = analyzer.get_dependency_summary(result, 2)
+    print(summary)
+
+    print("="*70)
+    print("Dependency Analysis Complete")
+    print("="*70)

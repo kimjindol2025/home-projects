@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+Loop Analyzer: 루프 구조의 형식적 분석
+
+루프의 경계, 변수 관계, 의존성 등을 분석하여
+다면체 모델로 표현할 수 있도록 정보 추출
+
+역할:
+  1. 루프 경계 추출 (예: 0 <= i < n)
+  2. 변수 관계식 정의 (예: j >= i)
+  3. 의존성 감지 (예: A[i] = A[i-1] + B[i])
+  4. 루프 불변식 추출
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Set, Optional, Tuple, Any
+from enum import Enum
+import re
+
+
+class DependencyType(Enum):
+    """의존성 종류"""
+    FLOW = "flow"          # 읽기-쓰기 (데이터 흐름)
+    ANTI = "anti"          # 쓰기-읽기 (역의존성)
+    OUTPUT = "output"      # 쓰기-쓰기 (출력 의존성)
+    INPUT = "input"        # 읽기-읽기 (입력, 실제로는 의존성 X)
+
+
+@dataclass
+class Bound:
+    """루프 경계"""
+    variable: str          # 루프 변수 (예: "i")
+    lower: Any             # 하한 (예: 0 또는 "0")
+    upper: Any             # 상한 (예: "n" 또는 100)
+    is_exclusive: bool = True  # 상한이 exclusive인가? (< vs <=)
+
+    def __str__(self):
+        upper_str = f"{self.upper}" if self.is_exclusive else f"{self.upper}+1"
+        return f"{self.lower} <= {self.variable} < {upper_str}"
+
+
+@dataclass
+class LoopInvariant:
+    """루프 불변식"""
+    description: str       # (예: "배열 A의 크기는 n")
+    symbolic: str          # SMT 식 (예: "len(A) == n")
+    importance: str        # "critical", "important", "nice_to_have"
+
+
+@dataclass
+class IndexExpression:
+    """인덱스 식 (예: A[i, j] 또는 B[2*i+1]"""
+    base_name: str         # 배열/메모리 이름 (예: "A")
+    indices: List[str]     # 인덱스 식 리스트 (예: ["i", "j"])
+
+    def __str__(self):
+        return f"{self.base_name}[{', '.join(self.indices)}]"
+
+
+@dataclass
+class MemoryAccess:
+    """메모리 접근"""
+    access_type: str       # "read" 또는 "write"
+    index_expr: IndexExpression
+    line_number: Optional[int] = None
+    operation: Optional[str] = None  # 예: "+", "*", "load", "store"
+
+
+@dataclass
+class Dependency:
+    """데이터 의존성"""
+    dep_type: DependencyType
+    source_access: MemoryAccess  # 먼저 실행
+    target_access: MemoryAccess  # 나중에 실행
+    distance_vector: Optional[List[int]] = None  # 반복 거리
+
+    def __str__(self):
+        return f"{self.dep_type.value}: {self.source_access.index_expr} -> {self.target_access.index_expr}"
+
+
+@dataclass
+class LoopNest:
+    """루프 중첩 구조"""
+    depth: int             # 루프 깊이
+    bounds: List[Bound]    # 각 루프의 경계
+    body: str              # 루프 본문 코드
+
+    # 분석 결과
+    memory_accesses: List[MemoryAccess] = field(default_factory=list)
+    dependencies: List[Dependency] = field(default_factory=list)
+    invariants: List[LoopInvariant] = field(default_factory=list)
+
+    # 메타데이터
+    sequential_dependencies: Set[Tuple[int, int]] = field(default_factory=set)  # (statement_id, statement_id)
+    parallelizable_loops: Set[int] = field(default_factory=set)  # 병렬화 가능한 루프 깊이
+
+
+class LoopAnalyzer:
+    """루프 분석기"""
+
+    def __init__(self):
+        """초기화"""
+        pass
+
+    def parse_loop_bound(self, bound_str: str) -> Optional[Bound]:
+        """
+        루프 경계 문자열 파싱
+
+        예: "0 <= i < n"
+            "i < 100"
+            "i in range(n)"
+
+        Args:
+            bound_str: 경계 문자열
+
+        Returns:
+            Bound 객체
+        """
+        # 패턴 1: "lower <= var < upper"
+        match = re.match(r"(\d+|[a-zA-Z_]\w*)\s*<=\s*([a-zA-Z_]\w*)\s*<\s*(.+)", bound_str)
+        if match:
+            return Bound(
+                variable=match.group(2),
+                lower=match.group(1),
+                upper=match.group(3),
+                is_exclusive=True
+            )
+
+        # 패턴 2: "var < upper"
+        match = re.match(r"([a-zA-Z_]\w*)\s*<\s*(.+)", bound_str)
+        if match:
+            return Bound(
+                variable=match.group(1),
+                lower=0,
+                upper=match.group(2),
+                is_exclusive=True
+            )
+
+        # 패턴 3: "var in range(upper)"
+        match = re.match(r"([a-zA-Z_]\w*)\s+in\s+range\((.+)\)", bound_str)
+        if match:
+            return Bound(
+                variable=match.group(1),
+                lower=0,
+                upper=match.group(2),
+                is_exclusive=True
+            )
+
+        return None
+
+    def extract_memory_accesses(self, code_str: str) -> List[MemoryAccess]:
+        """
+        코드에서 메모리 접근 추출
+
+        예:
+          A[i] = B[i] + C[i]
+          → 1개 write, 2개 read
+
+        Args:
+            code_str: 코드 문자열
+
+        Returns:
+            MemoryAccess 리스트
+        """
+        accesses = []
+
+        # 패턴: var[idx1, idx2, ...] 또는 var[idx]
+        pattern = r"([a-zA-Z_]\w*)\s*\[\s*([^\]]+)\s*\]"
+
+        # 쓰기 접근 찾기 (= 좌측)
+        write_pattern = r"([a-zA-Z_]\w*)\s*\[\s*([^\]]+)\s*\]\s*="
+        for match in re.finditer(write_pattern, code_str):
+            var_name = match.group(1)
+            indices_str = match.group(2)
+            indices = [idx.strip() for idx in indices_str.split(",")]
+
+            accesses.append(MemoryAccess(
+                access_type="write",
+                index_expr=IndexExpression(var_name, indices),
+                operation="store"
+            ))
+
+        # 읽기 접근 찾기 (= 우측, 또는 인자 등)
+        # (쓰기를 제외하고 모든 배열 접근)
+        for match in re.finditer(pattern, code_str):
+            var_name = match.group(1)
+            indices_str = match.group(2)
+            indices = [idx.strip() for idx in indices_str.split(",")]
+
+            # = 우측인지 확인
+            pos = match.start()
+            before_text = code_str[:pos]
+            if "=" not in before_text.split('\n')[-1]:
+                accesses.append(MemoryAccess(
+                    access_type="read",
+                    index_expr=IndexExpression(var_name, indices),
+                    operation="load"
+                ))
+
+        return accesses
+
+    def analyze_dependencies(
+        self,
+        accesses: List[MemoryAccess],
+        bounds: List[Bound]
+    ) -> List[Dependency]:
+        """
+        메모리 접근 사이의 의존성 분석
+
+        Args:
+            accesses: 메모리 접근 리스트
+            bounds: 루프 경계 리스트
+
+        Returns:
+            Dependency 리스트
+        """
+        dependencies = []
+
+        # 같은 배열에 접근하는 쌍 찾기
+        array_access_map: Dict[str, List[Tuple[int, MemoryAccess]]] = {}
+
+        for i, access in enumerate(accesses):
+            array_name = access.index_expr.base_name
+            if array_name not in array_access_map:
+                array_access_map[array_name] = []
+            array_access_map[array_name].append((i, access))
+
+        # 각 배열에 대해 의존성 검토
+        for array_name, access_list in array_access_map.items():
+            for i in range(len(access_list)):
+                for j in range(i + 1, len(access_list)):
+                    idx1, access1 = access_list[i]
+                    idx2, access2 = access_list[j]
+
+                    # 데이터 의존성 판정
+                    if access1.access_type == "write" and access2.access_type == "read":
+                        # Flow 의존성 (RAW)
+                        dep_type = DependencyType.FLOW
+                    elif access1.access_type == "read" and access2.access_type == "write":
+                        # Anti 의존성 (WAR)
+                        dep_type = DependencyType.ANTI
+                    elif access1.access_type == "write" and access2.access_type == "write":
+                        # Output 의존성 (WAW)
+                        dep_type = DependencyType.OUTPUT
+                    else:
+                        # 읽기-읽기는 의존성 아님
+                        continue
+
+                    dependencies.append(Dependency(
+                        dep_type=dep_type,
+                        source_access=access1,
+                        target_access=access2,
+                        distance_vector=self._compute_distance_vector(
+                            access1.index_expr,
+                            access2.index_expr,
+                            bounds
+                        )
+                    ))
+
+        return dependencies
+
+    def _compute_distance_vector(
+        self,
+        index1: IndexExpression,
+        index2: IndexExpression,
+        bounds: List[Bound]
+    ) -> Optional[List[int]]:
+        """
+        의존성 거리 벡터 계산
+
+        예:
+          A[i] vs A[i-1]
+          → distance_vector = [1]  (i번 반복에서 i-1 의존)
+
+        Args:
+            index1: 첫 번째 인덱스
+            index2: 두 번째 인덱스
+            bounds: 루프 경계
+
+        Returns:
+            거리 벡터 또는 None
+        """
+        # 간단한 경우: 직접 비교
+        if len(index1.indices) != len(index2.indices):
+            return None
+
+        distance_vector = []
+
+        for idx1, idx2 in zip(index1.indices, index2.indices):
+            # 간단한 경우: 같음
+            if idx1 == idx2:
+                distance_vector.append(0)
+            # idx1이 정수, idx2가 정수±상수
+            elif self._is_constant_diff(idx1, idx2):
+                diff = self._parse_constant_diff(idx1, idx2)
+                distance_vector.append(diff)
+            else:
+                # 복잡한 식은 분석 불가
+                return None
+
+        return distance_vector
+
+    def _is_constant_diff(self, expr1: str, expr2: str) -> bool:
+        """두 식이 상수 차이인가?"""
+        # 간단한 휴리스틱: 변수명이 같은가?
+        var1 = re.findall(r"[a-zA-Z_]\w*", expr1)
+        var2 = re.findall(r"[a-zA-Z_]\w*", expr2)
+        return set(var1) == set(var2)
+
+    def _parse_constant_diff(self, expr1: str, expr2: str) -> int:
+        """상수 차이 추출"""
+        # 간단한 경우: "i" vs "i-1" → 1
+        # "i+1" vs "i" → -1
+
+        # 숫자만 추출
+        nums1 = re.findall(r"[-+]?\d+", expr1)
+        nums2 = re.findall(r"[-+]?\d+", expr2)
+
+        sum1 = sum(int(n) for n in nums1)
+        sum2 = sum(int(n) for n in nums2)
+
+        return sum1 - sum2
+
+    def extract_invariants(
+        self,
+        code_str: str,
+        bounds: List[Bound]
+    ) -> List[LoopInvariant]:
+        """
+        루프 불변식 추출
+
+        Args:
+            code_str: 코드 문자열
+            bounds: 루프 경계
+
+        Returns:
+            LoopInvariant 리스트
+        """
+        invariants = []
+
+        # 불변식 1: 루프 경계 자체
+        for bound in bounds:
+            invariants.append(LoopInvariant(
+                description=f"루프 변수 {bound.variable} 범위",
+                symbolic=str(bound),
+                importance="critical"
+            ))
+
+        # 불변식 2: 배열 크기 (검출 가능하면)
+        # (간단한 휴리스틱)
+        if "range(n)" in code_str or "n)" in code_str:
+            invariants.append(LoopInvariant(
+                description="배열 크기는 n으로 고정",
+                symbolic="len(A) == n",
+                importance="important"
+            ))
+
+        return invariants
+
+    def analyze_loop_nest(
+        self,
+        code_str: str,
+        loop_bounds: List[str]
+    ) -> Optional[LoopNest]:
+        """
+        루프 중첩 구조 종합 분석
+
+        Args:
+            code_str: 루프 코드 전체
+            loop_bounds: 루프 경계 문자열 리스트
+
+        Returns:
+            LoopNest 객체
+        """
+        # 경계 파싱
+        bounds = []
+        for bound_str in loop_bounds:
+            bound = self.parse_loop_bound(bound_str)
+            if bound:
+                bounds.append(bound)
+
+        if not bounds:
+            return None
+
+        # 메모리 접근 추출
+        accesses = self.extract_memory_accesses(code_str)
+
+        # 의존성 분석
+        dependencies = self.analyze_dependencies(accesses, bounds)
+
+        # 불변식 추출
+        invariants = self.extract_invariants(code_str, bounds)
+
+        # 병렬화 가능성 분석
+        parallelizable = self._analyze_parallelizability(dependencies, len(bounds))
+
+        # 루프 중첩 객체 생성
+        loop_nest = LoopNest(
+            depth=len(bounds),
+            bounds=bounds,
+            body=code_str,
+            memory_accesses=accesses,
+            dependencies=dependencies,
+            invariants=invariants,
+            parallelizable_loops=parallelizable
+        )
+
+        return loop_nest
+
+    def _analyze_parallelizability(
+        self,
+        dependencies: List[Dependency],
+        num_loops: int
+    ) -> Set[int]:
+        """
+        어떤 루프가 병렬화 가능한지 분석
+
+        Args:
+            dependencies: 의존성 리스트
+            num_loops: 루프 개수
+
+        Returns:
+            병렬화 가능한 루프 깊이 집합
+        """
+        # 간단한 휴리스틱:
+        # 의존성이 없으면 병렬화 가능
+
+        if not dependencies:
+            return set(range(num_loops))
+
+        parallelizable = set(range(num_loops))
+
+        # 의존성이 있는 루프는 병렬화 불가
+        for dep in dependencies:
+            if dep.distance_vector:
+                for i, dist in enumerate(dep.distance_vector):
+                    if dist != 0:
+                        parallelizable.discard(i)
+
+        return parallelizable
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Loop Analyzer Demo")
+    print("="*70)
+
+    # 예제 1: 간단한 루프
+    print("\n[Example 1] Simple 2D Loop")
+    print("-"*70)
+
+    code1 = """
+    for i in range(n):
+        for j in range(m):
+            A[i,j] = B[i,j] + C[i,j]
+    """
+
+    bounds1 = [
+        "0 <= i < n",
+        "0 <= j < m"
+    ]
+
+    analyzer = LoopAnalyzer()
+    loop_nest1 = analyzer.analyze_loop_nest(code1, bounds1)
+
+    if loop_nest1:
+        print(f"Loop depth: {loop_nest1.depth}")
+        print(f"Bounds:")
+        for bound in loop_nest1.bounds:
+            print(f"  {bound}")
+        print(f"Memory accesses: {len(loop_nest1.memory_accesses)}")
+        for access in loop_nest1.memory_accesses:
+            print(f"  {access.access_type}: {access.index_expr}")
+        print(f"Dependencies: {len(loop_nest1.dependencies)}")
+        for dep in loop_nest1.dependencies:
+            print(f"  {dep}")
+        print(f"Parallelizable loops: {loop_nest1.parallelizable_loops}")
+
+    # 예제 2: 의존성이 있는 루프
+    print("\n[Example 2] Loop with Dependency")
+    print("-"*70)
+
+    code2 = """
+    for i in range(n):
+        A[i] = A[i-1] + B[i]
+    """
+
+    bounds2 = ["0 <= i < n"]
+
+    loop_nest2 = analyzer.analyze_loop_nest(code2, bounds2)
+
+    if loop_nest2:
+        print(f"Loop depth: {loop_nest2.depth}")
+        print(f"Dependencies: {len(loop_nest2.dependencies)}")
+        for dep in loop_nest2.dependencies:
+            print(f"  {dep}")
+            if dep.distance_vector:
+                print(f"  Distance vector: {dep.distance_vector}")
+        print(f"Parallelizable: {loop_nest2.parallelizable_loops}")
+
+    print("\n" + "="*70)
+    print("Analysis Complete")
+    print("="*70)

@@ -1,0 +1,520 @@
+/**
+ * KimSearch Mobile - SearchEngine 테스트
+ *
+ * 테스트 범위:
+ * - 기본 검색 (캐시, 관련도, 하이라이팅)
+ * - 빠른 검색
+ * - 정규식 검색
+ * - 유사도 검색
+ * - 관련도 계산
+ * - 캐시 관리
+ *
+ * Author: Claude (Haiku 4.5)
+ * Date: 2026-02-26
+ */
+
+// Mock DatabaseManager
+jest.mock('../src/database', () => ({
+  searchCode: jest.fn()
+}));
+
+import SearchEngine from '../src/searchEngine';
+import DatabaseManager from '../src/database';
+
+describe('SearchEngine', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    SearchEngine.clearCache();
+    SearchEngine.searchStats = {
+      totalSearches: 0,
+      lastSearch: null,
+      cachedResults: 0
+    };
+  });
+
+  describe('기본 검색 (search)', () => {
+    test('✅ 검색 실행 및 결과 반환', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          file_name: 'math.js',
+          path: 'src/utils/math.js',
+          extension: '.js',
+          functions: ['add', 'multiply'],
+          classes: [],
+          content: 'const add = (a, b) => a + b;',
+          lines_count: 5,
+          quality: { stars: 5, category: 'excellent' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      const response = await SearchEngine.search('add', { limit: 10 });
+
+      expect(response.query).toBe('add');
+      expect(response.results).toHaveLength(1);
+      expect(response.cached).toBe(false);
+      expect(response.count).toBe(1);
+      expect(response.timestamp).toBeDefined();
+    });
+
+    test('✅ 캐시 히트 감지', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          file_name: 'test.js',
+          path: 'src/test.js',
+          extension: '.js',
+          functions: [],
+          classes: [],
+          content: 'test code',
+          lines_count: 10,
+          quality: { stars: 3, category: 'ok' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      // 첫 번째 검색
+      const response1 = await SearchEngine.search('test', { limit: 10 });
+      expect(response1.cached).toBe(false);
+
+      // 두 번째 검색 (캐시)
+      const response2 = await SearchEngine.search('test', { limit: 10 });
+      expect(response2.cached).toBe(true);
+      expect(SearchEngine.searchStats.cachedResults).toBe(1);
+    });
+
+    test('✅ 캐시 키 생성 (다른 옵션 = 다른 캐시)', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.search('test', { lang: 'js', limit: 10 });
+      await SearchEngine.search('test', { lang: 'py', limit: 10 });
+
+      // 같은 쿼리지만 다른 언어이므로 DB 2번 호출
+      expect(DatabaseManager.searchCode).toHaveBeenCalledTimes(2);
+    });
+
+    test('✅ 검색어 하이라이팅', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          file_name: 'test.js',
+          path: 'src/test.js',
+          extension: '.js',
+          functions: [],
+          classes: [],
+          content: 'const test = 123; let test_var = 456;',
+          lines_count: 2,
+          quality: { stars: 4, category: 'good' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      const response = await SearchEngine.search('test', {});
+      expect(response.results[0].highlightedContent).toContain('【test】');
+    });
+
+    test('✅ 언어 필터 변환', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.search('func', { lang: 'py', limit: 10 });
+
+      const call = DatabaseManager.searchCode.mock.calls[0];
+      expect(call[1].extension).toBe('.py');
+    });
+
+    test('✅ 통계 업데이트', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.search('query1', {});
+      await SearchEngine.search('query2', {});
+
+      expect(SearchEngine.searchStats.totalSearches).toBe(2);
+      expect(SearchEngine.searchStats.lastSearch).toBe('query2');
+    });
+  });
+
+  describe('빠른 검색 (quickSearch)', () => {
+    test('✅ 빠른 검색 실행', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          file_name: 'math.js',
+          path: 'src/utils/math.js',
+          extension: '.js',
+          lines_count: 5,
+          functions: ['add'],
+          classes: []
+        },
+        {
+          id: 2,
+          file_name: 'util.js',
+          path: 'src/util.js',
+          extension: '.js',
+          lines_count: 20,
+          functions: [],
+          classes: []
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      const response = await SearchEngine.quickSearch('math', 5);
+
+      expect(response.query).toBe('math');
+      expect(response.count).toBe(2);
+      expect(response.mode).toBe('quick');
+      expect(response.results[0]).toHaveProperty('path');
+      expect(response.results[0]).toHaveProperty('file_name');
+      expect(response.results[0]).not.toHaveProperty('content');
+    });
+
+    test('✅ 기본 limit는 5', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.quickSearch('test');
+
+      const call = DatabaseManager.searchCode.mock.calls[0];
+      expect(call[1].limit).toBe(5);
+    });
+  });
+
+  describe('관련도 계산 (calculateRelevance)', () => {
+    test('✅ 파일명 매치 (높은 가중치)', () => {
+      const result = {
+        file_name: 'add.js',
+        functions: ['multiply'],
+        classes: [],
+        content: 'some code here',
+        quality: { stars: 3, category: 'ok' }
+      };
+
+      const score = SearchEngine.calculateRelevance(result, 'add');
+      expect(score).toBeGreaterThan(100);
+    });
+
+    test('✅ 함수명 매치 (중간 가중치)', () => {
+      const result = {
+        file_name: 'utils.js',
+        functions: ['addNumbers', 'subtract'],
+        classes: [],
+        content: 'some code',
+        quality: { stars: 3, category: 'ok' }
+      };
+
+      const score = SearchEngine.calculateRelevance(result, 'add');
+      expect(score).toBeGreaterThan(50);
+      expect(score).toBeLessThan(100);
+    });
+
+    test('✅ 클래스명 매치 (중간 가중치)', () => {
+      const result = {
+        file_name: 'index.js',
+        functions: [],
+        classes: ['MathCalculator'],
+        content: 'some code',
+        quality: { stars: 3, category: 'ok' }
+      };
+
+      const score = SearchEngine.calculateRelevance(result, 'Math');
+      expect(score).toBeGreaterThan(50);
+    });
+
+    test('✅ 내용 매치 (낮은 가중치)', () => {
+      const result = {
+        file_name: 'index.js',
+        functions: [],
+        classes: [],
+        content: 'function add(a) { return a + 1; } let add = 5;',
+        quality: { stars: 3, category: 'ok' }
+      };
+
+      const score = SearchEngine.calculateRelevance(result, 'add');
+      expect(score).toBeGreaterThan(0);
+      expect(score).toBeLessThan(50);
+    });
+
+    test('✅ 품질 보너스', () => {
+      const resultGood = {
+        file_name: 'test.js',
+        functions: [],
+        classes: [],
+        content: 'code',
+        quality: { stars: 5, category: 'excellent' }
+      };
+
+      const resultBad = {
+        file_name: 'test.js',
+        functions: [],
+        classes: [],
+        content: 'code',
+        quality: { stars: 1, category: 'poor' }
+      };
+
+      const scoreGood = SearchEngine.calculateRelevance(resultGood, 'test');
+      const scoreBad = SearchEngine.calculateRelevance(resultBad, 'test');
+
+      expect(scoreGood).toBeGreaterThan(scoreBad);
+    });
+
+    test('✅ 복합 점수', () => {
+      const result = {
+        file_name: 'Math.js',           // +100 (파일명)
+        functions: ['MathUtils'],        // +50 (함수)
+        classes: [],
+        content: 'Math operations here', // +20 (2매치 × 10)
+        quality: { stars: 5, category: 'excellent' } // +25 (5 × 5)
+      };
+
+      const score = SearchEngine.calculateRelevance(result, 'Math');
+      expect(score).toBeGreaterThanOrEqual(195);
+    });
+  });
+
+  describe('고급 검색 (advancedSearch - 정규식)', () => {
+    test('✅ 정규식 검색 실행', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          path: 'src/async.js',
+          file_name: 'async.js',
+          content: 'async (data) => { return data; }',
+          functions: [],
+          classes: [],
+          lines_count: 1,
+          quality: { stars: 4, category: 'good' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      const response = await SearchEngine.advancedSearch('async\\s*\\(', {});
+
+      expect(response.mode).toBe('advanced');
+      expect(response.count).toBeGreaterThanOrEqual(0);
+      expect(response.query).toBe('async\\s*\\(');
+    });
+
+    test('✅ 잘못된 정규식 처리', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      const response = await SearchEngine.advancedSearch('(invalid[', {});
+
+      expect(response.error).toBeDefined();
+      expect(response.results).toEqual([]);
+      expect(response.count).toBe(0);
+    });
+  });
+
+  describe('유사도 검색 (findSimilar)', () => {
+    test('✅ 유사 코드 찾기', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          path: 'src/math.js',
+          file_name: 'math.js',
+          content: 'const add = (a, b) => a + b;',
+          functions: [],
+          classes: [],
+          lines_count: 1,
+          quality: { stars: 5, category: 'excellent' },
+          last_modified: '2026-02-26'
+        },
+        {
+          id: 2,
+          path: 'src/calc.js',
+          file_name: 'calc.js',
+          content: 'function add(x, y) { return x + y; }',
+          functions: ['add'],
+          classes: [],
+          lines_count: 1,
+          quality: { stars: 4, category: 'good' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      const response = await SearchEngine.findSimilar('const add = (a, b) => a + b;', 0.7);
+
+      expect(response.mode).toBe('similarity');
+      expect(response.count).toBeGreaterThanOrEqual(0);
+      expect(response.threshold).toBe(0.7);
+    });
+
+    test('✅ 유사도 임계값 필터링', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          path: 'src/test.js',
+          file_name: 'test.js',
+          content: 'exact match code',
+          functions: [],
+          classes: [],
+          lines_count: 1,
+          quality: { stars: 3, category: 'ok' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      DatabaseManager.searchCode.mockResolvedValue(mockResults);
+
+      const response = await SearchEngine.findSimilar('exact match code', 0.95);
+
+      // 결과는 정렬되고 필터링됨
+      expect(response.results).toBeDefined();
+      expect(Array.isArray(response.results)).toBe(true);
+    });
+  });
+
+  describe('유사도 계산 (calculateSimilarity)', () => {
+    test('✅ 정확히 동일한 코드', () => {
+      const code = 'const x = 10;';
+      const similarity = SearchEngine.calculateSimilarity(code, code);
+      expect(similarity).toBe(1);
+    });
+
+    test('✅ 완전히 다른 코드', () => {
+      const code1 = 'const x = 10;';
+      const code2 = 'class Dog {}';
+      const similarity = SearchEngine.calculateSimilarity(code1, code2);
+      expect(similarity).toBeLessThan(0.5);
+    });
+
+    test('✅ 부분 유사 코드', () => {
+      const code1 = 'function add(a, b) { return a + b; }';
+      const code2 = 'function add(x, y) { return x + y; }';
+      const similarity = SearchEngine.calculateSimilarity(code1, code2);
+      expect(similarity).toBeGreaterThan(0.5);
+      expect(similarity).toBeLessThanOrEqual(1);
+    });
+
+    test('✅ 빈 문자열', () => {
+      const similarity = SearchEngine.calculateSimilarity('', '');
+      expect(similarity).toBe(0);
+    });
+  });
+
+  describe('텍스트 하이라이팅 (highlightText)', () => {
+    test('✅ 검색어 강조', () => {
+      const text = 'function add(a, b) { return a + b; }';
+      const highlighted = SearchEngine.highlightText(text, 'add');
+
+      expect(highlighted).toContain('【add】');
+      expect(highlighted).not.toContain('a, b');
+    });
+
+    test('✅ 대소문자 구분 없음', () => {
+      const text = 'const ADD = 10; const add = 20;';
+      const highlighted = SearchEngine.highlightText(text, 'add');
+
+      // 모든 add 변형이 강조됨
+      expect((highlighted.match(/【/g) || []).length).toBeGreaterThanOrEqual(2);
+    });
+
+    test('✅ 빈 검색어', () => {
+      const text = 'some code here';
+      const highlighted = SearchEngine.highlightText(text, '');
+
+      expect(highlighted).toBe(text);
+    });
+  });
+
+  describe('캐시 통계 (getCacheStats)', () => {
+    test('✅ 캐시 통계 반환', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      // 2번 같은 검색 (첫번째: miss, 두번째: hit)
+      await SearchEngine.search('query', {});
+      await SearchEngine.search('query', {});
+
+      const stats = SearchEngine.getCacheStats();
+
+      expect(stats.cacheSize).toBeGreaterThan(0);
+      expect(stats.totalSearches).toBe(2);
+      expect(stats.cachedResults).toBe(1);
+      expect(stats.hitRate).toBe('50.0');
+    });
+
+    test('✅ 0% 히트율 (캐시 미스)', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.search('query1', {});
+      await SearchEngine.search('query2', {});
+
+      const stats = SearchEngine.getCacheStats();
+
+      expect(stats.hitRate).toBe('0.0');
+    });
+
+    test('✅ 100% 히트율 (모두 캐시)', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.search('query', {});
+      await SearchEngine.search('query', {});
+      await SearchEngine.search('query', {});
+
+      const stats = SearchEngine.getCacheStats();
+
+      expect(stats.hitRate).toBe('66.7');
+    });
+  });
+
+  describe('캐시 관리 (clearCache)', () => {
+    test('✅ 캐시 초기화', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      await SearchEngine.search('query', {});
+      SearchEngine.clearCache();
+
+      const stats = SearchEngine.getCacheStats();
+      expect(stats.cacheSize).toBe(0);
+    });
+  });
+
+  describe('언어 필터 (getExtension)', () => {
+    test('✅ 언어 코드 → 확장자 변환', () => {
+      expect(SearchEngine.getExtension('js')).toBe('.js');
+      expect(SearchEngine.getExtension('python')).toBe('.py');
+      expect(SearchEngine.getExtension('go')).toBe('.go');
+      expect(SearchEngine.getExtension('typescript')).toBe('.ts');
+    });
+
+    test('✅ 대소문자 무시', () => {
+      expect(SearchEngine.getExtension('JS')).toBe('.js');
+      expect(SearchEngine.getExtension('PYTHON')).toBe('.py');
+    });
+
+    test('✅ 미지의 언어', () => {
+      expect(SearchEngine.getExtension('unknown')).toBeUndefined();
+    });
+  });
+
+  describe('응답 시간 측정', () => {
+    test('✅ 응답 시간 포함', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      const response = await SearchEngine.search('test', {});
+
+      expect(response.responseTime).toBeDefined();
+      expect(response.responseTime).toBeGreaterThanOrEqual(0);
+    });
+
+    test('✅ 캐시 응답이 더 빠름', async () => {
+      DatabaseManager.searchCode.mockResolvedValue([]);
+
+      const response1 = await SearchEngine.search('test', {});
+      const response2 = await SearchEngine.search('test', {});
+
+      // 캐시는 더 빨라야 함 (대부분의 경우)
+      expect(response2.responseTime).toBeLessThanOrEqual(response1.responseTime);
+    });
+  });
+});

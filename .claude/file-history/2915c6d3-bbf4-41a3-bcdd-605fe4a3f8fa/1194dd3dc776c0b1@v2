@@ -1,0 +1,327 @@
+#!/usr/bin/env node
+
+/**
+ * KimSearch v2 - Quality Assessment API Server
+ *
+ * 포트: 40008 (또는 환경변수 PORT)
+ *
+ * 엔드포인트:
+ * - POST   /quality/rate              : 평가 저장
+ * - GET    /quality/list              : 목록 조회
+ * - GET    /quality/security-review   : 보안 이슈
+ * - GET    /quality/stats             : 통계
+ * - GET    /quality/get               : 단일 조회
+ * - DELETE /quality/delete            : 삭제
+ * - GET    /health                    : 헬스 체크
+ *
+ * Author: Claude (Haiku 4.5)
+ * Date: 2026-02-27
+ */
+
+const http = require('http');
+const url = require('url');
+const QualityService = require('./quality-service');
+
+const PORT = process.env.PORT || 40008;
+const service = new QualityService();
+
+/**
+ * 요청 바디 파싱
+ */
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(new Error('Invalid JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * JSON 응답 전송
+ */
+function sendJSON(res, statusCode, data) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end(JSON.stringify(data, null, 2));
+}
+
+/**
+ * 에러 응답
+ */
+function sendError(res, statusCode, message) {
+  sendJSON(res, statusCode, {
+    error: message,
+    timestamp: new Date().toISOString()
+  });
+}
+
+/**
+ * 1️⃣ POST /quality/rate - 평가 저장
+ */
+async function handleRate(req, res) {
+  try {
+    const body = await parseBody(req);
+    const {
+      repo,
+      stars,
+      category = 'general',
+      issues = [],
+      actions = [],
+      deadline = null,
+      owner = 'unknown'
+    } = body;
+
+    if (!repo || !stars) {
+      return sendError(res, 400, 'Missing required fields: repo, stars');
+    }
+
+    const result = service.rate(repo, stars, category, issues, actions, deadline, owner);
+
+    sendJSON(res, 201, {
+      success: true,
+      message: `✅ Rated ${repo} with ${stars}⭐`,
+      data: result
+    });
+  } catch (e) {
+    sendError(res, 400, e.message);
+  }
+}
+
+/**
+ * 2️⃣ GET /quality/list - 목록 조회
+ */
+function handleList(req, res, searchParams) {
+  try {
+    // 필터 구성
+    const filters = {
+      stars: searchParams.get('stars')
+        ? searchParams.get('stars').split(',').map(Number)
+        : undefined,
+      status: searchParams.get('status'),
+      category: searchParams.get('category'),
+      search: searchParams.get('search'),
+      sort: searchParams.get('sort') || 'stars-desc',
+      limit: parseInt(searchParams.get('limit') || '100'),
+      page: parseInt(searchParams.get('page') || '0')
+    };
+
+    const results = service.list(filters);
+
+    sendJSON(res, 200, {
+      query: Object.fromEntries(searchParams),
+      count: results.length,
+      filters,
+      results
+    });
+  } catch (e) {
+    sendError(res, 400, e.message);
+  }
+}
+
+/**
+ * 3️⃣ GET /quality/get - 단일 저장소 조회
+ */
+function handleGet(req, res, searchParams) {
+  try {
+    const repo = searchParams.get('repo');
+    if (!repo) {
+      return sendError(res, 400, 'Missing required parameter: repo');
+    }
+
+    const result = service.get(repo);
+    if (!result) {
+      return sendJSON(res, 404, {
+        error: `Repository '${repo}' not found`,
+        message: 'Use /quality/list to see all assessments'
+      });
+    }
+
+    sendJSON(res, 200, result);
+  } catch (e) {
+    sendError(res, 400, e.message);
+  }
+}
+
+/**
+ * 4️⃣ GET /quality/security-review - 보안 이슈
+ */
+function handleSecurityReview(req, res) {
+  try {
+    const review = service.securityReview();
+
+    sendJSON(res, 200, {
+      severity: '🔴 CRITICAL',
+      message: `${review.critical_count} repositories need security review`,
+      urgent: {
+        count: review.urgent.length,
+        repos: review.urgent.map(r => ({
+          repo: r.repo,
+          stars: r.stars,
+          issues: r.issues,
+          deadline: r.deadline
+        }))
+      },
+      on_hold: {
+        count: review.on_hold.length,
+        repos: review.on_hold.map(r => r.repo)
+      }
+    });
+  } catch (e) {
+    sendError(res, 400, e.message);
+  }
+}
+
+/**
+ * 5️⃣ GET /quality/stats - 통계
+ */
+function handleStats(req, res) {
+  try {
+    const stats = service.statistics();
+
+    sendJSON(res, 200, {
+      timestamp: new Date().toISOString(),
+      summary: stats.summary,
+      distribution: stats.by_stars,
+      by_category: stats.by_category
+    });
+  } catch (e) {
+    sendError(res, 400, e.message);
+  }
+}
+
+/**
+ * 6️⃣ DELETE /quality/delete - 평가 삭제
+ */
+async function handleDelete(req, res) {
+  try {
+    const body = await parseBody(req);
+    const { repo } = body;
+
+    if (!repo) {
+      return sendError(res, 400, 'Missing required field: repo');
+    }
+
+    const result = service.delete(repo);
+    if (!result) {
+      return sendError(res, 404, `Repository '${repo}' not found`);
+    }
+
+    sendJSON(res, 200, {
+      success: true,
+      message: `✅ Deleted assessment for ${repo}`
+    });
+  } catch (e) {
+    sendError(res, 400, e.message);
+  }
+}
+
+/**
+ * 7️⃣ GET /health - 헬스 체크
+ */
+function handleHealth(req, res) {
+  const stats = service.statistics();
+
+  sendJSON(res, 200, {
+    status: 'ok',
+    service: 'KimSearch v2 Quality API',
+    version: '4.0',
+    port: PORT,
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    assessments: {
+      total: stats.total,
+      production_ready: stats.summary.production_ready,
+      security_issues: stats.summary.security_review,
+      incomplete: stats.summary.incomplete
+    }
+  });
+}
+
+/**
+ * HTTP 서버
+ */
+const server = http.createServer((req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+  const searchParams = new URLSearchParams(parsedUrl.query);
+
+  // CORS 헤더
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  // OPTIONS 요청 처리
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // 라우팅
+  if (pathname === '/quality/rate' && req.method === 'POST') {
+    handleRate(req, res);
+  } else if (pathname === '/quality/list' && req.method === 'GET') {
+    handleList(req, res, searchParams);
+  } else if (pathname === '/quality/get' && req.method === 'GET') {
+    handleGet(req, res, searchParams);
+  } else if (pathname === '/quality/security-review' && req.method === 'GET') {
+    handleSecurityReview(req, res);
+  } else if (pathname === '/quality/stats' && req.method === 'GET') {
+    handleStats(req, res);
+  } else if (pathname === '/quality/delete' && req.method === 'DELETE') {
+    handleDelete(req, res);
+  } else if (pathname === '/health' && req.method === 'GET') {
+    handleHealth(req, res);
+  } else {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: 'Not Found',
+      available: [
+        'POST   /quality/rate',
+        'GET    /quality/list',
+        'GET    /quality/get',
+        'GET    /quality/security-review',
+        'GET    /quality/stats',
+        'DELETE /quality/delete',
+        'GET    /health'
+      ]
+    }, null, 2));
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════════════════════════╗
+║  🌟 KimSearch v2 - Quality Assessment API Server           ║
+║  포트: ${PORT}                                                 ║
+║  상태: ✅ 실행 중                                           ║
+╠════════════════════════════════════════════════════════════╣
+║  엔드포인트:                                               ║
+║  POST   /quality/rate              - 평가 저장             ║
+║  GET    /quality/list              - 목록 조회             ║
+║  GET    /quality/get?repo=...      - 단일 조회             ║
+║  GET    /quality/security-review   - 보안 이슈             ║
+║  GET    /quality/stats             - 통계                 ║
+║  DELETE /quality/delete            - 삭제                 ║
+║  GET    /health                    - 헬스 체크             ║
+╚════════════════════════════════════════════════════════════╝
+
+✅ API 준비 완료! 테스트: curl http://localhost:${PORT}/health
+  `);
+});
+
+process.on('SIGINT', () => {
+  console.log('\n👋 종료 중...');
+  process.exit(0);
+});
+
+module.exports = server;

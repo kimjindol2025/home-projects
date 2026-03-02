@@ -1,0 +1,456 @@
+"""
+v5.5 API Handler
+HTTP 요청 처리 및 JSON 직렬화/역직렬화
+"""
+
+import json
+import re
+from typing import Dict, Any, Tuple, Optional
+from enum import Enum
+
+
+class HTTPMethod(Enum):
+    """HTTP 메서드"""
+    GET = 'GET'
+    POST = 'POST'
+    PUT = 'PUT'
+    DELETE = 'DELETE'
+    PATCH = 'PATCH'
+
+
+class HTTPStatusCode(Enum):
+    """HTTP 상태 코드"""
+    OK = (200, 'OK')
+    CREATED = (201, 'Created')
+    BAD_REQUEST = (400, 'Bad Request')
+    UNAUTHORIZED = (401, 'Unauthorized')
+    FORBIDDEN = (403, 'Forbidden')
+    NOT_FOUND = (404, 'Not Found')
+    CONFLICT = (409, 'Conflict')
+    INTERNAL_SERVER_ERROR = (500, 'Internal Server Error')
+
+    @property
+    def code(self) -> int:
+        return self.value[0]
+
+    @property
+    def reason(self) -> str:
+        return self.value[1]
+
+
+class APIRoute:
+    """API 라우트 정의"""
+
+    def __init__(self, method: HTTPMethod, path_pattern: str):
+        self.method = method
+        self.path_pattern = path_pattern
+        self.regex = self._compile_pattern(path_pattern)
+
+    @staticmethod
+    def _compile_pattern(path_pattern: str) -> re.Pattern:
+        """URL 패턴을 정규식으로 변환"""
+        # /researchers/<id> → /researchers/(\d+)
+        pattern = path_pattern.replace('<id>', r'(?P<id>\d+)')
+        pattern = pattern.replace('<experiment_id>', r'(?P<experiment_id>\d+)')
+        return re.compile(f'^{pattern}$')
+
+    def match(self, path: str) -> Optional[Dict[str, Any]]:
+        """경로 매칭"""
+        match = self.regex.match(path)
+        if match:
+            return match.groupdict()
+        return None
+
+
+class APIHandler:
+    """REST API 핸들러"""
+
+    def __init__(self, db_layer, auth_manager):
+        self.db = db_layer
+        self.auth = auth_manager
+        self.routes = self._init_routes()
+
+    def _init_routes(self) -> Dict[str, APIRoute]:
+        """라우트 초기화"""
+        routes = {}
+
+        # 【 Researchers Endpoints 】
+        routes['researchers_list'] = APIRoute(HTTPMethod.GET, '/api/researchers')
+        routes['researchers_create'] = APIRoute(HTTPMethod.POST, '/api/researchers')
+        routes['researchers_get'] = APIRoute(HTTPMethod.GET, '/api/researchers/<id>')
+        routes['researchers_update'] = APIRoute(HTTPMethod.PUT, '/api/researchers/<id>')
+        routes['researchers_delete'] = APIRoute(HTTPMethod.DELETE, '/api/researchers/<id>')
+
+        # 【 Experiments Endpoints 】
+        routes['experiments_list'] = APIRoute(HTTPMethod.GET, '/api/experiments')
+        routes['experiments_create'] = APIRoute(HTTPMethod.POST, '/api/experiments')
+        routes['experiments_get'] = APIRoute(HTTPMethod.GET, '/api/experiments/<experiment_id>')
+        routes['experiments_update'] = APIRoute(HTTPMethod.PUT, '/api/experiments/<experiment_id>')
+        routes['experiments_delete'] = APIRoute(HTTPMethod.DELETE, '/api/experiments/<experiment_id>')
+
+        # 【 Experiment Logs 】
+        routes['logs_add'] = APIRoute(HTTPMethod.POST, '/api/experiments/<experiment_id>/logs')
+        routes['logs_list'] = APIRoute(HTTPMethod.GET, '/api/experiments/<experiment_id>/logs')
+
+        # 【 Statistics 】
+        routes['stats'] = APIRoute(HTTPMethod.GET, '/api/statistics')
+        routes['top_experiments'] = APIRoute(HTTPMethod.GET, '/api/top-experiments')
+
+        # 【 Authentication 】
+        routes['auth_login'] = APIRoute(HTTPMethod.POST, '/api/auth/login')
+        routes['auth_logout'] = APIRoute(HTTPMethod.POST, '/api/auth/logout')
+
+        # 【 Health Check 】
+        routes['health'] = APIRoute(HTTPMethod.GET, '/api/health')
+
+        return routes
+
+    def match_route(self, method: str, path: str) -> Tuple[Optional[str], Optional[Dict]]:
+        """경로 매칭"""
+        try:
+            http_method = HTTPMethod[method.upper()]
+        except KeyError:
+            return None, None
+
+        for route_name, route in self.routes.items():
+            if route.method == http_method:
+                params = route.match(path)
+                if params is not None:  # 빈 dict도 유효한 파라미터
+                    return route_name, params
+
+        return None, None
+
+    # 【 Response Builders 】
+    @staticmethod
+    def json_response(status: HTTPStatusCode, data: Any = None, message: str = None) -> str:
+        """JSON 응답 생성"""
+        response = {
+            'status': status.code,
+            'reason': status.reason,
+            'data': data,
+            'message': message,
+        }
+
+        # None 값 제거
+        response = {k: v for k, v in response.items() if v is not None}
+
+        return json.dumps(response, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def parse_json_body(body: str) -> Dict:
+        """JSON 본문 파싱"""
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return {}
+
+    # 【 Researchers Handlers 】
+    def handle_researchers_list(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """연구자 목록 조회"""
+        try:
+            researchers = self.db.get_all_researchers()
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, researchers)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_researchers_create(self, params: Dict, body: str, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """연구자 생성"""
+        try:
+            data = self.parse_json_body(body)
+            name = data.get('name')
+            email = data.get('email')
+            role = data.get('role', 'researcher')
+
+            if not name or not email:
+                return HTTPStatusCode.BAD_REQUEST, self.json_response(
+                    HTTPStatusCode.BAD_REQUEST, message='name과 email은 필수'
+                )
+
+            researcher = self.db.create_researcher(name, email, role)
+            return HTTPStatusCode.CREATED, self.json_response(HTTPStatusCode.CREATED, researcher)
+        except ValueError as e:
+            return HTTPStatusCode.CONFLICT, self.json_response(
+                HTTPStatusCode.CONFLICT, message=str(e)
+            )
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_researchers_get(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """연구자 조회"""
+        try:
+            researcher_id = int(params.get('id', 0))
+            researcher = self.db.get_researcher(researcher_id)
+
+            if not researcher:
+                return HTTPStatusCode.NOT_FOUND, self.json_response(
+                    HTTPStatusCode.NOT_FOUND, message='연구자를 찾을 수 없습니다'
+                )
+
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, researcher)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_researchers_update(self, params: Dict, body: str, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """연구자 정보 수정"""
+        try:
+            researcher_id = int(params.get('id', 0))
+            data = self.parse_json_body(body)
+
+            researcher = self.db.get_researcher(researcher_id)
+            if not researcher:
+                return HTTPStatusCode.NOT_FOUND, self.json_response(
+                    HTTPStatusCode.NOT_FOUND, message='연구자를 찾을 수 없습니다'
+                )
+
+            updated = self.db.update_researcher(researcher_id, **data)
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, updated)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_researchers_delete(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """연구자 삭제 (ADMIN만)"""
+        try:
+            researcher_id = int(params.get('id', 0))
+
+            if self.db.delete_researcher(researcher_id):
+                return HTTPStatusCode.OK, self.json_response(
+                    HTTPStatusCode.OK, message='연구자가 삭제되었습니다'
+                )
+            else:
+                return HTTPStatusCode.NOT_FOUND, self.json_response(
+                    HTTPStatusCode.NOT_FOUND, message='연구자를 찾을 수 없습니다'
+                )
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    # 【 Experiments Handlers 】
+    def handle_experiments_list(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """실험 목록 조회"""
+        try:
+            status = params.get('status')
+            experiments = self.db.get_all_experiments(status)
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, experiments)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_experiments_create(self, params: Dict, body: str, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """실험 생성"""
+        try:
+            data = self.parse_json_body(body)
+            researcher_id = data.get('researcher_id')
+            subject = data.get('subject')
+
+            if not researcher_id or not subject:
+                return HTTPStatusCode.BAD_REQUEST, self.json_response(
+                    HTTPStatusCode.BAD_REQUEST, message='researcher_id와 subject는 필수'
+                )
+
+            experiment = self.db.create_experiment(
+                researcher_id,
+                subject,
+                data.get('description', ''),
+                data.get('status', 'pending')
+            )
+
+            return HTTPStatusCode.CREATED, self.json_response(HTTPStatusCode.CREATED, experiment)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_experiments_get(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """실험 조회"""
+        try:
+            experiment_id = int(params.get('experiment_id', 0))
+            experiment = self.db.get_experiment(experiment_id)
+
+            if not experiment:
+                return HTTPStatusCode.NOT_FOUND, self.json_response(
+                    HTTPStatusCode.NOT_FOUND, message='실험을 찾을 수 없습니다'
+                )
+
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, experiment)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_experiments_update(self, params: Dict, body: str, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """실험 수정"""
+        try:
+            experiment_id = int(params.get('experiment_id', 0))
+            data = self.parse_json_body(body)
+
+            experiment = self.db.get_experiment(experiment_id)
+            if not experiment:
+                return HTTPStatusCode.NOT_FOUND, self.json_response(
+                    HTTPStatusCode.NOT_FOUND, message='실험을 찾을 수 없습니다'
+                )
+
+            updated = self.db.update_experiment(experiment_id, **data)
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, updated)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_experiments_delete(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """실험 삭제"""
+        try:
+            experiment_id = int(params.get('experiment_id', 0))
+
+            if self.db.delete_experiment(experiment_id):
+                return HTTPStatusCode.OK, self.json_response(
+                    HTTPStatusCode.OK, message='실험이 삭제되었습니다'
+                )
+            else:
+                return HTTPStatusCode.NOT_FOUND, self.json_response(
+                    HTTPStatusCode.NOT_FOUND, message='실험을 찾을 수 없습니다'
+                )
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    # 【 Statistics Handlers 】
+    def handle_statistics(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """통계 조회"""
+        try:
+            stats = self.db.get_statistics()
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, stats)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_top_experiments(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """상위 실험 조회"""
+        try:
+            top_exps = self.db.get_top_experiments(limit=5)
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, top_exps)
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    # 【 Auth Handlers 】
+    def handle_auth_login(self, params: Dict, body: str, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """로그인"""
+        try:
+            data = self.parse_json_body(body)
+            email = data.get('email')
+            password = data.get('password')
+
+            if not email or not password:
+                return HTTPStatusCode.BAD_REQUEST, self.json_response(
+                    HTTPStatusCode.BAD_REQUEST, message='email과 password는 필수'
+                )
+
+            token = self.auth.authenticate(email, password)
+            if not token:
+                return HTTPStatusCode.UNAUTHORIZED, self.json_response(
+                    HTTPStatusCode.UNAUTHORIZED, message='이메일 또는 비밀번호가 잘못되었습니다'
+                )
+
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, {'token': token})
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_auth_logout(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """로그아웃"""
+        try:
+            if not token:
+                return HTTPStatusCode.UNAUTHORIZED, self.json_response(
+                    HTTPStatusCode.UNAUTHORIZED, message='토큰이 필요합니다'
+                )
+
+            self.auth.logout(token)
+            return HTTPStatusCode.OK, self.json_response(HTTPStatusCode.OK, message='로그아웃되었습니다')
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    # 【 Health Check 】
+    def handle_health(self, params: Dict, token: str = None) -> Tuple[HTTPStatusCode, str]:
+        """헬스 체크"""
+        try:
+            db_info = self.db.get_database_info()
+            return HTTPStatusCode.OK, self.json_response(
+                HTTPStatusCode.OK,
+                {'status': 'running', 'database': db_info}
+            )
+        except Exception as e:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message=str(e)
+            )
+
+    def handle_request(self, method: str, path: str, headers: Dict = None,
+                      body: str = '') -> Tuple[HTTPStatusCode, str]:
+        """HTTP 요청 처리"""
+        route_name, params = self.match_route(method, path)
+
+        if not route_name:
+            return HTTPStatusCode.NOT_FOUND, self.json_response(
+                HTTPStatusCode.NOT_FOUND, message='엔드포인트를 찾을 수 없습니다'
+            )
+
+        # 토큰 추출
+        auth_header = (headers or {}).get('Authorization', '')
+        from .auth import AuthMiddleware
+        middleware = AuthMiddleware(self.auth)
+        token = middleware.extract_token_from_header(auth_header) if auth_header else None
+
+        # 라우트별 핸들러 호출
+        handler_map = {
+            'researchers_list': self.handle_researchers_list,
+            'researchers_create': self.handle_researchers_create,
+            'researchers_get': self.handle_researchers_get,
+            'researchers_update': self.handle_researchers_update,
+            'researchers_delete': self.handle_researchers_delete,
+            'experiments_list': self.handle_experiments_list,
+            'experiments_create': self.handle_experiments_create,
+            'experiments_get': self.handle_experiments_get,
+            'experiments_update': self.handle_experiments_update,
+            'experiments_delete': self.handle_experiments_delete,
+            'stats': self.handle_statistics,
+            'top_experiments': self.handle_top_experiments,
+            'auth_login': self.handle_auth_login,
+            'auth_logout': self.handle_auth_logout,
+            'health': self.handle_health,
+        }
+
+        handler = handler_map.get(route_name)
+        if not handler:
+            return HTTPStatusCode.INTERNAL_SERVER_ERROR, self.json_response(
+                HTTPStatusCode.INTERNAL_SERVER_ERROR, message='핸들러를 찾을 수 없습니다'
+            )
+
+        # 메서드 시그니처에 따라 호출
+        try:
+            # body를 받는 핸들러인지 확인
+            import inspect
+            sig = inspect.signature(handler)
+            if 'body' in sig.parameters:
+                return handler(params, body, token)
+            else:
+                return handler(params, token)
+        except (TypeError, Exception):
+            try:
+                return handler(params, body, token)
+            except:
+                return handler(params, token)

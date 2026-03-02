@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+
+"""
+Adaptive Byzantine Attack Injectors for Phase 3 Experiments
+
+5가지 Adaptive Attack Types 구현:
+1. RMC (Reconnecting Malicious Clients)
+2. Delayed Poisoning
+3. Strategy-Evolution
+4. Collusion + Sybil Multiplicity
+5. Task-Specific Poisoning with Cross-Task Propagation
+
+Author: v16 Research Team
+Date: 2026-02-25
+"""
+
+import random
+from typing import List, Dict, Set, Tuple
+from dataclasses import dataclass
+from enum import Enum
+
+
+# ============================================================================
+# Enum: Attack Configurations
+# ============================================================================
+
+class AdaptiveAttackType(Enum):
+    """Adaptive Byzantine Attack Types"""
+    RMC = "rmc"
+    DELAYED_POISONING = "delayed"
+    STRATEGY_EVOLUTION = "str_evo"
+    COLLUSION_SYBIL = "collusion_sybil"
+    TASK_SPECIFIC = "task_specific"
+    MIXED = "mixed"
+
+
+# ============================================================================
+# Dataclass: Attack State
+# ============================================================================
+
+@dataclass
+class AttackState:
+    """Tracks attack progression over rounds"""
+    attack_type: AdaptiveAttackType
+    client_id: str
+    start_round: int
+    trigger_round: int = None  # For delayed poisoning
+    current_strategy: str = "initial"  # For strategy-evolution
+    confidence: float = 0.0  # Attacker's confidence in current strategy
+    metadata: Dict = None
+
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
+
+
+# ============================================================================
+# Attack 1: RMC (Reconnecting Malicious Clients)
+# ============================================================================
+
+def inject_rmc_attack(
+    client_gradients: Dict[str, List[float]],
+    client_ids: List[str],
+    round_num: int,
+    quarantined_clients: Set[str],
+    release_rounds: Dict[str, int],
+    reconnect_probability: float = 0.8,
+    perturbation_range: Tuple[float, float] = (0.05, 0.15)
+) -> Tuple[Dict[str, List[float]], Set[str]]:
+    """
+    RMC Attack: Quarantined client attempts rejoining after release epoch
+    with modified gradient to evade re-detection.
+
+    Strategy:
+    - After quarantine duration, client rejoins with new device ID
+    - Uses perturbed gradient (±5-15% scale) to evade trajectory-based detection
+    - Attempts multiple reconnections (Sybil-like behavior)
+
+    AIOps Impact:
+    - Peak-time re-infiltration (e.g., post-maintenance)
+    - Sustained alert fatigue (repeated detection/quarantine cycles)
+    - Recovery time extension (MTTR degradation)
+
+    Args:
+        client_gradients: Dict[client_id -> gradient_vector]
+        client_ids: List of client IDs
+        round_num: Current round number
+        quarantined_clients: Set of currently quarantined client IDs
+        release_rounds: Dict[client_id -> release_epoch]
+        reconnect_probability: Probability of rejoin attempt
+        perturbation_range: (min, max) perturbation scale
+
+    Returns:
+        (poisoned_gradients, active_rmc_clients)
+    """
+    poisoned_grads = {cid: g.copy() if isinstance(g, list) else g
+                     for cid, g in client_gradients.items()}
+    active_rmc = set()
+
+    for client_id in quarantined_clients:
+        release_round = release_rounds.get(client_id, float('inf'))
+
+        # Check if release epoch reached and reconnection attempted
+        if round_num >= release_round and random.random() < reconnect_probability:
+            if client_id in poisoned_grads:
+                # Perturb gradient: scale factor + small noise
+                scale = 1.0 + random.uniform(*perturbation_range)
+                if isinstance(poisoned_grads[client_id], list):
+                    poisoned_grads[client_id] = [g * scale for g in poisoned_grads[client_id]]
+                else:
+                    # numpy array
+                    poisoned_grads[client_id] = poisoned_grads[client_id] * scale
+
+                active_rmc.add(client_id)
+
+    return poisoned_grads, active_rmc
+
+
+# ============================================================================
+# Attack 2: Delayed Poisoning
+# ============================================================================
+
+def inject_delayed_poisoning(
+    client_gradients: Dict[str, List[float]],
+    client_ids: List[str],
+    malicious_clients: Set[str],
+    round_num: int,
+    trigger_round: int = 100,
+    poison_type: str = "label_flip"
+) -> Dict[str, List[float]]:
+    """
+    Delayed Poisoning: Byzantine maintains honest behavior for 100+ rounds,
+    then suddenly switches to poisoning at trigger_round (e.g., maintenance window).
+
+    Phases:
+    - Round 1 ~ trigger-1: All honest gradients → trusted by system
+    - Round trigger+ onwards: Poisoning activated (label-flip or sign-flip)
+
+    AIOps Impact:
+    - Undetected drift during normal operation
+    - Sudden model degradation at critical times
+    - RCA failure (misdiagnosed root causes)
+    - Cascading alerts (false positives)
+
+    Args:
+        client_gradients: Gradient dictionary
+        client_ids: List of client IDs
+        malicious_clients: Set of malicious client IDs
+        round_num: Current round
+        trigger_round: Round at which to activate poisoning
+        poison_type: "label_flip" (negate) or "sign_flip" (random coords)
+
+    Returns:
+        Poisoned gradients
+    """
+    poisoned_grads = {cid: g.copy() if isinstance(g, list) else g
+                     for cid, g in client_gradients.items()}
+
+    if round_num >= trigger_round:
+        for client_id in malicious_clients:
+            if client_id in poisoned_grads:
+                grad = poisoned_grads[client_id]
+
+                if poison_type == "label_flip":
+                    # Negate entire gradient
+                    if isinstance(grad, list):
+                        poisoned_grads[client_id] = [-g for g in grad]
+                    else:
+                        poisoned_grads[client_id] = -grad
+
+                elif poison_type == "sign_flip":
+                    # Random coordinate sign flip (30% flip rate)
+                    flip_ratio = 0.3
+                    if isinstance(grad, list):
+                        poisoned_grads[client_id] = [
+                            -g if random.random() < flip_ratio else g
+                            for g in grad
+                        ]
+                    else:
+                        mask = [random.random() < flip_ratio for _ in range(len(grad))]
+                        poisoned_grads[client_id] = grad * (1 - 2 * mask)
+
+    return poisoned_grads
+
+
+# ============================================================================
+# Attack 3: Strategy-Evolution
+# ============================================================================
+
+def inject_strategy_evolution(
+    client_gradients: Dict[str, List[float]],
+    client_ids: List[str],
+    malicious_clients: Set[str],
+    round_num: int,
+    evolution_interval: int = 20
+) -> Dict[str, List[float]]:
+    """
+    Strategy-Evolution: Attacker observes model state and adapts attack vector.
+
+    Evolution phases (cycle every evolution_interval rounds):
+    - Phase 0: High-variance Gaussian noise (obvious anomaly, detectable)
+    - Phase 1: Sign-flip (different pattern, may bypass static defenses)
+    - Phase 2: Adaptive magnitude scaling (match honest gradient scale)
+    - Phase 3+: Random strategy switching (avoid temporal patterns)
+
+    AIOps Impact:
+    - Evasion of fixed-threshold detection systems
+    - Detection accuracy degradation over time
+    - Adaptive defense mechanisms overwhelmed
+
+    Args:
+        client_gradients: Gradient dictionary
+        client_ids: List of client IDs
+        malicious_clients: Set of malicious client IDs
+        round_num: Current round
+        evolution_interval: Rounds per phase cycle
+
+    Returns:
+        Poisoned gradients
+    """
+    poisoned_grads = {cid: g.copy() if isinstance(g, list) else g
+                     for cid, g in client_gradients.items()}
+
+    phase = (round_num // evolution_interval) % 4
+
+    for client_id in malicious_clients:
+        if client_id not in poisoned_grads:
+            continue
+
+        grad = poisoned_grads[client_id]
+
+        if phase == 0:
+            # Phase 0: High-variance Gaussian noise
+            if isinstance(grad, list):
+                poisoned_grads[client_id] = [
+                    g + random.gauss(0, 1.0) for g in grad
+                ]
+            else:
+                poisoned_grads[client_id] = grad + [random.gauss(0, 1.0) for _ in range(len(grad))]
+
+        elif phase == 1:
+            # Phase 1: Sign-flip
+            if isinstance(grad, list):
+                poisoned_grads[client_id] = [-g for g in grad]
+            else:
+                poisoned_grads[client_id] = -grad
+
+        elif phase == 2:
+            # Phase 2: Adaptive magnitude scaling (match honest clients)
+            honest_grads = [poisoned_grads[cid] for cid in client_ids
+                           if cid not in malicious_clients and cid in poisoned_grads]
+            if honest_grads:
+                avg_magnitude = sum(
+                    sum(abs(g) for g in (gr if isinstance(gr, list) else [gr]))
+                    for gr in honest_grads
+                ) / len(honest_grads)
+
+                current_magnitude = sum(abs(g) for g in (grad if isinstance(grad, list) else [grad]))
+                scale = avg_magnitude / (current_magnitude + 1e-10)
+
+                if isinstance(grad, list):
+                    poisoned_grads[client_id] = [g * scale for g in grad]
+                else:
+                    poisoned_grads[client_id] = grad * scale
+
+        else:
+            # Phase 3: Random perturbation
+            if isinstance(grad, list):
+                poisoned_grads[client_id] = [
+                    g * random.uniform(0.9, 1.1) for g in grad
+                ]
+            else:
+                poisoned_grads[client_id] = grad * random.uniform(0.9, 1.1)
+
+    return poisoned_grads
+
+
+# ============================================================================
+# Attack 4: Collusion + Sybil Multiplicity
+# ============================================================================
+
+def inject_collusion_sybil(
+    client_gradients: Dict[str, List[float]],
+    client_ids: List[str],
+    malicious_group: Set[str],
+    sybil_multiplier: int = 3,
+    coordination_scale: float = 1.5
+) -> Tuple[Dict[str, List[float]], List[str]]:
+    """
+    Collusion + Sybil: Coordinated malicious group + fake client identities.
+
+    Strategy:
+    - Malicious group (15% of clients) coordinates poisoning
+    - Each quarantined malicious client spawns 2-3 Sybil (fake) IDs
+    - Sybils use coordinated poisoning gradients (amplified)
+
+    AIOps Impact:
+    - Amplified model poisoning (voting power inflation)
+    - Distributed attack nodes (harder to trace)
+    - Collusion-based Byzantine resilience bypass
+
+    Args:
+        client_gradients: Gradient dictionary
+        client_ids: List of client IDs
+        malicious_group: Set of coordinating malicious client IDs
+        sybil_multiplier: Number of Sybil identities per malicious client
+        coordination_scale: Amplification factor for coordinated attack
+
+    Returns:
+        (augmented_gradients, augmented_client_ids)
+    """
+    poisoned_grads = {cid: g.copy() if isinstance(g, list) else g
+                     for cid, g in client_gradients.items()}
+    augmented_ids = client_ids.copy()
+
+    # Amplify coordinated attack
+    for client_id in malicious_group:
+        if client_id in poisoned_grads:
+            grad = poisoned_grads[client_id]
+            scale = coordination_scale * (1.0 + len(malicious_group) * 0.05)
+
+            if isinstance(grad, list):
+                poisoned_grads[client_id] = [g * scale for g in grad]
+            else:
+                poisoned_grads[client_id] = grad * scale
+
+            # Add Sybil identities
+            for sybil_idx in range(sybil_multiplier):
+                sybil_id = f"{client_id}_sybil_{sybil_idx}"
+                augmented_ids.append(sybil_id)
+
+                # Sybil uses slightly perturbed coordinated gradient
+                perturbation = random.uniform(0.95, 1.05)
+                if isinstance(grad, list):
+                    sybil_grad = [g * scale * perturbation for g in grad]
+                else:
+                    sybil_grad = grad * scale * perturbation
+
+                poisoned_grads[sybil_id] = sybil_grad
+
+    return poisoned_grads, augmented_ids
+
+
+# ============================================================================
+# Attack 5: Task-Specific Poisoning with Cross-Task Propagation
+# ============================================================================
+
+def inject_task_specific_attack(
+    task_gradients: Dict[str, Dict[str, List[float]]],
+    client_ids: List[str],
+    malicious_clients: Set[str],
+    target_task: str = "rca",
+    poison_amplitude: float = 2.0,
+    cross_task_leak_ratio: float = 0.15
+) -> Dict[str, Dict[str, List[float]]]:
+    """
+    Task-Specific Poisoning: Poison only one task (e.g., RCA), leak to others.
+
+    Strategy:
+    - Malicious clients: Poison target task (RCA) with high amplitude
+    - Gradient mixing: 15% of poisoned RCA gradient leaks to other tasks
+    - Bypass: Multi-task quarantine may not catch task-specific bias
+
+    Phases:
+    1. Target task (RCA): Amplified poisoning (2.0× or higher)
+    2. Other tasks: Subtle cross-task contamination via correlation
+
+    AIOps Impact:
+    - Compromised root cause analysis → wrong remediation
+    - Cascading failures (incorrect fix attempts)
+    - Multi-task model correlation exploitation
+
+    Args:
+        task_gradients: Dict[task_name -> Dict[client_id -> gradient]]
+        client_ids: List of client IDs
+        malicious_clients: Set of malicious client IDs
+        target_task: Task to directly poison (default: "rca")
+        poison_amplitude: Amplification factor for target task
+        cross_task_leak_ratio: Fraction of poison leaking to other tasks
+
+    Returns:
+        Poisoned task gradients
+    """
+    poisoned_task_grads = {
+        task: {cid: g.copy() if isinstance(g, list) else g
+               for cid, g in grads.items()}
+        for task, grads in task_gradients.items()
+    }
+
+    # Step 1: Poison target task directly
+    if target_task in poisoned_task_grads:
+        target_grads = poisoned_task_grads[target_task]
+        for client_id in malicious_clients:
+            if client_id in target_grads:
+                grad = target_grads[client_id]
+                if isinstance(grad, list):
+                    target_grads[client_id] = [g * poison_amplitude for g in grad]
+                else:
+                    target_grads[client_id] = grad * poison_amplitude
+
+    # Step 2: Cross-task gradient mixing (leak poison)
+    for task in poisoned_task_grads:
+        if task != target_task:
+            if target_task in poisoned_task_grads:
+                target_grads = poisoned_task_grads[target_task]
+                current_grads = poisoned_task_grads[task]
+
+                for client_id in malicious_clients:
+                    if client_id in target_grads and client_id in current_grads:
+                        target_grad = target_grads[client_id]
+                        current_grad = current_grads[client_id]
+
+                        # Mix poison into current task
+                        if isinstance(target_grad, list) and isinstance(current_grad, list):
+                            leak = [g * cross_task_leak_ratio for g in target_grad]
+                            poisoned_task_grads[task][client_id] = [
+                                orig + leak_val
+                                for orig, leak_val in zip(current_grad, leak)
+                            ]
+                        else:
+                            leak = target_grad * cross_task_leak_ratio
+                            poisoned_task_grads[task][client_id] = current_grad + leak
+
+    return poisoned_task_grads
+
+
+# ============================================================================
+# Attack Dispatcher
+# ============================================================================
+
+def apply_adaptive_attack(
+    client_gradients: Dict[str, List[float]],
+    attack_type: AdaptiveAttackType,
+    client_ids: List[str],
+    malicious_clients: Set[str],
+    round_num: int,
+    attack_state: Dict[str, AttackState],
+    **kwargs
+) -> Tuple[Dict[str, List[float]], Set[str]]:
+    """
+    Apply specified adaptive attack to gradients.
+
+    Args:
+        client_gradients: Dict[client_id -> gradient]
+        attack_type: Type of adaptive attack
+        client_ids: List of client IDs
+        malicious_clients: Set of malicious client IDs
+        round_num: Current round
+        attack_state: Dict tracking attack progression
+        **kwargs: Attack-specific parameters
+
+    Returns:
+        (poisoned_gradients, detected_byzantine_hint)
+    """
+    detected = set()
+
+    if attack_type == AdaptiveAttackType.RMC:
+        quarantined = kwargs.get("quarantined_clients", set())
+        release_rounds = kwargs.get("release_rounds", {})
+        client_gradients, detected = inject_rmc_attack(
+            client_gradients, client_ids, round_num, quarantined, release_rounds
+        )
+
+    elif attack_type == AdaptiveAttackType.DELAYED_POISONING:
+        trigger_round = kwargs.get("trigger_round", 100)
+        poison_type = kwargs.get("poison_type", "label_flip")
+        client_gradients = inject_delayed_poisoning(
+            client_gradients, client_ids, malicious_clients, round_num, trigger_round, poison_type
+        )
+
+    elif attack_type == AdaptiveAttackType.STRATEGY_EVOLUTION:
+        evolution_interval = kwargs.get("evolution_interval", 20)
+        client_gradients = inject_strategy_evolution(
+            client_gradients, client_ids, malicious_clients, round_num, evolution_interval
+        )
+
+    elif attack_type == AdaptiveAttackType.COLLUSION_SYBIL:
+        sybil_multiplier = kwargs.get("sybil_multiplier", 3)
+        client_gradients, client_ids = inject_collusion_sybil(
+            client_gradients, client_ids, malicious_clients, sybil_multiplier
+        )
+
+    elif attack_type == AdaptiveAttackType.TASK_SPECIFIC:
+        # Placeholder for task-specific attack (handled separately in multi-task context)
+        pass
+
+    return client_gradients, detected
+
+
+# ============================================================================
+# Utility: Mixed Attack Simulator
+# ============================================================================
+
+def simulate_mixed_attacks(
+    client_gradients: Dict[str, List[float]],
+    client_ids: List[str],
+    malicious_ratio: float = 0.2,
+    round_num: int = 0,
+    attack_schedule: Dict[str, int] = None
+) -> Dict[str, List[float]]:
+    """
+    Simulate mixed/sequential adaptive attacks across a federated round.
+
+    Args:
+        client_gradients: Initial gradients
+        client_ids: List of client IDs
+        malicious_ratio: Fraction of malicious clients (0.1 ~ 0.4)
+        round_num: Current round
+        attack_schedule: Dict[round -> attack_type]
+
+    Returns:
+        Poisoned gradients after all attacks applied
+    """
+    num_malicious = max(1, int(len(client_ids) * malicious_ratio))
+    malicious_clients = set(random.sample(client_ids, num_malicious))
+
+    if attack_schedule and round_num in attack_schedule:
+        attack_type = attack_schedule[round_num]
+        client_gradients, _ = apply_adaptive_attack(
+            client_gradients, attack_type, client_ids, malicious_clients, round_num, {}
+        )
+
+    return client_gradients
+
+
+if __name__ == "__main__":
+    # Test: Verify attack injectors work without errors
+    print("Testing Adaptive Attack Injectors...")
+
+    test_clients = [f"client_{i}" for i in range(10)]
+    test_grads = {cid: [0.1 * i for i in range(5)] for cid in test_clients}
+
+    print("\n✓ Attack 1: RMC")
+    rmc_grads, rmc_active = inject_rmc_attack(
+        test_grads, test_clients, round_num=10,
+        quarantined_clients={"client_0", "client_1"},
+        release_rounds={"client_0": 5, "client_1": 10}
+    )
+    print(f"  RMC clients rejoining: {rmc_active}")
+
+    print("\n✓ Attack 2: Delayed Poisoning")
+    delayed_grads = inject_delayed_poisoning(
+        test_grads, test_clients, {"client_2"}, round_num=110, trigger_round=100
+    )
+    print(f"  Delayed poisoning activated at round 110 (trigger=100)")
+
+    print("\n✓ Attack 3: Strategy-Evolution")
+    str_evo_grads = inject_strategy_evolution(
+        test_grads, test_clients, {"client_3"}, round_num=50, evolution_interval=20
+    )
+    print(f"  Strategy-Evolution phase: {(50 // 20) % 4} at round 50")
+
+    print("\n✓ Attack 4: Collusion+Sybil")
+    collusion_grads, augmented_ids = inject_collusion_sybil(
+        test_grads, test_clients, {"client_4", "client_5"}, sybil_multiplier=2
+    )
+    print(f"  Sybil clients created: {len(augmented_ids) - len(test_clients)} extra")
+
+    print("\n✓ Attack 5: Task-Specific")
+    task_grads = {
+        "rca": test_grads.copy(),
+        "anomaly": test_grads.copy(),
+        "forecast": test_grads.copy()
+    }
+    task_poisoned = inject_task_specific_attack(
+        task_grads, test_clients, {"client_6"}, target_task="rca"
+    )
+    print(f"  Task-specific poison applied to RCA, leaked to other tasks")
+
+    print("\n✅ All attack injectors working correctly!")
+    print(f"📊 Total test clients: {len(test_clients)}")
+    print(f"📊 With Sybil: {len(augmented_ids)} client IDs")

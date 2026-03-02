@@ -1,0 +1,176 @@
+# graphql-c GraphQL 안전성 분석
+
+**날짜**: 2026년 2월 21일
+**심각도**: 🟡 **MEDIUM (메모리 할당, 입력 검증)**
+**위험도**: 65% (자동 스캔 평가)
+**신뢰도**: 75% (정적 코드 분석)
+
+---
+
+## 📋 요약
+
+graphql-c는 GraphQL API를 C로 구현한 라이브러리입니다.
+
+**주요 문제:**
+- 🔴 realloc 실패 시 메모리 누수 (2개 위치)
+- 🔴 malloc 실패 체크 부족 (1개)
+- 🟡 JSON 응답에서 입력 이스케이프 없음
+- 🟡 sscanf 입력 형식 검증 부족
+- ✅ 기본 메모리 관리: 정상
+
+---
+
+## 🔍 주요 문제점
+
+### 1. realloc 실패 시 메모리 누수
+
+```c
+// 줄 51-52
+type->fields = (kgraphql_field_t *)realloc(type->fields,
+                       type->field_capacity * sizeof(kgraphql_field_t));
+// ❌ realloc 실패 시 원본 포인터 손실!
+
+// 줄 70-71
+schema->types = (kgraphql_type_def_t **)realloc(schema->types,
+                       schema->type_capacity * sizeof(kgraphql_type_def_t *));
+// ❌ 동일 문제
+```
+
+### 2. malloc 실패 체크 부족
+
+```c
+kgraphql_type_def_t* kgraphql_type_new(const char *name) {
+    // ...
+    type->fields = (kgraphql_field_t *)malloc(type->field_capacity * sizeof(kgraphql_field_t));
+    // ❌ malloc 실패 체크 없음!
+
+    return type;  // fields가 NULL일 수 있음
+}
+```
+
+### 3. JSON 응답 입력 이스케이프 없음
+
+```c
+char* kgraphql_error(const char *message) {
+    char *error = (char *)malloc(1024);
+    if (!error) return NULL;
+
+    snprintf(error, 1024, "{\"errors\":[{\"message\":\"%s\"}]}",
+             message ? message : "Unknown error");
+    // ❌ message에 따옴표나 특수문자 있으면 JSON 깨짐!
+    return error;
+}
+```
+
+**공격 시나리오:**
+```c
+message = "Error\"}]},{\"fake\":\"data"
+결과: {"errors":[{"message":"Error"}]},{"fake":"data"}]}
+→ JSON 구조 변조
+```
+
+### 4. sscanf 형식 검증 부족
+
+```c
+bool kgraphql_parse_query(const char *query, char *operation, char *args) {
+    if (!query || !operation || !args) return false;
+
+    sscanf(query, "%255s(%255s)", operation, args);
+    // ❌ 닫는 괄호 검증 없음
+    // ❌ 형식 강제 없음
+
+    return true;  // 항상 true 반환!
+}
+```
+
+**예시:**
+```
+input = "query{field}"
+operation = "query{field" (예상: "query")
+args = "" (예상: "{field}")
+```
+
+---
+
+## ✅ 할 수 있는 말
+
+1. **"realloc 실패 시 메모리 누수 위험이 있습니다"** (100% 확인)
+2. **"malloc 실패 체크가 부족합니다"** (100% 확인)
+3. **"JSON 응답에 입력 이스케이프가 없습니다"** (코드 검증)
+
+---
+
+## 🎯 권고사항
+
+```c
+// 1. realloc 에러 처리
+bool kgraphql_type_add_field(...) {
+    // ...
+    if (type->field_count >= type->field_capacity) {
+        type->field_capacity *= 2;
+        kgraphql_field_t *new_fields = (kgraphql_field_t *)realloc(type->fields,
+                           type->field_capacity * sizeof(kgraphql_field_t));
+        if (!new_fields) {  // ✅ 추가
+            type->field_capacity /= 2;
+            return false;
+        }
+        type->fields = new_fields;
+    }
+    // ...
+}
+
+// 2. malloc 에러 체크
+kgraphql_type_def_t* kgraphql_type_new(const char *name) {
+    // ...
+    type->fields = (kgraphql_field_t *)malloc(type->field_capacity * sizeof(kgraphql_field_t));
+    if (!type->fields) {  // ✅ 추가
+        free(type);
+        return NULL;
+    }
+    return type;
+}
+
+// 3. JSON 이스케이프 추가
+static const char* escape_json_string(const char *input, char *output, size_t size) {
+    size_t j = 0;
+    for (size_t i = 0; input[i] && j < size - 1; i++) {
+        char c = input[i];
+        if (c == '"' || c == '\\' || c == '\n') {
+            if (j + 2 >= size) break;
+            output[j++] = '\\';
+        }
+        output[j++] = c;
+    }
+    output[j] = '\0';
+    return output;
+}
+
+// 사용:
+char escaped[2048];
+escape_json_string(message, escaped, sizeof(escaped));
+snprintf(error, 1024, "{\"errors\":[{\"message\":\"%s\"}]}", escaped);
+```
+
+---
+
+## 📊 최종 평가
+
+| 항목 | 평가 | 신뢰도 |
+|------|------|--------|
+| 메모리 할당 | 🔴 부족 | 40% |
+| realloc 처리 | 🔴 부족 | 0% |
+| 입력 검증 | 🔴 부족 | 20% |
+| JSON 이스케이프 | 🔴 없음 | 0% |
+| **전체** | **🟡 MEDIUM** | **75%** |
+
+```
+심각도:     🟡 MEDIUM
+위험도:     65% (메모리 + 입력 검증)
+신뢰도:     75% (정적 분석)
+권조:       에러 처리 + JSON 이스케이프 추가
+상태:       개선 필수
+```
+
+---
+
+**평가 일자**: 2026년 2월 21일

@@ -1,0 +1,570 @@
+# v15.2: VM Conditionals - 백필링 완성 & 조건부 분기
+
+## 개요
+
+v15.2는 **바이트코드를 실제로 실행하는 Virtual Machine (VM)** 을 구현합니다. v15.1의 컴파일러에서 바이트코드를 생성하면, v15.2의 VM이 그것을 스택 기반의 방식으로 실행합니다.
+
+핵심은 **백필링(Backfilling)** - 컴파일 시 미래의 주소를 모를 때, 플레이스홀더를 놓고 나중에 교정하는 기법입니다.
+
+---
+
+## 아키텍처 다이어그램
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│           Compiler (v15.1) → Bytecode                       │
+│  [정수] → CONSTANT [인덱스]                                 │
+│  [5] + [3] → CONSTANT + CONSTANT + ADD                      │
+│  [if] → 조건 + JUMP_NOT_TRUTHY @? + [then]                 │
+└─────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│        Backfilling: change_operand() 호출                   │
+│  1. emit_placeholder(OpJumpNotTruthy) → @1 (미정)           │
+│  2. [consequence 컴파일]                                    │
+│  3. fix_jump(@1) → @1의 피연산자를 현재 주소로 교정        │
+└─────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│            VM: Bytecode 실행 엔진                           │
+│  - IP (Instruction Pointer): 현재 실행 위치                │
+│  - Stack: 값 저장소                                         │
+│  - Constants: 리터럴 저장소                                 │
+│                                                             │
+│  루프: while ip < len(instructions) {                      │
+│    opcode = instructions[ip++]                              │
+│    match opcode {                                           │
+│      OpConstant: stack.push(constants[operand])            │
+│      OpAdd: stack.push(pop() + pop())                      │
+│      OpJump: ip = operand (절대 주소로 점프)               │
+│      OpJumpNotTruthy: if !pop().is_truthy() ip = operand  │
+│      ...                                                    │
+│    }                                                        │
+│  }                                                          │
+└─────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+                        Stack Top → Result
+```
+
+---
+
+## 핵심 개념
+
+### 1. 백필링 (Backfilling)
+
+#### 문제: 컴파일 시 점프 목적지를 모른다
+
+```rust
+// 컴파일 시:
+Expression::If {
+    condition: Box<Expression>,
+    consequence: Vec<Statement>,
+    alternative: Option<Vec<Statement>>,
+}
+```
+
+컴파일러는 다음을 알 수 없습니다:
+- else 블록이 어디 시작하는가?
+- if 문 전체가 끝나는 위치는?
+
+#### 해결: 플레이스홀더 사용
+
+```rust
+fn emit_placeholder(&mut self, op: OpCode) -> usize {
+    let pos = self.bytecode.len();
+    self.bytecode.add_instruction(op.as_byte());      // OpJumpNotTruthy (1byte)
+    self.bytecode.add_instruction(0x00);              // operand high (1byte)
+    self.bytecode.add_instruction(0x00);              // operand low  (1byte)
+    // 총 3바이트: OpCode + operand(u16)
+    pos
+}
+```
+
+#### 후방 수정 (Backfilling)
+
+```rust
+fn change_operand(&mut self, pos: usize, operand: u16) {
+    let bytes = operand.to_be_bytes();
+    self.bytecode.instructions[pos + 1] = bytes[0];  // high
+    self.bytecode.instructions[pos + 2] = bytes[1];  // low
+}
+
+fn fix_jump(&mut self, pos: usize) {
+    let target = self.bytecode.len() as u16;
+    self.change_operand(pos, target);
+}
+```
+
+#### If-Else 컴파일 예시
+
+```
+코드:
+if (5 > 3) { 10 } else { 20 }
+
+바이트코드 생성:
+[IP=0] CONSTANT 5        → stack=[5]
+[IP=3] CONSTANT 3        → stack=[5, 3]
+[IP=6] OpGreaterEqual    → stack=[true]
+[IP=7] JUMP_NOT_TRUTHY @? → (point_a)
+[IP=10] CONSTANT 10      → stack=[10]
+[IP=13] JUMP @?          → (point_b)
+[IP=16] CONSTANT 20      → stack=[20]
+[IP=19] (끝)
+
+백필링:
+- point_a: @7의 목적지를 @16으로 교정
+- point_b: @13의 목적지를 @19로 교정
+
+최종 바이트코드:
+[IP=0] CONSTANT 5
+[IP=3] CONSTANT 3
+[IP=6] OpGreaterEqual
+[IP=7] JUMP_NOT_TRUTHY @16  ← 교정됨!
+[IP=10] CONSTANT 10
+[IP=13] JUMP @19            ← 교정됨!
+[IP=16] CONSTANT 20
+```
+
+---
+
+### 2. 절대 주소 (Absolute Address)
+
+모든 점프 명령어는 **절대 주소**를 사용합니다:
+- 바이트코드 스트림의 정확한 위치 (0부터 시작)
+- 상대 주소가 아님 (차이값 아님)
+- 최대 주소: 0xFFFF (65,535) → 64KB 바이트코드 제한
+
+```rust
+pub fn run(&mut self) -> Result<Value, String> {
+    while self.ip < self.bytecode.instructions.len() {
+        let op = OpCode::from_byte(self.bytecode.instructions[self.ip])?;
+        self.ip += 1;
+
+        match op {
+            OpCode::OpJump => {
+                let target = self.read_u16() as usize;  // 절대 주소
+                self.ip = target;  // 덮어씀!
+            }
+            OpCode::OpJumpNotTruthy => {
+                let target = self.read_u16() as usize;
+                let cond = self.stack_pop()?;
+                if !cond.is_truthy() {
+                    self.ip = target;  // 조건부로 점프
+                }
+            }
+            ...
+        }
+    }
+}
+```
+
+---
+
+### 3. While 루프의 특수성
+
+**While 루프는 백필링이 필요 없습니다!**
+
+```rust
+Expression::While { condition, body } => {
+    let loop_start = self.bytecode.len() as u16;  // ← 이미 알고 있음!
+
+    self.compile_expression(condition)?;
+    let jump_not_truthy_pos = self.emit_placeholder(OpJumpNotTruthy);
+
+    for stmt in body {
+        self.compile_statement(stmt)?;
+    }
+
+    // loop_start가 이미 알려져 있으므로 백필링 불필요
+    self.emit_with_operand(OpCode::OpJump, loop_start);
+
+    self.fix_jump(jump_not_truthy_pos);  // 루프 탈출점만 교정
+}
+```
+
+#### While 바이트코드 예시
+
+```
+코드:
+x = 0;
+while (x < 5) { x = x + 1 }
+
+바이트코드:
+[IP=0] loop_start
+[IP=0]  CONSTANT 0      → x = 0
+[IP=3]  CONSTANT 5
+[IP=6]  OpLessThan      → x < 5 (조건)
+[IP=7]  JUMP_NOT_TRUTHY @?  (loop_exit)
+[IP=10] CONSTANT 1
+[IP=13] OpAdd           → x + 1
+[IP=14] (루프 본체)
+[IP=X]  JUMP @0         ← 루프 시작으로!
+[IP=X+3] (loop_exit)
+
+백필링:
+- @7의 목적지를 loop_exit으로 교정
+```
+
+---
+
+### 4. Stack 기반 VM
+
+#### 데이터 흐름
+
+```
+┌──────────────────────┐
+│   VM Stack           │  LIFO: Last In, First Out
+│                      │
+│  ┌────────────────┐  │
+│  │ Value::Int(8)  │  ← Top (스택의 상단)
+│  ├────────────────┤  │
+│  │ Value::Int(5)  │  │
+│  ├────────────────┤  │
+│  │ Value::Bool(t) │  │
+│  └────────────────┘  │
+└──────────────────────┘
+```
+
+#### 산술 연산 예시: 5 + 3
+
+```
+CONSTANT 5      → stack = [5]
+CONSTANT 3      → stack = [5, 3]
+OpAdd           → pop 3, pop 5, push (5+3)
+                → stack = [8]
+```
+
+#### 조건 판단 예시: if (5 == 5) { 10 }
+
+```
+CONSTANT 5      → stack = [5]
+CONSTANT 5      → stack = [5, 5]
+OpEqual         → pop 5, pop 5, push true
+                → stack = [true]
+JUMP_NOT_TRUTHY @16
+                → pop true, is_truthy(true)=true
+                → 점프하지 않음, ip += 2
+                → stack = []
+CONSTANT 10     → stack = [10]
+```
+
+---
+
+## OpCode 정의
+
+### 기본 연산
+
+| OpCode | 값 | 동작 | 스택 |
+|--------|-----|------|------|
+| OpConstant | 0 | 상수 풀에서 로드 | [] → [val] |
+| OpAdd | 1 | 더하기 | [a, b] → [a+b] |
+| OpSub | 2 | 빼기 | [a, b] → [a-b] |
+| OpMul | 3 | 곱하기 | [a, b] → [a*b] |
+| OpDiv | 4 | 나누기 | [a, b] → [a/b] |
+
+### 불리언 & 비교
+
+| OpCode | 값 | 동작 | 스택 |
+|--------|-----|------|------|
+| OpTrue | 5 | true 푸시 | [] → [true] |
+| OpFalse | 6 | false 푸시 | [] → [false] |
+| OpEqual | 7 | == | [a, b] → [a==b] |
+| OpNotEqual | 8 | != | [a, b] → [a!=b] |
+| OpLessThan | 9 | < | [a, b] → [a<b] |
+| OpGreaterThanOrEqual | 10 | >= | [a, b] → [a>=b] |
+
+### 단항 연산
+
+| OpCode | 값 | 동작 | 스택 |
+|--------|-----|------|------|
+| OpBang | 11 | ! (부정) | [v] → [!v] |
+| OpMinus | 12 | - (음수) | [n] → [-n] |
+
+### **점프 (조건부 분기)**
+
+| OpCode | 값 | 동작 | 피연산자 | 스택 |
+|--------|-----|------|---------|------|
+| OpJump | 13 | 항상 점프 | u16 주소 | 변화 없음 |
+| OpJumpNotTruthy | 14 | 거짓이면 점프 | u16 주소 | pop 1개 |
+
+### 기타
+
+| OpCode | 값 | 동작 | 스택 |
+|--------|-----|------|------|
+| OpNull | 15 | null 푸시 | [] → [null] |
+| OpPop | 16 | 상단 제거 | [v] → [] |
+| OpArray | 21 | 배열 생성 | [e1,e2,...,en] → [[e1,e2,...,en]] |
+| OpIndex | 23 | 인덱싱 | [arr, i] → [arr[i]] |
+
+---
+
+## 메모리 레이아웃
+
+### Bytecode 구조
+
+```rust
+pub struct Bytecode {
+    pub instructions: Vec<u8>,  // 명령어 스트림
+    pub constants: Vec<i64>,    // 리터럴 저장소
+}
+```
+
+### Instructions 포맷
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 바이트코드 스트림                                     │
+├─────────────────────────────────────────────────────┤
+│ [0]  OpConstant (1 byte)                            │
+│ [1]  Index High (1 byte)                            │
+│ [2]  Index Low  (1 byte)                            │
+├─────────────────────────────────────────────────────┤
+│ [3]  OpConstant (1 byte)                            │
+│ [4]  Index High (1 byte)                            │
+│ [5]  Index Low  (1 byte)                            │
+├─────────────────────────────────────────────────────┤
+│ [6]  OpAdd (1 byte)                                 │
+├─────────────────────────────────────────────────────┤
+│ [7]  OpJumpNotTruthy (1 byte)                       │
+│ [8]  Target High (1 byte) ← Backfilled!            │
+│ [9]  Target Low  (1 byte) ← Backfilled!            │
+└─────────────────────────────────────────────────────┘
+
+총 10 바이트
+```
+
+### Constants 저장소
+
+```
+┌─────────────────┐
+│ Constants Pool  │
+├─────────────────┤
+│ [0]: 42         │
+│ [1]: 10         │
+│ [2]: 3          │
+│ [3]: 100        │
+└─────────────────┘
+```
+
+---
+
+## Value 타입
+
+```rust
+pub enum Value {
+    Int(i64),                              // 정수
+    Bool(bool),                            // 불리언
+    Null,                                  // null
+    Array(Vec<Value>),                     // 배열
+    HashMap(HashMap<String, Value>),       // 해시맵
+}
+
+impl Value {
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Bool(b) => *b,
+            Int(0) => false,
+            Int(_) => true,
+            Null => false,
+            Array(_) => true,
+            HashMap(_) => true,
+        }
+    }
+}
+```
+
+#### Truthiness 규칙
+
+- **True**: `Bool(true)`, 0이 아닌 정수, 배열, 해시맵
+- **False**: `Bool(false)`, `Int(0)`, `Null`
+
+---
+
+## VM 실행 흐름
+
+### 단계별 실행
+
+```rust
+pub fn run(&mut self) -> Result<Value, String> {
+    // 1. IP 초기화
+    self.ip = 0;
+
+    // 2. 바이트코드 순회
+    while self.ip < self.bytecode.instructions.len() {
+        // 3. OpCode 읽기
+        let op_byte = self.bytecode.instructions[self.ip];
+        self.ip += 1;
+
+        let op = OpCode::from_byte(op_byte)?;
+
+        // 4. OpCode 실행
+        match op {
+            OpCode::OpConstant => {
+                let idx = self.read_u16() as usize;
+                let val = self.bytecode.get_constant(idx)?;
+                self.stack.push(Value::Int(val));
+            }
+            OpCode::OpAdd => {
+                let right = self.stack_pop()?;
+                let left = self.stack_pop()?;
+                self.stack.push(Value::Int(left + right));
+            }
+            OpCode::OpJump => {
+                let target = self.read_u16() as usize;
+                self.ip = target;  // ← IP 덮어씀!
+            }
+            ...
+        }
+    }
+
+    // 5. 최종 결과
+    self.stack_pop()
+}
+```
+
+---
+
+## 컴파일러 변경 사항
+
+### v15.1 → v15.2
+
+#### 1. emit_placeholder 버그 수정
+
+**v15.1 (잘못됨)**:
+```rust
+fn emit_placeholder(&mut self, op: OpCode) -> usize {
+    let pos = self.bytecode.len();
+    self.emit(op);                              // 1바이트
+    self.emit_with_operand(OpCode::OpJump, 0); // 3바이트
+    pos
+    // 총 4바이트! ❌
+}
+```
+
+**v15.2 (수정됨)**:
+```rust
+fn emit_placeholder(&mut self, op: OpCode) -> usize {
+    let pos = self.bytecode.len();
+    self.bytecode.add_instruction(op.as_byte());      // 1바이트
+    self.bytecode.add_instruction(0x00);              // 1바이트
+    self.bytecode.add_instruction(0x00);              // 1바이트
+    pos
+    // 총 3바이트! ✓
+}
+```
+
+#### 2. change_operand 추가
+
+```rust
+fn change_operand(&mut self, pos: usize, operand: u16) {
+    let bytes = operand.to_be_bytes();
+    self.bytecode.instructions[pos + 1] = bytes[0];
+    self.bytecode.instructions[pos + 2] = bytes[1];
+}
+```
+
+#### 3. While 표현식 지원
+
+```rust
+Expression::While { condition, body } => {
+    let loop_start = self.bytecode.len() as u16;
+    self.compile_expression(condition)?;
+    let jump_pos = self.emit_placeholder(OpCode::OpJumpNotTruthy);
+    for stmt in body {
+        self.compile_statement(stmt)?;
+    }
+    self.emit_with_operand(OpCode::OpJump, loop_start);
+    self.fix_jump(jump_pos);
+}
+```
+
+---
+
+## 성능 특성
+
+| 작업 | 시간 복잡도 | 공간 복잡도 |
+|------|-----------|-----------|
+| 컴파일 | O(n) | O(n) |
+| 실행 | O(m) | O(k) |
+| 백필링 | O(1) | O(1) |
+
+- n: AST 노드 수
+- m: 실행된 바이트코드 명령어 수
+- k: 스택 깊이
+
+---
+
+## 테스트 케이스
+
+### ✅ 23개 테스트 통과
+
+#### Value 테스트
+- `is_truthy_bool`: Bool 값의 참/거짓 판단
+- `is_truthy_int`: 정수 0/비0의 참/거짓 판단
+- `is_truthy_null`: Null 값의 거짓
+- `is_truthy_array`: 배열의 참
+- `display`: 값의 문자열 표현
+
+#### Compiler 테스트
+- `compile_integer_literal`: 정수 컴파일
+- `compile_boolean`: 불리언 컴파일
+- `compile_infix_expression`: 중위 연산식 컴파일
+- `emit_placeholder_is_3_bytes`: 플레이스홀더가 정확히 3바이트
+- `compile_while_loop`: While 루프 컴파일
+
+#### VM 테스트
+- `constant_integer`: 상수 로드
+- `arithmetic`: 산술 연산 (5 + 3 = 8)
+- `boolean`: 불리언 값
+- `array`: 배열 생성
+- `is_truthy`: 조건 판단
+
+---
+
+## 확장 가능성 (v16.0 준비)
+
+### 최적화 기회
+
+1. **상수 폴딩**: 컴파일 시 `2 + 3` → `5`로 미리 계산
+2. **데드 코드 제거**: `if false { ... }` 블록 제거
+3. **인라인 함수**: 작은 함수를 호출 대신 인라인화
+4. **코드 제너레이션**: WASM, Native Code로 컴파일
+
+### JIT 준비
+
+```
+Bytecode → Profiling → Hot Path 감지
+                    ↓
+          Machine Code 생성 (LLVM)
+                    ↓
+          실행 시간 성능 100배 향상
+```
+
+---
+
+## 용어 정리
+
+- **Bytecode**: 중간 표현 (Machine Code와 High-level Language 사이)
+- **VM (Virtual Machine)**: 소프트웨어 기반의 컴퓨터 시뮬레이션
+- **Backfilling**: 미래 주소를 나중에 교정하는 기법
+- **Operand**: 명령어의 인자 (예: 점프 주소)
+- **Instruction Pointer (IP)**: 현재 실행 위치
+- **Stack**: LIFO 자료구조로 임시 데이터 저장
+- **Constants Pool**: 리터럴(상수) 저장소
+- **Big-Endian**: 가장 중요한 바이트를 먼저 저장 (high byte first)
+
+---
+
+## 마치며
+
+v15.2는 **바이트코드 기반 인터프리터**의 완성입니다.
+- ✅ AST → Bytecode 컴파일러 (v15.1)
+- ✅ Bytecode 실행 엔진 (v15.2)
+
+다음 단계 (v16.0)에서는:
+- 최적화 (상수 폴딩, 데드 코드 제거)
+- JIT 컴파일 (성능 향상)
+- 고급 제어 흐름 (함수, 클로저)

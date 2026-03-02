@@ -1,0 +1,142 @@
+# v8.2 데이터 레이크 & 분산 병렬 처리 구현 계획
+
+## Context
+Python University 박사 과정(v8.2). v8.1의 AI 자가 치유 시스템이 처리할
+테라바이트급 데이터를 다루는 분산 병렬 처리 인프라를 구축한다.
+MapReduce 철학을 파이썬 표준 라이브러리로 직접 구현하는 것이 핵심.
+
+## 파일 위치
+- **메인**: `/data/data/com.termux/files/home/python-gogs/university_v8_2_DISTRIBUTED_DATA_LAKE.py` (~1,290줄)
+- **테스트**: `/data/data/com.termux/files/home/python-gogs/test_v8_2_data_lake.py` (~410줄)
+
+## 참조 파일
+- `university_v8_1_AIOPS_SELF_HEALING.py` — PART 0~7 구조, dataclass/Enum 패턴
+- `test_v8_1_aiops.py` — TestXxx 클래스 구조, setUp, test_NN 명명 규칙
+
+## 아키텍처 구성
+
+### 모듈 의존 트리
+```
+DataLakeOrchestrator (조율)
+  ├─ GogsDataLakeEngine ← RangePartitioner / HashPartitioner
+  ├─ MapReduceExecutor  ← word_count_mapper/reducer (모듈 레벨)
+  ├─ FaultToleranceManager
+  ├─ DataLocalityOptimizer
+  └─ SkewHandler
+```
+
+## 구현 모듈 목록
+
+### PART 0: Enum & Dataclass
+- `PartitionStrategy` Enum: RANGE, HASH
+- `WorkerStatus` Enum: IDLE, RUNNING, FAILED, RETRYING
+- `SkewLevel` Enum: BALANCED(<10%), MODERATE(10~30%), SEVERE(>30%)
+- `@dataclass Partition`: partition_id, data, strategy, node_id, size
+- `@dataclass WorkerResult`: worker_id, partition_id, result, status, attempts, duration_ms
+- `@dataclass MapReduceResult`: total_items, unique_keys, final_output, 3가지 타이밍
+- `@dataclass DataNode`: node_id, partitions, cpu_cores, network_cost
+- `@dataclass SkewReport`: partition_sizes, mean_size, std_dev, skew_ratio, level, hot_keys
+
+### 모듈 레벨 함수 (pickle 가능 — multiprocessing 필수)
+- `data_processor_worker(data_chunk)` — 제곱합 계산 (사용자 제공 코드)
+- `word_count_mapper(text_chunk)` — 텍스트 → [(단어, 1)] 쌍
+- `word_count_reducer(key, values)` — sum(values)
+- `square_sum_mapper(data_chunk)` — 수치 → [("sum", v²)]
+
+### PART 1: DataPartitioner
+- `RangePartitioner.partition(data)` — ceil(len/N) 단위로 균등 분할
+- `HashPartitioner.partition(data)` — hash(str(item)) % N 분산
+- 두 클래스 모두 `get_stats()` — sizes, mean, std_dev 반환
+
+### PART 2: GogsDataLakeEngine (기본 코드 포함)
+- `run_distributed_analysis(massive_data)` — 사용자 제공 코드 그대로
+- `run_with_timing(data)` — 직렬 vs 병렬 타이밍 비교
+
+### PART 3: MapReduceExecutor
+- `map_phase(data, map_func)` — 청크 분할 → Pool.map() → flatten
+- `shuffle_phase(mapped_data)` — {key: [values]} 그룹핑
+- `reduce_phase(shuffled, reduce_func)` — 키별 집계
+- `execute(data, map_func, reduce_func)` — 3단계 파이프라인
+
+### PART 4: FaultToleranceManager
+- `execute_with_retry(func, chunk, partition_id, worker_id)` — 최대 3회 재시도
+- `reassign_partition(partition, available_workers)` — 실패 횟수 최소 워커 선택
+- `run_with_fault_tolerance(data, func, num_workers)` — 결함 허용 분산 실행
+
+### PART 5: DataLocalityOptimizer
+- `register_node(node)`, `assign_partitions(partitions)`
+- `calculate_processing_cost(partition_id, target_node_id)` — 로컬(1.0x) vs 원격(3.0x)
+- `find_optimal_node(partition_id)` — 비용 최소 노드 선택
+- `optimize_assignments(partitions)` — 전체 파티션 최적 배치
+
+### PART 6: SkewHandler
+- `detect_skew(partitions)` — std_dev/mean 기반 SkewLevel 판정
+- `find_hot_keys(data, top_n=3)` — 빈도 상위 N키 탐지
+- `rebalance(partitions)` — 큰 파티션 분할 (target_size * 1.5 초과 시)
+- `isolate_hot_key(partitions, hot_key)` — 핫키를 별도 파티션으로
+
+### PART 7: DataLakeOrchestrator + main()
+- `run_full_pipeline(data)` — 전체 분산 처리 파이프라인
+- `benchmark(data, iterations=3)` — 직렬 vs 병렬 속도 비교
+- SECTION 1~7 데모 + 철학
+
+## 테스트 케이스 (16개)
+
+| 클래스 | 테스트 | 검증 내용 |
+|--------|--------|-----------|
+| TestDataPartitioner | test_01~03 | 균등분할, 해시분산, 통계정확성 |
+| TestMapReduceExecutor | test_04~07 | map변환, shuffle그룹핑, reduce집계, 전체파이프라인 |
+| TestFaultToleranceManager | test_08~10 | 재시도, 재할당, 정상처리 |
+| TestSkewHandler | test_11~13 | SEVERE탐지, 재분산, 핫키탐지 |
+| TestDataLakeOrchestrator | test_14~16 | 속도비교, 파이프라인정확성, 벤치마크 |
+
+## 핵심 기술 주의사항
+
+### Termux multiprocessing 필수 패턴
+```python
+# 반드시 모듈 레벨에 워커 함수 정의 (pickle 가능)
+def data_processor_worker(data_chunk):  # 클래스 밖!
+    return sum(val ** 2 for val in data_chunk)
+
+# 반드시 if __name__ == "__main__" 블록
+if __name__ == "__main__":
+    main()
+```
+
+### MapReduce map_phase 병렬화
+```python
+# 청크를 Pool.map()에 넘기는 방식 (함수는 모듈 레벨)
+chunks = split_into_chunks(data, num_workers)
+with mp.Pool(num_workers) as pool:
+    chunk_results = pool.map(word_count_mapper, chunks)  # 청크 단위
+all_mapped = [item for chunk_result in chunk_results for item in chunk_result]
+```
+
+## 검증 방법
+```bash
+# 메인 실행
+python university_v8_2_DISTRIBUTED_DATA_LAKE.py
+
+# 테스트 실행
+python test_v8_2_data_lake.py
+# 기대: Ran 16 tests in X.XXXs — OK
+
+# gogs 커밋
+cd ~/python-gogs && git add -A && git commit -m "v8.2: 데이터 레이크 & 분산 병렬 처리"
+```
+
+## 기대 출력
+```
+╔══════════════════════════════════════════════════════╗
+║   【 v8.2: 데이터 레이크 & 분산 병렬 처리 】        ║
+║   Python PhD 박사 과정 2 — 두 번째 연구             ║
+╚══════════════════════════════════════════════════════╝
+
+[SECTION 1] Range: [250,250,250,250] std=0.0 | Hash: [248,251,254,247] std=2.87
+[SECTION 2] 100,000 항목 → 직렬 45ms / 병렬 18ms = 2.4x
+[SECTION 3] 단어빈도: {the: 75, fox: 50 ...}
+[SECTION 5] SEVERE 스큐 → 재분산 후 BALANCED
+[SECTION 6] 가속배율: 2.36x | 결과일치: YES
+
+저장 필수 너는 기록이 증명이다 gogs
+```

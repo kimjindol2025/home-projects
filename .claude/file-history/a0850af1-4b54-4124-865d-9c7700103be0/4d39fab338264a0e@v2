@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+🏛️ v7.4: 시스템 모니터링과 프로메테우스 - 운영의 가시성 확보
+대규모 분산 시스템의 건강 상태를 실시간으로 추적하고 시각화
+
+석사 과정: 엔터프라이즈 운영 (Observability)
+"""
+
+import asyncio
+import time
+import random
+from typing import Dict, List, Any
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime, timedelta
+import json
+
+# ============= 메트릭 정의 =============
+
+class MetricType(Enum):
+    """프로메테우스 메트릭 타입"""
+    COUNTER = "counter"      # 계속 증가 (리셋 불가)
+    GAUGE = "gauge"          # 증감 가능한 값
+    HISTOGRAM = "histogram"  # 분포
+    SUMMARY = "summary"      # 백분위
+
+@dataclass
+class MetricValue:
+    """메트릭 값"""
+    name: str
+    value: float
+    timestamp: float
+    labels: Dict[str, str] = field(default_factory=dict)
+
+    def to_prometheus_format(self) -> str:
+        """프로메테우스 형식으로 변환"""
+        labels_str = ""
+        if self.labels:
+            labels_str = "{" + ",".join(
+                f'{k}="{v}"' for k, v in self.labels.items()
+            ) + "}"
+
+        # HELP와 TYPE 주석
+        return f"{self.name}{labels_str} {self.value} {int(self.timestamp * 1000)}"
+
+# ============= 메트릭 수집기 =============
+
+class PrometheusCollector:
+    """
+    프로메테우스 메트릭 수집기
+
+    역할:
+    1. 시스템 메트릭 추적
+    2. 메트릭 저장 및 조회
+    3. 프로메테우스 형식으로 내보내기
+    """
+
+    def __init__(self):
+        # Counters (계속 증가)
+        self.counters: Dict[str, float] = {
+            'http_requests_total': 0,
+            'http_errors_total': 0,
+            'cache_hits_total': 0,
+            'cache_misses_total': 0,
+            'db_queries_total': 0,
+            'grpc_calls_total': 0,
+        }
+
+        # Gauges (현재 값)
+        self.gauges: Dict[str, float] = {
+            'memory_usage_bytes': 0,
+            'cpu_usage_percent': 0,
+            'active_connections': 0,
+            'cache_size_bytes': 0,
+            'queue_depth': 0,
+        }
+
+        # Histograms (응답 시간 분포)
+        self.histograms: Dict[str, List[float]] = {
+            'http_request_duration_ms': [],
+            'cache_access_duration_us': [],
+            'db_query_duration_ms': [],
+            'grpc_call_duration_ms': [],
+        }
+
+        # Metadata
+        self.start_time = time.time()
+        self.collection_time = time.time()
+
+    def increment_counter(self, name: str, amount: float = 1.0) -> None:
+        """카운터 증가"""
+        if name in self.counters:
+            self.counters[name] += amount
+
+    def set_gauge(self, name: str, value: float) -> None:
+        """게이지 설정"""
+        if name in self.gauges:
+            self.gauges[name] = value
+
+    def add_histogram(self, name: str, value: float) -> None:
+        """히스토그램 값 추가"""
+        if name in self.histograms:
+            self.histograms[name].append(value)
+
+    def get_percentile(self, name: str, percentile: float) -> float:
+        """히스토그램 백분위 조회"""
+        if name not in self.histograms or not self.histograms[name]:
+            return 0.0
+
+        values = sorted(self.histograms[name])
+        index = int(len(values) * percentile / 100)
+        return values[min(index, len(values) - 1)]
+
+    def get_metrics_text(self) -> str:
+        """프로메테우스 형식의 메트릭 출력"""
+        lines = []
+        current_time = time.time()
+
+        # Counters
+        lines.append("# HELP http_requests_total Total HTTP requests")
+        lines.append("# TYPE http_requests_total counter")
+        lines.append(f"http_requests_total {self.counters['http_requests_total']}")
+        lines.append("")
+
+        lines.append("# HELP http_errors_total Total HTTP errors")
+        lines.append("# TYPE http_errors_total counter")
+        lines.append(f"http_errors_total {self.counters['http_errors_total']}")
+        lines.append("")
+
+        lines.append("# HELP cache_hits_total Total cache hits")
+        lines.append("# TYPE cache_hits_total counter")
+        lines.append(f"cache_hits_total {self.counters['cache_hits_total']}")
+        lines.append("")
+
+        # Gauges
+        lines.append("# HELP memory_usage_bytes Memory usage in bytes")
+        lines.append("# TYPE memory_usage_bytes gauge")
+        lines.append(f"memory_usage_bytes {self.gauges['memory_usage_bytes']}")
+        lines.append("")
+
+        lines.append("# HELP cpu_usage_percent CPU usage percentage")
+        lines.append("# TYPE cpu_usage_percent gauge")
+        lines.append(f"cpu_usage_percent {self.gauges['cpu_usage_percent']}")
+        lines.append("")
+
+        lines.append("# HELP active_connections Active database connections")
+        lines.append("# TYPE active_connections gauge")
+        lines.append(f"active_connections {self.gauges['active_connections']}")
+        lines.append("")
+
+        # Histograms with percentiles
+        if self.histograms['http_request_duration_ms']:
+            lines.append("# HELP http_request_duration_ms HTTP request latency")
+            lines.append("# TYPE http_request_duration_ms summary")
+            p50 = self.get_percentile('http_request_duration_ms', 50)
+            p95 = self.get_percentile('http_request_duration_ms', 95)
+            p99 = self.get_percentile('http_request_duration_ms', 99)
+            lines.append(f'http_request_duration_ms{{quantile="0.5"}} {p50}')
+            lines.append(f'http_request_duration_ms{{quantile="0.95"}} {p95}')
+            lines.append(f'http_request_duration_ms{{quantile="0.99"}} {p99}')
+            lines.append("")
+
+        # System info
+        uptime = current_time - self.start_time
+        lines.append("# HELP process_uptime_seconds Process uptime")
+        lines.append("# TYPE process_uptime_seconds gauge")
+        lines.append(f"process_uptime_seconds {uptime}")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    async def get_summary(self) -> Dict[str, Any]:
+        """메트릭 요약"""
+        total_requests = self.counters['http_requests_total']
+        error_rate = (self.counters['http_errors_total'] / total_requests * 100) if total_requests > 0 else 0
+
+        cache_requests = self.counters['cache_hits_total'] + self.counters['cache_misses_total']
+        cache_hit_rate = (self.counters['cache_hits_total'] / cache_requests * 100) if cache_requests > 0 else 0
+
+        return {
+            'counters': self.counters,
+            'gauges': self.gauges,
+            'error_rate': f'{error_rate:.2f}%',
+            'cache_hit_rate': f'{cache_hit_rate:.2f}%',
+            'uptime_seconds': time.time() - self.start_time,
+            'http_p50': self.get_percentile('http_request_duration_ms', 50),
+            'http_p95': self.get_percentile('http_request_duration_ms', 95),
+            'http_p99': self.get_percentile('http_request_duration_ms', 99),
+        }
+
+# ============= 알람 규칙 =============
+
+class AlertRule:
+    """알람 규칙"""
+
+    def __init__(self, name: str, condition_func, threshold: float, duration: int = 60):
+        self.name = name
+        self.condition_func = condition_func
+        self.threshold = threshold
+        self.duration = duration  # 초
+        self.triggered_at = None
+        self.resolved_at = None
+
+    def check(self, metrics: Dict[str, float]) -> bool:
+        """규칙 확인"""
+        return self.condition_func(metrics, self.threshold)
+
+    def trigger(self) -> None:
+        """알람 발생"""
+        if self.triggered_at is None:
+            self.triggered_at = time.time()
+
+    def resolve(self) -> None:
+        """알람 해제"""
+        self.triggered_at = None
+        self.resolved_at = time.time()
+
+    def is_active(self) -> bool:
+        """활성 여부"""
+        return self.triggered_at is not None
+
+# ============= 알람 관리자 =============
+
+class AlertManager:
+    """
+    알람 관리
+
+    역할:
+    1. 미리 정의된 규칙으로 메트릭 검사
+    2. 임계값 초과 시 알람 발생
+    3. 복구 시 알람 해제
+    """
+
+    def __init__(self, collector: PrometheusCollector):
+        self.collector = collector
+        self.rules: List[AlertRule] = []
+        self.alerts: List[Dict] = []
+        self._setup_rules()
+
+    def _setup_rules(self) -> None:
+        """기본 알람 규칙 설정"""
+
+        # Rule 1: 높은 에러율
+        self.rules.append(AlertRule(
+            name="HighErrorRate",
+            condition_func=lambda m, t: (m['http_errors'] / m['http_total'] * 100 > t) if m['http_total'] > 0 else False,
+            threshold=5.0  # 5% 이상
+        ))
+
+        # Rule 2: 높은 메모리 사용
+        self.rules.append(AlertRule(
+            name="HighMemoryUsage",
+            condition_func=lambda m, t: m['memory'] > t,
+            threshold=8000.0  # 8GB 이상
+        ))
+
+        # Rule 3: 높은 CPU 사용
+        self.rules.append(AlertRule(
+            name="HighCPUUsage",
+            condition_func=lambda m, t: m['cpu'] > t,
+            threshold=80.0  # 80% 이상
+        ))
+
+        # Rule 4: 낮은 캐시 히트율
+        self.rules.append(AlertRule(
+            name="LowCacheHitRate",
+            condition_func=lambda m, t: (m['cache_hits'] / (m['cache_hits'] + m['cache_misses']) * 100 < t) if (m['cache_hits'] + m['cache_misses']) > 0 else False,
+            threshold=60.0  # 60% 미만
+        ))
+
+        # Rule 5: 긴 응답 시간 (P99)
+        self.rules.append(AlertRule(
+            name="HighLatencyP99",
+            condition_func=lambda m, t: m['p99_latency'] > t,
+            threshold=1000.0  # 1초 이상
+        ))
+
+    async def check_alerts(self) -> List[Dict]:
+        """알람 규칙 확인"""
+        summary = await self.collector.get_summary()
+
+        metrics = {
+            'http_total': self.collector.counters['http_requests_total'],
+            'http_errors': self.collector.counters['http_errors_total'],
+            'cache_hits': self.collector.counters['cache_hits_total'],
+            'cache_misses': self.collector.counters['cache_misses_total'],
+            'memory': self.collector.gauges['memory_usage_bytes'],
+            'cpu': self.collector.gauges['cpu_usage_percent'],
+            'p99_latency': summary['http_p99'],
+        }
+
+        triggered_alerts = []
+
+        for rule in self.rules:
+            if rule.check(metrics):
+                if not rule.is_active():
+                    rule.trigger()
+                    alert = {
+                        'name': rule.name,
+                        'severity': 'warning',
+                        'timestamp': datetime.now().isoformat(),
+                        'message': f"Alert {rule.name} triggered (threshold: {rule.threshold})"
+                    }
+                    self.alerts.append(alert)
+                    triggered_alerts.append(alert)
+            else:
+                if rule.is_active():
+                    rule.resolve()
+
+        return triggered_alerts
+
+# ============= 대시보드 =============
+
+class Dashboard:
+    """
+    모니터링 대시보드
+
+    시각화:
+    1. 실시간 메트릭
+    2. 알람 상태
+    3. 성능 추세
+    """
+
+    def __init__(self, collector: PrometheusCollector, alert_manager: AlertManager):
+        self.collector = collector
+        self.alert_manager = alert_manager
+
+    async def render(self) -> str:
+        """대시보드 렌더링"""
+        summary = await self.collector.get_summary()
+
+        lines = []
+        lines.append("╔" + "="*78 + "╗")
+        lines.append("║" + " "*20 + "🏛️  SYSTEM MONITORING DASHBOARD" + " "*27 + "║")
+        lines.append("╠" + "="*78 + "╣")
+
+        # Requests
+        lines.append("║ 【 REQUEST METRICS 】" + " "*56 + "║")
+        lines.append(f"║   Total Requests: {summary['counters']['http_requests_total']:>10} " +
+                    f"│ Errors: {summary['counters']['http_errors_total']:>8} " +
+                    f"│ Error Rate: {summary['error_rate']:>6}" + " "*6 + "║")
+
+        # Cache
+        lines.append("║ 【 CACHE METRICS 】" + " "*58 + "║")
+        lines.append(f"║   Hits: {summary['counters']['cache_hits_total']:>10} " +
+                    f"│ Misses: {summary['counters']['cache_misses_total']:>10} " +
+                    f"│ Hit Rate: {summary['cache_hit_rate']:>6}" + " "*10 + "║")
+
+        # Latency
+        lines.append("║ 【 LATENCY METRICS 】" + " "*56 + "║")
+        lines.append(f"║   P50: {summary['http_p50']:>6.2f}ms " +
+                    f"│ P95: {summary['http_p95']:>6.2f}ms " +
+                    f"│ P99: {summary['http_p99']:>6.2f}ms" + " "*15 + "║")
+
+        # Resources
+        lines.append("║ 【 RESOURCE METRICS 】" + " "*55 + "║")
+        memory_gb = summary['gauges']['memory_usage_bytes'] / (1024**3)
+        lines.append(f"║   Memory: {memory_gb:>5.1f}GB " +
+                    f"│ CPU: {summary['gauges']['cpu_usage_percent']:>5.1f}% " +
+                    f"│ Connections: {summary['gauges']['active_connections']:>5.0f}" + " "*10 + "║")
+
+        # Uptime
+        uptime_hours = summary['uptime_seconds'] / 3600
+        lines.append(f"║   Uptime: {uptime_hours:>5.1f}h" + " "*68 + "║")
+
+        # Alerts
+        active_alerts = [r for r in self.alert_manager.rules if r.is_active()]
+        lines.append("║ 【 ALERT STATUS 】" + " "*59 + "║")
+
+        if active_alerts:
+            for alert in active_alerts:
+                lines.append(f"║   🔴 {alert.name:<20} TRIGGERED" + " "*40 + "║")
+        else:
+            lines.append("║   ✅ All systems normal" + " "*52 + "║")
+
+        lines.append("╚" + "="*78 + "╝")
+
+        return "\n".join(lines)
+
+# ============= 메인 시뮬레이션 =============
+
+async def run_monitoring_simulation():
+    """모니터링 시뮬레이션"""
+
+    print("\n" + "="*80)
+    print("🏛️ v7.4: 시스템 모니터링과 프로메테우스 - 운영의 가시성 확보")
+    print("="*80 + "\n")
+
+    # 1. 수집기 생성
+    collector = PrometheusCollector()
+    alert_manager = AlertManager(collector)
+    dashboard = Dashboard(collector, alert_manager)
+
+    print("✅ 모니터링 시스템 초기화\n")
+
+    # 2. 시뮬레이션: 정상 트래픽
+    print("【 시뮬레이션 단계 1: 정상 트래픽 】\n")
+
+    for i in range(100):
+        # HTTP 요청
+        collector.increment_counter('http_requests_total')
+        latency = random.gauss(50, 10)  # 평균 50ms, 표준편차 10ms
+        collector.add_histogram('http_request_duration_ms', max(latency, 0))
+
+        # 캐시 히트
+        if random.random() < 0.85:  # 85% 히트율
+            collector.increment_counter('cache_hits_total')
+        else:
+            collector.increment_counter('cache_misses_total')
+
+        # 리소스
+        collector.set_gauge('memory_usage_bytes', random.gauss(4000, 500) * 1024**2)  # 4GB ± 0.5GB
+        collector.set_gauge('cpu_usage_percent', random.gauss(30, 5))  # 30% ± 5%
+        collector.set_gauge('active_connections', random.randint(40, 60))
+
+    # 3. 대시보드 출력
+    dashboard_output = await dashboard.render()
+    print(dashboard_output)
+    print()
+
+    # 4. 알람 확인
+    alerts = await alert_manager.check_alerts()
+    if not alerts:
+        print("✅ 모든 알람 규칙 정상\n")
+
+    # 5. 시뮬레이션: 스파이크 트래픽
+    print("【 시뮬레이션 단계 2: 트래픽 스파이크 + 캐시 성능 저하 】\n")
+
+    # 캐시 성능 저하 시뮬레이션
+    for i in range(50):
+        collector.increment_counter('http_requests_total')
+        latency = random.gauss(500, 100)  # 500ms (높음)
+        collector.add_histogram('http_request_duration_ms', max(latency, 0))
+
+        # 캐시 미스 증가
+        if random.random() < 0.5:  # 50% 히트율로 저하
+            collector.increment_counter('cache_hits_total')
+        else:
+            collector.increment_counter('cache_misses_total')
+
+        # CPU 높음
+        collector.set_gauge('cpu_usage_percent', random.gauss(85, 10))
+        # 메모리 높음
+        collector.set_gauge('memory_usage_bytes', random.gauss(8500, 500) * 1024**2)
+        # 에러 증가
+        if random.random() < 0.08:  # 8% 에러율
+            collector.increment_counter('http_errors_total')
+
+    # 6. 알람 확인
+    alerts = await alert_manager.check_alerts()
+    if alerts:
+        print(f"🔴 감지된 알람: {len(alerts)}개\n")
+        for alert in alerts:
+            print(f"   {alert['name']}: {alert['message']}")
+        print()
+
+    # 7. 대시보드 재출력
+    dashboard_output = await dashboard.render()
+    print(dashboard_output)
+    print()
+
+    # 8. 메트릭 내보내기
+    print("【 Prometheus 형식 메트릭 내보내기 】\n")
+    metrics_text = collector.get_metrics_text()
+    print(metrics_text)
+    print()
+
+    # 9. 최종 요약
+    summary = await collector.get_summary()
+    print("="*80)
+    print("【 최종 통계 】")
+    print("="*80 + "\n")
+    print(f"총 요청: {summary['counters']['http_requests_total']} 회")
+    print(f"에러율: {summary['error_rate']}")
+    print(f"캐시 히트율: {summary['cache_hit_rate']}")
+    print(f"P99 응답 시간: {summary['http_p99']:.2f}ms")
+    print(f"시스템 가동시간: {summary['uptime_seconds']:.1f}초\n")
+
+    print("✨ v7.4 모니터링 시뮬레이션 성공!")
+    print("기록이 증명이다 gogs 🎓\n")
+
+# ============= 메인 실행 =============
+
+if __name__ == "__main__":
+    asyncio.run(run_monitoring_simulation())

@@ -1,0 +1,570 @@
+# Phase 13 v14.5: Functions — 로직의 독립적 실행 단위
+
+## 🎯 설계 철학
+
+**"함수는 변수 위의 추상화다."**
+
+지금까지 우리는:
+- v14.0에서 **토큰**을 만들었고,
+- v14.2에서 **표현식**을 해석했고,
+- v14.3에서 **객체**로 평가했고,
+- v14.4에서 **변수**를 기억했습니다.
+
+이제 단계입니다: **변수와 로직을 같이 묶어**, 독립적으로 실행할 수 있는 **모듈화의 정점**을 찍을 차례입니다.
+
+```
+함수 = 변수 + 로직의 캡슐화
+
+fn add(x, y) {
+  x + y
+}
+
+create: "add"라는 이름으로 (파라미터: x, y, 본문: x + y) 기억
+call:   add(5, 10) → 로컬 환경에서 x=5, y=10 설정 후 x+y 계산 → 15
+```
+
+---
+
+## 📌 핵심 개념
+
+### 1. 함수 리터럴 (Function Literal)
+
+**정의**: 코드 상에서 직접 함수를 정의하는 표현식
+
+```
+fn(x, y) { x + y }
+      ↑   ↑       ↑
+    파라미터 본문
+```
+
+**구조**:
+```rust
+pub enum Expression {
+    // ... 기존 ...
+    Function {
+        parameters: Vec<String>,
+        body: Vec<Statement>,
+    },
+}
+```
+
+### 2. 클로저 (Closure)
+
+**정의**: 함수가 정의된 시점의 환경을 "기억"하는 함수
+
+```
+let x = 10;
+fn() { x + 5 }    ← x=10의 환경을 "캡슐"에 담음
+
+→ 호출 시: 캡슐 속 x=10을 사용하여 계산 (15)
+```
+
+**메모리 구조**:
+```rust
+pub struct GogsFunction {
+    parameters: Vec<String>,
+    body: Vec<Statement>,
+    env: Environment,  // ← 정의 시점의 환경 캡처!
+}
+```
+
+### 3. 함수 호출 (Call Expression)
+
+**정의**: 함수를 실행하고 결과를 반환
+
+```
+add(5, 10)
+ ↑  ↑   ↑
+함수 인자들
+```
+
+**실행 흐름**:
+```
+1. add를 환경에서 조회 → GogsFunction 객체
+2. 새로운 로컬 환경 생성 (함수의 env를 outer로 설정)
+3. 파라미터 바인딩: x=5, y=10
+4. 본문 실행: x + y
+5. 결과 반환: 15
+```
+
+### 4. 로컬 환경 (Local Scope)
+
+**구조**:
+```
+Call: add(5, 10)
+  ↓
+Create Local Environment:
+  store: { "x": 5, "y": 10 }
+  outer: → Function's Captured Environment
+    outer: → Global Environment
+
+Lookup sequence:
+  x → Local.store.get("x") → 5 ✓
+  global_var → Local.outer.get("global_var") → ... → Global
+```
+
+**중요**: 함수의 outer는 **호출 환경이 아니라 정의 환경**입니다!
+
+```rust
+// 렉시컬 스코프 (Lexical Scope)
+let x = 10;
+fn make_adder(n) {
+    fn(m) { x + n + m }  // x=10, n=n 을 캡슐화
+}
+let adder = make_adder(5);
+adder(3);  // 10 + 5 + 3 = 18
+```
+
+---
+
+## 🏗️ 구현 설계
+
+### Expression 확장
+
+```rust
+pub enum Expression {
+    Literal(i32),
+    FloatLiteral(f64),
+    Identifier(String),
+    Prefix { operator, operand },
+    Infix { left, operator, right },
+    Grouped(Box<Expression>),
+    Function {                    // ← 새로 추가
+        parameters: Vec<String>,
+        body: Vec<Statement>,
+    },
+    Call {                        // ← 새로 추가
+        function: Box<Expression>,
+        arguments: Vec<Expression>,
+    },
+}
+```
+
+### Object 확장
+
+```rust
+pub enum Object {
+    Integer(i32),
+    Float(f64),
+    Boolean(bool),
+    Null,
+    Function(GogsFunction),  // ← 새로 추가
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct GogsFunction {
+    pub parameters: Vec<String>,
+    pub body: Vec<Statement>,
+    pub env: Environment,
+}
+```
+
+### Parser 수정
+
+#### 1. 함수 리터럴 파싱
+
+```
+현재 토큰: fn
+다음 토큰: (
+
+parse_fn_literal():
+  1. 파라미터 리스트 파싱: (x, y, z) → Vec<String>
+  2. 본문 파싱: { ... } → Vec<Statement>
+  3. Expression::Function { parameters, body } 반환
+```
+
+**예**:
+```
+fn(x, y) { x + y }
+         ↑
+    본문 시작
+
+파라미터: ["x", "y"]
+본문: [Statement::Expression(Infix {
+    left: Identifier("x"),
+    operator: Plus,
+    right: Identifier("y")
+})]
+```
+
+#### 2. 함수 호출 파싱
+
+```
+현재 토큰: identifier("add")
+다음 토큰: (
+
+parse_call_expression():
+  1. 함수 표현식 파싱: add → Identifier("add")
+  2. ( 확인
+  3. 인자 리스트 파싱: 5, 10 → Vec<Expression>
+  4. Expression::Call { function, arguments } 반환
+```
+
+**예**:
+```
+add(5, 10)
+  ↑       ↑
+  함수    인자
+
+Call {
+    function: Box(Identifier("add")),
+    arguments: [Literal(5), Literal(10)],
+}
+```
+
+### Evaluator 수정
+
+#### 1. 함수 리터럴 평가
+
+```rust
+Expression::Function { parameters, body } => {
+    // 현재 환경을 캡처!
+    let func = GogsFunction {
+        parameters,
+        body,
+        env: env.clone(),  // ← 클로저 캡처
+    };
+    Object::Function(func)
+}
+```
+
+#### 2. 함수 호출 평가
+
+```rust
+Expression::Call { function, arguments } => {
+    // 함수 객체 평가
+    let func_obj = self.eval_expression(function, env)?;
+
+    match func_obj {
+        Object::Function(func) => {
+            // 인자 평가
+            let args = arguments.iter()
+                .map(|arg| self.eval_expression(arg, env))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // 함수 호출
+            self.apply_function(func, args, env)
+        }
+        _ => Err("not a function".to_string()),
+    }
+}
+```
+
+#### 3. 함수 적용 (핵심!)
+
+```rust
+fn apply_function(
+    &self,
+    func: GogsFunction,
+    args: Vec<Object>,
+    env: &Environment,
+) -> Result<Object, String> {
+    // 파라미터 개수 확인
+    if func.parameters.len() != args.len() {
+        return Err(format!(
+            "wrong number of arguments: expected {}, got {}",
+            func.parameters.len(),
+            args.len()
+        ));
+    }
+
+    // 함수의 캡처된 환경을 기반으로 로컬 환경 생성
+    let mut local_env = Environment::extend(func.env.clone());
+
+    // 파라미터 바인딩
+    for (param, arg) in func.parameters.iter().zip(args.iter()) {
+        local_env.set(param.clone(), arg.clone());
+    }
+
+    // 본문 실행
+    let result = self.eval_statements(&func.body, &mut local_env)?;
+
+    Ok(result)
+}
+```
+
+---
+
+## 🔄 실행 흐름 (예제)
+
+### 예제 1: 단순 함수
+
+```
+코드:
+let add = fn(x, y) { x + y };
+add(5, 10)
+
+실행:
+1. Statement::Let { name: "add", value: Expression::Function { ... } }
+   - 함수 리터럴 평가:
+     GogsFunction {
+         parameters: ["x", "y"],
+         body: [Statement::Expression(Infix { ... })],
+         env: { store: {}, outer: None }  // 글로벌 환경 캡처
+     }
+   - "add" → 함수 객체 저장
+
+2. Statement::Expression(Call { function: Identifier("add"), arguments: [5, 10] })
+   - add → Object::Function(func)
+   - arguments → [Object::Integer(5), Object::Integer(10)]
+   - apply_function() 호출:
+     a. 로컬 환경 생성:
+        store: { "x": 5, "y": 10 }
+        outer: → func.env (글로벌)
+     b. 본문 실행: x + y
+        - x: local_env.get("x") → 5
+        - y: local_env.get("y") → 10
+        - 5 + 10 → 15
+     c. 반환: Object::Integer(15)
+
+결과: 15
+```
+
+### 예제 2: 클로저 (환경 캡처)
+
+```
+코드:
+let x = 10;
+let adder = fn(y) { x + y };
+adder(5)
+
+실행:
+1. let x = 10;
+   - x → Object::Integer(10)
+   - env.store = { "x": 10 }
+
+2. let adder = fn(y) { x + y };
+   - 함수 리터럴 평가:
+     GogsFunction {
+         parameters: ["y"],
+         body: [Infix { Identifier("x"), Plus, Identifier("y") }],
+         env: { store: { "x": 10 }, outer: None }  ← x=10 캡처!!
+     }
+   - "adder" → 함수 객체
+
+3. adder(5)
+   - apply_function():
+     a. 로컬 환경 생성:
+        store: { "y": 5 }
+        outer: → func.env (x=10 포함)
+     b. 본문 실행: x + y
+        - x: local_env.get("x") → 없음 → outer.get("x") → 10 ✓
+        - y: local_env.get("y") → 5 ✓
+        - 10 + 5 → 15
+     c. 반환: Object::Integer(15)
+
+결과: 15
+
+핵심: x는 함수 정의 시점에 캡처되었으므로,
+      나중에 전역 x를 변경해도 함수는 여전히 10을 사용!
+```
+
+### 예제 3: 중첩 함수 (Higher-Order Functions)
+
+```
+코드:
+let make_multiplier = fn(n) {
+    fn(x) { n * x }
+};
+let times2 = make_multiplier(2);
+times2(5)
+
+실행:
+1. make_multiplier = fn(n) { fn(x) { n * x } }
+   - env.store = {}
+
+2. times2 = make_multiplier(2)
+   - apply_function(make_multiplier, [2]):
+     a. local_env = { "n": 2 }
+     b. 본문 실행: fn(x) { n * x }
+        - 함수 리터럴 평가 (n=2의 환경 캡처!):
+          GogsFunction {
+              parameters: ["x"],
+              body: [Infix { Identifier("n"), Multiply, Identifier("x") }],
+              env: { store: { "n": 2 }, outer: → global }
+          }
+     c. 반환: 함수 객체
+   - "times2" → 위 함수 객체 저장
+
+3. times2(5)
+   - apply_function(times2_func, [5]):
+     a. local_env = { "x": 5, outer: { "n": 2 } }
+     b. 본문 실행: n * x
+        - n: local_env.get("n") → 없음 → outer.get("n") → 2 ✓
+        - x: local_env.get("x") → 5 ✓
+        - 2 * 5 → 10
+     c. 반환: Object::Integer(10)
+
+결과: 10
+```
+
+---
+
+## 🧪 테스트 케이스
+
+### 1. 단순 함수 정의 및 호출
+```
+let add = fn(x, y) { x + y };
+add(5, 3)
+Expected: 8
+```
+
+### 2. 함수 호출 없이 반환
+```
+fn(x) { x * 2 }
+Expected: <function object>
+```
+
+### 3. 단일 파라미터 함수
+```
+let square = fn(x) { x * x };
+square(4)
+Expected: 16
+```
+
+### 4. 파라미터 없는 함수
+```
+let constant = fn() { 42 };
+constant()
+Expected: 42
+```
+
+### 5. 클로저 (환경 캡처)
+```
+let x = 10;
+let adder = fn(y) { x + y };
+adder(5)
+Expected: 15
+```
+
+### 6. 중첩 함수 (Higher-Order)
+```
+let make_multiplier = fn(n) {
+    fn(x) { n * x }
+};
+let times3 = make_multiplier(3);
+times3(4)
+Expected: 12
+```
+
+### 7. 잘못된 파라미터 개수
+```
+let f = fn(x, y) { x + y };
+f(5)
+Expected: Error("wrong number of arguments: expected 2, got 1")
+```
+
+### 8. 비함수 호출 에러
+```
+let x = 5;
+x(10)
+Expected: Error("not a function")
+```
+
+### 9. 함수 반환값 사용
+```
+let add = fn(a, b) { a + b };
+let result = add(10, 20);
+result + 5
+Expected: 35
+```
+
+### 10. 복합 클로저
+```
+let a = 5;
+let b = 10;
+let combine = fn(c) { a + b + c };
+combine(2)
+Expected: 17
+```
+
+---
+
+## 🎓 교육적 가치
+
+1. **클로저의 이해** - 함수형 프로그래밍의 핵심
+2. **렉시컬 스코프** - JavaScript/Python/Ruby의 스코프 규칙 이해
+3. **고차 함수** - 함수를 반환하는 함수 (함수형의 꽃)
+4. **환경 캡처** - 메모리와 스코프의 관계 이해
+5. **콜 스택** - 함수 호출 시 스택 구조 형성
+
+---
+
+## 🔗 컴파일 파이프라인 진행
+
+```
+Source Code (텍스트)
+    ↓
+[v14.0 Lexer] → Token Stream
+    ↓
+[v14.2 Parser] → AST + Statements + Functions + Calls
+    ↓
+[v14.3 Evaluator] + [v14.4 Environment] + [v14.5 Functions]
+    ↓
+    → Object (with Memory + Functions)
+    ↓
+실행 결과 (변수 + 함수)
+```
+
+---
+
+## 📊 문법 다이어그램
+
+### 함수 리터럴
+```
+fn_literal → "fn" "(" parameter_list ")" "{" statements "}"
+parameter_list → identifier ("," identifier)*
+```
+
+### 함수 호출
+```
+call_expression → primary_expression "(" argument_list ")"
+argument_list → expression ("," expression)*
+```
+
+### 함수 선언
+```
+let_statement → "let" identifier "=" fn_literal
+```
+
+---
+
+## 💡 핵심 설계 철학
+
+> **"함수는 '시간을 정지'시킨다."**
+>
+> 함수를 정의하는 순간, 그 시점의 환경이 "동결"됩니다.
+> 나중에 함수를 호출해도, 그 동결된 환경 위에서 실행됩니다.
+>
+> 이것이 클로저의 마법입니다.
+> 이것이 함수형 프로그래밍의 아름다움입니다.
+
+---
+
+## 🚀 다음 단계
+
+**Phase 13 컴파일러 구현 로드맵**:
+
+```
+✅ v14.0 Lexer        - 토큰화
+✅ v14.2 Parser       - AST 생성
+✅ v14.3 Evaluator    - 평가 엔진
+✅ v14.4 Environment  - 변수 관리
+✅ v14.5 Functions    - 함수 정의/호출 (완료!)
+   ↓
+⏳ v14.6 Control Flow - if/else, 루프
+   ↓
+⏳ v14.7 Advanced     - 고급 기능
+```
+
+---
+
+**설계 완료 상태:**
+
+- ✅ 함수 리터럴 구조 정의
+- ✅ 클로저 (환경 캡처) 메커니즘
+- ✅ 함수 호출 평가 전략
+- ✅ 로컬 환경 생성 알고리즘
+- ✅ 파라미터 바인딩 방식
+- ✅ 오류 처리 (파라미터 개수 검증, 비함수 호출)

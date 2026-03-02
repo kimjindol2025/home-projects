@@ -1,0 +1,461 @@
+// curl Phase 4: 프로덕션 (에러 처리, 재시도, 캐싱)
+// 목표: 에러 처리, 재시도 로직, 응답 캐싱, 성능 모니터링
+
+type RequestID = u64
+type CacheID = u64
+type Timestamp = u64
+type URL = string
+type StatusCode = u64
+
+enum HttpMethod {
+    Get
+    Post
+    Put
+    Delete
+}
+
+enum ErrorType {
+    NetworkError
+    TimeoutError
+    BadStatus
+    InvalidURL
+    CacheError
+}
+
+enum RetryPolicy {
+    NoRetry
+    ExponentialBackoff(u64)  // max retries
+    LinearBackoff(u64)
+}
+
+type Error {
+    error_type: ErrorType
+    message: string
+    timestamp: Timestamp
+}
+
+type CachedResponse {
+    id: CacheID
+    url: URL
+    status_code: StatusCode
+    body: string
+    cached_at: Timestamp
+    ttl: u64
+}
+
+type RequestMetrics {
+    total_requests: u64
+    successful_requests: u64
+    failed_requests: u64
+    total_bytes_sent: u64
+    total_bytes_received: u64
+    average_response_time: u64
+}
+
+type HttpRequest {
+    id: RequestID
+    method: HttpMethod
+    url: URL
+    retry_policy: RetryPolicy
+    timeout: u64
+    timestamp: Timestamp
+}
+
+type HttpResponse {
+    request_id: RequestID
+    status_code: StatusCode
+    body: string
+    response_time: u64
+    timestamp: Timestamp
+}
+
+type HttpClient {
+    requests: Vec<HttpRequest>
+    responses: Vec<HttpResponse>
+    cache: Vec<CachedResponse>
+    error_log: Vec<Error>
+    metrics: RequestMetrics
+    next_request_id: RequestID
+    next_cache_id: CacheID
+}
+
+impl HttpClient {
+
+    fn new() -> HttpClient {
+        HttpClient {
+            requests: Vec::new(),
+            responses: Vec::new(),
+            cache: Vec::new(),
+            error_log: Vec::new(),
+            metrics: RequestMetrics {
+                total_requests: 0u64,
+                successful_requests: 0u64,
+                failed_requests: 0u64,
+                total_bytes_sent: 0u64,
+                total_bytes_received: 0u64,
+                average_response_time: 0u64
+            },
+            next_request_id: 1000u64,
+            next_cache_id: 100000u64
+        }
+    }
+
+    // GET 요청 (재시도 정책 포함)
+    fn get(mut self, url: URL, retry_policy: RetryPolicy) -> (HttpClient, RequestID) {
+        let request_id = self.next_request_id
+        self.next_request_id = self.next_request_id + 1u64
+
+        let request = HttpRequest {
+            id: request_id,
+            method: HttpMethod::Get,
+            url: url,
+            retry_policy: retry_policy,
+            timeout: 30u64,
+            timestamp: get_timestamp()
+        }
+
+        self.requests.push(request)
+        self.metrics.total_requests = self.metrics.total_requests + 1u64
+
+        (self, request_id)
+    }
+
+    // POST 요청
+    fn post(mut self, url: URL, retry_policy: RetryPolicy) -> (HttpClient, RequestID) {
+        let request_id = self.next_request_id
+        self.next_request_id = self.next_request_id + 1u64
+
+        let request = HttpRequest {
+            id: request_id,
+            method: HttpMethod::Post,
+            url: url,
+            retry_policy: retry_policy,
+            timeout: 30u64,
+            timestamp: get_timestamp()
+        }
+
+        self.requests.push(request)
+        self.metrics.total_requests = self.metrics.total_requests + 1u64
+
+        (self, request_id)
+    }
+
+    // 에러 로깅
+    fn log_error(mut self, error_type: ErrorType, message: string) -> HttpClient {
+        let error = Error {
+            error_type: error_type,
+            message: message,
+            timestamp: get_timestamp()
+        }
+
+        self.error_log.push(error)
+        self.metrics.failed_requests = self.metrics.failed_requests + 1u64
+        self
+    }
+
+    // 응답 캐싱
+    fn cache_response(mut self, url: URL, status_code: StatusCode, body: string, ttl: u64) -> (HttpClient, CacheID) {
+        let cache_id = self.next_cache_id
+        self.next_cache_id = self.next_cache_id + 1u64
+
+        let cached = CachedResponse {
+            id: cache_id,
+            url: url,
+            status_code: status_code,
+            body: body,
+            cached_at: get_timestamp(),
+            ttl: ttl
+        }
+
+        self.cache.push(cached)
+        (self, cache_id)
+    }
+
+    // 캐시에서 조회
+    fn get_cached_response(ref self, url: URL) -> Option<(StatusCode, string)> {
+        let mut i = 0u64
+
+        while i < self.cache.len() {
+            let cached = self.cache.get(i)
+
+            match cached {
+                Some(c) => {
+                    if c.url == url {
+                        let now = get_timestamp()
+                        if now - c.cached_at < c.ttl {
+                            return Some((c.status_code, c.body))
+                        }
+                    }
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        None
+    }
+
+    // 응답 저장
+    fn save_response(mut self, request_id: RequestID, status_code: StatusCode, body: string, response_time: u64) -> HttpClient {
+        let response = HttpResponse {
+            request_id: request_id,
+            status_code: status_code,
+            body: body,
+            response_time: response_time,
+            timestamp: get_timestamp()
+        }
+
+        if status_code >= 200u64 && status_code < 300u64 {
+            self.metrics.successful_requests = self.metrics.successful_requests + 1u64
+        } else {
+            self.metrics.failed_requests = self.metrics.failed_requests + 1u64
+        }
+
+        let total_responses = self.metrics.successful_requests + self.metrics.failed_requests
+        self.metrics.total_bytes_received = self.metrics.total_bytes_received + body.len()
+        self.metrics.average_response_time = (self.metrics.average_response_time + response_time) / 2u64
+
+        self.responses.push(response)
+        self
+    }
+
+    // 재시도 정책 적용
+    fn should_retry(status_code: StatusCode) -> bool {
+        (status_code == 408u64) ||   // Request Timeout
+        (status_code == 429u64) ||   // Too Many Requests
+        (status_code >= 500u64)      // Server errors
+    }
+
+    // 에러 로그 조회
+    fn get_error_log(ref self) -> Vec<string> {
+        let mut result = Vec::new()
+        let mut i = 0u64
+
+        while i < self.error_log.len() {
+            let error = self.error_log.get(i)
+
+            match error {
+                Some(e) => {
+                    result.push(e.message)
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        result
+    }
+
+    // 캐시 목록
+    fn list_cache(ref self) -> Vec<(CacheID, URL, u64)> {
+        let mut result = Vec::new()
+        let mut i = 0u64
+
+        while i < self.cache.len() {
+            let cached = self.cache.get(i)
+
+            match cached {
+                Some(c) => {
+                    result.push((c.id, c.url, c.body.len()))
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        result
+    }
+
+    // 요청 목록
+    fn list_requests(ref self) -> Vec<(RequestID, URL)> {
+        let mut result = Vec::new()
+        let mut i = 0u64
+
+        while i < self.requests.len() {
+            let request = self.requests.get(i)
+
+            match request {
+                Some(r) => {
+                    result.push((r.id, r.url))
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        result
+    }
+
+    // 응답 조회
+    fn get_response(ref self, request_id: RequestID) -> Option<(StatusCode, u64)> {
+        let mut i = 0u64
+
+        while i < self.responses.len() {
+            let response = self.responses.get(i)
+
+            match response {
+                Some(r) => {
+                    if r.request_id == request_id {
+                        return Some((r.status_code, r.response_time))
+                    }
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        None
+    }
+
+    // 메트릭 조회
+    fn get_metrics(ref self) -> (u64, u64, u64, u64) {
+        (
+            self.metrics.successful_requests,
+            self.metrics.failed_requests,
+            self.metrics.total_bytes_received,
+            self.metrics.average_response_time
+        )
+    }
+
+    // 성능 리포트
+    fn get_performance_report(ref self) -> string {
+        let success_rate = if self.metrics.total_requests > 0u64 {
+            (self.metrics.successful_requests * 100u64) / self.metrics.total_requests
+        } else {
+            0u64
+        }
+
+        "Success Rate: " ++ success_rate.to_string() ++ "% | " ++
+        "Avg Response: " ++ self.metrics.average_response_time.to_string() ++ "ms"
+    }
+}
+
+// === Option 타입 ===
+
+type Option<T> {
+    Some(T)
+    None
+}
+
+// === 유틸리티 ===
+
+fn get_timestamp() -> Timestamp {
+    12345678u64
+}
+
+// === 테스트 ===
+
+fn main() {
+    println!("=== curl Phase 4: 프로덕션 (에러 처리 + 캐싱) ===")
+
+    let mut client = HttpClient::new()
+    println!("🔌 HTTP 클라이언트 초기화")
+
+    // GET 요청 (재시도 정책)
+    println!("\n📤 GET 요청:")
+    let (client2, req1_id) = client.get("https://api.example.com/data", RetryPolicy::ExponentialBackoff(3u64))
+    client = client2
+    println!("✅ GET /data (재시도: 지수 백오프)")
+
+    let (client2, req2_id) = client.get("https://api.example.com/users", RetryPolicy::LinearBackoff(2u64))
+    client = client2
+    println!("✅ GET /users (재시도: 선형 백오프)")
+
+    let (client2, req3_id) = client.get("https://api.example.com/posts", RetryPolicy::NoRetry)
+    client = client2
+    println!("✅ GET /posts (재시도 없음)")
+
+    // 응답 저장
+    println!("\n📥 응답 저장:")
+    let client2 = client.save_response(req1_id, 200u64, "{\"data\":[1,2,3]}", 45u64)
+    client = client2
+    println!("✅ 200 OK (45ms)")
+
+    let client2 = client.save_response(req2_id, 200u64, "[{\"id\":1,\"name\":\"kim\"}]", 52u64)
+    client = client2
+    println!("✅ 200 OK (52ms)")
+
+    let client2 = client.save_response(req3_id, 500u64, "{\"error\":\"Internal Server Error\"}", 120u64)
+    client = client2
+    println!("✅ 500 Error (120ms)")
+
+    // 응답 캐싱
+    println!("\n💾 응답 캐싱:")
+    let (client2, _) = client.cache_response("https://api.example.com/data", 200u64, "{\"cached\":true}", 3600u64)
+    client = client2
+    println!("✅ /data 캐시 (TTL: 3600초)")
+
+    let (client2, _) = client.cache_response("https://api.example.com/users", 200u64, "[{\"cached\":true}]", 1800u64)
+    client = client2
+    println!("✅ /users 캐시 (TTL: 1800초)")
+
+    // 캐시에서 조회
+    println!("\n🔍 캐시 조회:")
+    let cached = client.get_cached_response("https://api.example.com/data")
+    match cached {
+        Some((status, body)) => {
+            println!("✅ 캐시 히트: " ++ status.to_string())
+        }
+        None => {
+            println!("❌ 캐시 미스")
+        }
+    }
+
+    // 에러 로깅
+    println!("\n⚠️  에러 로깅:")
+    let client2 = client.log_error(ErrorType::NetworkError, "Connection refused")
+    client = client2
+    println!("✅ Network error 기록")
+
+    let client2 = client.log_error(ErrorType::TimeoutError, "Request timeout after 30s")
+    client = client2
+    println!("✅ Timeout error 기록")
+
+    // 에러 로그 조회
+    println!("\n⚠️  에러 로그:")
+    let errors = client.get_error_log()
+    let mut i = 0u64
+    while i < errors.len() {
+        let err = errors.get(i).unwrap()
+        println!("  - " ++ err)
+        i = i + 1u64
+    }
+
+    // 캐시 목록
+    println!("\n💾 캐시 목록:")
+    let cached_items = client.list_cache()
+    let mut i = 0u64
+    while i < cached_items.len() {
+        let (id, url, size) = cached_items.get(i).unwrap()
+        println!("  " ++ url ++ " (" ++ size.to_string() ++ " bytes)")
+        i = i + 1u64
+    }
+
+    // 요청 목록
+    println!("\n📋 요청 목록:")
+    let requests = client.list_requests()
+    let mut i = 0u64
+    while i < requests.len() {
+        let (id, url) = requests.get(i).unwrap()
+        println!("  [" ++ id.to_string() ++ "] " ++ url)
+        i = i + 1u64
+    }
+
+    // 메트릭 조회
+    println!("\n📊 메트릭:")
+    let (success, failed, bytes, avg_time) = client.get_metrics()
+    println!("  성공: " ++ success.to_string())
+    println!("  실패: " ++ failed.to_string())
+    println!("  수신 바이트: " ++ bytes.to_string())
+    println!("  평균 응답시간: " ++ avg_time.to_string() ++ "ms")
+
+    // 성능 리포트
+    println!("\n📈 성능 리포트:")
+    let report = client.get_performance_report()
+    println!("  " ++ report)
+}

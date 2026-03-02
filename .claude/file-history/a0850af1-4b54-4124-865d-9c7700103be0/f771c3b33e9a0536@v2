@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+🏛️ v7.3: 캐싱 전략과 Redis - 데이터 접근 속도의 한계 돌파
+메모리 기반 초고속 캐시로 데이터베이스 부하 99% 감소
+
+석사 과정: 캐시 전략과 성능 극대화
+"""
+
+import asyncio
+import time
+import random
+from typing import Dict, Optional, Any, List
+from dataclasses import dataclass
+from enum import Enum
+from datetime import datetime, timedelta
+import json
+
+# ============= 캐시 전략 종류 =============
+
+class CacheStrategy(Enum):
+    """캐싱 전략"""
+    NO_CACHE = "캐시 없음"           # 매번 DB 조회
+    SIMPLE = "단순 캐시"            # TTL만 있음
+    LRU = "LRU (Least Recently Used)"  # 자주 쓰는 것 유지
+    LFU = "LFU (Least Frequently Used)" # 자주 접근하는 것 유지
+
+@dataclass
+class CacheEntry:
+    """캐시 항목"""
+    key: str
+    value: Any
+    created_at: float
+    last_accessed_at: float
+    access_count: int
+    ttl: Optional[float] = None
+
+    def is_expired(self, current_time: float) -> bool:
+        """만료 여부 확인"""
+        if self.ttl is None:
+            return False
+        return (current_time - self.created_at) > self.ttl
+
+    def age(self, current_time: float) -> float:
+        """생성 후 경과 시간"""
+        return current_time - self.created_at
+
+    def time_since_access(self, current_time: float) -> float:
+        """마지막 접근 후 경과 시간"""
+        return current_time - self.last_accessed_at
+
+# ============= Redis 시뮬레이터 =============
+
+class MockRedis:
+    """
+    Redis 기본 동작을 시뮬레이트하는 인메모리 캐시
+
+    실제 Redis:
+    - C로 구현되어 나노초 단위 응답
+    - 클러스터링, 복제, 영속성 지원
+    - 분산 시스템 전체에서 공유
+
+    이 구현:
+    - Python으로 개념 시연
+    - 단일 프로세스 (실제로는 별도 서버)
+    """
+
+    def __init__(self, max_size: int = 1000):
+        self.cache: Dict[str, CacheEntry] = {}
+        self.max_size = max_size
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """캐시에 데이터 저장"""
+        current_time = time.time()
+
+        # 만료된 항목 제거
+        self._cleanup_expired()
+
+        # 크기 초과 시 제거
+        if len(self.cache) >= self.max_size:
+            self._evict_one()
+
+        self.cache[key] = CacheEntry(
+            key=key,
+            value=value,
+            created_at=current_time,
+            last_accessed_at=current_time,
+            access_count=0,
+            ttl=ttl
+        )
+        return True
+
+    async def get(self, key: str) -> Optional[Any]:
+        """캐시에서 데이터 조회"""
+        current_time = time.time()
+
+        if key not in self.cache:
+            self.misses += 1
+            return None
+
+        entry = self.cache[key]
+
+        # 만료 확인
+        if entry.is_expired(current_time):
+            del self.cache[key]
+            self.misses += 1
+            return None
+
+        # 접근 횟수 및 시간 업데이트
+        entry.last_accessed_at = current_time
+        entry.access_count += 1
+        self.hits += 1
+
+        return entry.value
+
+    async def delete(self, key: str) -> bool:
+        """캐시에서 데이터 삭제"""
+        if key in self.cache:
+            del self.cache[key]
+            return True
+        return False
+
+    async def flush(self) -> None:
+        """캐시 전체 삭제"""
+        self.cache.clear()
+
+    async def info(self) -> Dict[str, Any]:
+        """캐시 상태 정보"""
+        total_requests = self.hits + self.misses
+        hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
+
+        return {
+            'size': len(self.cache),
+            'max_size': self.max_size,
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': f'{hit_rate:.1f}%',
+            'evictions': self.evictions,
+            'memory_estimate': f'{len(self.cache) * 1024} bytes'
+        }
+
+    def _cleanup_expired(self) -> None:
+        """만료된 항목 정리"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, entry in self.cache.items()
+            if entry.is_expired(current_time)
+        ]
+        for key in expired_keys:
+            del self.cache[key]
+
+    def _evict_one(self) -> None:
+        """캐시 크기 초과 시 하나 제거 (LRU)"""
+        if not self.cache:
+            return
+
+        current_time = time.time()
+        # 가장 오래 접근하지 않은 항목 제거
+        lru_key = min(
+            self.cache.keys(),
+            key=lambda k: self.cache[k].time_since_access(current_time)
+        )
+        del self.cache[lru_key]
+        self.evictions += 1
+
+# ============= 데이터 소스 (DB 시뮬레이터) =============
+
+class DatabaseSimulator:
+    """
+    데이터베이스를 시뮬레이트
+
+    실제 DB:
+    - 디스크 I/O (네트워크 포함)
+    - 수 밀리초 지연
+    - 동시 쿼리 처리
+
+    이 구현:
+    - 네트워크 지연 시뮬레이션 (2-10ms)
+    """
+
+    def __init__(self):
+        self.query_count = 0
+        self.total_time = 0
+
+    async def query_user(self, user_id: str) -> Dict:
+        """사용자 정보 조회 (DB에서)"""
+        # 네트워크 지연 시뮬레이션
+        delay = random.uniform(0.002, 0.010)  # 2-10ms
+        await asyncio.sleep(delay)
+
+        self.query_count += 1
+        self.total_time += delay
+
+        return {
+            'id': user_id,
+            'name': f'User {user_id}',
+            'email': f'user{user_id}@example.com',
+            'score': random.randint(1, 100),
+            'created_at': datetime.now().isoformat()
+        }
+
+    async def get_stats(self) -> Dict:
+        """조회 통계"""
+        avg_time = (self.total_time / self.query_count * 1000) if self.query_count > 0 else 0
+        return {
+            'total_queries': self.query_count,
+            'total_time': f'{self.total_time*1000:.1f}ms',
+            'avg_time': f'{avg_time:.2f}ms'
+        }
+
+# ============= 캐시 레이어 =============
+
+class CacheLayer:
+    """
+    캐시와 DB 사이의 레이어
+
+    역할:
+    1. 캐시에서 먼저 확인
+    2. 없으면 DB 조회
+    3. 결과를 캐시에 저장
+    """
+
+    def __init__(self, cache: MockRedis, db: DatabaseSimulator, strategy: CacheStrategy):
+        self.cache = cache
+        self.db = db
+        self.strategy = strategy
+        self.user_cache_hits = 0
+        self.user_cache_misses = 0
+
+    async def get_user(self, user_id: str, cache_ttl: int = 300) -> Dict:
+        """사용자 정보 조회 (캐시 우선)"""
+        cache_key = f"user:{user_id}"
+
+        # 캐시에서 조회
+        cached_user = await self.cache.get(cache_key)
+        if cached_user:
+            self.user_cache_hits += 1
+            return cached_user
+
+        # DB에서 조회
+        user = await self.db.query_user(user_id)
+        self.user_cache_misses += 1
+
+        # 캐시에 저장
+        await self.cache.set(cache_key, user, ttl=cache_ttl)
+
+        return user
+
+    async def get_hit_rate(self) -> float:
+        """캐시 히트율"""
+        total = self.user_cache_hits + self.user_cache_misses
+        return (self.user_cache_hits / total * 100) if total > 0 else 0
+
+# ============= 성능 테스트 =============
+
+async def benchmark_cache_vs_no_cache():
+    """캐시 있음/없음 성능 비교"""
+
+    print("\n" + "="*80)
+    print("🏛️ v7.3: 캐싱 전략 성능 벤치마크")
+    print("="*80 + "\n")
+
+    db = DatabaseSimulator()
+
+    # 1. 캐시 없음
+    print("【 시나리오 1: 캐시 없음 (매번 DB 조회) 】\n")
+    start_time = time.time()
+    for i in range(20):
+        # 같은 사용자를 20번 조회 (ID: user_1)
+        await db.query_user("user_1")
+    no_cache_time = time.time() - start_time
+
+    db_stats = await db.get_stats()
+    print(f"  총 시간: {no_cache_time*1000:.1f}ms")
+    print(f"  DB 쿼리: {db_stats['total_queries']}회")
+    print(f"  평균 응답: {db_stats['avg_time']}\n")
+
+    # 2. 캐시 있음
+    print("【 시나리오 2: 캐시 있음 (LRU, TTL=300초) 】\n")
+
+    cache = MockRedis(max_size=100)
+    db2 = DatabaseSimulator()
+    cache_layer = CacheLayer(cache, db2, CacheStrategy.LRU)
+
+    start_time = time.time()
+    for i in range(20):
+        await cache_layer.get_user("user_1", cache_ttl=300)
+    cache_time = time.time() - start_time
+
+    cache_info = await cache.info()
+    print(f"  총 시간: {cache_time*1000:.1f}ms")
+    print(f"  캐시 히트: {cache_info['hits']}회")
+    print(f"  캐시 미스: {cache_info['misses']}회")
+    print(f"  히트율: {cache_info['hit_rate']}")
+    print(f"  DB 쿼리: {db2.query_count}회\n")
+
+    # 3. 성능 비교
+    print("【 성능 개선 】\n")
+    speedup = no_cache_time / cache_time
+    print(f"  속도 향상: {speedup:.1f}배 빠름")
+    print(f"  시간 절감: {(no_cache_time - cache_time)*1000:.1f}ms")
+    print(f"  DB 부하 감소: {(1 - db2.query_count/db_stats['total_queries'])*100:.0f}%\n")
+
+# ============= 다양한 시나리오 =============
+
+async def scenario_hot_data():
+    """시나리오: 인기 있는 데이터 (80/20 법칙)"""
+
+    print("【 시나리오: 핫 데이터 (80/20 법칙) 】\n")
+    print("  80%의 요청이 20%의 사용자에게 집중\n")
+
+    cache = MockRedis(max_size=100)
+    db = DatabaseSimulator()
+    cache_layer = CacheLayer(cache, db, CacheStrategy.LRU)
+
+    # 20개의 "핫" 사용자 (80%의 요청)
+    hot_users = [f"user_{i}" for i in range(20)]
+    # 80개의 "콜드" 사용자 (20%의 요청)
+    cold_users = [f"user_{i}" for i in range(20, 100)]
+
+    start_time = time.time()
+
+    # 100번의 요청 시뮬레이션
+    for i in range(100):
+        if i % 5 < 4:  # 80%
+            user_id = random.choice(hot_users)
+        else:  # 20%
+            user_id = random.choice(cold_users)
+
+        await cache_layer.get_user(user_id, cache_ttl=300)
+
+    elapsed_time = time.time() - start_time
+    hit_rate = await cache_layer.get_hit_rate()
+    cache_info = await cache.info()
+
+    print(f"  총 시간: {elapsed_time*1000:.1f}ms")
+    print(f"  캐시 히트율: {hit_rate:.1f}%")
+    print(f"  DB 쿼리: {db.query_count}회")
+    print(f"  캐시 크기: {cache_info['size']}/{cache_info['max_size']}\n")
+
+async def scenario_ttl_expiration():
+    """시나리오: TTL 만료로 인한 갱신"""
+
+    print("【 시나리오: TTL 만료 (데이터 신선도 유지) 】\n")
+    print("  3초 TTL로 설정하고, 5초 후 조회\n")
+
+    cache = MockRedis(max_size=100)
+    db = DatabaseSimulator()
+    cache_layer = CacheLayer(cache, db, CacheStrategy.SIMPLE)
+
+    # 첫 조회: DB에서 가져오고 캐시 저장
+    user1 = await cache_layer.get_user("user_1", cache_ttl=3)
+    print(f"  1초: user_1 조회 (DB 쿼리, 캐시 저장)")
+
+    # 1.5초 후: 캐시에서 가져옴
+    await asyncio.sleep(1.5)
+    user2 = await cache_layer.get_user("user_1", cache_ttl=3)
+    print(f"  2.5초: user_1 조회 (캐시 히트)")
+
+    # 4초 후: TTL 만료, 다시 DB에서 가져옴
+    await asyncio.sleep(2.5)
+    user3 = await cache_layer.get_user("user_1", cache_ttl=3)
+    print(f"  5초: user_1 조회 (TTL 만료, DB 쿼리)\n")
+
+    cache_info = await cache.info()
+    print(f"  캐시 히트율: {cache_info['hit_rate']}")
+    print(f"  총 DB 쿼리: {db.query_count}회\n")
+
+# ============= 메인 시뮬레이션 =============
+
+async def run_caching_simulation():
+    """캐싱 전략 시뮬레이션"""
+
+    print("\n" + "="*80)
+    print("🏛️ v7.3: 캐싱 전략과 Redis - 데이터 접근 속도의 한계 돌파")
+    print("="*80 + "\n")
+
+    # 1. 기본 벤치마크
+    await benchmark_cache_vs_no_cache()
+
+    # 2. 시나리오별 테스트
+    print("="*80)
+    print("【 다양한 시나리오 분석 】")
+    print("="*80 + "\n")
+
+    await scenario_hot_data()
+    await scenario_ttl_expiration()
+
+    print("="*80)
+    print("【 시뮬레이션 완료 】")
+    print("="*80 + "\n")
+
+    print("✨ v7.3 캐싱 전략 시뮬레이션 성공!")
+    print("기록이 증명이다 gogs 🎓\n")
+
+# ============= 메인 실행 =============
+
+if __name__ == "__main__":
+    asyncio.run(run_caching_simulation())

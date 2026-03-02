@@ -1,0 +1,618 @@
+# 🎓 Go 301-3-5: 시스템의 명탐정 - 관찰 가능성 (Observability)
+
+> **전공 301: 분산 시스템 및 클라우드 네이티브 아키텍처**
+>
+> 저자: Claude Haiku 4.5
+> 수준: 박사 고급 (분산 시스템 설계)
+> 이전 학습: Go 301-3-4 API Gateway와 JWT 인증 완료
+
+---
+
+## 🎯 핵심 철학
+
+```
+분산 시스템 = 거대한 기계 (수십 개 서비스가 얽혀 있음)
+
+문제 상황:
+- 특정 요청이 왜 느린가?
+- 어디서 에러가 났는가?
+- 어느 서비스가 병목인가?
+- 시스템은 건강한가?
+
+해결책: Observability = Three Pillars
+1. Logging (로깅): "무엇이 일어났는가?"
+2. Metrics (메트릭): "얼마나 많이?"
+3. Tracing (트레이싱): "어디를 거쳤는가?"
+
+이 세 가지를 결합하면 분산 시스템의 모든 것이 보인다!
+```
+
+---
+
+## 📚 학습 목표
+
+이 레슨을 마치면 다음을 이해하게 됩니다:
+
+1. **분산 트레이싱**: Trace ID로 요청 흐름 추적
+2. **Span**: 각 서비스 처리 시간 기록
+3. **메트릭 수집**: Prometheus 기반 모니터링
+4. **구조화된 로깅**: JSON 형태의 slog
+5. **Context와 Trace ID**: Context로 추적 정보 전파
+6. **골든 시그널**: Latency, Traffic, Errors, Saturation
+7. **마이크로서비스 모니터링**: 전체 시스템 건강도 확인
+8. **디버깅 능력**: 장애 원인 파악 및 최적화
+
+---
+
+## 1️⃣ 분산 트레이싱 (Distributed Tracing)
+
+### 📋 개념
+
+```
+분산 트레이싱 = "요청이 서비스들을 거치는 경로를 기록하는 것"
+
+문제:
+Client → Service A (10ms)
+      → Service B (50ms)
+      → Service C (30ms)
+        → Database (100ms)
+
+어디가 느린가? 전체 소요시간: 190ms
+
+해결:
+각 구간마다 시간을 기록하고, 요청의 ID로 연결
+```
+
+### 📊 아키텍처
+
+```
+Client 요청 시작
+  ↓
+[Trace ID 생성: trace-abc123]
+  ↓
+Service A
+  ├─ Span 1: "인증 (5ms)"
+  └─ trace-abc123 헤더에 담아 다음 서비스로
+  ↓
+Service B
+  ├─ Span 2: "데이터 조회 (50ms)"
+  └─ trace-abc123 전파
+  ↓
+Service C
+  ├─ Span 3: "계산 (30ms)"
+  └─ trace-abc123 전파
+  ↓
+Database
+  ├─ Span 4: "쿼리 실행 (100ms)"
+  └─ Trace 완료
+
+결과: 전체 흐름이 하나의 Trace ID로 연결됨
+```
+
+### 🔧 코드 패턴
+
+```go
+import "context"
+
+// Trace ID 생성
+func generateTraceID() string {
+    return fmt.Sprintf("trace-%d-%d", time.Now().Unix(), rand.Int63())
+}
+
+// Context에 Trace ID 저장
+func contextWithTraceID(ctx context.Context, traceID string) context.Context {
+    return context.WithValue(ctx, "trace_id", traceID)
+}
+
+// Context에서 Trace ID 추출
+func getTraceID(ctx context.Context) string {
+    traceID, ok := ctx.Value("trace_id").(string)
+    if !ok {
+        return "unknown"
+    }
+    return traceID
+}
+
+// 요청 시작
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    traceID := generateTraceID()
+    ctx := contextWithTraceID(r.Context(), traceID)
+
+    // 다음 서비스 호출 시 헤더에 Trace ID 포함
+    req, _ := http.NewRequestWithContext(ctx, "GET", "http://service-b:3000/api", nil)
+    req.Header.Set("X-Trace-ID", traceID)
+    http.DefaultClient.Do(req)
+}
+```
+
+---
+
+## 2️⃣ 메트릭 수집 (Metrics) - Prometheus
+
+### 📋 개념
+
+```
+메트릭 = "시스템의 상태를 숫자로 표현"
+
+예시:
+- HTTP 요청 수: 1,234개/초
+- 평균 응답 시간: 45ms
+- 현재 활성 연결: 523개
+- 메모리 사용량: 512MB
+- 고루틴 개수: 42개
+
+Prometheus:
+- Go로 작성된 시계열 데이터베이스
+- Pull 모델 (Prometheus가 서버에서 데이터를 당겨감)
+- Go 서버는 /metrics 엔드포인트 열기만 하면 됨
+```
+
+### 📊 메트릭 타입
+
+```
+1. Counter: 계속 증가 (리셋 안 함)
+   - 예: 처리된 요청 수
+   - 특징: 항상 증가, 감소 안 함
+
+2. Gauge: 올라갔다 내려갔다
+   - 예: 현재 메모리 사용량
+   - 특징: 증가/감소 가능
+
+3. Histogram: 값의 분포
+   - 예: 요청 시간 (0-10ms, 10-50ms, 50-100ms 등)
+   - 특징: 버킷 단위로 기록
+
+4. Summary: Histogram 축약 버전
+   - 예: 요청 시간의 p50, p95, p99
+   - 특징: 서버에서 백분위수 계산
+```
+
+### 🔧 코드 패턴
+
+```go
+// Counter 예제
+var processedRequests = prometheus.NewCounter(prometheus.CounterOpts{
+    Name: "http_requests_processed_total",
+    Help: "총 처리된 HTTP 요청 수",
+})
+
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    processedRequests.Inc()  // 1씩 증가
+}
+
+// Gauge 예제
+var activeConnections = prometheus.NewGauge(prometheus.GaugeOpts{
+    Name: "active_connections",
+    Help: "현재 활성 연결 수",
+})
+
+func clientConnected() {
+    activeConnections.Inc()
+}
+
+func clientDisconnected() {
+    activeConnections.Dec()
+}
+
+// Histogram 예제
+var requestDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+    Name:    "http_request_duration_seconds",
+    Help:    "HTTP 요청 처리 시간 (초)",
+    Buckets: []float64{.001, .01, .05, .1, .5, 1},
+})
+
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    start := time.Now()
+    // 요청 처리...
+    requestDuration.Observe(time.Since(start).Seconds())
+}
+
+// /metrics 엔드포인트 노출
+func main() {
+    http.Handle("/metrics", promhttp.Handler())
+    http.ListenAndServe(":2112", nil)
+}
+```
+
+---
+
+## 3️⃣ 구조화된 로깅 (Structured Logging) - slog
+
+### 📋 개념
+
+```
+전통 로깅:
+"2026-02-25 21:45:30 Payment processed for user john amount 5000"
+→ 검색 어려움, 파싱 어려움
+
+구조화된 로깅 (slog):
+{
+  "timestamp": "2026-02-25T21:45:30Z",
+  "level": "INFO",
+  "message": "Payment processed",
+  "user_id": "john",
+  "amount": 5000,
+  "currency": "USD",
+  "trace_id": "trace-abc123"
+}
+→ 쉽게 검색, 파싱 가능
+```
+
+### 🔧 코드 패턴
+
+```go
+import "log/slog"
+
+// 기본 로깅
+func main() {
+    slog.Info("애플리케이션 시작", "port", 8080)
+    slog.Warn("높은 메모리 사용", "usage_mb", 512)
+    slog.Error("데이터베이스 연결 실패", "error", "connection timeout")
+}
+
+// 구조화된 필드 추가
+func processPayment(userID string, amount float64) {
+    slog.Info("결제 처리",
+        "user_id", userID,
+        "amount", amount,
+        "currency", "USD",
+        "timestamp", time.Now(),
+    )
+}
+
+// 트레이스 ID 포함
+func handleRequest(ctx context.Context, userID string) {
+    traceID := getTraceID(ctx)
+    slog.InfoCtx(ctx, "요청 처리",
+        "trace_id", traceID,
+        "user_id", userID,
+        "service", "payment-service",
+    )
+}
+
+// 에러 로깅 (파일명, 라인 번호 포함)
+func riskyOperation() error {
+    if err := someOperation(); err != nil {
+        slog.Error("작업 실패",
+            "error", err,
+            "file", "payment.go",
+            "line", 42,
+        )
+        return err
+    }
+    return nil
+}
+
+// 로그 포매터 설정 (JSON)
+func init() {
+    handler := slog.NewJSONHandler(os.Stdout, nil)
+    slog.SetDefault(slog.New(handler))
+}
+```
+
+---
+
+## 4️⃣ Context와 Trace ID의 결합
+
+### 📋 개념
+
+```
+Context = "요청 생명주기 내의 데이터 전달 채널" (2-4에서 배움)
+
+이제 여기에 Trace ID를 담으면:
+- 함수 호출마다 Trace ID 자동 전파
+- 모든 로그에 Trace ID 포함 가능
+- 전체 요청 경로 추적 가능
+
+"Context가 끊기면 추적도 끊긴다"
+→ 중요한 원칙: Context 전파 실수하지 말 것!
+```
+
+### 🔧 패턴
+
+```go
+// 요청 시작
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    traceID := generateTraceID()
+    ctx := context.WithValue(r.Context(), "trace_id", traceID)
+
+    // 다음 서비스로 호출 (Context 전파)
+    callServiceB(ctx, userID)
+}
+
+// Service B
+func callServiceB(ctx context.Context, userID string) {
+    traceID := getTraceID(ctx)
+
+    // 로그에 자동으로 trace_id 포함
+    slog.InfoCtx(ctx, "Service B 처리 중",
+        "user_id", userID,
+        "trace_id", traceID,
+    )
+
+    // Service C 호출 (Context 전파!)
+    callServiceC(ctx, userID)
+}
+
+// Service C
+func callServiceC(ctx context.Context, userID string) {
+    traceID := getTraceID(ctx)
+
+    // DB 호출 시에도 Context 전파
+    result := db.QueryWithContext(ctx, "SELECT * FROM users WHERE id = ?", userID)
+}
+
+// ⚠️ 실수 예시:
+func badPattern() {
+    // Context를 새로 만들면 Trace ID 끊김!
+    newCtx := context.Background()  // ❌ 잘못됨
+    callService(newCtx)
+
+    // 올바른 방식:
+    callService(ctx)  // ✓ 기존 ctx 전파
+}
+```
+
+---
+
+## 5️⃣ 골든 시그널 (Golden Signals)
+
+### 📋 개념
+
+```
+시스템 건강도를 판단하는 4가지 필수 지표
+```
+
+### 📊 4가지 신호
+
+#### **1. Latency (지연시간)**
+```
+"요청 처리에 걸리는 시간"
+
+메트릭:
+- 평균 응답시간
+- P50 (중간값)
+- P95 (95%의 요청이 이 이상 걸림)
+- P99 (99%의 요청이 이 이상 걸림)
+
+예시:
+평균: 50ms
+P95: 100ms
+P99: 500ms
+→ 대부분은 빠르지만 일부 느린 요청이 있다
+
+목표: P99 < 1000ms
+```
+
+#### **2. Traffic (트래픽)**
+```
+"시스템에 가해지는 수요"
+
+메트릭:
+- 초당 요청 수 (RPS: Requests Per Second)
+- 초당 처리 바이트
+- 동시 연결 수
+
+예시:
+평상시: 1,000 RPS
+피크시: 5,000 RPS
+용량한계: 10,000 RPS
+
+목표: 예상 트래픽의 50% 이상 여유
+```
+
+#### **3. Errors (오류율)**
+```
+"요청 실패율"
+
+메트릭:
+- HTTP 4xx (클라이언트 오류)
+- HTTP 5xx (서버 오류)
+- 시간초과 (Timeout)
+- 연결 거부 (Connection refused)
+
+예시:
+성공: 995,000개
+실패: 5,000개
+오류율: 0.5%
+
+목표: < 0.1%
+```
+
+#### **4. Saturation (포화도)**
+```
+"자원 사용 한계치"
+
+메트릭:
+- CPU 사용률
+- 메모리 사용률
+- 디스크 사용률
+- 네트워크 대역폭
+
+예시:
+CPU: 70% (정상)
+메모리: 85% (높음)
+디스크: 95% (매우 높음)
+→ 디스크 용량 부족 위험
+
+목표: 일반적으로 70% 이하 유지
+```
+
+---
+
+## 6️⃣ 실전 예제: Observability 통합
+
+### 📋 시스템 설계
+
+```
+요청 흐름:
+Client → Gateway (Trace ID 생성, 로깅, 메트릭)
+      → Service A (Trace ID 전파, slog, 메트릭)
+      → Service B (Trace ID 전파, slog, 메트릭)
+      → Database (Context 전파, 트레이싱)
+
+각 계층에서:
+1. Trace ID 기록
+2. 처리시간 측정
+3. 구조화된 로그 출력
+4. 메트릭 수집
+5. 에러 발생 시 자세한 정보 기록
+```
+
+### 🔧 구현 구조
+
+```go
+type ObservableService struct {
+    logger   *slog.Logger
+    metrics  *ServiceMetrics
+}
+
+// 요청 처리
+func (os *ObservableService) HandleRequest(ctx context.Context, req Request) {
+    // 1. Trace ID 생성 또는 추출
+    traceID := getOrCreateTraceID(ctx)
+    ctx = contextWithTraceID(ctx, traceID)
+
+    // 2. 처리 시작 기록
+    start := time.Now()
+    os.logger.InfoCtx(ctx, "요청 처리 시작",
+        "trace_id", traceID,
+        "method", req.Method,
+        "path", req.Path,
+    )
+
+    // 3. 비즈니스 로직 처리
+    result, err := os.processRequest(ctx, req)
+
+    // 4. 처리시간 측정
+    duration := time.Since(start).Seconds()
+    os.metrics.RequestDuration.Observe(duration)
+
+    // 5. 결과 로깅
+    if err != nil {
+        os.logger.ErrorCtx(ctx, "요청 처리 실패",
+            "trace_id", traceID,
+            "error", err,
+            "duration_ms", duration*1000,
+        )
+        os.metrics.Errors.Inc()
+    } else {
+        os.logger.InfoCtx(ctx, "요청 처리 완료",
+            "trace_id", traceID,
+            "duration_ms", duration*1000,
+            "result_size", len(result),
+        )
+        os.metrics.SuccessfulRequests.Inc()
+    }
+}
+```
+
+---
+
+## 7️⃣ 모니터링 대시보드 구상
+
+### 📊 Julia 연산 모듈 모니터링 지표
+
+```
+【 성능 지표 】
+- 평균 연산 시간
+- P50, P95, P99 레이턴시
+- 초당 연산 요청 수 (RPS)
+- 연산 실패율
+
+【 자원 사용 】
+- CPU 사용률
+- 메모리 사용량
+- GPU 메모리 (있다면)
+- 현재 활성 작업 수
+
+【 안정성 】
+- 타임아웃율
+- 메모리 누수 감지
+- 장애 복구 횟수
+- 마지막 장애 시간
+
+【 비즈니스 】
+- 요청당 연산 비용
+- 누적 처리량
+- 사용자별 쿼터 사용량
+
+시각화:
+- 실시간 차트 (최근 1시간)
+- 일일 요약 (최근 7일)
+- 트렌드 분석 (최근 30일)
+- 알림 설정 (임계값 초과)
+```
+
+---
+
+## 8️⃣ 실전 예제: 완전한 Observability Demo
+
+### 📋 시스템 시뮬레이션
+
+```
+3-tier 아키텍처:
+API Gateway
+  ↓ (Trace ID 전파)
+Service A (인증)
+  ↓ (Context 전파)
+Service B (비즈니스 로직)
+  ↓ (Context 전파)
+Database
+
+각 단계에서:
+1. Trace ID 기록
+2. 처리시간 측정
+3. slog 로깅
+4. 메트릭 수집
+5. 에러 처리
+```
+
+---
+
+## 🎓 학습 체크리스트
+
+- [ ] 분산 트레이싱 개념 이해
+- [ ] Trace ID 생성 및 전파 구현
+- [ ] Prometheus 메트릭 4가지 타입 이해
+- [ ] Counter, Gauge, Histogram 구현
+- [ ] slog 구조화된 로깅 사용
+- [ ] Context에 Trace ID 저장 및 전파
+- [ ] 골든 시그널 4가지 이해
+- [ ] Latency 측정 및 모니터링
+- [ ] 에러율 추적
+- [ ] 자원 포화도 감시
+- [ ] 완전한 관찰 가능성 시스템 설계
+
+---
+
+## 💡 핵심 요약
+
+```
+Observability = Three Pillars
+
+1. Logging (slog)
+   "무엇이 일어났는가?"
+   구조화된 JSON 형태
+   Trace ID 포함
+
+2. Metrics (Prometheus)
+   "얼마나 많이?"
+   Counter, Gauge, Histogram
+   골든 시그널 수집
+
+3. Tracing (Distributed Tracing)
+   "어디를 거쳤는가?"
+   Trace ID로 요청 흐름 추적
+   Context로 정보 전파
+
+이 세 가지를 결합하면:
+분산 시스템이 투명하게 보인다
+장애의 원인을 정확히 파악할 수 있다
+성능 최적화 지점을 찾을 수 있다
+
+Go 301 완성!
+다음은 Go 401: 커널 수준 최적화
+
+Your record is your proof. (기록이 증명이다.)
+```

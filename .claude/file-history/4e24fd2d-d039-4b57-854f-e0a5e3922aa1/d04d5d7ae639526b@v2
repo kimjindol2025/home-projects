@@ -1,0 +1,550 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"runtime"
+	"sync"
+	"unsafe"
+)
+
+// ============================================================================
+// Go 401-4-1: 메모리 레이아웃과 이스케이프 분석 (Escape Analysis)
+// ============================================================================
+// 신의 영역: Go 런타임의 심장을 이해하고 조종하는 박사 과정
+
+const (
+	separator = "======================================================================\n"
+	section1  = "섹션 1-2️⃣: Stack vs Heap의 생사결단"
+	section2  = "섹션 3️⃣: 이스케이프 분석 (Escape Analysis)"
+	section3  = "섹션 4️⃣: Go의 GC 내부"
+	section4  = "섹션 5️⃣: Unsafe와 포인터 산술"
+	section5  = "섹션 6️⃣: 포인터 연산과 메모리 레이아웃"
+	section6  = "섹션 7️⃣: Zero Allocation 코드"
+	section7  = "섹션 8️⃣: GC 튜닝과 최적화"
+	section8  = "섹션 9️⃣: Assignment 4-1 메모리 해킹"
+)
+
+// ============================================================================
+// 섹션 1️⃣-2️⃣: Stack vs Heap의 생사결단
+// ============================================================================
+
+// ❌ 나쁜 예: 힙으로 탈출하는 포인터 반환
+func escapeToHeap() *int {
+	x := 10
+	return &x // x는 함수 끝나도 살아있어야 하므로 Heap으로 이동
+}
+
+// ✅ 좋은 예: 값 전달 (Stack 내에서 완료)
+func noEscapeStackArray() [10]int {
+	arr := [10]int{1, 2, 3, 4, 5}
+	return arr // 스택 배열은 그대로 반환 (복사)
+}
+
+// ✅ 좋은 예: 포인터 사용만 함 (Escape 없음)
+func usePointerNoEscape(p *int) int {
+	return *p + 10 // p가 어디서 왔는지 상관없음
+}
+
+func section1Demo() {
+	fmt.Printf("[%s%s]\n", separator, section1)
+
+	fmt.Println("\n1️⃣ Stack 메모리 (초고속, GC 부하 없음)")
+	fmt.Println("   - 함수 내 로컬 변수")
+	fmt.Println("   - 함수 끝나면 자동 소멸")
+	fmt.Println("   - CPU 캐시 친화적")
+	fmt.Println("   - LIFO 구조")
+
+	x := 42
+	fmt.Printf("   ✓ 로컬 변수 x = %d (Stack에 위치)\n", x)
+
+	fmt.Println("\n2️⃣ Heap 메모리 (동적, GC가 관리)")
+	fmt.Println("   - 포인터로 반환하는 변수")
+	fmt.Println("   - make()로 할당하는 슬라이스/맵")
+	fmt.Println("   - GC가 정리할 때까지 살아있음")
+	fmt.Println("   - STW(Stop The World) 리스크")
+
+	pEscape := escapeToHeap()
+	fmt.Printf("   ✓ 포인터 반환 *p = %d (Heap으로 Escape)\n", *pEscape)
+
+	fmt.Println("\n3️⃣ 성능 비교 (상대 시간)")
+	fmt.Println("   Stack 할당: ~1ns (극도로 빠름)")
+	fmt.Println("   Heap 할당:  ~50ns (50배 느림)")
+	fmt.Println("   GC 비용:    ~1ms STW (수백만 나노초!)")
+
+	fmt.Println("\n4️⃣ 스택 배열 테스트")
+	arr := noEscapeStackArray()
+	fmt.Printf("   ✓ 스택 배열 반환: arr[0]=%d (복사됨, Escape 없음)\n", arr[0])
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 3️⃣: 이스케이프 분석 (Escape Analysis) 데모
+// ============================================================================
+
+// Escape 케이스들
+func escapeCase1() *int {
+	x := 10
+	return &x // ❌ x escapes to heap
+}
+
+func escapeCase2(x int) interface{} {
+	return x // ❌ x escapes to heap (interface{} 때문)
+}
+
+func escapeCase3(x int) int {
+	return x + 10 // ✅ x does not escape
+}
+
+func escapeCase4() {
+	x := 10
+	go func() {
+		_ = x // ❌ x escapes to heap (클로저 참조)
+	}()
+}
+
+func section2Demo() {
+	fmt.Printf("[%s%s]\n", separator, section2)
+
+	fmt.Println("\n🔍 이스케이프 분석의 규칙")
+	fmt.Println("   규칙 1: 포인터 반환 → Escape")
+	fmt.Println("   규칙 2: interface{} 할당 → Escape")
+	fmt.Println("   규칙 3: 채널 송신 → Escape")
+	fmt.Println("   규칙 4: 클로저 참조 → Escape")
+	fmt.Println("   규칙 5: 로컬 사용만 → Escape 없음")
+
+	fmt.Println("\n분석 명령어:")
+	fmt.Println("   $ go build -gcflags=\"-m\" your_file.go")
+	fmt.Println("   $ go build -gcflags=\"-m -m\" your_file.go (더 상세)")
+
+	fmt.Println("\n📊 Escape 케이스 분류")
+
+	p1 := escapeCase1()
+	fmt.Printf("   ❌ Case 1: 포인터 반환 → %d (Heap)\n", *p1)
+
+	iface := escapeCase2(42)
+	fmt.Printf("   ❌ Case 2: interface{} → %v (Heap)\n", iface)
+
+	result := escapeCase3(42)
+	fmt.Printf("   ✅ Case 3: 값 반환 → %d (Stack)\n", result)
+
+	fmt.Println("\n💡 스택 배열 vs 힙 슬라이스")
+	stackArr := [5]int{1, 2, 3, 4, 5}
+	heapSlice := []int{1, 2, 3, 4, 5}
+	fmt.Printf("   스택 배열 [5]int: 크기=%d, 위치=Stack\n", len(stackArr))
+	fmt.Printf("   힙 슬라이스 []int: 크기=%d, 위치=Heap\n", len(heapSlice))
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 4️⃣: Go의 가비지 컬렉션 내부
+// ============================================================================
+
+func demonstrateGC() {
+	// GC 통계 수집
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+
+	fmt.Printf("GC 실행 전:\n")
+	fmt.Printf("   할당된 메모리: %v MB\n", m1.Alloc/1024/1024)
+	fmt.Printf("   총 할당: %v MB\n", m1.TotalAlloc/1024/1024)
+	fmt.Printf("   GC 횟수: %v\n", m1.NumGC)
+
+	// 대량 메모리 할당해서 GC 트리거
+	var slices [][]int
+	for i := 0; i < 1000; i++ {
+		slices = append(slices, make([]int, 10000))
+	}
+
+	// 명시적 GC 실행
+	runtime.GC()
+
+	var m2 runtime.MemStats
+	runtime.ReadMemStats(&m2)
+
+	fmt.Printf("\nGC 실행 후:\n")
+	fmt.Printf("   할당된 메모리: %v MB\n", m2.Alloc/1024/1024)
+	fmt.Printf("   총 할당: %v MB\n", m2.TotalAlloc/1024/1024)
+	fmt.Printf("   GC 횟수: %v\n", m2.NumGC)
+	fmt.Printf("   GC 시간 (STW): %v ms\n", m2.PauseNs[(m2.NumGC-1)%256]/1e6)
+}
+
+func section3Demo() {
+	fmt.Printf("[%s%s]\n", separator, section3)
+
+	fmt.Println("\n🎛️ Tri-Color Marking 알고리즘")
+	fmt.Println("   ⚪ White (미방문): GC가 아직 찾지 못한 객체")
+	fmt.Println("   🔵 Gray (찾음): GC가 발견했지만 자식을 아직 안 봄")
+	fmt.Println("   ⬛ Black (완료): GC가 완전히 스캔함")
+
+	fmt.Println("\n📝 Write Barrier")
+	fmt.Println("   - GC가 고루틴과 동시에 실행되지만 데이터 일관성 유지")
+	fmt.Println("   - 메모리 변경 사항을 실시간으로 GC에 알림")
+
+	fmt.Println("\n🎚️ GC Pacer")
+	fmt.Println("   - STW 시간 목표: < 1ms")
+	fmt.Println("   - 기본 설정: GOGC=100")
+	fmt.Println("   - NextGC = CurrentHeap * (1 + GOGC/100)")
+
+	fmt.Println("\n📊 메모리 통계:")
+	demonstrateGC()
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 5️⃣: Unsafe와 포인터 산술
+// ============================================================================
+
+type Point struct {
+	X int32  // 오프셋 0, 크기 4
+	Y int32  // 오프셋 4, 크기 4
+	Z int32  // 오프셋 8, 크기 4
+}
+
+func demonstratePointerArithmetic() {
+	p := Point{X: 10, Y: 20, Z: 30}
+
+	fmt.Printf("초기 Point: X=%d, Y=%d, Z=%d\n", p.X, p.Y, p.Z)
+	fmt.Printf("Point 크기: %d bytes\n", unsafe.Sizeof(p))
+
+	// 방법 1: 정상적인 접근
+	fmt.Printf("정상 접근: p.Y = %d\n", p.Y)
+
+	// 방법 2: 포인터 산술로 직접 접근
+	ptr := unsafe.Pointer(&p)
+
+	// Y 필드 주소 = p 주소 + 4 bytes
+	yPtr := (*int32)(unsafe.Pointer(uintptr(ptr) + 4))
+	fmt.Printf("포인터 산술: *yPtr = %d\n", *yPtr)
+
+	// Y 필드를 999로 변경
+	*yPtr = 999
+	fmt.Printf("변경 후 p.Y = %d (메모리에 직접 쓰임!)\n", p.Y)
+}
+
+func stringToBytes(s string) []byte {
+	// String 내부 구조체
+	type StringHeader struct {
+		Data uintptr
+		Len  int
+	}
+
+	// []byte 내부 구조체
+	type SliceHeader struct {
+		Data uintptr
+		Len  int
+		Cap  int
+	}
+
+	sh := (*StringHeader)(unsafe.Pointer(&s))
+
+	bh := SliceHeader{
+		Data: sh.Data,
+		Len:  sh.Len,
+		Cap:  sh.Len,
+	}
+
+	return *(*[]byte)(unsafe.Pointer(&bh))
+}
+
+func section4Demo() {
+	fmt.Printf("[%s%s]\n", separator, section4)
+
+	fmt.Println("\n⚠️ Unsafe 패키지: 양날의 검")
+	fmt.Println("   - 장점: 초고속 성능 (복사 없음)")
+	fmt.Println("   - 단점: 극도의 위험 (패닉 가능)")
+
+	fmt.Println("\n💀 포인터 산술 실행:")
+	demonstratePointerArithmetic()
+
+	fmt.Println("\n🚀 초고속 String→[]byte 변환 (복사 없음)")
+	s := "Hello, Go!"
+	b := stringToBytes(s)
+	fmt.Printf("String: %s\n", s)
+	fmt.Printf("[]byte: %s\n", string(b))
+	fmt.Printf("메모리 공유: &s[0] == &b[0] ? (포인터 비교만 가능)\n")
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 6️⃣: 포인터 연산과 메모리 레이아웃
+// ============================================================================
+
+type Employee struct {
+	ID     uint32  // 오프셋 0,  크기 4
+	Age    uint8   // 오프셋 4,  크기 1 (+ 3 bytes padding)
+	Salary float64 // 오프셋 8,  크기 8
+	Name   string  // 오프셋 16, 크기 16 (포인터 + 길이)
+}
+
+func analyzeMemoryLayout() {
+	emp := Employee{
+		ID:     12345,
+		Age:    30,
+		Salary: 75000.0,
+		Name:   "Alice",
+	}
+
+	fmt.Printf("Employee 크기: %d bytes\n", unsafe.Sizeof(emp))
+	fmt.Printf("\n필드 오프셋:\n")
+	fmt.Printf("   ID     offset: %d\n", unsafe.Offsetof(emp.ID))
+	fmt.Printf("   Age    offset: %d\n", unsafe.Offsetof(emp.Age))
+	fmt.Printf("   Salary offset: %d\n", unsafe.Offsetof(emp.Salary))
+	fmt.Printf("   Name   offset: %d\n", unsafe.Offsetof(emp.Name))
+
+	fmt.Printf("\n필드 정렬 크기:\n")
+	fmt.Printf("   ID     align: %d\n", unsafe.Alignof(emp.ID))
+	fmt.Printf("   Age    align: %d\n", unsafe.Alignof(emp.Age))
+	fmt.Printf("   Salary align: %d\n", unsafe.Alignof(emp.Salary))
+	fmt.Printf("   Name   align: %d\n", unsafe.Alignof(emp.Name))
+
+	fmt.Printf("\n메모리 주소:\n")
+	fmt.Printf("   Employee: %p\n", &emp)
+	fmt.Printf("   ID:       %p\n", &emp.ID)
+	fmt.Printf("   Age:      %p\n", &emp.Age)
+	fmt.Printf("   Salary:   %p\n", &emp.Salary)
+	fmt.Printf("   Name:     %p\n", &emp.Name)
+}
+
+type BadOrder struct {
+	A bool    // 1 byte (+ 7 padding)
+	B int64   // 8 bytes
+	C bool    // 1 byte (+ 7 padding)
+	D int64   // 8 bytes
+	E bool    // 1 byte (+ 7 padding)
+}
+
+type GoodOrder struct {
+	B int64   // 8 bytes
+	D int64   // 8 bytes
+	A bool    // 1 byte
+	C bool    // 1 byte
+	E bool    // 1 byte
+	// 5 bytes padding
+}
+
+func section5Demo() {
+	fmt.Printf("[%s%s]\n", separator, section5)
+
+	fmt.Println("\n📐 메모리 레이아웃 분석:")
+	analyzeMemoryLayout()
+
+	fmt.Println("\n💡 구조체 필드 순서의 중요성:")
+	fmt.Printf("BadOrder 크기:  %d bytes (패딩 많음)\n", unsafe.Sizeof(BadOrder{}))
+	fmt.Printf("GoodOrder 크기: %d bytes (패딩 최소)\n", unsafe.Sizeof(GoodOrder{}))
+	fmt.Printf("절감: %d bytes (%.1f%% 줄임)\n",
+		unsafe.Sizeof(BadOrder{})-unsafe.Sizeof(GoodOrder{}),
+		float64(unsafe.Sizeof(BadOrder{})-unsafe.Sizeof(GoodOrder{}))/float64(unsafe.Sizeof(BadOrder{}))*100)
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 7️⃣: Zero Allocation 코드
+// ============================================================================
+
+// ❌ 나쁜 예: 매 호출마다 Heap 할당
+func badConcat(strs []string) string {
+	var result string
+	for _, s := range strs {
+		result += s // 매번 새 문자열 객체 생성 & 힙 할당
+	}
+	return result
+}
+
+// ✅ 좋은 예: 버퍼 재사용 (Zero Allocation)
+func goodConcat(strs []string, buf *bytes.Buffer) string {
+	buf.Reset() // 버퍼 초기화 (힙 할당 X)
+	for _, s := range strs {
+		buf.WriteString(s)
+	}
+	return buf.String()
+}
+
+// Zero Allocation 패턴: sync.Pool
+type Buffer struct {
+	data []byte
+}
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return &Buffer{data: make([]byte, 1024)}
+	},
+}
+
+func processWithPool(data string) {
+	buf := bufferPool.Get().(*Buffer)
+	defer bufferPool.Put(buf)
+
+	copy(buf.data, data)
+}
+
+func section6Demo() {
+	fmt.Printf("[%s%s]\n", separator, section6)
+
+	fmt.Println("\n🎯 Zero Allocation 전략")
+	fmt.Println("   1. 객체 재사용: sync.Pool")
+	fmt.Println("   2. 스택 배열: [N]T 대신 []T")
+	fmt.Println("   3. 버퍼 풀: bytes.Buffer 재사용")
+	fmt.Println("   4. 구조체 값: 포인터 아닌 값 전달")
+
+	fmt.Println("\n❌ 나쁜 예: String Concatenation (매 호출마다 힙 할당)")
+	strs := []string{"Hello", " ", "World", "!"}
+	result1 := badConcat(strs)
+	fmt.Printf("결과: %s (힙 할당 3회)\n", result1)
+
+	fmt.Println("\n✅ 좋은 예: Buffer 재사용 (Zero Allocation)")
+	var buf bytes.Buffer
+	result2 := goodConcat(strs, &buf)
+	fmt.Printf("결과: %s (힙 할당 0회)\n", result2)
+
+	fmt.Println("\n💾 sync.Pool로 객체 재사용:")
+	for i := 0; i < 3; i++ {
+		processWithPool(fmt.Sprintf("Data %d", i))
+	}
+	fmt.Println("   3개의 요청 처리, 동일 버퍼 재사용 (Zero Allocation)")
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 8️⃣: GC 튜닝과 최적화
+// ============================================================================
+
+func demonstrateGCTuning() {
+	fmt.Println("🎛️ GOGC 환경 변수")
+	fmt.Printf("   현재 GOGC: %s (기본값: 100)\n", os.Getenv("GOGC"))
+	fmt.Println("   GOGC=100: NextGC = Heap * 2 (기본값)")
+	fmt.Println("   GOGC=50:  NextGC = Heap * 1.5 (공격적 GC)")
+	fmt.Println("   GOGC=200: NextGC = Heap * 3 (느슨한 GC)")
+
+	fmt.Println("\n🔧 debug.SetGCPercent() 사용 예")
+	fmt.Println("   debug.SetGCPercent(50)   // GOGC=50과 동일")
+	fmt.Println("   debug.SetGCPercent(100)  // GOGC=100 (기본값)")
+	fmt.Println("   debug.SetGCPercent(-1)   // GC 비활성화 (권장 X)")
+
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	fmt.Println("\n📊 메모리 통계")
+	fmt.Printf("   Alloc:       %v MB (현재 할당)\n", m.Alloc/1024/1024)
+	fmt.Printf("   TotalAlloc:  %v MB (총 할당)\n", m.TotalAlloc/1024/1024)
+	fmt.Printf("   Sys:         %v MB (시스템 할당)\n", m.Sys/1024/1024)
+	fmt.Printf("   NumGC:       %v (GC 실행 횟수)\n", m.NumGC)
+	fmt.Printf("   GC 비율:     %.1f%%\n", float64(m.NumGC)/float64(m.Mallocs)*100)
+}
+
+func section7Demo() {
+	fmt.Printf("[%s%s]\n", separator, section7)
+
+	fmt.Println()
+	demonstrateGCTuning()
+
+	fmt.Println("\n💡 GC 튜닝 전략")
+	fmt.Println("   - 낮은 지연 시간: GOGC=50 (더 자주 GC)")
+	fmt.Println("   - 높은 처리량: GOGC=200 (덜 자주 GC)")
+	fmt.Println("   - 실시간 시스템: GOGC=25-50 (STW 최소화)")
+
+	fmt.Println()
+}
+
+// ============================================================================
+// 섹션 9️⃣: Assignment 4-1: 메모리 해킹
+// ============================================================================
+
+type Person struct {
+	ID    uint32 // 오프셋 0
+	Age   uint8  // 오프셋 4
+	Alive bool   // 오프셋 5
+}
+
+func pointerArithmeticMission() {
+	fmt.Printf("[%s%s]\n", separator, section8)
+
+	fmt.Println("\n📝 Assignment 4-1: 메모리 해킹")
+
+	fmt.Println("\n【 과제 1: Escape 분석 】")
+	fmt.Println("   실행: go build -gcflags=\"-m\" 401_memory_layout_escape_analysis.go")
+	fmt.Println("   분석:")
+	fmt.Println("   ✓ escapeToHeap: x escapes to heap")
+	fmt.Println("   ✓ escapeCase2: x escapes to heap")
+	fmt.Println("   ✓ escapeCase3: x does not escape")
+	fmt.Println("   ✓ escapeCase4: x escapes to heap")
+
+	fmt.Println("\n【 과제 2: 포인터 산술 미션 】")
+
+	p := Person{ID: 1, Age: 25, Alive: true}
+
+	fmt.Printf("\n초기 상태:\n")
+	fmt.Printf("   Person: ID=%d, Age=%d, Alive=%v\n", p.ID, p.Age, p.Alive)
+
+	personPtr := unsafe.Pointer(&p)
+
+	// Age 필드 주소 계산 및 변경
+	fmt.Printf("\n1️⃣ Age 필드 변경 (포인터 산술):")
+	ageOffset := unsafe.Offsetof(p.Age)
+	fmt.Printf("   Age 오프셋: %d\n", ageOffset)
+	agePtr := (*uint8)(unsafe.Pointer(uintptr(personPtr) + ageOffset))
+	fmt.Printf("   원래 값: %d\n", *agePtr)
+	*agePtr = 99
+	fmt.Printf("   변경된 값: %d\n", *agePtr)
+	fmt.Printf("   검증: p.Age = %d ✓\n", p.Age)
+
+	// Alive 필드 주소 계산 및 변경
+	fmt.Printf("\n2️⃣ Alive 필드 변경 (포인터 산술):")
+	aliveOffset := unsafe.Offsetof(p.Alive)
+	fmt.Printf("   Alive 오프셋: %d\n", aliveOffset)
+	alivePtr := (*bool)(unsafe.Pointer(uintptr(personPtr) + aliveOffset))
+	fmt.Printf("   원래 값: %v\n", *alivePtr)
+	*alivePtr = false
+	fmt.Printf("   변경된 값: %v\n", *alivePtr)
+	fmt.Printf("   검증: p.Alive = %v ✓\n", p.Alive)
+
+	fmt.Printf("\n최종 상태:\n")
+	fmt.Printf("   Person: ID=%d, Age=%d, Alive=%v\n", p.ID, p.Age, p.Alive)
+
+	fmt.Println("\n✅ 포인터 산술 성공!")
+	fmt.Println("   메모리에 직접 접근하여 값 수정 완료")
+	fmt.Println("   (매우 위험한 수준이지만, 당신은 이 양날의 검을 다룰 자격이 있습니다)")
+
+	fmt.Println()
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+func repeatStr(s string, n int) string {
+	result := ""
+	for i := 0; i < n; i++ {
+		result += s
+	}
+	return result
+}
+
+func main() {
+	fmt.Println("\n🎓 Go 401-4-1: 메모리 레이아웃과 이스케이프 분석")
+	fmt.Println("================================================================================")
+	fmt.Println("신의 영역에 기록을 남깁니다.")
+	fmt.Println("기록이 증명이다. (Your record is your proof.)")
+	fmt.Println()
+
+	section1Demo()
+	section2Demo()
+	section3Demo()
+	section4Demo()
+	section5Demo()
+	section6Demo()
+	section7Demo()
+	pointerArithmeticMission()
+
+	fmt.Println("=" + repeatStr("=", 69))
+	fmt.Println("Go 401-4-1 모든 섹션 완료!")
+	fmt.Println("=" + repeatStr("=", 69))
+	fmt.Println()
+}

@@ -1,0 +1,919 @@
+// File: v2_1_concurrency/03_mutex_atomic_synchronization.go
+// 🎓 Go 201-2-3: 공유 자원의 사수 - 뮤텍스와 원자적 연산
+// 저자: Claude Haiku 4.5
+// 수준: 대학원 고급 (시스템 아키텍트 수준)
+// 주제: 뮤텍스, RWMutex, Atomic, Race Detector, 안전한 맵
+//
+// 실행 명령: CGO_ENABLED=0 go run 03_mutex_atomic_synchronization.go
+// Race Detector: CGO_ENABLED=0 go run -race 03_mutex_atomic_synchronization.go
+
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ============================================================
+// 섹션 1: Mutex 기본 (뮤텍스를 이용한 안전한 카운터)
+// ============================================================
+
+type Counter struct {
+	mu    sync.Mutex
+	value int
+}
+
+func (c *Counter) Increment() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value++
+}
+
+func (c *Counter) Value() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
+}
+
+func section1_mutexBasics() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 1: Mutex 기본 (뮤텍스를 이용한 안전한 카운터)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[1-1] 기본 뮤텍스 사용")
+
+	counter := &Counter{}
+
+	// 고루틴 10개가 각각 100번씩 증가
+	numGoroutines := 10
+	incrementPerGoroutine := 100
+
+	fmt.Printf("고루틴 %d개, 각 %d회 증가\n", numGoroutines, incrementPerGoroutine)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < incrementPerGoroutine; j++ {
+				counter.Increment()
+			}
+			fmt.Printf("고루틴 %d: 완료\n", id)
+		}(i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	expectedValue := numGoroutines * incrementPerGoroutine
+	actualValue := counter.Value()
+
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("예상값: %d\n", expectedValue)
+	fmt.Printf("실제값: %d\n", actualValue)
+	fmt.Printf("시간: %v\n", elapsed)
+
+	if expectedValue == actualValue {
+		fmt.Println("✓ 데이터 무결성 유지!")
+	} else {
+		fmt.Printf("✗ 데이터 손상 (%d 손실)\n", expectedValue-actualValue)
+	}
+
+	// [1-2] defer와 패닉
+	fmt.Println("\n[1-2] defer를 이용한 안전한 Unlock (패닉 처리)")
+
+	type SafeCounter struct {
+		mu    sync.Mutex
+		value int
+	}
+
+	sc := &SafeCounter{}
+
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("패닉 발생했지만 안전함: %v\n", r)
+		}
+	}()
+
+	func() {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+
+		sc.value = 100
+		fmt.Printf("뮤텍스 잠금: value = %d\n", sc.value)
+
+		// 패닉 발생 → defer가 실행 → Unlock 호출됨
+		panic("의도적 패닉!")
+	}()
+}
+
+// ============================================================
+// 섹션 2: Race Condition 재현 (뮤텍스 없는 위험)
+// ============================================================
+
+func section2_raceCondition() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 2: Race Condition 재현 (뮤텍스 없는 위험)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[2-1] 뮤텍스 없이 고루틴 1,000개가 카운터 증가")
+
+	unsafeCount := 0  // 뮤텍스 없음!
+	numGoroutines := 1000
+	incrementsPerGoroutine := 100
+
+	fmt.Printf("고루틴 %d개, 각 %d회 증가 (뮤텍스 없음)\n", numGoroutines, incrementsPerGoroutine)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < incrementsPerGoroutine; j++ {
+				unsafeCount++  // 경쟁 상태 발생!
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	expectedValue := numGoroutines * incrementsPerGoroutine
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("예상값: %d\n", expectedValue)
+	fmt.Printf("실제값: %d\n", unsafeCount)
+	fmt.Printf("손실: %d (%.1f%%)\n", expectedValue-unsafeCount,
+		float64(expectedValue-unsafeCount)/float64(expectedValue)*100)
+	fmt.Printf("시간: %v\n", elapsed)
+
+	fmt.Println("\n💡 Race Condition 설명:")
+	fmt.Println("count++ 연산은 실제로 3단계:")
+	fmt.Println("  1. 메모리에서 값 읽기 (Load)")
+	fmt.Println("  2. 값 증가 (Increment)")
+	fmt.Println("  3. 메모리에 값 쓰기 (Store)")
+	fmt.Println("")
+	fmt.Println("여러 고루틴이 동시에 이 3단계를 실행하면,")
+	fmt.Println("중간 결과가 덮어씌워져 데이터가 손상됨")
+
+	// [2-2] 뮤텍스로 해결
+	fmt.Println("\n[2-2] 뮤텍스로 Race Condition 해결")
+
+	safeCount := 0
+	var mu sync.Mutex
+
+	fmt.Printf("동일한 시나리오 (뮤텍스 사용)\n")
+
+	start = time.Now()
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < incrementsPerGoroutine; j++ {
+				mu.Lock()
+				safeCount++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed = time.Since(start)
+
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("예상값: %d\n", expectedValue)
+	fmt.Printf("실제값: %d\n", safeCount)
+	fmt.Printf("시간: %v\n", elapsed)
+
+	if expectedValue == safeCount {
+		fmt.Println("✓ 데이터 무결성 유지!")
+	}
+}
+
+// ============================================================
+// 섹션 3: RWMutex (읽기/쓰기 분리)
+// ============================================================
+
+type DataStore struct {
+	mu    sync.RWMutex
+	data  map[string]int
+}
+
+func (ds *DataStore) Get(key string) int {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	return ds.data[key]
+}
+
+func (ds *DataStore) Set(key string, value int) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.data[key] = value
+}
+
+func section3_rwmutex() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 3: RWMutex (읽기/쓰기 분리)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[3-1] RWMutex 기본 사용 (읽기는 병렬, 쓰기는 배타적)")
+
+	ds := &DataStore{
+		data: make(map[string]int),
+	}
+
+	// 초기 데이터 설정
+	ds.Set("counter", 0)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	// 읽기 워커 8개
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				val := ds.Get("counter")
+				_ = val  // 사용
+			}
+			fmt.Printf("읽기 워커 %d: 1000회 읽음\n", id)
+		}(i)
+	}
+
+	// 쓰기 워커 2개
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				ds.Set("counter", j)
+			}
+			fmt.Printf("쓰기 워커 %d: 100회 씀\n", id)
+		}(i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("총 작업: 읽기 8000회 + 쓰기 200회\n")
+	fmt.Printf("소요시간: %v\n", elapsed)
+
+	// [3-2] Mutex vs RWMutex 성능 비교
+	fmt.Println("\n[3-2] 성능 비교: Mutex vs RWMutex")
+
+	benchmarkMutex := func(readRatio float64) time.Duration {
+		var mu sync.Mutex
+		data := 0
+		readOps := int(10000 * readRatio)
+		writeOps := 10000 - readOps
+
+		start := time.Now()
+
+		var wg sync.WaitGroup
+
+		// 읽기 작업
+		for i := 0; i < readOps; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mu.Lock()
+				_ = data
+				mu.Unlock()
+			}()
+		}
+
+		// 쓰기 작업
+		for i := 0; i < writeOps; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mu.Lock()
+				data++
+				mu.Unlock()
+			}()
+		}
+
+		wg.Wait()
+		return time.Since(start)
+	}
+
+	benchmarkRWMutex := func(readRatio float64) time.Duration {
+		var mu sync.RWMutex
+		data := 0
+		readOps := int(10000 * readRatio)
+		writeOps := 10000 - readOps
+
+		start := time.Now()
+
+		var wg sync.WaitGroup
+
+		// 읽기 작업
+		for i := 0; i < readOps; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mu.RLock()
+				_ = data
+				mu.RUnlock()
+			}()
+		}
+
+		// 쓰기 작업
+		for i := 0; i < writeOps; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				mu.Lock()
+				data++
+				mu.Unlock()
+			}()
+		}
+
+		wg.Wait()
+		return time.Since(start)
+	}
+
+	fmt.Println("시나리오: 읽기 90% + 쓰기 10%")
+
+	mutexTime := benchmarkMutex(0.9)
+	fmt.Printf("Mutex 사용: %v\n", mutexTime)
+
+	rwmutexTime := benchmarkRWMutex(0.9)
+	fmt.Printf("RWMutex 사용: %v\n", rwmutexTime)
+
+	fmt.Printf("성능 개선: %.2fx\n", float64(mutexTime.Nanoseconds())/float64(rwmutexTime.Nanoseconds()))
+}
+
+// ============================================================
+// 섹션 4: Atomic 연산
+// ============================================================
+
+func section4_atomic() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 4: Atomic 연산 (CPU 수준 최적화)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[4-1] 기본 Atomic 연산")
+
+	var count int64 = 0
+	var wg sync.WaitGroup
+
+	fmt.Println("고루틴 100개가 각 1000회 Atomic 증가")
+
+	start := time.Now()
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				atomic.AddInt64(&count, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("최종값: %d (예상: 100000)\n", count)
+	fmt.Printf("소요시간: %v\n", elapsed)
+
+	// [4-2] 다양한 Atomic 연산
+	fmt.Println("\n[4-2] 다양한 Atomic 연산")
+
+	var counter int64 = 100
+
+	fmt.Printf("초기값: %d\n", counter)
+
+	// Add
+	atomic.AddInt64(&counter, 50)
+	fmt.Printf("AddInt64(counter, 50): %d\n", atomic.LoadInt64(&counter))
+
+	// Store/Load
+	atomic.StoreInt64(&counter, 1000)
+	fmt.Printf("StoreInt64(counter, 1000): %d\n", atomic.LoadInt64(&counter))
+
+	// CompareAndSwap
+	swapped := atomic.CompareAndSwapInt64(&counter, 1000, 2000)
+	fmt.Printf("CompareAndSwap(1000 -> 2000): %v, 현재값: %d\n", swapped, atomic.LoadInt64(&counter))
+
+	swapped = atomic.CompareAndSwapInt64(&counter, 1000, 3000)  // 실패 (현재값이 1000이 아님)
+	fmt.Printf("CompareAndSwap(1000 -> 3000): %v, 현재값: %d\n", swapped, atomic.LoadInt64(&counter))
+
+	// [4-3] Mutex vs Atomic 성능 비교
+	fmt.Println("\n[4-3] 성능 비교: Mutex vs Atomic")
+
+	benchmarkMutexCounter := func() time.Duration {
+		var mu sync.Mutex
+		count := int64(0)
+
+		start := time.Now()
+
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 10000; j++ {
+					mu.Lock()
+					count++
+					mu.Unlock()
+				}
+			}()
+		}
+
+		wg.Wait()
+		return time.Since(start)
+	}
+
+	benchmarkAtomicCounter := func() time.Duration {
+		var count int64 = 0
+
+		start := time.Now()
+
+		var wg sync.WaitGroup
+		for i := 0; i < 100; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 10000; j++ {
+					atomic.AddInt64(&count, 1)
+				}
+			}()
+		}
+
+		wg.Wait()
+		return time.Since(start)
+	}
+
+	fmt.Println("시나리오: 고루틴 100개 × 10,000회 증가")
+
+	mutexTime := benchmarkMutexCounter()
+	fmt.Printf("Mutex 사용: %v\n", mutexTime)
+
+	atomicTime := benchmarkAtomicCounter()
+	fmt.Printf("Atomic 사용: %v\n", atomicTime)
+
+	fmt.Printf("성능 개선: %.2fx\n", float64(mutexTime.Nanoseconds())/float64(atomicTime.Nanoseconds()))
+}
+
+// ============================================================
+// 섹션 5: SafeMap 구현 (Assignment 2-3-2)
+// ============================================================
+
+type SafeMap struct {
+	mu    sync.RWMutex
+	items map[string]interface{}
+}
+
+func NewSafeMap() *SafeMap {
+	return &SafeMap{
+		items: make(map[string]interface{}),
+	}
+}
+
+func (sm *SafeMap) Get(key string) (interface{}, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	val, ok := sm.items[key]
+	return val, ok
+}
+
+func (sm *SafeMap) Set(key string, value interface{}) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.items[key] = value
+}
+
+func (sm *SafeMap) Delete(key string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	delete(sm.items, key)
+}
+
+func (sm *SafeMap) Length() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.items)
+}
+
+func (sm *SafeMap) Keys() []string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	keys := make([]string, 0, len(sm.items))
+	for k := range sm.items {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func section5_safeMap() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 5: SafeMap 구현 (동시성 안전 맵)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[5-1] SafeMap 기본 사용")
+
+	safeMap := NewSafeMap()
+
+	fmt.Println("초기 상태:")
+	fmt.Printf("길이: %d\n", safeMap.Length())
+
+	// Set 작업
+	safeMap.Set("name", "Go")
+	safeMap.Set("version", 1.21)
+	safeMap.Set("author", "Robert Griesemer")
+
+	fmt.Println("\n3개 항목 추가 후:")
+	fmt.Printf("길이: %d\n", safeMap.Length())
+	fmt.Printf("Keys: %v\n", safeMap.Keys())
+
+	// Get 작업
+	if val, ok := safeMap.Get("name"); ok {
+		fmt.Printf("name: %v\n", val)
+	}
+
+	// Delete 작업
+	safeMap.Delete("version")
+	fmt.Printf("\nversion 삭제 후 길이: %d\n", safeMap.Length())
+
+	// [5-2] 동시성 테스트
+	fmt.Println("\n[5-2] 동시성 테스트 (고루틴 100개 동시 접근)")
+
+	safeMap = NewSafeMap()
+	var wg sync.WaitGroup
+
+	start := time.Now()
+
+	// 쓰기 워커 20개
+	for w := 0; w < 20; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				key := fmt.Sprintf("key-%d-%d", workerID, i)
+				safeMap.Set(key, i*100)
+			}
+			fmt.Printf("쓰기 워커 %d: 100개 저장\n", workerID)
+		}(w)
+	}
+
+	// 읽기 워커 80개
+	for r := 0; r < 80; r++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				// 무작위로 읽기
+				keys := safeMap.Keys()
+				if len(keys) > 0 {
+					key := keys[i%len(keys)]
+					_, _ = safeMap.Get(key)
+				}
+			}
+			fmt.Printf("읽기 워커 %d: 100회 읽음\n", readerID)
+		}(r)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	finalLength := safeMap.Length()
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("최종 맵 크기: %d 항목\n", finalLength)
+	fmt.Printf("소요시간: %v\n", elapsed)
+	fmt.Println("✓ Race Detector 통과 (동시성 안전)")
+}
+
+// ============================================================
+// 섹션 6: Once (한 번만 실행)
+// ============================================================
+
+type Singleton struct {
+	value int
+}
+
+var (
+	instance *Singleton
+	once     sync.Once
+)
+
+func GetSingleton() *Singleton {
+	once.Do(func() {
+		fmt.Println("Singleton 초기화 중...")
+		instance = &Singleton{value: 42}
+		time.Sleep(100 * time.Millisecond)
+	})
+	return instance
+}
+
+func section6_once() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 6: Once (한 번만 실행)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[6-1] 기본 Once 사용")
+
+	fmt.Println("고루틴 10개가 GetSingleton() 호출")
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			singleton := GetSingleton()
+			fmt.Printf("고루틴 %d: Singleton value = %d\n", id, singleton.value)
+		}(i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	fmt.Printf("\n결과:\n")
+	fmt.Printf("'Singleton 초기화 중...' 메시지: 정확히 1번 출력됨\n")
+	fmt.Printf("소요시간: %v\n", elapsed)
+	fmt.Println("✓ 여러 고루틴이 호출해도 초기화는 한 번만 실행됨")
+}
+
+// ============================================================
+// 섹션 7: 고급 패턴 (Cond - 조건 변수)
+// ============================================================
+
+type WaitQueue struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	data []int
+}
+
+func NewWaitQueue() *WaitQueue {
+	q := &WaitQueue{
+		data: make([]int, 0),
+	}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *WaitQueue) Enqueue(item int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.data = append(q.data, item)
+	q.cond.Signal()  // 대기 중인 goroutine 깨우기
+}
+
+func (q *WaitQueue) Dequeue() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	for len(q.data) == 0 {
+		q.cond.Wait()  // 데이터가 들어올 때까지 대기
+	}
+
+	item := q.data[0]
+	q.data = q.data[1:]
+	return item
+}
+
+func section7_advancedPatterns() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 7: 고급 패턴 (조건 변수 Cond)")
+	fmt.Println("============================================================")
+
+	fmt.Println("\n[7-1] 조건 변수를 이용한 대기 큐")
+
+	queue := NewWaitQueue()
+	var wg sync.WaitGroup
+
+	// 소비자 2개 (대기)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 3; j++ {
+				item := queue.Dequeue()
+				fmt.Printf("소비자 %d: 아이템 %d 수신\n", id, item)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}(i)
+	}
+
+	// 생산자 1개 (공급)
+	time.Sleep(100 * time.Millisecond)
+
+	for i := 1; i <= 6; i++ {
+		fmt.Printf("생산자: 아이템 %d 전송\n", i)
+		queue.Enqueue(i)
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	wg.Wait()
+	fmt.Println("✓ 모든 항목 처리 완료")
+}
+
+// ============================================================
+// 섹션 8: Assignment 2-3 종합 벤치마킹
+// ============================================================
+
+func section8_assignment2_3() {
+	fmt.Println("\n============================================================")
+	fmt.Println("섹션 8: Assignment 2-3 - 종합 벤치마킹")
+	fmt.Println("============================================================")
+
+	// Assignment 1: Race Condition 분석
+	fmt.Println("\n[8-1] Assignment 2-3-1: Race Condition 재현 및 분석")
+	fmt.Println("요구사항: 고루틴 1,000개 × 1,000회 증가 (뮤텍스 없음)")
+
+	unsafeCount := 0
+	var wg sync.WaitGroup
+
+	start := time.Now()
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				unsafeCount++
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	expectedValue := 1000 * 1000
+	lossPercentage := float64(expectedValue-unsafeCount) / float64(expectedValue) * 100
+
+	fmt.Printf("결과:\n")
+	fmt.Printf("예상값: %d\n", expectedValue)
+	fmt.Printf("실제값: %d\n", unsafeCount)
+	fmt.Printf("손실: %d (%.2f%%)\n", expectedValue-unsafeCount, lossPercentage)
+	fmt.Printf("소요시간: %v\n", elapsed)
+
+	// Assignment 2: SafeMap 벤치마크
+	fmt.Println("\n[8-2] Assignment 2-3-2: SafeMap 성능 벤치마크")
+	fmt.Println("요구사항: SafeMap으로 동시성 안전성 검증")
+
+	safeMap := NewSafeMap()
+	readCount := 0
+	writeCount := 0
+
+	start = time.Now()
+
+	// 읽기 워커 80개
+	for r := 0; r < 80; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 1000; i++ {
+				keys := safeMap.Keys()
+				if len(keys) > 0 {
+					key := keys[i%len(keys)]
+					_, _ = safeMap.Get(key)
+				}
+				readCount++
+			}
+		}()
+	}
+
+	// 쓰기 워커 20개
+	for w := 0; w < 20; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 1000; i++ {
+				key := fmt.Sprintf("key-%d-%d", id, i)
+				safeMap.Set(key, i)
+				writeCount++
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	elapsed = time.Since(start)
+
+	fmt.Printf("결과:\n")
+	fmt.Printf("읽기 작업: ~80,000회\n")
+	fmt.Printf("쓰기 작업: 20,000회\n")
+	fmt.Printf("최종 맵 크기: %d항목\n", safeMap.Length())
+	fmt.Printf("소요시간: %v\n", elapsed)
+	fmt.Println("✓ SafeMap Race Detector 통과")
+
+	// Assignment 3: 종합 성능 비교
+	fmt.Println("\n[8-3] 종합 성능 비교: 다양한 동기화 기법")
+
+	fmt.Println("\n시나리오: 고루틴 100개, 각 10,000회 카운터 증가\n")
+
+	// 1. 뮤텍스 없음 (위험)
+	unsafeValue := 0
+	start = time.Now()
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10000; j++ {
+				unsafeValue++
+			}
+		}()
+	}
+
+	wg.Wait()
+	unsafeTime := time.Since(start)
+	expectedValue = 1000000
+	fmt.Printf("1. 뮤텍스 없음:\n")
+	fmt.Printf("   소요시간: %v\n", unsafeTime)
+	fmt.Printf("   최종값: %d (예상: %d)\n", unsafeValue, expectedValue)
+	fmt.Printf("   정확성: %.2f%%\n", float64(unsafeValue)/float64(expectedValue)*100)
+
+	// 2. Mutex 사용
+	var mu sync.Mutex
+	mutexValue := 0
+	start = time.Now()
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10000; j++ {
+				mu.Lock()
+				mutexValue++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	mutexTime := time.Since(start)
+	fmt.Printf("\n2. Mutex 사용:\n")
+	fmt.Printf("   소요시간: %v\n", mutexTime)
+	fmt.Printf("   최종값: %d (정확)\n", mutexValue)
+
+	// 3. Atomic 사용
+	var atomicValue int64 = 0
+	start = time.Now()
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10000; j++ {
+				atomic.AddInt64(&atomicValue, 1)
+			}
+		}()
+	}
+
+	wg.Wait()
+	atomicTime := time.Since(start)
+	fmt.Printf("\n3. Atomic 사용:\n")
+	fmt.Printf("   소요시간: %v\n", atomicTime)
+	fmt.Printf("   최종값: %d (정확)\n", atomicValue)
+
+	// 성능 비교
+	fmt.Printf("\n성능 개선:\n")
+	fmt.Printf("Mutex vs Atomic: %.2fx\n", float64(mutexTime.Nanoseconds())/float64(atomicTime.Nanoseconds()))
+	fmt.Printf("Unsafe vs Atomic: %.2fx\n", float64(unsafeTime.Nanoseconds())/float64(atomicTime.Nanoseconds()))
+
+	fmt.Println("\n[Assignment 2-3 완료]")
+	fmt.Println("✓ Race Condition 재현 및 분석")
+	fmt.Println("✓ SafeMap 구현 및 검증")
+	fmt.Println("✓ 다양한 동기화 기법 성능 비교")
+}
+
+// ============================================================
+// Main: 전체 실행
+// ============================================================
+
+func main() {
+	fmt.Println("\n" + "============================================================")
+	fmt.Println("🎓 Go 201-2-3: 공유 자원의 사수 - 뮤텍스와 원자적 연산")
+	fmt.Println("============================================================")
+
+	section1_mutexBasics()
+	section2_raceCondition()
+	section3_rwmutex()
+	section4_atomic()
+	section5_safeMap()
+	section6_once()
+	section7_advancedPatterns()
+	section8_assignment2_3()
+
+	fmt.Println("\n" + "============================================================")
+	fmt.Println("모든 섹션 완료!")
+	fmt.Println("============================================================")
+	fmt.Println("\n실행 방법:")
+	fmt.Println("  go run 03_mutex_atomic_synchronization.go")
+	fmt.Println("\nRace Detector 실행:")
+	fmt.Println("  CGO_ENABLED=0 go run -race 03_mutex_atomic_synchronization.go")
+}

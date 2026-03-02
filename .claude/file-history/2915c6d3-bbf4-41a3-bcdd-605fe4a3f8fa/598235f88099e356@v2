@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""
+아핀 산술 (Affine Arithmetic)
+
+구간 산술의 interval bloat 문제를 해결합니다.
+
+각 값을 다음과 같이 표현:
+  x = x₀ + x₁·ε₁ + x₂·ε₂ + ... + xₙ·εₙ
+      ↑     ↑ 이전 계산에서 도입된 오차
+    중심값
+
+ε_i ∈ [-1, 1]은 정규화된 오차이며, 각 변수는 자신의 오차항을 추적합니다.
+
+예시:
+  x = 1.0 (정확)              → x = 1.0
+  y = 1.0 ± 0.01             → y = 1.0 + 0.01·ε₁
+  z = x + y = 2.0 + 0.01·ε₁  → z = 2.0 + 0.01·ε₁
+  w = z + y = 3.0 + 0.02·ε₁  → w = 3.0 + 0.02·ε₁
+
+구간 범위:
+  z ∈ [2.0 - 0.01, 2.0 + 0.01] = [1.99, 2.01]
+  w ∈ [3.0 - 0.02, 3.0 + 0.02] = [2.98, 3.02]
+
+vs 구간 산술:
+  IA: z = [1, 2] + [0.99, 1.01] = [1.99, 3.01]  ← 범위가 더 넓음!
+  IA: w = [1.99, 3.01] + [0.99, 1.01] = [2.98, 4.02]  ← 더더 넓음!
+
+결론: AA가 더 정확한 오차 추적을 제공합니다.
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, Optional
+import math
+
+
+# 전역 오차 심볼 카운터
+_error_symbol_counter = 0
+
+
+def get_new_error_symbol() -> int:
+    """새로운 오차 심볼 ID 생성"""
+    global _error_symbol_counter
+    _error_symbol_counter += 1
+    return _error_symbol_counter
+
+
+def reset_error_counter():
+    """오류 심볼 카운터 초기화"""
+    global _error_symbol_counter
+    _error_symbol_counter = 0
+
+
+@dataclass
+class AffineForm:
+    """아핀 형태: x = x₀ + Σ xᵢ·εᵢ"""
+    center: float                    # 중심값 x₀
+    error_terms: Dict[int, float] = field(default_factory=dict)  # {εᵢ_id: 계수 xᵢ}
+
+    def bounds(self) -> Tuple[float, float]:
+        """구간 범위 계산"""
+        radius = sum(abs(coef) for coef in self.error_terms.values())
+        return (self.center - radius, self.center + radius)
+
+    def midpoint(self) -> float:
+        """중점 (중심값과 동일)"""
+        return self.center
+
+    def radius(self) -> float:
+        """반지름 (오차의 합)"""
+        return sum(abs(coef) for coef in self.error_terms.values())
+
+    def width(self) -> float:
+        """폭 (2 × 반지름)"""
+        return 2 * self.radius()
+
+    def __str__(self) -> str:
+        lower, upper = self.bounds()
+        terms_str = " + ".join(
+            f"{coef:.4g}·ε{eid}" for eid, coef in sorted(self.error_terms.items())
+        )
+        if terms_str:
+            return f"{self.center:.4g} + ({terms_str})"
+        else:
+            return f"{self.center:.4g}"
+
+    def __repr__(self) -> str:
+        return f"AffineForm({self.center}, {self.error_terms})"
+
+    # ==================== 산술 연산 ====================
+
+    def __add__(self, other) -> 'AffineForm':
+        """덧셈: (x₀ + Σxᵢεᵢ) + (y₀ + Σyⱼεⱼ) = (x₀+y₀) + Σ(xᵢ+yᵢ)εᵢ"""
+        if isinstance(other, (int, float)):
+            result = AffineForm(
+                center=self.center + other,
+                error_terms=self.error_terms.copy()
+            )
+        elif isinstance(other, AffineForm):
+            result = AffineForm(
+                center=self.center + other.center,
+                error_terms=self.error_terms.copy()
+            )
+            for eid, coef in other.error_terms.items():
+                if eid in result.error_terms:
+                    result.error_terms[eid] += coef
+                else:
+                    result.error_terms[eid] = coef
+        else:
+            return NotImplemented
+
+        return result
+
+    def __radd__(self, other) -> 'AffineForm':
+        return self.__add__(other)
+
+    def __sub__(self, other) -> 'AffineForm':
+        """뺄셈: (x₀ + Σxᵢεᵢ) - (y₀ + Σyⱼεⱼ) = (x₀-y₀) + Σ(xᵢ-yᵢ)εᵢ"""
+        if isinstance(other, (int, float)):
+            result = AffineForm(
+                center=self.center - other,
+                error_terms=self.error_terms.copy()
+            )
+        elif isinstance(other, AffineForm):
+            result = AffineForm(
+                center=self.center - other.center,
+                error_terms=self.error_terms.copy()
+            )
+            for eid, coef in other.error_terms.items():
+                if eid in result.error_terms:
+                    result.error_terms[eid] -= coef
+                else:
+                    result.error_terms[eid] = -coef
+        else:
+            return NotImplemented
+
+        return result
+
+    def __rsub__(self, other) -> 'AffineForm':
+        if isinstance(other, (int, float)):
+            return AffineForm(
+                center=other - self.center,
+                error_terms={eid: -coef for eid, coef in self.error_terms.items()}
+            )
+        return NotImplemented
+
+    def __mul__(self, other) -> 'AffineForm':
+        """곱셈: (x₀ + Σxᵢεᵢ) * (y₀ + Σyⱼεⱼ)"""
+        if isinstance(other, (int, float)):
+            return AffineForm(
+                center=self.center * other,
+                error_terms={eid: coef * other for eid, coef in self.error_terms.items()}
+            )
+        elif isinstance(other, AffineForm):
+            # (x₀ + e_x) * (y₀ + e_y) = x₀*y₀ + x₀*e_y + y₀*e_x + e_x*e_y
+            # 선형 부분: x₀*e_y + y₀*e_x
+            # 비선형 부분: e_x*e_y (새로운 오차 심볼 도입)
+
+            result = AffineForm(center=self.center * other.center)
+
+            # 선형 부분: x₀ * other의 오차항들
+            for eid, coef in other.error_terms.items():
+                if eid in result.error_terms:
+                    result.error_terms[eid] += self.center * coef
+                else:
+                    result.error_terms[eid] = self.center * coef
+
+            # 선형 부분: y₀ * self의 오차항들
+            for eid, coef in self.error_terms.items():
+                if eid in result.error_terms:
+                    result.error_terms[eid] += other.center * coef
+                else:
+                    result.error_terms[eid] = other.center * coef
+
+            # 비선형 부분: e_x * e_y (새로운 오차 항)
+            # Σ(xᵢεᵢ) * Σ(yⱼεⱼ) = ΣΣ xᵢyⱼ εᵢεⱼ
+            # εᵢεⱼ의 크기 경계: max(Σ|xᵢyⱼ|) ≤ 1
+            nonlinear_coef = 0.0
+            for eid1, x_coef in self.error_terms.items():
+                for eid2, y_coef in other.error_terms.items():
+                    nonlinear_coef += abs(x_coef * y_coef)
+
+            if nonlinear_coef > 1e-15:  # 무시할 수 있을 정도로 작지 않으면
+                new_error_id = get_new_error_symbol()
+                result.error_terms[new_error_id] = nonlinear_coef
+
+            return result
+        else:
+            return NotImplemented
+
+    def __rmul__(self, other) -> 'AffineForm':
+        return self.__mul__(other)
+
+    def __truediv__(self, other) -> 'AffineForm':
+        """나눗셈: 1/y * x ≈ (1/y₀) * x + (1/y₀) * e_x - (x₀/y₀²) * e_y"""
+        if isinstance(other, (int, float)):
+            if other == 0:
+                raise ValueError("Division by zero")
+            return AffineForm(
+                center=self.center / other,
+                error_terms={eid: coef / other for eid, coef in self.error_terms.items()}
+            )
+        elif isinstance(other, AffineForm):
+            # 1차 테일러 근사: (x₀ + e_x) / (y₀ + e_y) ≈ x₀/y₀ + (e_x*y₀ - x₀*e_y) / y₀²
+            y_bounds = other.bounds()
+            if y_bounds[0] <= 0 <= y_bounds[1]:
+                raise ValueError("Division by affine form containing zero")
+
+            center = self.center / other.center
+            result = AffineForm(center=center)
+
+            # 선형 부분: e_x / y₀
+            for eid, coef in self.error_terms.items():
+                result.error_terms[eid] = coef / other.center
+
+            # 선형 부분: -(x₀ / y₀²) * e_y
+            y0_sq = other.center ** 2
+            for eid, coef in other.error_terms.items():
+                coef_val = -(self.center / y0_sq) * coef
+                if eid in result.error_terms:
+                    result.error_terms[eid] += coef_val
+                else:
+                    result.error_terms[eid] = coef_val
+
+            # 비선형 부분: (e_x * e_y) / y₀² (무시할 수 있는 경우가 많음)
+            # 생략 (정밀도와 복잡도의 트레이드오프)
+
+            return result
+        else:
+            return NotImplemented
+
+    def __rtruediv__(self, other) -> 'AffineForm':
+        if isinstance(other, (int, float)):
+            return AffineForm(center=other) / self
+        return NotImplemented
+
+    def __neg__(self) -> 'AffineForm':
+        """음수"""
+        return AffineForm(
+            center=-self.center,
+            error_terms={eid: -coef for eid, coef in self.error_terms.items()}
+        )
+
+    # ==================== 특수 함수 ====================
+
+    def exp(self) -> 'AffineForm':
+        """지수 함수: e^x ≈ e^x₀ + e^x₀ * e_x"""
+        exp_center = math.exp(self.center)
+        result = AffineForm(center=exp_center)
+
+        # 1차 테일러: d/dx[e^x] = e^x
+        for eid, coef in self.error_terms.items():
+            result.error_terms[eid] = exp_center * coef
+
+        return result
+
+    def log(self) -> 'AffineForm':
+        """자연로그: ln(x) ≈ ln(x₀) + e_x / x₀"""
+        if self.center <= 0:
+            raise ValueError("log requires positive value")
+
+        log_center = math.log(self.center)
+        result = AffineForm(center=log_center)
+
+        # 1차 테일러: d/dx[ln(x)] = 1/x
+        for eid, coef in self.error_terms.items():
+            result.error_terms[eid] = coef / self.center
+
+        return result
+
+    def sqrt(self) -> 'AffineForm':
+        """제곱근: sqrt(x) ≈ sqrt(x₀) + e_x / (2*sqrt(x₀))"""
+        if self.center <= 0:
+            raise ValueError("sqrt requires positive value")
+
+        sqrt_center = math.sqrt(self.center)
+        result = AffineForm(center=sqrt_center)
+
+        # 1차 테일러: d/dx[sqrt(x)] = 1/(2*sqrt(x))
+        for eid, coef in self.error_terms.items():
+            result.error_terms[eid] = coef / (2 * sqrt_center)
+
+        return result
+
+    def sin(self) -> 'AffineForm':
+        """사인 함수: sin(x) ≈ sin(x₀) + cos(x₀) * e_x"""
+        sin_center = math.sin(self.center)
+        cos_center = math.cos(self.center)
+
+        result = AffineForm(center=sin_center)
+
+        # 1차 테일러: d/dx[sin(x)] = cos(x)
+        for eid, coef in self.error_terms.items():
+            result.error_terms[eid] = cos_center * coef
+
+        return result
+
+    def cos(self) -> 'AffineForm':
+        """코사인 함수: cos(x) ≈ cos(x₀) - sin(x₀) * e_x"""
+        cos_center = math.cos(self.center)
+        sin_center = math.sin(self.center)
+
+        result = AffineForm(center=cos_center)
+
+        # 1차 테일러: d/dx[cos(x)] = -sin(x)
+        for eid, coef in self.error_terms.items():
+            result.error_terms[eid] = -sin_center * coef
+
+        return result
+
+    def power(self, n: int) -> 'AffineForm':
+        """거듭제곱: x^n ≈ x₀^n + n*x₀^(n-1) * e_x"""
+        pow_center = self.center ** n
+        result = AffineForm(center=pow_center)
+
+        if n != 0:
+            # 1차 테일러: d/dx[x^n] = n*x^(n-1)
+            derivative = n * (self.center ** (n - 1))
+            for eid, coef in self.error_terms.items():
+                result.error_terms[eid] = derivative * coef
+
+        return result
+
+    def relative_error_bound(self) -> float:
+        """상대 오차 경계"""
+        if abs(self.center) < 1e-15:
+            return self.radius()  # 절대 오차 사용
+
+        return self.radius() / abs(self.center)
+
+    def to_interval(self):
+        """Interval 객체로 변환"""
+        from interval_arithmetic import Interval
+        lower, upper = self.bounds()
+        return Interval(lower, upper)
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Affine Arithmetic Demo")
+    print("="*70)
+
+    # 예제 1: Interval bloat 해결
+    print("\n[Example 1] Solving Interval Bloat")
+    print("-"*70)
+
+    # 정확한 값
+    x_exact = 1.0
+
+    # AA로 표현: 1.0 ± 0.1
+    x = AffineForm(center=1.0)
+    x.error_terms[1] = 0.1
+
+    print(f"x = {x}")
+    print(f"x bounds = {x.bounds()}")
+
+    # x - x 계산
+    diff = x - x
+    print(f"\nx - x = {diff}")
+    print(f"(x - x) bounds = {diff.bounds()}")
+    print(f"✓ 정확히 0!")
+
+    # 예제 2: 오차 누적 추적
+    print("\n[Example 2] Error Accumulation")
+    print("-"*70)
+
+    reset_error_counter()
+    a = AffineForm(center=1.0)
+    a.error_terms[1] = 0.01
+
+    b = AffineForm(center=2.0)
+    b.error_terms[2] = 0.01
+
+    c = a + b
+    print(f"a = {a}")
+    print(f"b = {b}")
+    print(f"a + b = {c}")
+
+    d = c + a
+    print(f"(a + b) + a = {d}")
+    print(f"bounds = {d.bounds()}")
+
+    # 예제 3: 곱셈의 비선형 항
+    print("\n[Example 3] Nonlinear Terms in Multiplication")
+    print("-"*70)
+
+    reset_error_counter()
+    x = AffineForm(center=2.0)
+    x.error_terms[1] = 0.1
+
+    y = AffineForm(center=3.0)
+    y.error_terms[2] = 0.1
+
+    product = x * y
+    print(f"x = {x}, bounds = {x.bounds()}")
+    print(f"y = {y}, bounds = {y.bounds()}")
+    print(f"x * y = {product}")
+    print(f"x * y bounds = {product.bounds()}")
+    print(f"비선형 항이 새로운 오차 심볼 도입!")
+
+    # 예제 4: 특수 함수
+    print("\n[Example 4] Special Functions")
+    print("-"*70)
+
+    reset_error_counter()
+    x = AffineForm(center=0.5)
+    x.error_terms[1] = 0.05
+
+    exp_x = x.exp()
+    log_x = x.log()
+    sqrt_x = x.sqrt()
+
+    print(f"x = {x}")
+    print(f"exp(x) = {exp_x}")
+    print(f"log(x) = {log_x}")
+    print(f"sqrt(x) = {sqrt_x}")
+
+    print("\n" + "="*70)
+    print("Affine Arithmetic Complete")
+    print("="*70)

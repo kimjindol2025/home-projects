@@ -1,0 +1,397 @@
+# Phase 6.2 — Capability Runtime: AST & TypeChecker 설계
+
+## 컨텍스트
+
+**마누스 AI L2 Execution Layer** 구현 시작.
+FreeLang VM은 L1 Runtime Kernel(✅ 완성). 이제 AI가 "무엇을 실행할 수 있는가"를 정의하는
+Capability Runtime을 구축한다.
+
+**Phase 6 Spec (확정)**:
+- Default Deny
+- Explicit Declaration (함수 단위)
+- Static First (컴파일 타임 검증)
+- Strict Propagation (호출자도 명시 필요)
+- Constant Path Only
+- VM 최종 집행자
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 작업 |
+|------|------|
+| `src/ast.ts` | Capability/Annotation 노드 추가 |
+| `src/parser.ts` | parseAnnotations() 추가 |
+| `src/type-system.ts` | Capability 타입 추가, fn 타입 확장 |
+| `src/type-checker.ts` | Capability 검증 로직 추가 |
+| `src/vm-capability-test.ts` | 신규 테스트 15개 |
+
+---
+
+## Step 1: AST 확장 (`src/ast.ts`)
+
+### 추가할 타입 (MatchArm 정의 아래, Stmt 위)
+
+```typescript
+// Capability 종류
+export type CapabilityKind =
+  | "read_file"
+  | "write_file"
+  | "network"
+  | "spawn_process"
+  | "execute_code"
+
+// Capability 선언 (allow/limit)
+export type CapabilityAnnotation =
+  | { kind: "allow"; cap: CapabilityKind; arg?: string }
+  | { kind: "limit"; resource: "cpu" | "memory" | "io"; value: number }
+
+// 내장 함수 Required Capability
+export type RequiredCapability = CapabilityKind
+```
+
+### FnStmt 노드 확장 (Stmt 유니온에서)
+
+```typescript
+// 현재 (ast.ts:36):
+| { kind: "fn"; name: string; params: string[]; body: Stmt[] }
+
+// 변경:
+| { kind: "fn"; name: string; params: string[];
+    body: Stmt[]; annotations: CapabilityAnnotation[] }
+```
+
+---
+
+## Step 2: Parser 확장 (`src/parser.ts`)
+
+### parseAnnotations() 신규 함수
+
+`parseFnStmt()`의 `expect(T.RParen)` (줄 107) 직후에 삽입:
+
+```typescript
+function parseAnnotations(): CapabilityAnnotation[] {
+  if (!at(T.LBracket)) return []    // [] 없으면 빈 배열
+  advance()                          // [
+  const annotations: CapabilityAnnotation[] = []
+
+  while (!at(T.RBracket) && !at(T.EOF)) {
+    const name = expect(T.Ident).value   // "allow" or "limit"
+
+    if (name === "allow") {
+      expect(T.LParen)
+      const capName = expect(T.Ident).value as CapabilityKind
+      let arg: string | undefined
+      if (match(T.LParen)) {             // allow(read_file("/tmp"))
+        // 이미 (를 소비, 다음은 문자열 인자
+        arg = expect(T.String).value
+        expect(T.RParen)
+      } else if (match(T.Comma) || at(T.String)) {
+        arg = expect(T.String).value     // allow(read_file, "/tmp")
+      }
+      expect(T.RParen)
+      annotations.push({ kind: "allow", cap: capName, arg })
+
+    } else if (name === "limit") {
+      expect(T.LParen)
+      // limit(cpu=5000, memory=512000000)
+      while (!at(T.RParen) && !at(T.EOF)) {
+        const res = expect(T.Ident).value as "cpu" | "memory" | "io"
+        expect(T.Assign)   // =
+        const val = Number(expect(T.Number).value)
+        annotations.push({ kind: "limit", resource: res, value: val })
+        match(T.Comma)
+      }
+      expect(T.RParen)
+    }
+
+    match(T.Comma)
+  }
+
+  expect(T.RBracket)   // ]
+  return annotations
+}
+```
+
+### parseFnStmt 수정
+
+```typescript
+// 줄 107 (expect RParen) 직후:
+expect(T.RParen)
+const annotations = parseAnnotations()    // ← 추가
+if (match(T.Arrow)) { ... }               // 기존
+// ...
+return { kind: "fn", name, params, body, annotations }   // ← annotations 추가
+```
+
+---
+
+## Step 3: Type System 확장 (`src/type-system.ts`)
+
+### Capability 타입 추가 (TypeCheckError 위)
+
+```typescript
+export type CapabilityKind =
+  | "read_file"
+  | "write_file"
+  | "network"
+  | "spawn_process"
+  | "execute_code"
+
+export interface Capability {
+  cap: CapabilityKind
+  arg?: string          // path prefix, hostname, etc.
+}
+```
+
+### Type 유니온 확장 (줄 21)
+
+```typescript
+// 현재:
+| { kind: "fn"; paramTypes: Type[]; returnType: Type }
+
+// 변경:
+| { kind: "fn"; paramTypes: Type[]; returnType: Type;
+    capabilities: Capability[] }
+```
+
+---
+
+## Step 4: TypeChecker 확장 (`src/type-checker.ts`)
+
+### 4-1: 클래스 필드 추가 (줄 23 뒤)
+
+```typescript
+// 현재 컨텍스트 함수의 capability 스택
+private currentCapabilities: Capability[] = []
+```
+
+### 4-2: Built-in Registry (private 상수)
+
+```typescript
+private readonly BUILTIN_REQUIRED_CAPABILITIES: Map<string, CapabilityKind> = new Map([
+  ["file.read",     "read_file"],
+  ["file.write",    "write_file"],
+  ["http.request",  "network"],
+  ["http.get",      "network"],
+  ["process.spawn", "spawn_process"],
+  ["eval",          "execute_code"],
+])
+```
+
+### 4-3: registerFunctionType() 수정 (줄 66-87)
+
+AST의 annotations에서 capabilities 추출하여 저장:
+
+```typescript
+private registerFunctionType(stmt: Stmt): void {
+  if (stmt.kind === "fn") {
+    const fnStmt = stmt as any
+
+    // 기존 paramTypes, returnType 생성 ...
+
+    // [Phase 6 추가] annotation → capabilities 변환
+    const capabilities: Capability[] = (fnStmt.annotations || [])
+      .filter((a: any) => a.kind === "allow")
+      .map((a: any) => ({ cap: a.cap, arg: a.arg }))
+
+    const fnType: Type = {
+      kind: "fn",
+      paramTypes,
+      returnType,
+      capabilities,          // ← 추가
+    }
+    this.functionTypes.set(fnStmt.name, fnType)
+  }
+}
+```
+
+### 4-4: case "fn" stmt 수정 (줄 105-147)
+
+capabilities 스택 저장/복원 (중첩 함수 격리):
+
+```typescript
+case "fn": {
+  const fnStmt = stmt as any
+  const savedEnv = new Map(this.env)
+  const savedReturnTypes = this.currentFunctionReturnTypes
+  const savedCapabilities = this.currentCapabilities  // ← 추가
+
+  // 현재 함수의 선언 capability로 컨텍스트 설정
+  const fnType = this.functionTypes.get(fnStmt.name)
+  this.currentCapabilities = fnType?.kind === "fn"
+    ? fnType.capabilities
+    : []
+
+  this.currentFunctionReturnTypes = []
+
+  // 파라미터 등록 ...
+  // 본문 검사 ...
+
+  // return 타입 추론 후 갱신 시 capabilities 보존
+  const existingFnType = this.functionTypes.get(fnStmt.name)
+  if (existingFnType && existingFnType.kind === "fn") {
+    this.functionTypes.set(fnStmt.name, {
+      kind: "fn",
+      paramTypes: existingFnType.paramTypes,
+      returnType: inferredReturn,
+      capabilities: existingFnType.capabilities,   // ← 보존
+    })
+  }
+
+  this.currentCapabilities = savedCapabilities    // ← 복원
+  this.currentFunctionReturnTypes = savedReturnTypes
+  this.env = savedEnv
+  break
+}
+```
+
+### 4-5: case "call" 검증 추가 (줄 441 직후)
+
+```typescript
+// 인자 타입 검증 루프 후, return fnType.returnType 전에 삽입:
+
+// [Phase 6] Capability Propagation 검증
+// Strict: callee.capabilities ⊆ caller.capabilities
+if (fnType.capabilities && fnType.capabilities.length > 0) {
+  for (const required of fnType.capabilities) {
+    const callerHas = this.currentCapabilities.some(
+      c => c.cap === required.cap &&
+           this.capabilityCovers(c, required)
+    )
+    if (!callerHas) {
+      this.addError(
+        `Call to '${fnName}' requires capability '${required.cap}' ` +
+        `${required.arg ? `(${required.arg})` : ""}, ` +
+        `but caller does not declare it`,
+        undefined, undefined
+      )
+    }
+  }
+}
+```
+
+### 4-6: capabilityCovers() 헬퍼 추가
+
+Path prefix 매칭 + network wildcard 처리:
+
+```typescript
+private capabilityCovers(caller: Capability, callee: Capability): boolean {
+  if (caller.cap !== callee.cap) return false
+  if (!callee.arg) return true   // callee가 경로 무관하면 OK
+  if (!caller.arg) return false  // caller가 무제한인데 callee가 제한적? 아니, 이 경우는 OK
+
+  // Path: /tmp → /tmp/file.txt OK, /tmp → /etc NG
+  if (caller.cap === "read_file" || caller.cap === "write_file") {
+    return this.pathIsUnder(callee.arg, caller.arg)
+  }
+
+  // Network: api.openai.com → api.openai.com OK, *.openai.com → sub.openai.com OK
+  if (caller.cap === "network") {
+    return this.hostMatches(callee.arg, caller.arg)
+  }
+
+  return caller.arg === callee.arg
+}
+
+private pathIsUnder(target: string, allowedPrefix: string): boolean {
+  // ".." 즉시 거부
+  if (target.includes("..")) return false
+  const normalized = target.replace(/\/+/g, "/").replace(/\/$/, "")
+  const prefix = allowedPrefix.replace(/\/+/g, "/").replace(/\/$/, "")
+  return normalized === prefix || normalized.startsWith(prefix + "/")
+}
+
+private hostMatches(target: string, pattern: string): boolean {
+  if (pattern === target) return true
+  if (pattern.startsWith("*.")) {
+    const base = pattern.slice(2)
+    return target.endsWith("." + base) && !target.slice(0, -base.length - 1).includes(".")
+  }
+  return false
+}
+```
+
+### 4-7: Built-in 호출 검증 (case "call" 확장)
+
+내장 함수(file.read 등) 호출 시 capability 검증:
+
+```typescript
+// case "call" 초반에 built-in 검증 추가
+const builtinRequired = this.BUILTIN_REQUIRED_CAPABILITIES.get(fnName)
+if (builtinRequired) {
+  const callerHas = this.currentCapabilities.some(c => c.cap === builtinRequired)
+  if (!callerHas) {
+    this.addError(
+      `'${fnName}' requires capability '${builtinRequired}', not declared`,
+      undefined, undefined
+    )
+  }
+}
+```
+
+---
+
+## Step 5: 테스트 파일 (`src/vm-capability-test.ts`, 15개)
+
+```
+Suite A — Capability 선언 & 파싱 (5개):
+  1. annotation 없는 함수 → capabilities: []
+  2. allow(read_file("/tmp")) 파싱 → cap: read_file, arg: /tmp
+  3. allow(network("api.openai.com")) 파싱
+  4. limit(cpu=5000) 파싱
+  5. 다중 annotation → 배열로 수집
+
+Suite B — 정적 검증 (Compile Error) (5개):
+  6. 권한 없이 read_file 함수 호출 → 에러
+  7. 권한 있는 함수 정상 호출 → 통과
+  8. Strict Propagation: caller도 선언 필요 → 에러
+  9. 중첩 함수 독립 컨텍스트 → 외부 capability 영향 없음
+  10. Path escape ".." 포함 → 에러
+
+Suite C — 호환성 (5개):
+  11. 기존 102개 테스트 호환성 유지
+  12. annotation 없는 기존 함수 → 정상 동작
+  13. SAFE 내장 함수(print, len) → capability 불필요
+  14. 재귀 함수 capability 자기 참조
+  15. capability 없는 최상위 코드 실행
+```
+
+---
+
+## 검증 순서
+
+```bash
+npm run build
+node dist/vm-capability-test.js        # 신규 15개
+node dist/vm-function-types-test.js    # Phase 5.5.2 (15개)
+node dist/vm-typed-arithmetic-test.js  # Phase 5.5 (15개)
+node dist/vm-types-test.js             # Phase 5 (20개)
+node dist/vm-compatibility-test.js     # 호환성
+# 목표: 117개 전체 통과 (102 + 15)
+```
+
+---
+
+## 구현 순서 (엄수)
+
+```
+1. ast.ts   — CapabilityAnnotation 타입 + FnStmt 확장
+2. parser.ts — parseAnnotations() + parseFnStmt 수정
+3. type-system.ts — Capability 타입 + fn 타입 확장
+4. type-checker.ts — 5가지 수정 (4-1 ~ 4-7)
+5. vm-capability-test.ts — 15개 테스트 작성
+6. npm run build → 테스트 실행
+```
+
+---
+
+## 리스크 통제
+
+| 리스크 | 대책 |
+|--------|------|
+| 기존 FnStmt 사용 코드 깨짐 | annotations 필드 optional로 선언 |
+| capabilities 필드 누락 | registerFunctionType 갱신 지점 모두 처리 |
+| fn expr(람다)도 처리 | case "fn" expr에도 동일 패턴 적용 |
+| Built-in registry 불완전 | v1은 핵심 5개만, 추후 확장 |
+| Parser 파싱 실패 | parseAnnotations 실패 시 빈 배열 반환 (Fail Safe) |

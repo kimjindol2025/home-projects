@@ -1,0 +1,245 @@
+/**
+ * FreeLang v5 Blockchain — Blockchain
+ *
+ * 기능:
+ *   addBlock(block)          — 블록 추가 (검증 후)
+ *   getBalance(address)      — UTXO 기반 잔고
+ *   getUtxos(address)        — 미사용 출력 목록
+ *   getTxHistory(address)    — 트랜잭션 내역
+ *   isValid()                — 전체 체인 유효성
+ *   fork(index)              — 특정 높이에서 포크
+ *   getStats()               — 체인 통계
+ *   adjustDifficulty()       — 난이도 동적 조정 (2016블록마다)
+ */
+
+import { Block, Transaction, UTXO, ChainStats } from "./types";
+import { validateBlock } from "./block";
+import { createGenesisBlock } from "./block";
+
+// 목표 블록 생성 시간 (ms) — Bitcoin: 10분, 여기선 5초
+const TARGET_BLOCK_TIME_MS = 5_000;
+// 난이도 조정 주기
+const DIFFICULTY_ADJUST_INTERVAL = 10;
+// 최초 난이도
+const INITIAL_DIFFICULTY = 1;
+// 블록 보상
+const BLOCK_REWARD = 50;
+
+// ============================================================
+// UTXO Set (미사용 출력 관리)
+// ============================================================
+
+class UtxoSet {
+  private utxos: Map<string, UTXO> = new Map(); // key: txId:index
+
+  private key(txId: string, index: number): string {
+    return `${txId}:${index}`;
+  }
+
+  addOutput(txId: string, index: number, address: string, amount: number): void {
+    const k = this.key(txId, index);
+    this.utxos.set(k, { txId, index, address, amount, spent: false });
+  }
+
+  spend(txId: string, index: number): boolean {
+    const k    = this.key(txId, index);
+    const utxo = this.utxos.get(k);
+    if (!utxo || utxo.spent) return false;
+    utxo.spent = true;
+    return true;
+  }
+
+  getByAddress(address: string): UTXO[] {
+    return [...this.utxos.values()].filter(
+      (u) => u.address === address && !u.spent
+    );
+  }
+
+  getBalance(address: string): number {
+    return this.getByAddress(address).reduce((s, u) => s + u.amount, 0);
+  }
+
+  size(): number { return this.utxos.size; }
+
+  clone(): UtxoSet {
+    const copy = new UtxoSet();
+    for (const [k, u] of this.utxos) {
+      copy.utxos.set(k, { ...u });
+    }
+    return copy;
+  }
+}
+
+// ============================================================
+// Blockchain
+// ============================================================
+
+export class Blockchain {
+  private chain:   Block[]  = [];
+  private utxoSet: UtxoSet  = new UtxoSet();
+  private txIndex: Map<string, { blockIdx: number; tx: Transaction }> = new Map();
+  private difficulty: number = INITIAL_DIFFICULTY;
+
+  constructor() {
+    const genesis = createGenesisBlock();
+    this.chain.push(genesis);
+  }
+
+  // ── 블록 추가 ────────────────────────────────────────────
+
+  addBlock(block: Block): { ok: boolean; errors: string[] } {
+    const prevBlock = this.chain[this.chain.length - 1];
+    const result    = validateBlock(block, prevBlock, this.difficulty);
+
+    if (!result.valid) {
+      return { ok: false, errors: result.errors };
+    }
+
+    // UTXO 업데이트
+    this.applyBlock(block);
+    this.chain.push(block);
+
+    // 난이도 조정
+    if (this.chain.length % DIFFICULTY_ADJUST_INTERVAL === 0) {
+      this.adjustDifficulty();
+    }
+
+    return { ok: true, errors: [] };
+  }
+
+  /** 유효성 검사 없이 강제 추가 (테스트용) */
+  addBlockForce(block: Block): void {
+    this.applyBlock(block);
+    this.chain.push(block);
+  }
+
+  // ── UTXO 적용 ───────────────────────────────────────────
+
+  private applyBlock(block: Block): void {
+    const blockIdx = this.chain.length;
+
+    // 코인베이스 출력
+    if (block.coinbase) {
+      this.utxoSet.addOutput(block.coinbase.id, 0, block.coinbase.to, block.coinbase.amount);
+    }
+
+    // 트랜잭션 처리
+    for (const tx of block.transactions) {
+      // 입력(소비): from 주소의 UTXO를 소비
+      // (단순 모델: from 주소 잔고에서 차감 — UTXO 직접 참조 대신 주소 기반)
+      const senderUtxos = this.utxoSet.getByAddress(tx.from);
+      let needed = tx.amount + tx.fee;
+      for (const utxo of senderUtxos) {
+        if (needed <= 0) break;
+        this.utxoSet.spend(utxo.txId, utxo.index);
+        needed -= utxo.amount;
+      }
+
+      // 잔액 UTXO (거스름돈)
+      if (needed < 0) {
+        this.utxoSet.addOutput(tx.id, 0, tx.from, Math.abs(needed));
+      }
+
+      // 출력: to 주소에 추가
+      this.utxoSet.addOutput(tx.id, 1, tx.to, tx.amount);
+
+      // 트랜잭션 인덱스
+      this.txIndex.set(tx.id, { blockIdx, tx });
+    }
+  }
+
+  // ── 조회 ────────────────────────────────────────────────
+
+  getHeight(): number { return this.chain.length - 1; }
+  getLatestBlock(): Block { return this.chain[this.chain.length - 1]; }
+  getBlock(index: number): Block | undefined { return this.chain[index]; }
+  getChain(): Block[] { return [...this.chain]; }
+  getDifficulty(): number { return this.difficulty; }
+  getBlockReward(): number { return BLOCK_REWARD; }
+
+  getBalance(address: string): number {
+    return this.utxoSet.getBalance(address);
+  }
+
+  getUtxos(address: string): UTXO[] {
+    return this.utxoSet.getByAddress(address);
+  }
+
+  getTx(txId: string): Transaction | undefined {
+    return this.txIndex.get(txId)?.tx;
+  }
+
+  getTxHistory(address: string): Transaction[] {
+    return [...this.txIndex.values()]
+      .filter(({ tx }) => tx.from === address || tx.to === address)
+      .map(({ tx }) => tx);
+  }
+
+  // ── 체인 유효성 검증 ────────────────────────────────────
+
+  isValid(): boolean {
+    for (let i = 1; i < this.chain.length; i++) {
+      const block    = this.chain[i];
+      const prev     = this.chain[i - 1];
+      const result   = validateBlock(block, prev, INITIAL_DIFFICULTY); // 단순화: 최초 난이도 사용
+      if (!result.valid) return false;
+    }
+    return true;
+  }
+
+  // ── 통계 ────────────────────────────────────────────────
+
+  getStats(): ChainStats {
+    const totalTx    = this.chain.reduce((s, b) => s + b.transactions.length, 0);
+    const totalCoins = this.chain.reduce((s, b) => s + (b.coinbase?.amount ?? 0), 0);
+
+    let avgBlockTimeMs = 0;
+    if (this.chain.length > 1) {
+      const times: number[] = [];
+      for (let i = 1; i < this.chain.length; i++) {
+        times.push(this.chain[i].header.timestamp - this.chain[i - 1].header.timestamp);
+      }
+      avgBlockTimeMs = times.reduce((a, b) => a + b, 0) / times.length;
+    }
+
+    return {
+      height:         this.getHeight(),
+      totalTx,
+      totalCoins,
+      difficulty:     this.difficulty,
+      avgBlockTimeMs,
+      hashRate:       0, // 외부에서 채굴 결과로 채움
+    };
+  }
+
+  // ── 난이도 조정 ─────────────────────────────────────────
+
+  private adjustDifficulty(): void {
+    const window = Math.min(DIFFICULTY_ADJUST_INTERVAL, this.chain.length - 1);
+    if (window < 2) return;
+
+    const recent      = this.chain.slice(-window);
+    const elapsed     = recent[recent.length - 1].header.timestamp - recent[0].header.timestamp;
+    const expected    = TARGET_BLOCK_TIME_MS * window;
+    const ratio       = elapsed / expected;
+
+    if (ratio < 0.5)  this.difficulty++;              // 너무 빠름 → 난이도 상승
+    else if (ratio > 2) this.difficulty = Math.max(1, this.difficulty - 1); // 너무 느림 → 감소
+  }
+
+  // ── 포크 ────────────────────────────────────────────────
+
+  /** index 높이까지의 체인으로 새 Blockchain 인스턴스 반환 */
+  fork(height: number): Blockchain {
+    const forked = new Blockchain();
+    forked.chain = [];
+
+    for (let i = 0; i <= height && i < this.chain.length; i++) {
+      forked.chain.push(this.chain[i]);
+      if (i > 0) {
+        forked.applyBlock(this.chain[i]);
+      }
+    }
+    return forked;
+  }
+}

@@ -1,0 +1,356 @@
+# ============================================================================
+# optimization/indexing.fl - 데이터베이스 인덱싱 최적화
+# ============================================================================
+# Phase 1B 구현
+# 작성: 2026-03-02
+# 책임: 인덱스 생성, 쿼리 분석, 성능 모니터링
+
+# ─────────────────────────────────────────────────────────────────────────
+# 인덱스 정의
+# ─────────────────────────────────────────────────────────────────────────
+
+struct IndexDefinition
+  name: string
+  tableName: string
+  columns: array<string>
+  isUnique: bool
+  isCovering: bool           # 모든 필요한 컬럼 포함
+
+fn createOptimalIndexes
+  input: db: Database
+  output: Result<void, string>
+  intent: "쿼리 패턴에 맞는 최적 인덱스 생성"
+  do
+    # 1. 기존 인덱스 (Phase 1에서 생성)
+    # idx_todos_completed
+    # idx_todos_created_at
+
+    # 2. Phase 1B: 추가 인덱스
+    # 제목 검색용
+    match createIndexIfNotExists(db, IndexDefinition{
+      name: "idx_todos_title",
+      tableName: "todos",
+      columns: ["title"],
+      isUnique: false,
+      isCovering: false
+    })
+      Err(e) => return Err("Failed to create title index: " + e)
+      Ok(_) => {}
+
+    # 복합 인덱스 (자주 함께 사용)
+    match createIndexIfNotExists(db, IndexDefinition{
+      name: "idx_todos_completed_created",
+      tableName: "todos",
+      columns: ["completed", "created_at DESC"],
+      isUnique: false,
+      isCovering: false
+    })
+      Err(e) => return Err("Failed to create composite index: " + e)
+      Ok(_) => {}
+
+    # 커버링 인덱스 (모든 열 포함)
+    match createIndexIfNotExists(db, IndexDefinition{
+      name: "idx_todos_cover",
+      tableName: "todos",
+      columns: ["completed", "id", "title", "created_at"],
+      isUnique: false,
+      isCovering: true
+    })
+      Err(e) => return Err("Failed to create covering index: " + e)
+      Ok(_) => {}
+
+    return Ok(void)
+
+fn createIndexIfNotExists
+  input: (db: Database, index: IndexDefinition)
+  output: Result<void, string>
+  intent: "인덱스 생성 (중복 방지)"
+  do
+    # 인덱스 존재 확인
+    match indexExists(db, index.name)
+      Ok(true) => return Ok(void)  # 이미 존재
+      Err(e) => return Err(e)
+      Ok(false) => {
+        # 인덱스 생성
+        let query = buildCreateIndexQuery(index)
+        return executeSql(db, query, [])
+      }
+
+fn indexExists
+  input: (db: Database, indexName: string)
+  output: Result<bool, string>
+  intent: "인덱스 존재 여부 확인"
+  do
+    let query = "SELECT name FROM sqlite_master WHERE type='index' AND name=?"
+    match executeQuery(db, query, [indexName])
+      Ok(rows) => {
+        if arrayLen(rows) > 0
+          Ok(true)
+        else
+          Ok(false)
+      }
+      Err(e) => Err(e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 쿼리 성능 분석
+# ─────────────────────────────────────────────────────────────────────────
+
+struct QueryPlan
+  query: string
+  selectid: number
+  order: number
+  from: string
+  detail: string
+  hasFullTableScan: bool
+  hasIndexedScan: bool
+  estimatedCost: number
+
+fn analyzeQueryPerformance
+  input: (db: Database, query: string)
+  output: Result<QueryPlan, string>
+  intent: "EXPLAIN QUERY PLAN으로 쿼리 분석"
+  do
+    let explainQuery = "EXPLAIN QUERY PLAN " + query
+
+    match executeQuery(db, explainQuery, [])
+      Ok(rows) => {
+        if arrayLen(rows) == 0
+          return Err("No query plan available")
+
+        let firstRow = arrayGet(rows, 0)
+        let detail = firstRow.get("detail").getOrElse("")
+
+        let hasFullScan = stringContains(detail, "SCAN TABLE")
+        let hasIndexed = stringContains(detail, "SEARCH") ||
+                        stringContains(detail, "INDEX")
+
+        Ok({
+          query: query,
+          selectid: 0,
+          order: 0,
+          from: "",
+          detail: detail,
+          hasFullTableScan: hasFullScan,
+          hasIndexedScan: hasIndexed,
+          estimatedCost: 0
+        })
+      }
+      Err(e) => Err(e)
+
+fn findSlowQueries
+  input: db: Database
+  output: Result<array<SlowQuery>, string>
+  intent: "느린 쿼리 식별"
+  do
+    let slowQueries = []
+
+    # 일반적인 느린 쿼리 패턴
+    let patterns = [
+      "SELECT * FROM todos WHERE title LIKE ?",
+      "SELECT * FROM todos WHERE completed = ? AND created_at > ?",
+      "SELECT COUNT(*) FROM todos"
+    ]
+
+    for pattern in patterns
+      match analyzeQueryPerformance(db, pattern)
+        Ok(plan) => {
+          if plan.hasFullTableScan && !plan.hasIndexedScan
+            slowQueries = arrayPush(slowQueries, {
+              query: pattern,
+              reason: "Full table scan without index",
+              recommendedIndex: suggestIndexForQuery(pattern)
+            })
+        }
+        Err(_) => {}
+
+    Ok(slowQueries)
+
+fn suggestIndexForQuery
+  input: query: string
+  output: string
+  intent: "쿼리에 맞는 인덱스 제안"
+  do
+    # 간단한 패턴 매칭
+    if stringContains(query, "WHERE title LIKE")
+      return "CREATE INDEX idx_todos_title ON todos(title)"
+
+    if stringContains(query, "WHERE completed =")
+      return "CREATE INDEX idx_todos_completed ON todos(completed)"
+
+    if stringContains(query, "ORDER BY created_at")
+      return "CREATE INDEX idx_todos_created_at ON todos(created_at DESC)"
+
+    return "No index suggestion available"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 인덱스 통계
+# ─────────────────────────────────────────────────────────────────────────
+
+struct IndexStatistics
+  name: string
+  tableName: string
+  columnCount: number
+  uniqueValue: bool
+  estimatedRowCount: number
+  usageCount: number
+  lastUsed: string
+
+fn getIndexStatistics
+  input: (db: Database, indexName: string)
+  output: Result<IndexStatistics, string>
+  intent: "인덱스 사용 통계 조회"
+  do
+    let query = "PRAGMA index_info(?) UNION ALL SELECT * FROM sqlite_stat1"
+
+    match executeQuery(db, query, [indexName])
+      Ok(rows) => {
+        # 통계 계산
+        let stats = {
+          name: indexName,
+          tableName: "",
+          columnCount: arrayLen(rows),
+          uniqueValue: false,
+          estimatedRowCount: 0,
+          usageCount: 0,
+          lastUsed: getCurrentTime()
+        }
+        Ok(stats)
+      }
+      Err(e) => Err(e)
+
+fn analyzeIndexEfficiency
+  input: db: Database
+  output: Result<IndexReport, string>
+  intent: "모든 인덱스의 효율성 분석"
+  do
+    let query = "SELECT name, tbl_name FROM sqlite_master WHERE type='index'"
+
+    match executeQuery(db, query, [])
+      Ok(rows) => {
+        let report = {
+          totalIndexes: arrayLen(rows),
+          efficientIndexes: 0,
+          inefficientIndexes: 0,
+          unusedIndexes: 0,
+          recommendations: []
+        }
+
+        for i in 0..arrayLen(rows)
+          let row = arrayGet(rows, i)
+          let indexName = row.get("name").getOrElse("")
+
+          match getIndexStatistics(db, indexName)
+            Ok(stats) => {
+              if stats.usageCount == 0
+                report.unusedIndexes = report.unusedIndexes + 1
+            }
+            Err(_) => {}
+
+        Ok(report)
+      }
+      Err(e) => Err(e)
+
+# ─────────────────────────────────────────────────────────────────────────
+# 쿼리 빌더
+# ─────────────────────────────────────────────────────────────────────────
+
+fn buildCreateIndexQuery
+  input: index: IndexDefinition
+  output: string
+  intent: "CREATE INDEX SQL 생성"
+  do
+    let columnList = joinStrings(index.columns, ", ")
+    let unique = if index.isUnique
+                   "UNIQUE "
+                 else
+                   ""
+
+    return "CREATE " + unique + "INDEX " + index.name +
+           " ON " + index.tableName + " (" + columnList + ")"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 헬퍼 함수
+# ─────────────────────────────────────────────────────────────────────────
+
+struct SlowQuery
+  query: string
+  reason: string
+  recommendedIndex: string
+
+struct IndexReport
+  totalIndexes: number
+  efficientIndexes: number
+  inefficientIndexes: number
+  unusedIndexes: number
+  recommendations: array<string>
+
+fn getCurrentTime
+  input: void
+  output: string
+  intent: "현재 시간"
+  do
+    return "2026-03-02T10:30:00Z"
+
+fn stringContains
+  input: (haystack: string, needle: string)
+  output: bool
+  intent: "문자열 포함 여부"
+  do
+    # Phase B 런타임에서 구현
+    return false
+
+fn arrayLen<T>
+  input: arr: array<T>
+  output: number
+  intent: "배열 길이"
+  do
+    return 0
+
+fn arrayGet<T>
+  input: (arr: array<T>, index: number)
+  output: T
+  intent: "배열 요소"
+  do
+    return arr[0]  # 임시
+
+fn arrayPush<T>
+  input: (arr: array<T>, item: T)
+  output: array<T>
+  intent: "배열에 추가"
+  do
+    return arr
+
+fn joinStrings
+  input: (items: array<string>, sep: string)
+  output: string
+  intent: "문자열 배열 연결"
+  do
+    return ""
+
+fn getOrElse<T>
+  input: (opt: Option<T>, default: T)
+  output: T
+  intent: "Option 또는 기본값"
+  do
+    match opt
+      Some(v) => v
+      None => default
+
+fn executeSql
+  input: (db: Database, query: string, params: array<string>)
+  output: Result<QueryResult, string>
+  intent: "SQL 실행"
+  do
+    # Phase B 런타임에서 구현
+    return Ok({
+      rowsAffected: 0,
+      lastInsertId: 0,
+      rows: []
+    })
+
+fn executeQuery
+  input: (db: Database, query: string, params: array<string>)
+  output: Result<array<map<string, string>>, string>
+  intent: "SELECT 쿼리"
+  do
+    return Ok([])

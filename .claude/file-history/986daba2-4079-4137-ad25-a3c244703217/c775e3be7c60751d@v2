@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+정밀도 강등 검증기 (Mixed-Precision Verifier)
+
+FP32 연산을 FP16 또는 BF16으로 변경할 때의 오차를 분석하고,
+그 오차가 AI 모델의 정확도에 미치는 영향을 평가합니다.
+"""
+
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
+from enum import Enum
+import math
+
+from floating_point_analyzer import (
+    FloatingPointFormat, FloatingPointAnalyzer, FloatingPointSpec
+)
+from interval_arithmetic import Interval
+from affine_arithmetic import AffineForm
+
+
+class SafetyLevel(Enum):
+    """안전성 수준"""
+    SAFE = "safe"              # 오차가 허용 범위 내
+    WARNING = "warning"        # 오차가 경계선
+    UNSAFE = "unsafe"          # 오차가 너무 큼
+
+
+@dataclass
+class MixedPrecisionAnalysis:
+    """정밀도 강등 분석 결과"""
+    src_format: FloatingPointFormat
+    tgt_format: FloatingPointFormat
+    operation: str              # "add", "mul", "exp", etc.
+    src_error_bound: float      # 원본 형식의 오차
+    tgt_error_bound: float      # 목표 형식의 오차
+    error_increase: float       # 오차 증가 배수
+    relative_error_increase: float  # 상대 오차 증가
+    safety_level: SafetyLevel
+    analysis_detail: str        # 상세 분석
+
+
+class MixedPrecisionVerifier:
+    """정밀도 강등 검증 엔진"""
+
+    def __init__(self, tolerance_threshold: float = 1e-3):
+        """
+        Args:
+            tolerance_threshold: 허용 오차 임계값 (1% = 0.01)
+        """
+        self.tolerance_threshold = tolerance_threshold
+        self.analyzer = FloatingPointAnalyzer()
+
+    def verify_cast(self,
+                   value: float,
+                   src_format: FloatingPointFormat,
+                   tgt_format: FloatingPointFormat,
+                   verbose: bool = True) -> MixedPrecisionAnalysis:
+        """형식 변환의 안전성 검증"""
+
+        src_spec = self.analyzer.get_spec(src_format)
+        tgt_spec = self.analyzer.get_spec(tgt_format)
+
+        # 오차 계산
+        src_error = self.analyzer.rounding_error_bound(value, src_spec)
+        tgt_error = self.analyzer.rounding_error_bound(value, tgt_spec)
+
+        error_increase = tgt_error / src_error if src_error > 0 else 1.0
+        rel_error = abs(tgt_error / value) if value != 0 else float('inf')
+
+        # 안전성 판정
+        if rel_error <= self.tolerance_threshold:
+            safety = SafetyLevel.SAFE
+        elif rel_error <= self.tolerance_threshold * 2:
+            safety = SafetyLevel.WARNING
+        else:
+            safety = SafetyLevel.UNSAFE
+
+        detail = (
+            f"Value: {value:.6g}\n"
+            f"Source ({src_spec.name}) error: {src_error:.3e}\n"
+            f"Target ({tgt_spec.name}) error: {tgt_error:.3e}\n"
+            f"Error increase: {error_increase:.2f}x\n"
+            f"Relative error: {rel_error:.3%}"
+        )
+
+        if verbose:
+            print(detail)
+
+        return MixedPrecisionAnalysis(
+            src_format=src_format,
+            tgt_format=tgt_format,
+            operation="cast",
+            src_error_bound=src_error,
+            tgt_error_bound=tgt_error,
+            error_increase=error_increase,
+            relative_error_increase=rel_error,
+            safety_level=safety,
+            analysis_detail=detail
+        )
+
+    def verify_operation(self,
+                        operation: str,
+                        operands: List[float],
+                        src_format: FloatingPointFormat,
+                        tgt_format: FloatingPointFormat) -> MixedPrecisionAnalysis:
+        """연산의 정밀도 강등 검증"""
+
+        src_spec = self.analyzer.get_spec(src_format)
+        tgt_spec = self.analyzer.get_spec(tgt_format)
+
+        # 연산 선택
+        if operation == "add" and len(operands) >= 2:
+            src_error = self.analyzer.addition_error_bound(
+                operands[0], operands[1], src_spec
+            )
+            tgt_error = self.analyzer.addition_error_bound(
+                operands[0], operands[1], tgt_spec
+            )
+            result = operands[0] + operands[1]
+
+        elif operation == "mul" and len(operands) >= 2:
+            src_error = self.analyzer.multiplication_error_bound(
+                operands[0], operands[1], src_spec
+            )
+            tgt_error = self.analyzer.multiplication_error_bound(
+                operands[0], operands[1], tgt_spec
+            )
+            result = operands[0] * operands[1]
+
+        elif operation == "exp" and len(operands) >= 1:
+            # exp의 오차: d/dx[exp(x)] = exp(x)
+            # 상대 오차 ≈ (ulp(x) / x) * exp(x) / exp(x) ≈ ulp(x) / x
+            src_error = (self.analyzer.ulp(operands[0], src_spec) / operands[0]
+                        if operands[0] != 0 else src_spec.epsilon)
+            tgt_error = (self.analyzer.ulp(operands[0], tgt_spec) / operands[0]
+                        if operands[0] != 0 else tgt_spec.epsilon)
+            result = math.exp(operands[0])
+
+        else:
+            raise ValueError(f"Unsupported operation: {operation}")
+
+        error_increase = tgt_error / src_error if src_error > 0 else 1.0
+        rel_error = abs(tgt_error / result) if result != 0 else float('inf')
+
+        # 안전성 판정
+        if rel_error <= self.tolerance_threshold:
+            safety = SafetyLevel.SAFE
+        elif rel_error <= self.tolerance_threshold * 2:
+            safety = SafetyLevel.WARNING
+        else:
+            safety = SafetyLevel.UNSAFE
+
+        detail = (
+            f"Operation: {operation}({', '.join(f'{x:.6g}' for x in operands)})\n"
+            f"Result: {result:.6g}\n"
+            f"Source ({src_spec.name}) error: {src_error:.3e}\n"
+            f"Target ({tgt_spec.name}) error: {tgt_error:.3e}\n"
+            f"Error increase: {error_increase:.2f}x\n"
+            f"Relative error: {rel_error:.3%}"
+        )
+
+        return MixedPrecisionAnalysis(
+            src_format=src_format,
+            tgt_format=tgt_format,
+            operation=operation,
+            src_error_bound=src_error,
+            tgt_error_bound=tgt_error,
+            error_increase=error_increase,
+            relative_error_increase=rel_error,
+            safety_level=safety,
+            analysis_detail=detail
+        )
+
+    def analyze_softmax_with_precision(self,
+                                       logits: List[float],
+                                       precision: FloatingPointFormat) -> Dict:
+        """Softmax 계산에서의 정밀도 분석"""
+
+        spec = self.analyzer.get_spec(precision)
+
+        # Step 1: max 찾기
+        max_logit = max(logits)
+        max_error = self.analyzer.ulp(max_logit, spec)
+
+        # Step 2: exp(logit - max)
+        shifted = [x - max_logit for x in logits]
+        exp_errors = []
+        exp_results = []
+
+        for val in shifted:
+            exp_val = math.exp(val)
+            # exp 오차
+            exp_error = self.analyzer.ulp(val, spec) * exp_val  # 1차 근사
+            exp_errors.append(abs(exp_error))
+            exp_results.append(exp_val)
+
+        # Step 3: 합 계산
+        exact_sum = sum(exp_results)
+        # 누적 오차 (최악의 경우)
+        sum_error = sum(exp_errors) + self.analyzer.rounding_error_bound(exact_sum, spec)
+
+        # Step 4: 나눗셈
+        softmax_errors = []
+        for exp_val in exp_results:
+            # (a ± δa) / (b ± δb) ≈ a/b ± (a*δb + b*δa) / b²
+            div_error = abs((exp_val * sum_error + exact_sum * max_error) / (exact_sum ** 2))
+            softmax_errors.append(div_error)
+
+        return {
+            "precision": precision.value,
+            "max_error": max_error,
+            "exp_errors": exp_errors,
+            "sum_error": sum_error,
+            "softmax_errors": softmax_errors,
+            "max_softmax_error": max(softmax_errors) if softmax_errors else 0,
+            "mean_softmax_error": sum(softmax_errors) / len(softmax_errors) if softmax_errors else 0,
+        }
+
+    def compare_precision_cascade(self,
+                                 value: float,
+                                 operations: List[str],
+                                 src_format: FloatingPointFormat,
+                                 tgt_format: FloatingPointFormat) -> float:
+        """연산 체인에서의 누적 오차"""
+
+        src_spec = self.analyzer.get_spec(src_format)
+        tgt_spec = self.analyzer.get_spec(tgt_format)
+
+        current_value = value
+        total_src_error = 0.0
+        total_tgt_error = 0.0
+
+        for op in operations:
+            if op == "exp":
+                src_error = self.analyzer.rounding_error_bound(current_value, src_spec)
+                tgt_error = self.analyzer.rounding_error_bound(current_value, tgt_spec)
+                current_value = math.exp(current_value)
+
+            elif op == "log":
+                src_error = self.analyzer.rounding_error_bound(current_value, src_spec)
+                tgt_error = self.analyzer.rounding_error_bound(current_value, tgt_spec)
+                if current_value <= 0:
+                    raise ValueError("log of non-positive value")
+                current_value = math.log(current_value)
+
+            elif op == "sqrt":
+                src_error = self.analyzer.rounding_error_bound(current_value, src_spec)
+                tgt_error = self.analyzer.rounding_error_bound(current_value, tgt_spec)
+                if current_value < 0:
+                    raise ValueError("sqrt of negative value")
+                current_value = math.sqrt(current_value)
+
+            else:
+                continue
+
+            total_src_error += src_error
+            total_tgt_error += tgt_error
+
+        # 상대 오차
+        if current_value != 0:
+            src_rel_error = total_src_error / abs(current_value)
+            tgt_rel_error = total_tgt_error / abs(current_value)
+        else:
+            src_rel_error = float('inf')
+            tgt_rel_error = float('inf')
+
+        return tgt_rel_error - src_rel_error
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Mixed-Precision Verifier Demo")
+    print("="*70)
+
+    verifier = MixedPrecisionVerifier(tolerance_threshold=0.01)  # 1% 허용
+
+    # 예제 1: FP32 → BF16 캐스트
+    print("\n[Example 1] FP32 → BF16 Cast")
+    print("-"*70)
+
+    for value in [1.0, 10.0, 100.0]:
+        analysis = verifier.verify_cast(
+            value,
+            FloatingPointFormat.FP32,
+            FloatingPointFormat.BF16
+        )
+        print(f"Safety: {analysis.safety_level.value}\n")
+
+    # 예제 2: 연산 검증
+    print("\n[Example 2] Operation: Addition")
+    print("-"*70)
+
+    analysis = verifier.verify_operation(
+        "add",
+        [1.5, 2.5],
+        FloatingPointFormat.FP32,
+        FloatingPointFormat.FP16
+    )
+    print(analysis.analysis_detail)
+    print(f"Safety: {analysis.safety_level.value}\n")
+
+    # 예제 3: Softmax 분석
+    print("\n[Example 3] Softmax Precision Analysis")
+    print("-"*70)
+
+    logits = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+    print("FP32:")
+    fp32_analysis = verifier.analyze_softmax_with_precision(logits, FloatingPointFormat.FP32)
+    print(f"  Max error: {fp32_analysis['max_softmax_error']:.3e}")
+
+    print("\nBF16:")
+    bf16_analysis = verifier.analyze_softmax_with_precision(logits, FloatingPointFormat.BF16)
+    print(f"  Max error: {bf16_analysis['max_softmax_error']:.3e}")
+
+    print(f"\nError increase: {bf16_analysis['max_softmax_error'] / fp32_analysis['max_softmax_error']:.2f}x")
+
+    print("\n" + "="*70)
+    print("Mixed-Precision Verification Complete")
+    print("="*70)

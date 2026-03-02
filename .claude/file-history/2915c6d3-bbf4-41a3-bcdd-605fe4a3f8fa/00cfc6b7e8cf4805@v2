@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+메모리 레이아웃 검증기 (Memory Layout Verifier)
+
+다양한 메모리 레이아웃 변환의 정확성을 검증합니다.
+
+핵심 개념:
+  1. Row-major layout: 행 기준 배치 (C 스타일)
+                       A[i][j] → address = base + i*N + j
+  2. Column-major layout: 열 기준 배치 (Fortran 스타일)
+                          A[i][j] → address = base + j*M + i
+  3. Tiled layout: 타일 단위 블록 배치
+                   A[i][j] → tile_id + offset_in_tile
+  4. Boundary handling: 부분 타일 처리 (패딩)
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple, Set, Callable
+import z3
+
+
+class MemoryLayoutType(Enum):
+    """메모리 레이아웃 유형"""
+    ROW_MAJOR = "row_major"          # C: A[i*N + j]
+    COLUMN_MAJOR = "column_major"    # Fortran: A[j*M + i]
+    TILED = "tiled"                  # Blocked: A[tile_id][offset]
+    STRIDED = "strided"              # 여러 채널 (NCHW, NHWC)
+    PADDED = "padded"                # 패딩된 배치
+
+
+class BoundaryHandling(Enum):
+    """경계 조건 처리 방식"""
+    NO_PADDING = "no_padding"        # 패딩 없음
+    ZERO_PADDING = "zero_padding"    # 0으로 패딩
+    REPLICATE = "replicate"          # 경계 값 복제
+    CIRCULAR = "circular"            # 순환 (래핑)
+
+
+@dataclass
+class MemoryAddress:
+    """메모리 주소 계산"""
+    base_address: int
+    offset: int
+    dimension_indices: Dict[str, int]  # {차원명: 인덱스}
+    layout_type: MemoryLayoutType
+
+    @property
+    def absolute_address(self) -> int:
+        """절대 메모리 주소"""
+        return self.base_address + self.offset
+
+    def __str__(self) -> str:
+        indices_str = ", ".join(
+            f"{dim}={idx}" for dim, idx in self.dimension_indices.items()
+        )
+        return f"Address(base={self.base_address}, offset={self.offset}, indices=[{indices_str}])"
+
+
+@dataclass
+class LayoutTransformationSpec:
+    """레이아웃 변환 사양"""
+    src_layout: MemoryLayoutType
+    tgt_layout: MemoryLayoutType
+    src_dimensions: Dict[str, int]     # {차원명: 크기}
+    tgt_dimensions: Dict[str, int]     # {차원명: 크기}
+    tile_sizes: Optional[Dict[str, int]] = None  # 타일 크기
+    src_padding: int = 0
+    tgt_padding: int = 0
+
+
+@dataclass
+class AccessPattern:
+    """메모리 접근 패턴"""
+    iteration_order: List[str]          # 루프 변수 순서
+    bounds: Dict[str, Tuple[int, int]]  # {변수: (min, max)}
+    access_stride: Dict[str, int]       # {변수: stride}
+    accesses: List[Dict[str, int]] = field(default_factory=list)  # 모든 접근
+
+    def generate_accesses(self) -> None:
+        """접근 패턴 생성"""
+        self.accesses = []
+
+        def generate(idx: int, current_indices: Dict[str, int]):
+            if idx == len(self.iteration_order):
+                self.accesses.append(current_indices.copy())
+                return
+
+            var = self.iteration_order[idx]
+            min_val, max_val = self.bounds[var]
+            stride = self.access_stride.get(var, 1)
+
+            for value in range(min_val, max_val + 1, stride):
+                current_indices[var] = value
+                generate(idx + 1, current_indices)
+
+        generate(0, {})
+
+
+@dataclass
+class MemoryLayoutVerificationResult:
+    """검증 결과"""
+    is_equivalent: bool
+    access_count_match: bool          # 접근 횟수가 같은가?
+    address_mapping_valid: bool       # 주소 매핑이 1:1인가?
+    cache_efficiency: Dict[str, float]  # Cache hit ratio 등
+    boundary_handling_correct: bool
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+class MemoryLayoutVerifier:
+    """메모리 레이아웃 검증 엔진"""
+
+    def __init__(self, ctx: Optional[z3.Context] = None):
+        self.ctx = ctx or z3.Context()
+
+    def compute_address_row_major(
+        self,
+        indices: Dict[str, int],
+        dimensions: Dict[str, int]
+    ) -> int:
+        """Row-major 주소 계산: A[i][j] = i*N + j"""
+        # 차원 순서: i, j, k, ...
+        dim_names = sorted(dimensions.keys())
+        address = 0
+        multiplier = 1
+
+        # 역순으로 처리 (가장 안쪽 루프가 가장 빠름)
+        for dim in reversed(dim_names):
+            address += indices.get(dim, 0) * multiplier
+            multiplier *= dimensions[dim]
+
+        return address
+
+    def compute_address_column_major(
+        self,
+        indices: Dict[str, int],
+        dimensions: Dict[str, int]
+    ) -> int:
+        """Column-major 주소 계산: A[i][j] = j*M + i (Fortran)"""
+        dim_names = sorted(dimensions.keys())
+        address = 0
+        multiplier = 1
+
+        # 정방향 처리 (첫 번째 인덱스가 빠름)
+        for dim in dim_names:
+            address += indices.get(dim, 0) * multiplier
+            multiplier *= dimensions[dim]
+
+        return address
+
+    def compute_address_tiled(
+        self,
+        indices: Dict[str, int],
+        dimensions: Dict[str, int],
+        tile_sizes: Dict[str, int]
+    ) -> int:
+        """타일 레이아웃 주소 계산"""
+        # 타일 ID 계산
+        tile_indices = {}
+        offset = 0
+        multiplier = 1
+
+        for dim in sorted(tile_sizes.keys()):
+            tile_idx = indices.get(dim, 0) // tile_sizes[dim]
+            offset_in_tile = indices.get(dim, 0) % tile_sizes[dim]
+
+            tile_indices[dim] = tile_idx
+            offset += offset_in_tile * multiplier
+            multiplier *= tile_sizes[dim]
+
+        # 타일 ID → 메모리 위치
+        tile_address = 0
+        tile_multiplier = 1
+
+        for dim in sorted(dimensions.keys()):
+            if dim in tile_indices:
+                num_tiles = (dimensions[dim] + tile_sizes[dim] - 1) // tile_sizes[dim]
+                tile_address += tile_indices[dim] * tile_multiplier
+                tile_multiplier *= num_tiles
+
+        return tile_address * (tile_sizes.get('i', 1) * tile_sizes.get('j', 1)) + offset
+
+    def verify_layout_transformation(
+        self,
+        spec: LayoutTransformationSpec,
+        pattern: AccessPattern
+    ) -> MemoryLayoutVerificationResult:
+        """레이아웃 변환 검증"""
+        result = MemoryLayoutVerificationResult(
+            is_equivalent=True,
+            access_count_match=True,
+            address_mapping_valid=True,
+            boundary_handling_correct=True,
+            cache_efficiency={}
+        )
+
+        # 접근 패턴 생성
+        pattern.generate_accesses()
+
+        # 모든 접근에서 주소 매핑 확인
+        src_addresses = {}
+        tgt_addresses = {}
+
+        for access in pattern.accesses:
+            # 원본 레이아웃의 주소
+            if spec.src_layout == MemoryLayoutType.ROW_MAJOR:
+                src_addr = self.compute_address_row_major(access, spec.src_dimensions)
+            elif spec.src_layout == MemoryLayoutType.COLUMN_MAJOR:
+                src_addr = self.compute_address_column_major(access, spec.src_dimensions)
+            elif spec.src_layout == MemoryLayoutType.TILED:
+                src_addr = self.compute_address_tiled(
+                    access, spec.src_dimensions, spec.tile_sizes or {}
+                )
+            else:
+                src_addr = self.compute_address_row_major(access, spec.src_dimensions)
+
+            # 타겟 레이아웃의 주소
+            if spec.tgt_layout == MemoryLayoutType.ROW_MAJOR:
+                tgt_addr = self.compute_address_row_major(access, spec.tgt_dimensions)
+            elif spec.tgt_layout == MemoryLayoutType.COLUMN_MAJOR:
+                tgt_addr = self.compute_address_column_major(access, spec.tgt_dimensions)
+            elif spec.tgt_layout == MemoryLayoutType.TILED:
+                tgt_addr = self.compute_address_tiled(
+                    access, spec.tgt_dimensions, spec.tile_sizes or {}
+                )
+            else:
+                tgt_addr = self.compute_address_row_major(access, spec.tgt_dimensions)
+
+            # 주소 매핑 저장
+            key = str(access)
+            src_addresses[key] = src_addr
+            tgt_addresses[key] = tgt_addr
+
+            # 1:1 매핑인지 확인
+            if src_addr in src_addresses.values() and src_addresses.values().count(src_addr) > 1:
+                result.address_mapping_valid = False
+                result.errors.append(f"Address collision at {access}")
+
+        # 접근 횟수 확인
+        if len(src_addresses) != len(tgt_addresses):
+            result.access_count_match = False
+            result.errors.append(f"Access count mismatch: {len(src_addresses)} vs {len(tgt_addresses)}")
+
+        # 최종 판정
+        result.is_equivalent = (
+            result.access_count_match and
+            result.address_mapping_valid and
+            result.boundary_handling_correct
+        )
+
+        return result
+
+    def analyze_cache_locality(
+        self,
+        addresses: List[int],
+        cache_line_size: int = 64
+    ) -> Dict[str, float]:
+        """Cache 지역성 분석"""
+        if not addresses:
+            return {"hit_ratio": 0.0, "reuse_distance": 0}
+
+        # 연속 메모리 접근 확인
+        consecutive_accesses = 0
+        in_same_line = 0
+
+        for i in range(1, len(addresses)):
+            if addresses[i] - addresses[i-1] == 1:
+                consecutive_accesses += 1
+            if (addresses[i] // cache_line_size) == (addresses[i-1] // cache_line_size):
+                in_same_line += 1
+
+        return {
+            "hit_ratio": in_same_line / len(addresses) if len(addresses) > 0 else 0,
+            "consecutive_ratio": consecutive_accesses / (len(addresses) - 1) if len(addresses) > 1 else 0,
+            "spatial_locality": "good" if consecutive_accesses > len(addresses) * 0.7 else "poor"
+        }
+
+    def verify_boundary_handling(
+        self,
+        dimensions: Dict[str, int],
+        tile_sizes: Dict[str, int],
+        handling_type: BoundaryHandling
+    ) -> bool:
+        """경계 조건 처리 검증"""
+        # 모든 차원이 타일 크기의 배수인지 확인
+        for dim, size in dimensions.items():
+            if dim in tile_sizes:
+                remainder = size % tile_sizes[dim]
+                if remainder != 0:
+                    # 부분 타일 필요
+                    if handling_type == BoundaryHandling.NO_PADDING:
+                        return False  # 부분 타일을 처리할 수 없음
+                    elif handling_type == BoundaryHandling.ZERO_PADDING:
+                        # 패딩으로 부분 타일 채우기 가능
+                        pass
+
+        return True
+
+    def validate_tiled_access(
+        self,
+        indices: Dict[str, int],
+        dimensions: Dict[str, int],
+        tile_sizes: Dict[str, int],
+        padding: int = 0
+    ) -> Tuple[bool, str]:
+        """타일 접근 유효성 검사"""
+        for dim, idx in indices.items():
+            dim_size = dimensions.get(dim, 0)
+            padded_size = dim_size + padding
+
+            if idx < 0 or idx >= padded_size:
+                return False, f"Index {dim}={idx} out of bounds (size={padded_size})"
+
+        return True, "Valid"
+
+    def suggest_optimal_layout(
+        self,
+        access_patterns: List[AccessPattern]
+    ) -> MemoryLayoutType:
+        """접근 패턴 기반 최적 레이아웃 제안"""
+        # 간단한 휴리스틱:
+        # - 모두 순차 접근 → Row-major
+        # - 혼합 접근 → Tiled
+        # - 대각선 접근 → Column-major
+
+        sequential_count = 0
+        mixed_count = 0
+
+        for pattern in access_patterns:
+            # 접근 패턴 분석
+            if len(pattern.iteration_order) == 1:
+                sequential_count += 1
+            else:
+                mixed_count += 1
+
+        if sequential_count > mixed_count:
+            return MemoryLayoutType.ROW_MAJOR
+        elif mixed_count > sequential_count:
+            return MemoryLayoutType.TILED
+        else:
+            return MemoryLayoutType.ROW_MAJOR
+
+    def estimate_memory_footprint(
+        self,
+        dimensions: Dict[str, int],
+        element_size: int = 4  # 바이트
+    ) -> int:
+        """메모리 사용량 예측"""
+        total_elements = 1
+        for size in dimensions.values():
+            total_elements *= size
+        return total_elements * element_size
+
+
+# 사용 예제
+if __name__ == "__main__":
+    print("="*70)
+    print("Memory Layout Verifier Demo")
+    print("="*70)
+
+    # 예제 1: Row-major vs Column-major
+    print("\n[Example 1] Row-major vs Column-major")
+    print("-"*70)
+
+    verifier = MemoryLayoutVerifier()
+
+    # Row-major: A[i][j] = i*3 + j
+    indices = {"i": 1, "j": 2}
+    dimensions = {"i": 4, "j": 3}
+
+    row_major_addr = verifier.compute_address_row_major(indices, dimensions)
+    col_major_addr = verifier.compute_address_column_major(indices, dimensions)
+
+    print(f"Indices: i=1, j=2")
+    print(f"Dimensions: 4x3")
+    print(f"Row-major address: {row_major_addr}")
+    print(f"Column-major address: {col_major_addr}")
+
+    # 예제 2: Tiled 레이아웃
+    print("\n[Example 2] Tiled Layout")
+    print("-"*70)
+
+    tile_sizes = {"i": 2, "j": 2}
+    tiled_addr = verifier.compute_address_tiled(indices, dimensions, tile_sizes)
+    print(f"Tiled address (tile size 2x2): {tiled_addr}")
+
+    # 예제 3: 레이아웃 변환 검증
+    print("\n[Example 3] Layout Transformation Verification")
+    print("-"*70)
+
+    spec = LayoutTransformationSpec(
+        src_layout=MemoryLayoutType.ROW_MAJOR,
+        tgt_layout=MemoryLayoutType.COLUMN_MAJOR,
+        src_dimensions={"i": 4, "j": 3},
+        tgt_dimensions={"i": 4, "j": 3}
+    )
+
+    pattern = AccessPattern(
+        iteration_order=["i", "j"],
+        bounds={"i": (0, 1), "j": (0, 2)},
+        access_stride={"i": 1, "j": 1}
+    )
+
+    result = verifier.verify_layout_transformation(spec, pattern)
+    print(f"Transformation equivalent: {result.is_equivalent}")
+    print(f"Access count match: {result.access_count_match}")
+    print(f"Errors: {result.errors}")
+
+    # 예제 4: Cache 지역성 분석
+    print("\n[Example 4] Cache Locality Analysis")
+    print("-"*70)
+
+    addresses = [0, 1, 2, 3, 4, 5, 64, 65, 66]  # 연속 접근 + 캐시 라인 경계
+    cache_stats = verifier.analyze_cache_locality(addresses)
+    print(f"Cache statistics: {cache_stats}")
+
+    # 예제 5: 경계 조건 처리
+    print("\n[Example 5] Boundary Handling")
+    print("-"*70)
+
+    valid, msg = verifier.validate_tiled_access(
+        {"i": 2, "j": 1},
+        {"i": 10, "j": 10},
+        {"i": 4, "j": 4}
+    )
+    print(f"Tiled access valid: {valid} ({msg})")
+
+    # 예제 6: 메모리 footprint
+    print("\n[Example 6] Memory Footprint")
+    print("-"*70)
+
+    footprint = verifier.estimate_memory_footprint({"i": 1000, "j": 1000}, element_size=4)
+    print(f"Memory footprint for 1000x1000 matrix (f32): {footprint / 1e6:.2f} MB")
+
+    print("\n" + "="*70)
+    print("Memory Layout Verifier Complete")
+    print("="*70)

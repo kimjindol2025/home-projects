@@ -1,0 +1,253 @@
+/**
+ * Stochastic Optimizer Main Implementation
+ *
+ * PhD 논문의 핵심: Stochastic Search를 통한 자동 코드 최적화
+ *
+ * 알고리즘:
+ * 1. 원본 코드의 성능 측정 (baseline)
+ * 2. 반복:
+ *    a. 랜덤 뮤테이션 생성
+ *    b. 정확성 검증
+ *    c. 성능 평가
+ *    d. 최고 성능 기록
+ * 3. 최적화된 코드 반환
+ *
+ * Week 13-16 (Graduate Level) 개념 적용:
+ * - Weighted Sharding: 변형 선택에 가중치 적용 (Phase 2)
+ * - Hierarchical AllReduce: 계층적 검색 (Phase 2)
+ */
+
+#include "stochastic_optimizer.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include <iomanip>
+#include <fstream>
+
+namespace sco {
+
+StochasticOptimizer::StochasticOptimizer(mlir::MLIRContext* ctx,
+                                          const Config& cfg)
+    : context(ctx), config(cfg) {
+    // 재현성을 위한 시드 설정
+    if (config.enableSeed) {
+        srand(config.seed);
+    }
+
+    // 컴포넌트 초기화
+    mutator = std::make_unique<IRMutator>(ctx);
+    checker = std::make_unique<CorrectnessChecker>(ctx);
+    evaluator = std::make_unique<PerformanceEvaluator>(ctx);
+}
+
+// ============================================================================
+// 메인 최적화 루프
+// ============================================================================
+
+OptimizationResult StochasticOptimizer::optimize(mlir::Operation* target) {
+    if (config.verbose) {
+        llvm::outs() << "\n" << std::string(60, '=') << "\n";
+        llvm::outs() << "🚀 Starting Stochastic Code Optimization\n";
+        llvm::outs() << std::string(60, '=') << "\n\n";
+    }
+
+    startTime = std::chrono::high_resolution_clock::now();
+
+    // Step 1: 원본 성능 측정
+    llvm::outs() << "📊 Phase 1: Baseline Performance\n";
+    auto baselineMetrics = evaluator->evaluate(target);
+    baselineMetrics.print();
+
+    currentBest.originalLatency = baselineMetrics.latency;
+    currentBest.optimizedLatency = baselineMetrics.latency;
+    currentBest.speedup = 1.0;
+    currentBest.improvement = 0.0;
+
+    llvm::outs() << "\n📊 Phase 2: Stochastic Search\n";
+    llvm::outs() << std::string(60, '-') << "\n";
+    llvm::outs() << std::setw(6) << "Iter"
+                 << std::setw(15) << "Mutation"
+                 << std::setw(12) << "Latency"
+                 << std::setw(12) << "Speedup"
+                 << std::setw(10) << "Status\n";
+    llvm::outs() << std::string(60, '-') << "\n";
+
+    // Step 2: 스토캐스틱 검색 메인 루프
+    while (shouldContinue()) {
+        iterationCount++;
+
+        // a. 뮤테이션 생성
+        auto mutation = mutator->mutateLoc(target);
+
+        // b. 뮤테이션 적용
+        mlir::Operation* mutatedOp = mutator->applyMutation(target, mutation);
+        if (!mutatedOp) {
+            logProgress(iterationCount, mutation, baselineMetrics);
+            continue;  // 뮤테이션 실패, 다음으로
+        }
+
+        // c. 정확성 검증
+        if (!checker->verify(target, mutatedOp)) {
+            logProgress(iterationCount, mutation, baselineMetrics);
+            llvm::outs() << " [FAIL]\n";
+            continue;  // 정확성 검사 실패
+        }
+
+        // d. 성능 평가
+        auto metrics = evaluator->evaluate(mutatedOp);
+
+        // e. 최고 성능 업데이트
+        double speedup = currentBest.originalLatency / metrics.latency;
+        if (metrics.latency < currentBest.optimizedLatency) {
+            currentBest.optimizedLatency = metrics.latency;
+            currentBest.speedup = speedup;
+            currentBest.improvement = (1.0 - speedup) * 100;
+            currentBest.bestMutation = mutation.description;
+            currentBest.appliedTransforms.push_back(mutation.description);
+            currentBest.mutationsSuccessful++;
+
+            logProgress(iterationCount, mutation, metrics);
+            llvm::outs() << " [✓ NEW BEST]\n";
+        } else {
+            currentBest.mutationsAttempted++;
+            logProgress(iterationCount, mutation, metrics);
+            llvm::outs() << " [OK]\n";
+        }
+    }
+
+    // Step 3: 최종 결과 계산
+    auto endTime = std::chrono::high_resolution_clock::now();
+    currentBest.optimizationTime = endTime - startTime;
+
+    if (config.verbose) {
+        llvm::outs() << "\n" << std::string(60, '=') << "\n";
+        llvm::outs() << "✅ Optimization Complete\n";
+        llvm::outs() << std::string(60, '=') << "\n\n";
+
+        llvm::outs() << "📈 Final Results:\n";
+        llvm::outs() << "   Original Latency: " << std::fixed
+                     << std::setprecision(3)
+                     << currentBest.originalLatency << " ms\n";
+        llvm::outs() << "   Optimized Latency: " << currentBest.optimizedLatency
+                     << " ms\n";
+        llvm::outs() << "   Speedup: " << std::fixed << std::setprecision(2)
+                     << currentBest.speedup << "x\n";
+        llvm::outs() << "   Improvement: " << currentBest.improvement << "%\n";
+        llvm::outs() << "   Iterations: " << iterationCount << "\n";
+        llvm::outs() << "   Time: " << std::fixed << std::setprecision(1)
+                     << currentBest.optimizationTime.count() << " seconds\n";
+        llvm::outs() << "\n";
+    }
+
+    return currentBest;
+}
+
+// ============================================================================
+// 최적화 계속 조건 확인
+// ============================================================================
+
+bool StochasticOptimizer::shouldContinue() const {
+    // 최대 반복 횟수 확인
+    if (iterationCount >= config.maxIterations) {
+        if (config.verbose) {
+            llvm::outs() << "\n[STOP] Reached max iterations: "
+                        << config.maxIterations << "\n";
+        }
+        return false;
+    }
+
+    // 최대 시간 확인
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    auto elapsedSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            currentTime - startTime)
+            .count();
+
+    if (elapsedSeconds >= config.maxTime) {
+        if (config.verbose) {
+            llvm::outs() << "\n[STOP] Reached max time: "
+                        << config.maxTime << " seconds\n";
+        }
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// 진행 상황 로깅
+// ============================================================================
+
+void StochasticOptimizer::logProgress(int iteration,
+                                      const MutationCandidate& mutation,
+                                      const PerformanceMetrics& metrics) {
+    double speedup = currentBest.originalLatency / metrics.latency;
+
+    llvm::outs() << std::setw(6) << iteration
+                 << std::setw(15) << mutation.description.substr(0, 14)
+                 << std::setw(12) << std::fixed << std::setprecision(3)
+                 << metrics.latency
+                 << std::setw(12) << std::setprecision(2) << speedup
+                 << "x";
+}
+
+// ============================================================================
+// 체크포인트 저장
+// ============================================================================
+
+void StochasticOptimizer::saveCheckpoint(const OptimizationResult& result,
+                                         const std::string& filename) {
+    std::ofstream file(filename);
+
+    file << "=== Optimization Checkpoint ===\n\n";
+    file << "Iteration: " << iterationCount << "\n";
+    file << "Original Latency: " << result.originalLatency << " ms\n";
+    file << "Optimized Latency: " << result.optimizedLatency << " ms\n";
+    file << "Speedup: " << result.speedup << "x\n";
+    file << "Improvement: " << result.improvement << "%\n";
+    file << "Best Mutation: " << result.bestMutation << "\n";
+    file << "Mutations Attempted: " << result.mutationsAttempted << "\n";
+    file << "Mutations Successful: " << result.mutationsSuccessful << "\n";
+    file << "\n";
+
+    file << "Applied Transforms:\n";
+    for (const auto& transform : result.appliedTransforms) {
+        file << "  - " << transform << "\n";
+    }
+
+    file.close();
+
+    if (config.verbose) {
+        llvm::outs() << "✓ Checkpoint saved: " << filename << "\n";
+    }
+}
+
+// ============================================================================
+// 진행 상황 조회
+// ============================================================================
+
+OptimizationResult StochasticOptimizer::getProgress() const {
+    return currentBest;
+}
+
+}  // namespace sco
+
+// ============================================================================
+// OptimizationResult 출력
+// ============================================================================
+
+void OptimizationResult::print() const {
+    llvm::outs() << "\n╔════════════════════════════════════════╗\n";
+    llvm::outs() << "║     Optimization Results             ║\n";
+    llvm::outs() << "╠════════════════════════════════════════╣\n";
+    llvm::outs() << "║ Original:  " << std::fixed << std::setprecision(3)
+                 << std::setw(8) << originalLatency << " ms\n";
+    llvm::outs() << "║ Optimized: " << std::setw(8) << optimizedLatency
+                 << " ms\n";
+    llvm::outs() << "║ Speedup:   " << std::setw(8) << speedup << "x\n";
+    llvm::outs() << "║ Improvement:" << std::setw(7) << improvement << "%\n";
+    llvm::outs() << "║ Mutations: " << std::setw(8) << mutationsSuccessful
+                 << "/" << mutationsAttempted << "\n";
+    llvm::outs() << "║ Time:      " << std::fixed << std::setprecision(1)
+                 << std::setw(8) << optimizationTime.count() << " sec\n";
+    llvm::outs() << "╚════════════════════════════════════════╝\n\n";
+}

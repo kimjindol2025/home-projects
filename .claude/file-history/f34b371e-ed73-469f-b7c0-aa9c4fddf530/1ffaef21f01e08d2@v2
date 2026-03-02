@@ -1,0 +1,850 @@
+# v5.2 데이터베이스 정규화와 NoSQL — 심화 가이드
+
+**주제:** 데이터의 무결성과 확장성 사이의 줄타기
+**난이도:** 대학교 3학년 전공 필수
+**학습 시간:** 12시간 (이론 6시간 + 실습 6시간)
+
+---
+
+## 📚 목차
+
+1. [고등학교 vs 대학교](#고등학교-vs-대학교)
+2. [ACID와 트랜잭션의 실제](#acid와-트랜잭션의-실제)
+3. [정규화의 진짜 의미](#정규화의-진짜-의미)
+4. [인덱싱과 쿼리 최적화](#인덱싱과-쿼리-최적화)
+5. [NoSQL 아키텍처](#nosql-아키텍처)
+6. [동시성 제어](#동시성-제어)
+7. [성능 최적화 전략](#성능-최적화-전략)
+8. [실전 설계 사례](#실전-설계-사례)
+
+---
+
+## 고등학교 vs 대학교
+
+### 고등학교: 파일에 저장
+
+```python
+# 파일 저장 (위험)
+import json
+
+def save_user(name, balance):
+    with open('users.json', 'r') as f:
+        data = json.load(f)  # 파일 읽음
+
+    data.append({'name': name, 'balance': balance})
+
+    with open('users.json', 'w') as f:
+        json.dump(data, f)  # 파일 쓰기
+
+# 문제점:
+# 1. 동시 쓰기: 2명이 동시에 저장하면?
+#    User1: 읽기 [Alice: 100]
+#    User2: 읽기 [Alice: 100]
+#    User1: 저장 [Alice: 100, Bob: 200]
+#    User2: 저장 [Alice: 100, Charlie: 300]  ← Bob 사라짐!
+
+# 2. 데이터 손상: 저장 중 시스템 오류?
+#    절반만 저장되거나 corrupted
+
+# 3. 용량: 필요한 것만 찾으려면 전체 파일 읽어야 함
+#    사용자 100만 명 → 매번 100MB 읽음
+
+# 4. 복잡한 쿼리 불가
+#    "잔액 > 1000인 모든 사용자"? 처음부터 끝까지 읽어야 함
+```
+
+### 대학교: 데이터베이스로 저장
+
+```python
+# 데이터베이스 저장 (안전)
+import sqlite3
+
+conn = sqlite3.connect('database.db')
+cursor = conn.cursor()
+
+# 1. 동시성 제어: SQLite가 자동으로 lock
+#    User1과 User2가 동시 접근 → 순서대로 처리
+
+# 2. 트랜잭션 보장:
+#    UPDATE 중 오류 → 자동 ROLLBACK
+
+# 3. 용량 절약: 필요한 것만 로드
+#    인덱스로 0.001초 안에 찾음
+
+# 4. 복잡한 쿼리:
+cursor.execute('SELECT * FROM users WHERE balance > 1000 ORDER BY balance DESC')
+
+# 설계자의 마법!
+conn.commit()
+```
+
+---
+
+## ACID와 트랜잭션의 실제
+
+### 1. 원자성 (Atomicity): 모두 또는 아무것도 아니면
+
+```python
+"""
+비유: 은행 송금
+계좌 A: 10,000원
+계좌 B: 5,000원
+
+A → B로 3,000원 송금
+"""
+
+# ❌ 없이 (위험)
+def unsafe_transfer(a_id, b_id, amount):
+    a_balance = db.query(f"SELECT balance FROM accounts WHERE id = {a_id}")
+    b_balance = db.query(f"SELECT balance FROM accounts WHERE id = {b_id}")
+
+    # 이 사이에 오류 발생 가능!
+    db.execute(f"UPDATE accounts SET balance = {a_balance - amount} WHERE id = {a_id}")
+
+    # 여기서 시스템 오류!
+    db.execute(f"UPDATE accounts SET balance = {b_balance + amount} WHERE id = {b_id}")
+
+    # 문제: A는 출금되었는데 B는 입금 안 됨!
+
+# ✅ 트랜잭션으로 (안전)
+def safe_transfer(a_id, b_id, amount):
+    try:
+        conn.execute('BEGIN')  # 시작
+
+        conn.execute(
+            'UPDATE accounts SET balance = balance - ? WHERE id = ?',
+            (amount, a_id)
+        )
+
+        # 여기서 오류 발생해도 괜찮음
+
+        conn.execute(
+            'UPDATE accounts SET balance = balance + ? WHERE id = ?',
+            (amount, b_id)
+        )
+
+        conn.commit()  # 모두 성공 → 확정
+    except:
+        conn.rollback()  # 실패 → 모두 취소
+```
+
+### 2. 일관성 (Consistency): 규칙 위반 없음
+
+```python
+# 불변 규칙들:
+# 1. 모든 user_id는 users 테이블에 존재
+# 2. 모든 잔액은 >= 0
+# 3. 송금 후 총액 = 송금 전 총액
+
+# 데이터베이스 제약 조건:
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL  -- NULL 금지 (무결성)
+);
+
+CREATE TABLE accounts (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    balance INTEGER NOT NULL CHECK (balance >= 0),  -- 잔액 >= 0
+    FOREIGN KEY (user_id) REFERENCES users(id)  -- user_id 유효성 검사
+);
+
+# 이제 규칙 위반은 불가능!
+# db.execute("INSERT INTO accounts VALUES (1, 999, -100)")  -- 오류!
+```
+
+### 3. 고립성 (Isolation): 동시 실행 안전
+
+```python
+"""
+트랜잭션 1: 계좌 A 잔액 조회
+트랜잭션 2: 계좌 A에서 출금
+
+시간    TX1                 TX2
+────────────────────────────────────
+10:00  SELECT balance FROM A  (10,000)
+10:01                       BEGIN
+10:02                       UPDATE A SET balance = 7,000
+10:03  SELECT balance FROM A  (???)
+"""
+
+# Isolation Level이 결정:
+# READ UNCOMMITTED: 10:03 조회 → 7,000 (TX2 미완료인데도!)
+# READ COMMITTED: 10:03 조회 → 10,000 (TX2 완료 전까지 대기)
+# REPEATABLE READ: 10:03 조회 → 10,000 (스냅샷 사용)
+# SERIALIZABLE: 10:03 조회 → 10,000 (완전 순서대로)
+
+# 일반적 선택: REPEATABLE READ
+# 속도 vs 안전성의 균형
+```
+
+### 4. 지속성 (Durability): 저장되면 영원함
+
+```python
+"""
+데이터 저장 경로:
+메모리 (빠르지만 휘발성) → 디스크 (느리지만 영구적)
+"""
+
+# COMMIT 시:
+# 1. 데이터를 메모리 버퍼에 쓰기
+# 2. 트랜잭션 로그에 기록
+# 3. fsync()로 디스크에 강제 쓰기
+# 4. "확정" 반환
+
+# 이후 시스템 장애 후에도:
+# → 트랜잭션 로그 재실행
+# → 데이터 복구
+
+# 그래서 은행은 절대 데이터 손실이 없음!
+```
+
+---
+
+## 정규화의 진짜 의미
+
+### 문제: 비정규화의 폐해
+
+```python
+# ❌ 나쁜 설계: 모든 정보를 한 테이블에
+
+users_denormalized = [
+    {
+        'user_id': 1,
+        'name': '설계자',
+        'email': 'designer@gogs.io',
+        'city': 'Seoul',
+        'city_zip': '06000',
+        'account_1': '123456',
+        'account_1_balance': 10000,
+        'account_2': '789012',
+        'account_2_balance': 5000,
+        'account_3': None,
+        'account_3_balance': None
+    },
+    {
+        'user_id': 2,
+        'name': '개발자',
+        'email': 'dev@gogs.io',
+        'city': 'Seoul',
+        'city_zip': '06000',
+        'account_1': '456789',
+        'account_1_balance': 8000,
+        'account_2': None,
+        'account_2_balance': None,
+        'account_3': None,
+        'account_3_balance': None
+    }
+]
+
+# 문제들:
+# 1. 중복 (Seoul, 06000)이 반복됨
+# 2. 수정 이상 (Modification Anomaly):
+#    - 삽입 이상: 새 city_zip 추가 불가 (user_id 필요)
+#    - 수정 이상: Seoul의 zip을 06001로 수정하려면 모든 행 수정
+#    - 삭제 이상: 사용자 삭제 → city_zip 정보도 사라짐
+# 3. NULL 낭비: account_3, account_3_balance (NULL)
+# 4. 확장성: 계좌 3개 초과 불가
+# 5. 인덱싱 어려움
+```
+
+### 해결: 정규화
+
+```python
+# ✅ 정규화된 설계: 테이블 분리
+
+users = [
+    {'user_id': 1, 'name': '설계자', 'email': 'designer@gogs.io', 'city_id': 1},
+    {'user_id': 2, 'name': '개발자', 'email': 'dev@gogs.io', 'city_id': 1}
+]
+
+cities = [
+    {'city_id': 1, 'name': 'Seoul', 'zip': '06000'}
+]
+
+accounts = [
+    {'account_id': 1, 'user_id': 1, 'balance': 10000},
+    {'account_id': 2, 'user_id': 1, 'balance': 5000},
+    {'account_id': 3, 'user_id': 2, 'balance': 8000}
+]
+
+# 장점:
+# 1. 중복 제거 (Seoul 1번만)
+# 2. 수정 쉬움: Seoul zip 수정 → 1곳만
+# 3. NULL 없음 (필요한 것만 저장)
+# 4. 무제한 확장
+# 5. 빠른 검색 (인덱스 효율)
+
+# 단점:
+# JOIN 필요: SELECT * FROM users JOIN cities ON users.city_id = cities.city_id
+#          → 약간 느림 (인덱스로 보상)
+```
+
+### 정규형 단계
+
+```
+1NF: 각 셀에 원자값만
+   ├─ ❌ 리스트, dict, 복합값 금지
+   └─ ✅ 각 행은 유일, 각 열은 원자값
+
+      ❌ {user_id: 1, accounts: [123, 456]}  ← 리스트!
+      ✅ {user_id: 1, account_id: 123}
+
+2NF: 1NF + 부분 함수 종속 제거
+   ├─ 부분 함수 종속: 기본키 일부에만 의존하는 컬럼
+   └─ 복합 기본키가 아닌 한 자동 만족
+
+      복합 기본키: (user_id, account_id)
+      ❌ account_type: account_id에만 의존 (user_id 무관)
+      ✅ 별도 테이블로 분리
+
+3NF: 2NF + 이행 함수 종속 제거
+   ├─ 이행 함수 종속: A→B→C 형태
+   └─ 가장 흔한 것
+
+      ❌ {user_id: 1, city: 'Seoul', zip: '06000'}
+         user_id → city, city → zip (이행)
+      ✅ city 정보 별도 테이블
+
+BCNF: 3NF의 더 엄격한 버전 (실무에서 거의 사용)
+```
+
+---
+
+## 인덱싱과 쿼리 최적화
+
+### 1. 인덱싱의 원리
+
+```python
+"""
+비유: 책의 찾아보기
+"""
+
+# ❌ 인덱스 없이
+def find_user_no_index(name):
+    for user in all_users:  # 100만 건
+        if user.name == name:
+            return user
+    # 최악: 100만 번 비교
+
+# ✅ 인덱스 있이
+CREATE INDEX idx_name ON users(name);
+
+# → B-Tree 구조
+#         [M]
+#       /  |  \
+#    [A-L][N-Z]
+#   /  |  \
+# [A][B-C][D-L]...
+
+# 찾기: "Michael"
+# 1. M 범위 포함 → [N-Z] 분기 (절반 제거)
+# 2. 다시 분기... (다시 절반)
+# 3. 20번 비교로 100만 개 중 찾음!
+# 속도: 50,000배 빠름
+
+# 시간 복잡도:
+# 없음: O(n) = 100만
+# 있음: O(log n) = 20
+```
+
+### 2. 복합 인덱스
+
+```python
+# 자주 함께 쓰는 컬럼:
+# WHERE user_id = 1 AND date > '2024-01-01'
+
+# ❌ 단일 인덱스 2개
+CREATE INDEX idx_user ON transactions(user_id);
+CREATE INDEX idx_date ON transactions(date);
+
+# → 2개 인덱스 검사, 그 다음 AND 조합
+# → 느림
+
+# ✅ 복합 인덱스 1개
+CREATE INDEX idx_user_date ON transactions(user_id, date);
+
+# → (user_id=1) 범위 찾기
+#   그 안에서 (date > '2024-01-01') 찾기
+# → 빠름!
+
+# 순서 중요!
+# idx_user_date: user_id로 먼저 정렬, 그 안에서 date 정렬
+# → WHERE user_id = 1 AND date > '2024-01-01': 효율적 ✅
+# → WHERE date > '2024-01-01': 비효율 ❌
+```
+
+### 3. 쿼리 최적화 예제
+
+```python
+# ❌ 느린 쿼리 (2초)
+SELECT u.name, COUNT(a.id) as account_count
+FROM users u
+JOIN accounts a ON u.id = a.user_id
+WHERE u.created_at > '2024-01-01'
+ORDER BY account_count DESC;
+
+# 문제:
+# 1. 인덱스 없음: 모든 users 테이블 스캔
+# 2. 조인 비효율: 모든 accounts 스캔
+# 3. COUNT 후 정렬: 수천 개 계산
+
+# ✅ 빠른 쿼리 (0.2초)
+CREATE INDEX idx_users_created ON users(created_at);
+CREATE INDEX idx_accounts_user ON accounts(user_id);
+
+SELECT u.name, COUNT(a.id) as account_count
+FROM users u
+JOIN accounts a ON u.id = a.user_id
+WHERE u.created_at > '2024-01-01'  -- 인덱스 활용
+ORDER BY account_count DESC
+LIMIT 10;  -- 상위 10개만
+
+# 개선사항:
+# 1. created_at 인덱스로 빠른 필터링
+# 2. user_id 인덱스로 빠른 조인
+# 3. LIMIT로 불필요한 계산 제거
+
+# 결과: 10배 빠름!
+```
+
+---
+
+## NoSQL 아키텍처
+
+### 1. CAP 이론의 현실
+
+```python
+"""
+각 NoSQL DB는 CAP 중 2가지 선택
+"""
+
+# CP Database (PostgreSQL, MongoDB with strong consistency)
+#   "정합성 우선"
+#   은행, 금융거래
+
+db.users.insertOne({_id: 1, name: 'Alice', balance: 10000})
+
+# 모든 사본(replica)이 같은 값
+# 네트워크 분할 → 일부 서버 불가
+# 리스크: 잠깐 안 됨, 데이터 손실 X
+
+# AP Database (DynamoDB, Cassandra, Redis)
+#   "가용성 우선"
+#   SNS, 게임, IoT 로그
+
+user_docs = [{id: 1, name: 'Alice', likes: 100}]
+# 서버 A: likes = 100
+# 서버 B: likes = 99 (약간 지남)
+# 서버 C: likes = 98 (더 지남)
+
+# 네트워크 분할해도 모두 작동
+# 리스크: 잠깐 부정확함, 결국 일치
+```
+
+### 2. Document Store 설계
+
+```python
+# ✅ Document (유연한 구조)
+{
+  "_id": "user_001",
+  "name": "설계자",
+  "email": "designer@gogs.io",
+  "profile": {
+    "age": 25,
+    "bio": "Language Designer",
+    "location": {
+      "city": "Seoul",
+      "country": "Korea",
+      "coordinates": [37.5665, 126.9780]
+    }
+  },
+  "interests": ["programming", "language design", "rust"],
+  "social": {
+    "twitter": "@gogs_lang",
+    "github": "gogs-lang"
+  },
+  "settings": {
+    "theme": "dark",
+    "notifications": true
+  },
+  "created_at": "2024-01-01T00:00:00Z",
+  "updated_at": "2024-01-15T12:30:00Z"
+}
+
+# vs 관계형 (정규화)
+users:
+  - user_id, name, email, profile_id, settings_id
+profiles:
+  - profile_id, age, bio, location_id, interests (배열)
+locations:
+  - location_id, city, country, lat, lng
+social_profiles:
+  - user_id, platform, handle
+settings:
+  - setting_id, theme, notifications
+
+# JOIN 6개 필요!
+# vs Document: 1번 조회
+
+# 트레이드오프:
+# ✅ 빠른 조회 (1번)
+# ✅ 유연한 구조 (새 필드 추가 쉬움)
+# ❌ 중복 가능 (여러 문서가 같은 도시)
+# ❌ 업데이트 복잡 (모든 문서 업데이트)
+```
+
+### 3. 집계 파이프라인
+
+```python
+# MongoDB 스타일 집계
+db.transactions.aggregate([
+  # Stage 1: 필터
+  {$match: {amount: {$gt: 1000}, date: {$gte: '2024-01-01'}}},
+
+  # Stage 2: 변형
+  {$project: {amount: 1, user_id: 1, profit: {$multiply: ['$amount', 0.1]}}},
+
+  # Stage 3: 그룹화
+  {$group: {
+    _id: '$user_id',
+    total_amount: {$sum: '$amount'},
+    total_profit: {$sum: '$profit'},
+    count: {$sum: 1}
+  }},
+
+  # Stage 4: 정렬
+  {$sort: {total_profit: -1}},
+
+  # Stage 5: 제한
+  {$limit: 10}
+])
+
+# 결과:
+# [
+#   {_id: 1, total_amount: 50000, total_profit: 5000, count: 5},
+#   {_id: 2, total_amount: 30000, total_profit: 3000, count: 3},
+#   ...
+# ]
+
+# 각 Stage는 병렬화 가능
+# 매우 빠름!
+```
+
+---
+
+## 동시성 제어
+
+### 1. Lock 메커니즘
+
+```python
+"""
+동시성 문제: Lost Update
+"""
+
+# ❌ 문제 상황
+시간    TX1                    TX2
+────────────────────────────────────────
+1:00   SELECT balance = 100
+1:01                          SELECT balance = 100
+1:02   UPDATE balance = 100 - 50 = 50 저장
+1:03                          UPDATE balance = 100 - 30 = 70 저장
+결과:  balance = 70 (50 손실!)
+
+# ✅ 해결: Lock
+시간    TX1                       TX2
+──────────────────────────────────────────
+1:00   LOCK (exclusive)
+1:01   SELECT balance = 100
+1:02                            LOCK 대기...
+1:03   UPDATE balance = 50 저장
+1:04   UNLOCK
+1:05                            LOCK 획득
+1:06                            SELECT balance = 50
+1:07                            UPDATE balance = 20 저장
+1:08                            UNLOCK
+결과:  balance = 20 (정확!)
+
+# Lock 종류:
+# Shared Lock (읽기): 여러 TX 동시 획득 가능
+# Exclusive Lock (쓰기): 한 TX만 독점
+```
+
+### 2. 낙관적 vs 비관적 Lock
+
+```python
+# 비관적 Lock (Conservative)
+# "문제 있을 거야" → 미리 Lock
+class PessimisticLock:
+    def update_balance(self, account_id, amount):
+        db.execute('SELECT * FROM accounts WHERE id = ? FOR UPDATE', account_id)
+        # 이제 Lock 획득 (다른 TX 대기)
+        balance = db.query('SELECT balance FROM accounts WHERE id = ?', account_id)
+        db.execute('UPDATE accounts SET balance = ? WHERE id = ?',
+                  balance - amount, account_id)
+
+# 장점: 충돌 처리 간단
+# 단점: 성능 (대기 시간)
+
+# 낙관적 Lock (Optimistic)
+# "문제 없을 거야" → 나중에 확인
+class OptimisticLock:
+    def update_balance(self, account_id, amount, version):
+        balance = db.query('SELECT balance, version FROM accounts WHERE id = ?',
+                          account_id)
+
+        # 버전 확인 (다른 TX가 수정했나?)
+        if balance.version != version:
+            raise ConflictError("데이터 변경됨, 재시도")
+
+        db.execute(
+            'UPDATE accounts SET balance = ?, version = version + 1 WHERE id = ? AND version = ?',
+            balance - amount, account_id, version
+        )
+
+# 장점: 높은 동시성, 빠름
+# 단점: 충돌 시 재시도 필요
+```
+
+---
+
+## 성능 최적화 전략
+
+### 1. 배치 처리
+
+```python
+# ❌ 개별 처리: 1000개 가입자, 각 1ms
+for user in users:
+    db.insert(user)
+# 총 시간: 1000ms
+
+# ✅ 배치 처리: 100개씩 묶어서, 각 10ms
+for i in range(0, 1000, 100):
+    db.insert_batch(users[i:i+100])
+# 총 시간: 100ms (10배 빠름!)
+
+# SQL 예제:
+# 개별: INSERT INTO users VALUES (...); (1000번)
+# 배치: INSERT INTO users VALUES (...), (...), (...); (10번)
+```
+
+### 2. 캐싱 전략
+
+```python
+# 3단계 캐시
+# L1: 메모리 캐시 (가장 빠름, 작음)
+# L2: 분산 캐시 (Redis, 중간 속도)
+# L3: 데이터베이스 (느림, 큼)
+
+class CacheStrategy:
+    def get_user(self, user_id):
+        # 1. L1 확인
+        if user_id in self.memory_cache:
+            return self.memory_cache[user_id]
+
+        # 2. L2 확인
+        cached = redis.get(f'user:{user_id}')
+        if cached:
+            self.memory_cache[user_id] = cached
+            return cached
+
+        # 3. L3에서 조회
+        user = db.query('SELECT * FROM users WHERE id = ?', user_id)
+
+        # 캐시 업데이트
+        redis.set(f'user:{user_id}', user, ex=3600)  # 1시간 TTL
+        self.memory_cache[user_id] = user
+
+        return user
+
+# 히트율 측정:
+# 좋은 캐시: 95% 이상 히트
+# 나쁜 캐시: 30% 이하 히트
+```
+
+### 3. 샤딩 (Horizontal Scaling)
+
+```python
+"""
+하나의 테이블을 여러 데이터베이스에 분산
+"""
+
+# 원래 (한 서버):
+# users 테이블: 1000만 행, 검색 느림
+
+# 샤딩 후 (4개 서버):
+def get_shard(user_id, shard_count=4):
+    shard_id = user_id % shard_count
+    return shard_id
+
+# user_id 1 → shard 1 (Server 1)
+# user_id 2 → shard 2 (Server 2)
+# user_id 3 → shard 3 (Server 3)
+# user_id 4 → shard 0 (Server 4)
+# user_id 5 → shard 1 (Server 1)
+# ...
+
+# 장점:
+# 1. 병렬성: 4개 서버 동시 쿼리
+# 2. 용량: 각 서버 250만 행만
+# 3. 속도: 2배~4배 빠름
+
+# 단점:
+# 1. 복잡도 증가
+# 2. JOIN 어려움 (다른 서버의 데이터)
+# 3. 리밸런싱 (서버 추가 시)
+```
+
+---
+
+## 실전 설계 사례
+
+### 사례: 소셜 미디어 피드 시스템
+
+```python
+"""
+수백만 사용자, 수십억 게시물
+"친구의 최신 게시물" → 빠르게 표시해야 함
+"""
+
+【 설계 1: 관계형 DB만 사용 】
+
+# 테이블:
+# users: user_id, name
+# posts: post_id, user_id, content, created_at
+# follows: follower_id, following_id
+# feeds: post_id, viewer_id, created_at
+
+# 피드 조회 쿼리:
+SELECT p.content, u.name, p.created_at
+FROM feeds f
+JOIN posts p ON f.post_id = p.post_id
+JOIN users u ON p.user_id = u.user_id
+WHERE f.viewer_id = 1
+ORDER BY p.created_at DESC
+LIMIT 20;
+
+# 문제:
+# - JOIN 3개 = 느림
+# - 매 요청마다 계산
+# - 확장 어려움
+
+【 설계 2: 하이브리드 (추천!) 】
+
+# 1. DB: 사용자 정보, 관계 저장
+CREATE TABLE users (user_id PRIMARY KEY, name, ...);
+CREATE TABLE follows (follower_id, following_id, PRIMARY KEY(follower_id, following_id));
+
+# 2. 캐시 (Redis): 피드 미리 계산
+# user:1:feed = [post_100, post_99, post_98, ...]  (최근순)
+
+# 피드 조회:
+def get_feed(user_id):
+    # 1. Redis에서 즉시 반환
+    feed_ids = redis.lrange(f'user:{user_id}:feed', 0, 19)  # 1ms
+
+    if not feed_ids:
+        # 2. 캐시 없으면 계산
+        feed_ids = compute_feed(user_id)  # 100ms
+        redis.setex(f'user:{user_id}:feed', 3600, feed_ids)  # 1시간 캐시
+
+    # 3. 게시물 상세 조회
+    posts = db.query(f'SELECT * FROM posts WHERE id IN ({feed_ids})')
+    return posts
+
+# 게시물 작성 시:
+def post_new(user_id, content):
+    # 1. DB에 저장
+    post_id = db.insert('INSERT INTO posts (...) VALUES (...)', user_id, content)
+
+    # 2. 팔로워의 캐시 업데이트
+    followers = db.query('SELECT follower_id FROM follows WHERE following_id = ?', user_id)
+    for follower in followers:
+        redis.lpush(f'user:{follower}:feed', post_id)  # 앞에 추가
+        redis.ltrim(f'user:{follower}:feed', 0, 100)   # 최대 100개 유지
+
+# 성능:
+# - 피드 조회: 1ms (캐시 히트)
+# - 게시물 작성: 10ms (비동기로 백그라운드)
+# - 확장 가능: 캐시는 수평 확장 가능
+```
+
+### 사례: 실시간 모니터링 시스템
+
+```python
+"""
+1000개 서버, 초당 100만 메트릭
+시계열 데이터 최적화
+"""
+
+【 설계: Time-Series DB + 집계 】
+
+# 1. Raw 메트릭 저장 (InfluxDB 스타일)
+measurement: cpu_usage
+tags: {host: "server-001", region: "us-west"}
+field: value=45.2
+timestamp: 2024-01-15T10:00:00Z
+
+# 2. 자동 집계 (Downsampling)
+# 1분마다 원본 저장
+# 1시간마다 1분 데이터 평균
+# 1일마다 1시간 데이터 평균
+# 1년 후 삭제
+
+# 쿼리:
+# 최근 1시간: 원본 데이터 (정확)
+# 최근 1주: 1시간 집계 (중간 정확)
+# 최근 1년: 1일 집계 (개략)
+
+# 쿼리 예:
+SELECT AVG(value) as avg_cpu
+FROM cpu_usage
+WHERE host = 'server-001' AND time > now() - 7d
+GROUP BY time(1h);
+
+# 결과: 그래프 그리기에 딱 적합
+
+# 저장 공간:
+# 원본: 100만 메트릭/초 × 86400초 × 1년 = 31억 개
+#     → 수 TB 필요
+# 집계 후: 1000 서버 × 365일 × 24 = 876만 개
+#        → 수 GB (1000배 감소!)
+
+# 성능:
+# 원본 조회: 느림 (수십억 행)
+# 집계 조회: 빠름 (수천 행)
+```
+
+---
+
+## 요약
+
+| 개념 | 핵심 | 구현 | 효과 |
+|------|------|------|------|
+| **ACID** | 안전한 변경 | 트랜잭션 | 데이터 손실 0% |
+| **정규화** | 중복 제거 | 테이블 분리 | 용량 50% 절약 |
+| **인덱싱** | 빠른 검색 | B-Tree | 50,000배 빠름 |
+| **NoSQL** | 유연한 저장 | Document | 스케일 무제한 |
+| **동시성** | 안전한 동시 접근 | Lock/Version | 데이터 일관성 |
+| **캐싱** | 반복 조회 고속화 | Redis | 99% 빠름 |
+| **샤딩** | 수평 확장 | 분산 저장 | N배 빠름 |
+
+**설계자의 철학:**
+> "작은 시스템: 단순함이 최고
+> 중간 시스템: 정규화와 인덱싱
+> 큰 시스템: 캐싱과 샤딩
+> 거대 시스템: NoSQL + 분산 아키텍처"
+
+---
+
+## 다음 단계: v5.3 알고리즘과 자료구조 심화
+
+이제 **데이터 저장(v5.2)**을 완성했습니다.
+다음은 **효율적인 처리(v5.3)**를 배웁니다.
+
+- 정렬: O(n log n)의 비결
+- 검색: 이진 탐색, 해시테이블
+- 그래프: 최단경로, 신장트리
+- 동적 계획법: 최적 부분문제
+
+**대학 3학년의 진정한 면모를 드러내는 과정입니다.**

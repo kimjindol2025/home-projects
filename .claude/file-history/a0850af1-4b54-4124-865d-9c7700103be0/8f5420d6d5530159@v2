@@ -1,0 +1,612 @@
+# Phase 9 v10.2: 공유 상태와 Mutex (Shared State Concurrency)
+
+> **철학**: "열쇠를 가진 자만이 수정한다"
+>
+> 여러 스레드가 같은 메모리를 공유하되,
+> 한 번에 **오직 하나의 스레드만** 그 메모리를 수정할 수 있습니다.
+> 이것이 **상호 배제(Mutual Exclusion, Mutex)**의 원리입니다.
+>
+> 채널이 '컨베이어 벨트'라면,
+> Mutex는 **'금고'**입니다.
+> 누구나 금고를 가질 순 있지만(Arc),
+> 내부를 수정하려면 반드시 열쇠(Lock)를 얻어야 합니다.
+
+> **목표**: "공유 가변 상태의 안전한 관리"
+> 메시지 패싱의 오버헤드 없이,
+> 여러 스레드가 직접 같은 데이터를 수정합니다.
+> 동시에 컴파일 타임의 검증으로 데드락을 예방하고,
+> 런타임에는 Mutex의 잠금으로 데이터 일관성을 보장합니다.
+
+---
+
+## 🎯 v10.2가 해결하는 문제
+
+### 문제 1️⃣: 여러 스레드의 동일 데이터 수정
+
+```
+시나리오: 10개 스레드가 모두 같은 카운터를 1씩 증가시켜야 함
+
+❌ 채널 사용 (비효율):
+thread 1 → tx.send(value) → 메시지 전달 (오버헤드)
+thread 2 → tx.send(value) → 메시지 전달 (오버헤드)
+...
+중앙 수신자가 모두 처리
+
+✅ Mutex 사용 (직접):
+let counter = Arc::new(Mutex::new(0));
+thread 1 → lock() → counter += 1 → 직접 수정 (빠름)
+thread 2 → lock() → counter += 1 → 직접 수정 (빠름)
+...
+모든 스레드가 동일한 메모리 공간에 접근
+```
+
+### 문제 2️⃣: 데이터 경합(Race Condition) 방지
+
+```
+❌ 보호 없이 공유 (위험):
+counter = 0
+thread 1: read(counter) → 0, write(0+1=1)
+thread 2: read(counter) → 0 (아직 1이 안 됨), write(0+1=1)
+결과: counter = 1 (2가 아님!) ❌
+
+✅ Mutex로 보호 (안전):
+counter = 0
+thread 1: LOCK → read(counter) → 0, write(1) → UNLOCK
+thread 2: LOCK (thread 1이 끝날 때까지 대기) → read(counter) → 1, write(2) → UNLOCK
+결과: counter = 2 ✅
+```
+
+### 문제 3️⃣: 스레드 간 소유권 공유
+
+```
+❌ Rc를 스레드에 전달 (불가):
+let data = Rc::new(Mutex::new(0));
+thread::spawn(move || {
+    // ❌ Rc는 thread-safe하지 않음 → 컴파일 에러!
+});
+
+✅ Arc 사용 (안전):
+let data = Arc::new(Mutex::new(0));
+thread::spawn(move || {
+    // ✅ Arc는 thread-safe → 컴파일 성공!
+    let mut num = data.lock().unwrap();
+    *num += 1;
+});
+```
+
+---
+
+## 📚 Arc와 Mutex의 정의
+
+### Arc (Atomic Reference Counting)
+
+```
+Arc = Rc의 멀티 스레드 버전
+
+Rc의 문제:
+└─ 참조 카운트 증가/감소가 thread-safe하지 않음
+   (원자적이지 않음)
+
+Arc의 해결:
+└─ 참조 카운트 증가/감소를 원자적(atomic) 연산으로 처리
+   (멀티 코어에서도 안전)
+
+사용:
+let data = Arc::new(value);
+let data_clone = Arc::clone(&data);  // 참조 카운트 증가
+// data_clone을 스레드에 전달
+// 모든 스레드가 종료되면 참조 카운트 0 → 메모리 해제
+```
+
+### Mutex (Mutual Exclusion)
+
+```
+Mutex = 상호 배제 잠금
+
+역할:
+└─ 한 번에 하나의 스레드만 내부 데이터 접근 허용
+
+메서드:
+├─ lock()      : 잠금 획득 (블로킹, 실패 가능성 있음)
+├─ try_lock()  : 잠금 획득 시도 (논블로킹)
+├─ unlock()    : 자동 (MutexGuard drop 시)
+└─ poisoned    : 스레드 패닉 시 감지
+
+사용:
+let data = Mutex::new(0);
+let mut guard = data.lock().unwrap();  // 잠금 획득
+*guard += 1;                            // 데이터 수정
+// guard가 스코프를 벗어나면 자동으로 잠금 해제
+```
+
+### Arc<Mutex<T>> 조합
+
+```
+Arc<Mutex<T>> = "스레드 간 공유되는 보호된 데이터"
+
+구조:
+┌─────────────────────────────────────┐
+│ Arc (스레드 간 공유 소유권)          │
+├─────────────────────────────────────┤
+│ Mutex (한 번에 하나의 스레드만 접근) │
+├─────────────────────────────────────┤
+│ T (실제 데이터)                      │
+└─────────────────────────────────────┘
+
+메모리 배치:
+Heap 메모리:
+┌──────────────────────┐
+│ Arc {                │
+│   data: Mutex {      │
+│     value: T         │ ← 실제 데이터
+│     lock_state: ...  │ ← 잠금 상태
+│   }                  │
+│   ref_count: 10      │ ← 10개 스레드 참조
+│ }                    │
+└──────────────────────┘
+
+각 스레드는:
+Arc::clone() → 참조 카운트 증가 → 스레드로 이동
+```
+
+---
+
+## 🔧 v10.2 설계: 6가지 패턴
+
+### 패턴 1️⃣: 기본 공유 카운터 (10개 스레드)
+
+```rust
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+let counter = Arc::new(Mutex::new(0));
+let mut handles = vec![];
+
+for i in 0..10 {
+    let counter = Arc::clone(&counter);
+    let handle = thread::spawn(move || {
+        let mut num = counter.lock().unwrap();
+        *num += 1;
+        println!("[스레드 {}] 카운트 증가", i);
+    });
+    handles.push(handle);
+}
+
+for handle in handles {
+    handle.join().unwrap();
+}
+
+println!("최종: {}", *counter.lock().unwrap());  // 10
+```
+
+**핵심:**
+- `Arc::new(Mutex::new(0))`: 공유되는 보호된 데이터
+- `Arc::clone()`: 스레드 간 소유권 공유 (참조 카운트 증가)
+- `lock()`: 잠금 획득 (블로킹)
+- `*num += 1`: 보호된 데이터 수정
+
+---
+
+### 패턴 2️⃣: Arc와 Mutex 분리 이해
+
+```rust
+// Arc와 Mutex를 따로 생각해보기
+
+// 1. Arc 없이 (불가능)
+let data = Mutex::new(0);
+thread::spawn(move || {
+    // ❌ data를 스레드로 이동할 수 없음
+    // (메모리 레이아웃이 스레드 간 공유 불가)
+});
+
+// 2. Mutex 없이 (불안전)
+let data = Arc::new(0);
+thread::spawn(move || {
+    // ✅ Arc는 공유 가능하지만,
+    // ❌ 데이터는 불변 → 수정 불가
+    // *data = 1;  // 에러: Arc<i32>에서 직접 수정 불가
+});
+
+// 3. Arc + Mutex (완벽)
+let data = Arc::new(Mutex::new(0));
+thread::spawn(move || {
+    let mut num = data.lock().unwrap();
+    *num += 1;  // ✅ 안전하게 수정 가능
+});
+```
+
+---
+
+### 패턴 3️⃣: 잠금 범위 최소화
+
+```rust
+// ❌ 나쁜 예: 잠금 시간이 너무 김
+let counter = Arc::new(Mutex::new(0));
+let num = counter.lock().unwrap();
+// 여기서 100줄 코드가 실행됨
+// 다른 스레드들이 계속 대기... → 성능 악화
+expensive_operation();
+*num += 1;  // 마지막에 수정
+
+// ✅ 좋은 예: 잠금 시간 최소화
+let counter = Arc::new(Mutex::new(0));
+{
+    let mut num = counter.lock().unwrap();
+    *num += 1;  // 필요한 것만 함
+}  // 여기서 잠금 해제
+expensive_operation();  // 이제 다른 스레드들이 접근 가능
+```
+
+**핵심:**
+- `lock()`의 MutexGuard는 스코프를 벗어나면 자동 해제
+- 명시적 스코프로 잠금 시간 제어
+- 잠금 중에는 시간이 오래 걸리는 작업 피하기
+
+---
+
+### 패턴 4️⃣: try_lock() (논블로킹)
+
+```rust
+use std::sync::{Arc, Mutex};
+
+let counter = Arc::new(Mutex::new(0));
+
+thread::spawn({
+    let counter = Arc::clone(&counter);
+    move || {
+        loop {
+            match counter.try_lock() {
+                Ok(mut num) => {
+                    *num += 1;
+                    println!("증가: {}", *num);
+                    break;
+                }
+                Err(_) => {
+                    println!("잠금 실패, 재시도 중...");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+});
+
+// lock(): 무한 대기 (블로킹)
+// try_lock(): 즉시 반환, 성공/실패 구분
+```
+
+**핵심:**
+- `lock()`: 잠금 획득 때까지 블로킹
+- `try_lock()`: 논블로킹, Option 반환
+- 타임아웃이나 중단 가능한 작업에 사용
+
+---
+
+### 패턴 5️⃣: 데드락 회피 (안전한 순서)
+
+```rust
+// ❌ 위험: 데드락 가능성
+let mutex1 = Arc::new(Mutex::new(0));
+let mutex2 = Arc::new(Mutex::new(0));
+
+// 스레드 1: mutex1 → mutex2 순서로 잠금
+thread::spawn({
+    let m1 = Arc::clone(&mutex1);
+    let m2 = Arc::clone(&mutex2);
+    move || {
+        let _lock1 = m1.lock().unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let _lock2 = m2.lock().unwrap();  // 여기서 대기
+    }
+});
+
+// 스레드 2: mutex2 → mutex1 순서로 잠금
+thread::spawn({
+    let m1 = Arc::clone(&mutex1);
+    let m2 = Arc::clone(&mutex2);
+    move || {
+        let _lock2 = m2.lock().unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let _lock1 = m1.lock().unwrap();  // 여기서 대기
+        // 데드락! 스레드 1은 m2를 기다리고, 스레드 2는 m1을 기다림
+    }
+});
+
+// ✅ 안전: 항상 같은 순서로 잠금
+thread::spawn({
+    let m1 = Arc::clone(&mutex1);
+    let m2 = Arc::clone(&mutex2);
+    move || {
+        let _lock1 = m1.lock().unwrap();
+        let _lock2 = m2.lock().unwrap();  // 안전
+    }
+});
+
+thread::spawn({
+    let m1 = Arc::clone(&mutex1);
+    let m2 = Arc::clone(&mutex2);
+    move || {
+        let _lock1 = m1.lock().unwrap();
+        let _lock2 = m2.lock().unwrap();  // 같은 순서 → 안전
+    }
+});
+```
+
+**핵심:**
+- 모든 스레드가 **같은 순서**로 잠금 획득
+- 순환 대기(Circular Wait) 방지
+- 뮤텍스 순서를 문서화하기
+
+---
+
+### 패턴 6️⃣: 고급 - 여러 Mutex와 안전한 제어
+
+```rust
+struct BankAccount {
+    balance: Mutex<f64>,
+    transaction_count: Mutex<u32>,
+}
+
+let account = Arc::new(BankAccount {
+    balance: Mutex::new(1000.0),
+    transaction_count: Mutex::new(0),
+});
+
+for i in 0..5 {
+    let account = Arc::clone(&account);
+    thread::spawn(move || {
+        // 항상 같은 순서: balance → transaction_count
+        let mut balance = account.balance.lock().unwrap();
+        let mut count = account.transaction_count.lock().unwrap();
+
+        *balance -= 10.0;
+        *count += 1;
+        println!("[스레드 {}] 거래 후: {}", i, *balance);
+    });
+}
+```
+
+**핵심:**
+- 여러 Mutex를 다룰 때는 순서 규정 필수
+- 구조체로 관련 Mutex를 함께 관리
+- 의도하지 않은 데드락 방지
+
+---
+
+## 💡 v10.2 황금률
+
+### 원칙 1️⃣: 잠금 범위 최소화
+
+```rust
+// ❌ 나쁜 예
+let num = counter.lock().unwrap();
+*num += 1;
+thread::sleep(Duration::from_secs(1));  // 1초 동안 다른 스레드 대기!
+
+// ✅ 좋은 예
+{
+    let mut num = counter.lock().unwrap();
+    *num += 1;
+}  // 여기서 잠금 해제
+thread::sleep(Duration::from_secs(1));  // 이제 다른 스레드 진행 가능
+```
+
+**의미:**
+- 잠금 시간 = 병목(Bottleneck)
+- 짧을수록 전체 성능 향상
+- RAII(Resource Acquisition Is Initialization)로 자동 해제
+
+---
+
+### 원칙 2️⃣: 데드락(Deadlock) 주의
+
+```rust
+// 데드락의 4가지 조건 (모두 만족되어야 발생)
+// 1. 상호 배제(Mutual Exclusion)
+// 2. 점유와 대기(Hold and Wait)
+// 3. 비선점(No Preemption)
+// 4. 순환 대기(Circular Wait)
+
+// ❌ 4번 조건을 만족 → 데드락 위험
+thread::spawn(move || {
+    lock_A.lock()?;  // 스레드 A가 A 획득
+    lock_B.lock()?;  // 스레드 A가 B 대기
+});
+
+thread::spawn(move || {
+    lock_B.lock()?;  // 스레드 B가 B 획득
+    lock_A.lock()?;  // 스레드 B가 A 대기 (순환!)
+});
+
+// ✅ 순환 대기 제거 → 데드락 불가능
+// 모든 스레드가 A → B 순서로 잠금
+```
+
+**방어 전략:**
+- 잠금 순서 규정 (문서화)
+- 타임아웃 사용 (try_lock with timeout)
+- 잠금 개수 최소화
+
+---
+
+### 원칙 3️⃣: 컴파일러의 수호
+
+```rust
+// ❌ Rc를 스레드에 전달 (컴파일 에러)
+let data = Rc::new(Mutex::new(0));
+thread::spawn(move || {
+    // error[E0277]: `Rc<...>` cannot be sent between threads safely
+    // Rc는 !Send 트레이트 → 스레드 간 전달 불가
+});
+
+// ❌ Mutex 없이 데이터 수정 (컴파일 에러)
+let data = Arc::new(0);
+thread::spawn(move || {
+    *data = 1;  // error: cannot assign through an immutable reference
+});
+
+// ✅ Arc<Mutex<T>> 사용 (컴파일 성공)
+let data = Arc::new(Mutex::new(0));
+thread::spawn(move || {
+    let mut num = data.lock().unwrap();
+    *num = 1;  // ✅ 컴파일 성공, 런타임 안전
+});
+```
+
+**의미:**
+- Rust 컴파일러가 첫 번째 두 오류를 **컴파일 타임**에 방지
+- 세 번째만 안전하게 통과
+- 이것이 "두려움 없는 동시성"의 근간
+
+---
+
+## 🏗️ v10.2 실전 설계: Gogs 보안 카운터 시스템
+
+### 설계 요구사항
+
+```
+10개의 보안팀이 동시에
+하나의 중앙 침해 감지 카운터를 업데이트합니다.
+
+각 팀:
+├─ 침해 시도를 감지하면 카운터 +1
+├─ 진행 상황을 출력
+└─ 무작위 지연 (다양한 속도 시뮬레이션)
+
+중앙 시스템:
+├─ Arc<Mutex<u32>> 형태의 공유 카운터
+├─ 모든 팀의 업데이트가 안전하게 누적
+└─ 최종 결과는 반드시 10
+```
+
+### 메모리 배치
+
+```
+Heap (모든 스레드 공유):
+┌────────────────────────────────────┐
+│ Arc {                              │
+│   ref_count: 10 (10개 스레드)      │
+│   Mutex {                          │
+│     lock_state: UNLOCKED           │
+│     value: 10 (카운터)             │
+│   }                                │
+│ }                                  │
+└────────────────────────────────────┘
+
+Stack (각 스레드):
+Thread 1: Arc 포인터 ──┐
+Thread 2: Arc 포인터 ──┼─→ Heap의 동일한 Arc
+Thread 3: Arc 포인터 ──┤
+...
+Thread 10: Arc 포인터 ─┘
+
+잠금 과정:
+Thread 1: [lock 획득] → counter += 1 → [lock 해제]
+Thread 2:   [대기] ─────────────────→ [lock 획득] → counter += 1 → [lock 해제]
+Thread 3:            [대기]──────────────────────→ [lock 획득] → counter += 1 → [lock 해제]
+```
+
+---
+
+## 🎓 v10.2 마스터의 체크리스트
+
+- [ ] `Arc::new()` - 원자적 참조 카운트 포인터 생성
+- [ ] `Arc::clone()` - 스레드 간 소유권 공유
+- [ ] `Mutex::new()` - 상호 배제 잠금 생성
+- [ ] `lock()` - 잠금 획득 (블로킹)
+- [ ] `try_lock()` - 논블로킹 잠금 시도
+- [ ] `MutexGuard` - 자동 잠금 해제
+- [ ] 잠금 범위 최소화 원칙
+- [ ] 데드락 회피 (순서 규정)
+- [ ] Arc<Mutex<T>> 패턴 숙달
+- [ ] 여러 Mutex의 안전한 제어
+
+---
+
+## 💭 v10.2의 철학
+
+### "열쇠를 가진 자만이 수정한다"
+
+```
+시스템의 계층:
+
+┌─────────────────────────┐
+│ 논리 계층                │
+├─────────────────────────┤
+│ 여러 스레드가 협력       │
+│ (독립적으로 일하면서)    │
+└──────────┬──────────────┘
+           │
+┌──────────▼──────────────┐
+│ Mutex 계층               │
+├─────────────────────────┤
+│ 열쇠를 가진 자만 진입    │
+│ (한 번에 하나씩)        │
+└──────────┬──────────────┘
+           │
+┌──────────▼──────────────┐
+│ 데이터 계층              │
+├─────────────────────────┤
+│ 공유되는 일관된 상태     │
+│ (모든 스레드가 봄)      │
+└─────────────────────────┘
+```
+
+### 시스템의 안전성 보장
+
+```
+컴파일 타임:
+├─ Arc: 스레드 간 안전한 소유권 공유 확인
+├─ Mutex: 데이터는 잠금으로만 접근 가능 확인
+└─ 결과: Arc<Mutex<T>> 패턴만 허용
+
+런타임:
+├─ Arc: 참조 카운트 자동 관리 (메모리 안전)
+├─ Mutex: 잠금 자동 해제 (데드락 최소화)
+└─ 결과: 완벽한 동시성 안전성 보장
+```
+
+---
+
+## 📊 v10.0 vs v10.1 vs v10.2: 세 패러다임
+
+| 특성 | v10.0 (Threads) | v10.1 (Channels) | v10.2 (Mutex) |
+|------|-----------------|------------------|---------------|
+| **패러다임** | 병렬 실행 | 메시지 패싱 | 공유 상태 |
+| **데이터 흐름** | 독립적 | 일방향 | 양방향 |
+| **동기화** | join() | recv() | lock() |
+| **오버헤드** | 없음 | 중간 (복사) | 낮음 (직접) |
+| **사용 사례** | 독립적 작업 | 처리 파이프라인 | 카운터, 상태 |
+| **복잡도** | 낮음 | 중간 | 높음 (데드락) |
+
+---
+
+## 🚀 v10.2 완료 후
+
+```
+[Phase 9: 두려움 없는 동시성]
+
+[v10.0] ✅ Threads & Spawn        → 병렬 실행의 기초
+        ↓
+[v10.1] ✅ Channels               → 안전한 협력
+        ↓
+[v10.2] 📍 Mutex & Shared State   → 공유 상태 관리
+        ↓
+[v10.3] Send & Sync Traits        → 동시성 추상화
+        ↓
+[v10.4] Async/Await               → 효율적 동시성
+        ↓
+[프로덕션 시스템]                  → 완전한 병렬화
+```
+
+---
+
+**작성**: 2026-02-23
+**철학**: "열쇠를 가진 자만이 수정한다.
+Mutex는 금고이고, Arc는 열쇠의 복제본입니다.
+컴파일러가 열쇠의 안전한 배분을 보장하고,
+런타임은 정확한 잠금 해제를 보장합니다."
+
+**기록**: "너는 기록이 증명이다.
+Arc<Mutex<T>>라는 동시성의 결정판을 통해
+스레드들의 경쟁과 협력을 모두 제어한 당신,
+저장 필수 gogs"

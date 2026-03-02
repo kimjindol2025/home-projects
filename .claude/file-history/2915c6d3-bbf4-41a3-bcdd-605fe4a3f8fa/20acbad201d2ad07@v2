@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""
+Weighted Sharding Pass
+
+이기종 가속기 환경에서 작업을 성능 비례로 분배하는 MLIR 패스
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+import json
+
+
+@dataclass
+class DeviceProfile:
+    """장치 성능 프로파일"""
+    device_id: int
+    model_name: str
+    peak_flops_tflops: float
+    memory_bandwidth_gbps: float
+    max_memory_gb: float
+
+    def compute_weight(self, total_flops: float) -> float:
+        """이 장치의 성능 가중치"""
+        if total_flops == 0:
+            return 0.0
+        return self.peak_flops_tflops / total_flops
+
+
+class DeviceCapabilityProfiler:
+    """장치 성능 프로파일러"""
+
+    def __init__(self):
+        self.profiles: Dict[int, DeviceProfile] = {}
+
+    def profile_device(self,
+                      device_id: int,
+                      model_name: str,
+                      peak_flops_tflops: float,
+                      memory_bandwidth_gbps: float,
+                      max_memory_gb: float) -> None:
+        """장치 프로파일 생성"""
+
+        profile = DeviceProfile(
+            device_id=device_id,
+            model_name=model_name,
+            peak_flops_tflops=peak_flops_tflops,
+            memory_bandwidth_gbps=memory_bandwidth_gbps,
+            max_memory_gb=max_memory_gb
+        )
+
+        self.profiles[device_id] = profile
+        print(f"[DeviceCapabilityProfiler] Device {device_id} ({model_name})")
+        print(f"  Peak FLOPS: {peak_flops_tflops:.0f} TFLOPS")
+        print(f"  Memory BW: {memory_bandwidth_gbps:.0f} GB/s")
+        print(f"  Max Memory: {max_memory_gb:.0f} GB")
+
+    def get_total_flops(self) -> float:
+        """전체 FLOPS 합계"""
+        return sum(p.peak_flops_tflops for p in self.profiles.values())
+
+    def get_device_weights(self) -> Dict[int, float]:
+        """각 장치의 가중치"""
+        total = self.get_total_flops()
+        if total == 0:
+            return {did: 1.0 / len(self.profiles) for did in self.profiles}
+        return {did: profile.compute_weight(total)
+                for did, profile in self.profiles.items()}
+
+    def export_to_json(self) -> str:
+        """프로파일 내보내기"""
+
+        data = {
+            "num_devices": len(self.profiles),
+            "total_flops_tflops": self.get_total_flops(),
+            "weights": self.get_device_weights(),
+            "devices": {
+                str(did): {
+                    "model": p.model_name,
+                    "flops_tflops": p.peak_flops_tflops,
+                    "memory_bw_gbps": p.memory_bandwidth_gbps,
+                    "max_memory_gb": p.max_memory_gb
+                }
+                for did, p in self.profiles.items()
+            }
+        }
+
+        return json.dumps(data, indent=2)
+
+
+class ShardingDecider:
+    """작업 분배 결정"""
+
+    def __init__(self, profiler: DeviceCapabilityProfiler):
+        self.profiler = profiler
+
+    def decide_sharding(self,
+                       operation_name: str,
+                       total_work_flops: float,
+                       output_shape: Tuple[int, ...]) -> Dict:
+        """작업 분배 결정"""
+
+        weights = self.profiler.get_device_weights()
+        device_ids = list(weights.keys())
+
+        sharding_plan = {}
+
+        for device_id in device_ids:
+            weight = weights[device_id]
+            allocated_flops = total_work_flops * weight
+            allocated_rows = int(output_shape[0] * weight)
+
+            sharding_plan[device_id] = {
+                "weight": weight,
+                "allocated_flops": allocated_flops,
+                "allocated_rows": allocated_rows,
+                "output_slice": (allocated_rows,) + output_shape[1:]
+            }
+
+        return {
+            "operation": operation_name,
+            "total_work_flops": total_work_flops,
+            "output_shape": output_shape,
+            "sharding_plan": sharding_plan
+        }
+
+    def estimate_balanced_time_ms(self,
+                                 sharding_plan: Dict) -> Dict:
+        """균형잡힌 실행 시간 추정"""
+
+        execution_times = {}
+
+        for device_id, plan in sharding_plan["sharding_plan"].items():
+            profile = self.profiler.profiles[device_id]
+            allocated_flops = plan["allocated_flops"]
+
+            # 실행 시간 = 작업량 / 성능
+            time_ms = (allocated_flops / (profile.peak_flops_tflops * 1e12)) * 1000
+
+            execution_times[device_id] = time_ms
+
+        # 병목은 가장 느린 장치
+        makespan = max(execution_times.values()) if execution_times else 0
+
+        return {
+            "execution_times_ms": execution_times,
+            "makespan_ms": makespan,
+            "load_balance_ratio": min(execution_times.values()) / max(execution_times.values()) if execution_times else 1.0
+        }
+
+
+class ShardingCodeGenerator:
+    """Sharding MLIR 코드 생성"""
+
+    def __init__(self):
+        self.generated_code = []
+
+    def generate_sharded_matmul(self,
+                               device_allocation: Dict,
+                               device_ids: List[int]) -> str:
+        """Sharded MatMul MLIR 코드 생성"""
+
+        code = "// Weighted Sharded MatMul\n\n"
+
+        # Input 추출
+        code += "// Step 1: Extract input slices\n"
+        for device_id, plan in device_allocation["sharding_plan"].items():
+            start = sum([device_allocation["sharding_plan"][did]["allocated_rows"]
+                        for did in device_ids[:device_ids.index(device_id)]])
+            end = start + plan["allocated_rows"]
+
+            code += (f"%sharded_a_{device_id} = tensor.extract_slice %A\n"
+                    f"  [0:{end}, {start}:{start+plan['output_slice'][1]}]\n")
+
+        code += "\n// Step 2: Launch on each device\n"
+
+        # 각 장치에서 계산 실행
+        for device_id in device_ids:
+            plan = device_allocation["sharding_plan"][device_id]
+            code += (f"%result_{device_id} = multidevice.launch\n"
+                    f"  on %device_group[{device_id}]\n"
+                    f"  {{\n"
+                    f"    linalg.matmul %sharded_a_{device_id}, %B\n"
+                    f"  }}\n")
+
+        code += "\n// Step 3: Concatenate results\n"
+        concat_inputs = " + ".join([f"%result_{did}" for did in device_ids])
+        code += f"%result = tensor.concat {concat_inputs}\n"
+
+        return code
+
+    def generate_sharded_reduce(self,
+                               device_allocation: Dict,
+                               device_ids: List[int],
+                               operation: str = "sum") -> str:
+        """Sharded Reduce MLIR 코드 생성"""
+
+        code = f"// Weighted Sharded {operation.upper()}\n\n"
+
+        # 각 장치에서 부분 계산
+        code += "// Step 1: Partial reduction on each device\n"
+        for device_id in device_ids:
+            plan = device_allocation["sharding_plan"][device_id]
+            code += (f"%partial_{device_id} = multidevice.launch\n"
+                    f"  on %device_group[{device_id}]\n"
+                    f"  {{\n"
+                    f"    linalg.reduce operation = {operation}\n"
+                    f"  }}\n")
+
+        # AllReduce
+        code += "\n// Step 2: AllReduce\n"
+        code += ("_%reduced = multidevice.all_reduce\n"
+                "  on %device_group\n"
+                f"  operation {operation}\n")
+
+        return code
+
+    def export_generated_code(self) -> str:
+        """생성된 코드 내보내기"""
+        return "\n".join(self.generated_code)
+
+
+class ShardingPass:
+    """Weighted Sharding MLIR 패스"""
+
+    def __init__(self, profiler: DeviceCapabilityProfiler):
+        self.profiler = profiler
+        self.decider = ShardingDecider(profiler)
+        self.code_generator = ShardingCodeGenerator()
+
+    def run_on_operation(self,
+                        operation_name: str,
+                        operation_type: str,
+                        total_work_flops: float,
+                        output_shape: Tuple[int, ...],
+                        device_ids: List[int]) -> Dict:
+        """개별 연산에 Sharding Pass 실행"""
+
+        # Step 1: Sharding 결정
+        sharding_plan = self.decider.decide_sharding(
+            operation_name,
+            total_work_flops,
+            output_shape
+        )
+
+        # Step 2: 시간 추정
+        timing = self.decider.estimate_balanced_time_ms(sharding_plan)
+
+        # Step 3: 코드 생성
+        if operation_type == "matmul":
+            generated_code = self.code_generator.generate_sharded_matmul(
+                sharding_plan,
+                device_ids
+            )
+        elif operation_type == "reduce":
+            generated_code = self.code_generator.generate_sharded_reduce(
+                sharding_plan,
+                device_ids
+            )
+        else:
+            generated_code = "// Operation not yet supported\n"
+
+        return {
+            "operation": operation_name,
+            "sharding_plan": sharding_plan,
+            "timing": timing,
+            "generated_mlir_code": generated_code
+        }
+
+    def run_on_module(self,
+                     operations: List[Dict]) -> Dict:
+        """모듈 전체에 Sharding Pass 실행"""
+
+        results = {
+            "num_operations": len(operations),
+            "sharding_results": [],
+            "total_makespan_ms": 0.0
+        }
+
+        device_ids = list(self.profiler.profiles.keys())
+        total_makespan = 0.0
+
+        for op in operations:
+            result = self.run_on_operation(
+                op["name"],
+                op["type"],
+                op.get("work_flops", 1e12),
+                op.get("output_shape", (1000, 1000)),
+                device_ids
+            )
+
+            results["sharding_results"].append(result)
+            total_makespan += result["timing"]["makespan_ms"]
+
+        results["total_makespan_ms"] = total_makespan
+
+        return results
+
+    def report(self, results: Dict) -> str:
+        """Sharding Pass 결과 리포트"""
+
+        report = "\n╔════════════════════════════════════════════════════════════════════╗\n"
+        report += "║         WEIGHTED SHARDING PASS REPORT                          ║\n"
+        report += "╚════════════════════════════════════════════════════════════════════╝\n\n"
+
+        report += f"Total Operations: {results['num_operations']}\n"
+        report += f"Total Makespan: {results['total_makespan_ms']:.2f}ms\n\n"
+
+        report += "Per-Operation Sharding:\n"
+        for i, result in enumerate(results["sharding_results"], 1):
+            report += f"\n{i}. {result['operation']}\n"
+            report += f"   Makespan: {result['timing']['makespan_ms']:.2f}ms\n"
+            report += f"   Load Balance: {result['timing']['load_balance_ratio']:.2f}\n"
+
+            timing = result["timing"]["execution_times_ms"]
+            for device_id, time_ms in timing.items():
+                report += f"   Device {device_id}: {time_ms:.2f}ms\n"
+
+        report += "\n" + "─" * 68 + "\n"
+
+        return report
+

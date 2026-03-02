@@ -1,0 +1,566 @@
+// tmux Phase 4: 프로덕션 (에러 처리, 성능, 세션 저장)
+// 목표: 완전한 세션 저장/복구, 에러 처리, 성능 최적화
+
+type SessionID = u64
+type WindowID = u64
+type PaneID = u64
+type SessionName = string
+type WindowName = string
+type Timestamp = u64
+
+enum SplitDirection {
+    Horizontal
+    Vertical
+}
+
+enum SessionState {
+    Active(Timestamp)
+    Detached(Timestamp)
+    Terminated
+}
+
+enum ErrorType {
+    SessionNotFound
+    WindowNotFound
+    PaneNotFound
+    InvalidOperation
+    ConfigurationError
+    StorageError
+}
+
+type Error {
+    error_type: ErrorType
+    message: string
+    timestamp: Timestamp
+}
+
+type Config {
+    prefix: string
+    base_index: u64
+    mouse_enabled: bool
+    default_terminal: string
+    status_bg: string
+    status_fg: string
+    max_panes: u64
+    max_windows: u64
+    auto_save: bool
+    save_interval: u64
+}
+
+type Pane {
+    id: PaneID
+    content: string
+    created_at: Timestamp
+    focused: bool
+}
+
+type Window {
+    id: WindowID
+    name: WindowName
+    panes: Vec<Pane>
+    active_pane_index: u64
+    created_at: Timestamp
+}
+
+type Session {
+    id: SessionID
+    name: SessionName
+    state: SessionState
+    windows: Vec<Window>
+    active_window_index: u64
+    created_at: Timestamp
+}
+
+type SessionSnapshot {
+    session_id: SessionID
+    session_name: SessionName
+    window_count: u64
+    created_at: Timestamp
+}
+
+// === 프로덕션 세션 관리자 ===
+
+type SessionManager {
+    sessions: Vec<Session>
+    config: Config
+    next_session_id: SessionID
+    next_window_id: WindowID
+    next_pane_id: PaneID
+    error_log: Vec<Error>
+    snapshots: Vec<SessionSnapshot>
+    operation_count: u64
+}
+
+impl SessionManager {
+
+    fn new() -> SessionManager {
+        let default_config = Config {
+            prefix: "C-a",
+            base_index: 1u64,
+            mouse_enabled: true,
+            default_terminal: "screen-256color",
+            status_bg: "black",
+            status_fg: "white",
+            max_panes: 16u64,
+            max_windows: 32u64,
+            auto_save: true,
+            save_interval: 300u64
+        }
+
+        SessionManager {
+            sessions: Vec::new(),
+            config: default_config,
+            next_session_id: 1000u64,
+            next_window_id: 10000u64,
+            next_pane_id: 100000u64,
+            error_log: Vec::new(),
+            snapshots: Vec::new(),
+            operation_count: 0u64
+        }
+    }
+
+    // 에러 로깅
+    fn log_error(mut self, error_type: ErrorType, message: string) -> SessionManager {
+        let error = Error {
+            error_type: error_type,
+            message: message,
+            timestamp: get_timestamp()
+        }
+        self.error_log.push(error)
+        self
+    }
+
+    // 세션 생성 (에러 처리)
+    fn create_session(mut self, name: SessionName) -> (SessionManager, Result<SessionID, Error>) {
+        if name.len() == 0u64 {
+            let error = Error {
+                error_type: ErrorType::ConfigurationError,
+                message: "Session name cannot be empty",
+                timestamp: get_timestamp()
+            }
+            self.error_log.push(error)
+            return (self, Result::Err(error))
+        }
+
+        let session_id = self.next_session_id
+        self.next_session_id = self.next_session_id + 1u64
+
+        let window_id = self.next_window_id
+        self.next_window_id = self.next_window_id + 1u64
+
+        let pane_id = self.next_pane_id
+        self.next_pane_id = self.next_pane_id + 1u64
+
+        let now = get_timestamp()
+
+        let pane = Pane {
+            id: pane_id,
+            content: "",
+            created_at: now,
+            focused: true
+        }
+
+        let mut panes = Vec::new()
+        panes.push(pane)
+
+        let window = Window {
+            id: window_id,
+            name: "default",
+            panes: panes,
+            active_pane_index: 0u64,
+            created_at: now
+        }
+
+        let mut windows = Vec::new()
+        windows.push(window)
+
+        let session = Session {
+            id: session_id,
+            name: name,
+            state: SessionState::Active(now),
+            windows: windows,
+            active_window_index: 0u64,
+            created_at: now
+        }
+
+        self.sessions.push(session)
+        self.operation_count = self.operation_count + 1u64
+
+        (self, Result::Ok(session_id))
+    }
+
+    // 윈도우 생성 (제한 확인)
+    fn create_window(mut self, session_id: SessionID, window_name: WindowName) -> (SessionManager, Result<WindowID, Error>) {
+        let mut found = false
+        let mut window_count = 0u64
+        let mut i = 0u64
+
+        while i < self.sessions.len() {
+            let sess = self.sessions.get(i)
+
+            match sess {
+                Some(s) => {
+                    if s.id == session_id {
+                        window_count = s.windows.len()
+                        found = true
+                    }
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        if !found {
+            let error = Error {
+                error_type: ErrorType::SessionNotFound,
+                message: "Session not found",
+                timestamp: get_timestamp()
+            }
+            self.error_log.push(error)
+            return (self, Result::Err(error))
+        }
+
+        if window_count >= self.config.max_windows {
+            let error = Error {
+                error_type: ErrorType::InvalidOperation,
+                message: "Max windows limit reached",
+                timestamp: get_timestamp()
+            }
+            self.error_log.push(error)
+            return (self, Result::Err(error))
+        }
+
+        let window_id = self.next_window_id
+        self.next_window_id = self.next_window_id + 1u64
+
+        let pane_id = self.next_pane_id
+        self.next_pane_id = self.next_pane_id + 1u64
+
+        let now = get_timestamp()
+
+        let pane = Pane {
+            id: pane_id,
+            content: "",
+            created_at: now,
+            focused: true
+        }
+
+        let mut panes = Vec::new()
+        panes.push(pane)
+
+        let window = Window {
+            id: window_id,
+            name: window_name,
+            panes: panes,
+            active_pane_index: 0u64,
+            created_at: now
+        }
+
+        i = 0u64
+        while i < self.sessions.len() {
+            let sess = self.sessions.get(i)
+
+            match sess {
+                Some(s) => {
+                    if s.id == session_id {
+                        let mut updated_session = Session {
+                            id: s.id,
+                            name: s.name,
+                            state: s.state,
+                            windows: s.windows,
+                            active_window_index: s.active_window_index,
+                            created_at: s.created_at
+                        }
+                        updated_session.windows.push(window)
+                        self.sessions.set(i, updated_session)
+                    }
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        self.operation_count = self.operation_count + 1u64
+        (self, Result::Ok(window_id))
+    }
+
+    // 세션 스냅샷 (저장)
+    fn save_snapshot(mut self, session_id: SessionID) -> (SessionManager, Result<(), Error>) {
+        let mut i = 0u64
+        let mut found = false
+
+        while i < self.sessions.len() {
+            let sess = self.sessions.get(i)
+
+            match sess {
+                Some(s) => {
+                    if s.id == session_id {
+                        let snapshot = SessionSnapshot {
+                            session_id: s.id,
+                            session_name: s.name,
+                            window_count: s.windows.len(),
+                            created_at: get_timestamp()
+                        }
+                        self.snapshots.push(snapshot)
+                        found = true
+                    }
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        if found {
+            (self, Result::Ok(()))
+        } else {
+            let error = Error {
+                error_type: ErrorType::SessionNotFound,
+                message: "Cannot save snapshot: session not found",
+                timestamp: get_timestamp()
+            }
+            self.error_log.push(error)
+            (self, Result::Err(error))
+        }
+    }
+
+    // 세션 목록 (안전한 조회)
+    fn list_sessions(ref self) -> Vec<(SessionID, SessionName, bool)> {
+        let mut result = Vec::new()
+        let mut i = 0u64
+
+        while i < self.sessions.len() {
+            let sess = self.sessions.get(i)
+
+            match sess {
+                Some(s) => {
+                    match s.state {
+                        SessionState::Terminated => {}
+                        _ => {
+                            let is_active = match s.state {
+                                SessionState::Active(_) => true
+                                _ => false
+                            }
+                            result.push((s.id, s.name, is_active))
+                        }
+                    }
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        result
+    }
+
+    // 에러 로그 조회
+    fn get_error_log(ref self) -> Vec<string> {
+        let mut result = Vec::new()
+        let mut i = 0u64
+
+        while i < self.error_log.len() {
+            let err = self.error_log.get(i)
+
+            match err {
+                Some(e) => {
+                    result.push(e.message)
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        result
+    }
+
+    // 스냅샷 목록
+    fn list_snapshots(ref self) -> Vec<(SessionID, SessionName, u64)> {
+        let mut result = Vec::new()
+        let mut i = 0u64
+
+        while i < self.snapshots.len() {
+            let snap = self.snapshots.get(i)
+
+            match snap {
+                Some(s) => {
+                    result.push((s.session_id, s.session_name, s.window_count))
+                }
+                None => {}
+            }
+
+            i = i + 1u64
+        }
+
+        result
+    }
+
+    // 통계
+    fn get_stats(ref self) -> (u64, u64, u64) {
+        let session_count = self.sessions.len()
+        let error_count = self.error_log.len()
+        let operation_count = self.operation_count
+
+        (session_count, error_count, operation_count)
+    }
+
+    // 성능 리포트
+    fn get_performance_report(ref self) -> string {
+        let (sessions, errors, ops) = self.get_stats()
+        "Sessions: " ++ sessions.to_string() ++
+        " | Errors: " ++ errors.to_string() ++
+        " | Ops: " ++ ops.to_string()
+    }
+}
+
+// === Result 타입 ===
+
+type Result<T, E> {
+    Ok(T)
+    Err(E)
+}
+
+// === 유틸리티 ===
+
+fn get_timestamp() -> Timestamp {
+    12345678u64
+}
+
+// === 테스트 ===
+
+fn main() {
+    println!("=== tmux Phase 4: 프로덕션 (에러 처리 + 저장) ===")
+
+    let mut mgr = SessionManager::new()
+
+    // 세션 생성
+    println!("📝 세션 생성:")
+    let (mgr2, result) = mgr.create_session("dev")
+    mgr = mgr2
+
+    let sess_id = match result {
+        Result::Ok(id) => {
+            println!("✅ dev 세션 생성 (ID: " ++ id.to_string() ++ ")")
+            id
+        }
+        Result::Err(e) => {
+            println!("❌ 오류: " ++ e.message)
+            0u64
+        }
+    }
+
+    let (mgr2, result) = mgr.create_session("work")
+    mgr = mgr2
+
+    match result {
+        Result::Ok(id) => {
+            println!("✅ work 세션 생성 (ID: " ++ id.to_string() ++ ")")
+        }
+        Result::Err(e) => {
+            println!("❌ 오류: " ++ e.message)
+        }
+    }
+
+    // 윈도우 생성
+    println!("\n🪟 윈도우 생성:")
+    let (mgr2, result) = mgr.create_window(sess_id, "editor")
+    mgr = mgr2
+
+    match result {
+        Result::Ok(id) => {
+            println!("✅ editor 윈도우 생성 (ID: " ++ id.to_string() ++ ")")
+        }
+        Result::Err(e) => {
+            println!("❌ 오류: " ++ e.message)
+        }
+    }
+
+    let (mgr2, result) = mgr.create_window(sess_id, "terminal")
+    mgr = mgr2
+
+    match result {
+        Result::Ok(id) => {
+            println!("✅ terminal 윈도우 생성 (ID: " ++ id.to_string() ++ ")")
+        }
+        Result::Err(e) => {
+            println!("❌ 오류: " ++ e.message)
+        }
+    }
+
+    // 스냅샷 저장
+    println!("\n💾 스냅샷 저장:")
+    let (mgr2, result) = mgr.save_snapshot(sess_id)
+    mgr = mgr2
+
+    match result {
+        Result::Ok(_) => {
+            println!("✅ dev 세션 스냅샷 저장")
+        }
+        Result::Err(e) => {
+            println!("❌ 오류: " ++ e.message)
+        }
+    }
+
+    // 잘못된 세션 접근 (에러 처리 테스트)
+    println!("\n🧪 에러 처리 테스트:")
+    let (mgr2, result) = mgr.create_window(9999u64, "test")
+    mgr = mgr2
+
+    match result {
+        Result::Ok(id) => {
+            println!("✅ 성공")
+        }
+        Result::Err(e) => {
+            println!("✅ 에러 감지: " ++ e.message)
+        }
+    }
+
+    // 세션 목록
+    println!("\n📋 세션 목록:")
+    let sessions = mgr.list_sessions()
+    let mut i = 0u64
+    while i < sessions.len() {
+        let (id, name, active) = sessions.get(i).unwrap()
+        let status = if active { "활성화" } else { "분리됨" }
+        println!("  [" ++ id.to_string() ++ "] " ++ name ++ " (" ++ status ++ ")")
+        i = i + 1u64
+    }
+
+    // 스냅샷 목록
+    println!("\n📸 저장된 스냅샷:")
+    let snapshots = mgr.list_snapshots()
+    let mut i = 0u64
+    while i < snapshots.len() {
+        let (id, name, windows) = snapshots.get(i).unwrap()
+        println!("  [" ++ id.to_string() ++ "] " ++ name ++ " (윈도우: " ++ windows.to_string() ++ ")")
+        i = i + 1u64
+    }
+
+    // 에러 로그
+    println!("\n⚠️  에러 로그:")
+    let errors = mgr.get_error_log()
+    if errors.len() == 0u64 {
+        println!("  (에러 없음)")
+    } else {
+        let mut i = 0u64
+        while i < errors.len() {
+            let err = errors.get(i).unwrap()
+            println!("  - " ++ err)
+            i = i + 1u64
+        }
+    }
+
+    // 성능 리포트
+    println!("\n📊 성능 리포트:")
+    let report = mgr.get_performance_report()
+    println!("  " ++ report)
+
+    let (session_count, error_count, operation_count) = mgr.get_stats()
+    println!("\n📈 통계:")
+    println!("  세션: " ++ session_count.to_string())
+    println!("  에러: " ++ error_count.to_string())
+    println!("  작업: " ++ operation_count.to_string())
+}

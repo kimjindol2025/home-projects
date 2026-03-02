@@ -1,0 +1,517 @@
+# Phase 13 v14.2: Parser — 프랫 파싱과 우선순위의 질서
+
+## 🎯 설계 철학
+
+**"연산자는 양옆의 숫자를 끌어당기는 자석이다."**
+
+프랫 파싱(Pratt Parsing)은 1973년 Vaughan Pratt가 제안한 알고리즘으로, 연산자의 **결합력(Binding Power)**을 비교하여 AST를 구성합니다.
+
+```
+Input:      5 + 10 * 2
+Naive:      (5 + 10) * 2 = 30  ❌
+Pratt:      (5 + (10 * 2)) = 25  ✓
+
+왜?  *의 결합력(100) > +의 결합력(50)
+     따라서 10 * 2가 먼저 결합되어야 함.
+```
+
+---
+
+## 📌 핵심 개념
+
+### 1. 연산자 우선순위 (Precedence)
+
+연산자마다 "자석의 세기"를 숫자로 표현합니다:
+
+```rust
+enum Precedence {
+    Lowest = 1,       // 가장 약한 자석
+    Equality = 2,     // == !=
+    Comparison = 3,   // < > <= >=
+    Sum = 4,          // + -
+    Product = 5,      // * /
+    Call = 6,         // 함수 호출 (가장 강한 자석)
+}
+```
+
+**숫자가 클수록 먼저 결합됩니다:**
+```
+1 + 2 * 3
+     ↑
+Product(5) > Sum(4)이므로
+먼저 결합됨
+```
+
+---
+
+### 2. 전위 파서 (Prefix Parser)
+
+**역할**: 연산자 왼쪽에 올 수 있는 것을 처리합니다.
+
+**예시**:
+```
+5        → 숫자 리터럴
+-x       → 부호 연산자
+(x + y)  → 괄호 표현식
+```
+
+**구현**:
+```rust
+fn parse_prefix(&mut self) -> Option<Expression> {
+    match &self.cur_token {
+        Token::Int(n) => {
+            let val = *n;
+            Some(Expression::Literal(val))
+        }
+        Token::Minus => {
+            // -x 처리
+            self.next_token();
+            let expr = self.parse_expression(Precedence::Product)?;
+            Some(Expression::Prefix {
+                operator: PrefixOp::Minus,
+                operand: Box::new(expr),
+            })
+        }
+        Token::LeftParen => {
+            // (x + y) 처리
+            self.next_token();
+            let expr = self.parse_expression(Precedence::Lowest)?;
+            self.expect_token(Token::RightParen)?;
+            Some(expr)
+        }
+        _ => None,
+    }
+}
+```
+
+---
+
+### 3. 중위 파서 (Infix Parser)
+
+**역할**: 연산자 양쪽에 있는 식을 결합합니다.
+
+**예시**:
+```
+5 + 10   → 중위 연산자
+f(x)     → 함수 호출 (함수도 중위처럼)
+```
+
+**구현**:
+```rust
+fn parse_infix(&mut self, left: Expression) -> Option<Expression> {
+    // 1. 현재 연산자의 우선순위 기록
+    let cur_precedence = self.cur_precedence();
+    let operator = match &self.cur_token {
+        Token::Plus => InfixOp::Plus,
+        Token::Minus => InfixOp::Minus,
+        Token::Star => InfixOp::Multiply,
+        Token::Slash => InfixOp::Divide,
+        _ => return None,
+    };
+
+    // 2. 다음 토큰으로 이동
+    self.next_token();
+
+    // 3. 오른쪽을 더 높은 우선순위로 파싱
+    //    (자신의 우선순위와 같거나 높은 연산자가 나올 때까지)
+    let right = self.parse_expression(cur_precedence)?;
+
+    // 4. 트리 결합
+    Some(Expression::Infix {
+        left: Box::new(left),
+        operator,
+        right: Box::new(right),
+    })
+}
+```
+
+---
+
+### 4. 프랫 파싱의 심장: parse_expression()
+
+**핵심 알고리즘**:
+
+```
+1. 왼쪽 식 파싱 (전위)
+   → 숫자 또는 괄호 표현식
+
+2. 루프: 세미콜론을 만나거나 우선순위가 떨어질 때까지
+   a. 현재 우선순위 < 다음 연산자 우선순위?
+      → YES: 계속 결합
+      → NO: 종료
+
+   b. 중위 연산자 처리
+      → 오른쪽을 재귀 호출
+      → 트리에 추가
+
+3. 최종 식 반환
+```
+
+**코드**:
+```rust
+fn parse_expression(&mut self, precedence: Precedence) -> Option<Expression> {
+    // 1단계: 전위 처리 (숫자 또는 -x 등)
+    let mut left_exp = self.parse_prefix()?;
+
+    // 2단계: 루프 (우선순위가 떨어질 때까지)
+    while !self.peek_token_is(Token::Semicolon) &&
+          precedence < self.peek_precedence() {
+        // 다음 토큰이 중위 연산자가 아니면 종료
+        if !self.is_infix_operator(&self.peek_token) {
+            break;
+        }
+
+        self.next_token();
+        left_exp = self.parse_infix(left_exp)?;
+    }
+
+    Some(left_exp)
+}
+```
+
+---
+
+## 🌳 AST 구조
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expression {
+    // 리터럴
+    Literal(i32),
+
+    // 전위 연산 (단항)
+    Prefix {
+        operator: PrefixOp,
+        operand: Box<Expression>,
+    },
+
+    // 중위 연산 (이항)
+    Infix {
+        left: Box<Expression>,
+        operator: InfixOp,
+        right: Box<Expression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrefixOp {
+    Minus,    // -x
+    Bang,     // !x (NOT)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InfixOp {
+    Plus,
+    Minus,
+    Multiply,
+    Divide,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+```
+
+---
+
+## 📊 상세 예제: 5 + 10 * 2
+
+```
+입력 토큰: [Int(5), Plus, Int(10), Star, Int(2), Semicolon]
+
+시작: parse_expression(Lowest)
+
+1단계: 전위 처리
+  ├─ parse_prefix() 호출
+  ├─ Token::Int(5) 매칭
+  └─ left_exp = Literal(5)
+
+2단계: 루프 시작 (precedence=Lowest(1) < peek=Plus(4)?)
+  ├─ YES: 계속
+  ├─ self.next_token() → cur=Plus
+  └─ parse_infix(Literal(5)) 호출
+
+  parse_infix 내부:
+    ├─ cur_precedence = Plus(4)
+    ├─ operator = Plus
+    ├─ self.next_token() → cur=Int(10)
+    └─ 오른쪽 재귀: parse_expression(Plus(4))
+
+    재귀 1: parse_expression(Plus(4))
+      ├─ 전위: Literal(10)
+      ├─ 루프: Plus(4) < Star(5)? YES
+      ├─ parse_infix(Literal(10))
+      │
+      │ parse_infix 내부:
+      │  ├─ cur_precedence = Star(5)
+      │  ├─ operator = Star
+      │  ├─ self.next_token() → cur=Int(2)
+      │  └─ 오른쪽 재귀: parse_expression(Star(5))
+      │
+      │  재귀 2: parse_expression(Star(5))
+      │    ├─ 전위: Literal(2)
+      │    ├─ 루프: Star(5) < Semicolon? NO
+      │    └─ return Literal(2)
+      │
+      │  └─ return Infix { Literal(10) * Literal(2) }
+      │
+      └─ return Infix { Literal(10) * Literal(2) }
+
+  └─ return Infix { Literal(5) + (Literal(10) * Literal(2)) }
+
+최종 AST:
+  Infix {
+    left: Literal(5),
+    operator: Plus,
+    right: Infix {
+      left: Literal(10),
+      operator: Multiply,
+      right: Literal(2),
+    }
+  }
+
+평가: 5 + (10 * 2) = 5 + 20 = 25 ✓
+```
+
+---
+
+## 🔑 Box<T>가 필수인 이유
+
+```rust
+// ❌ 이렇게 하면 안됨 (컴파일 에러)
+pub enum Expression {
+    Infix {
+        left: Expression,    // 어? 얼마나 크지?
+        operator: InfixOp,
+        right: Expression,
+    }
+}
+// 컴파일러: "Expression 크기를 알 수 없다!"
+// 왜냐하면 Expression 안에 Expression이 있고,
+// 그 안에 또 Expression이 있고... 무한 재귀
+
+// ✓ Box를 사용하면 됨
+pub enum Expression {
+    Infix {
+        left: Box<Expression>,    // 포인터 (8바이트 고정)
+        operator: InfixOp,
+        right: Box<Expression>,   // 포인터 (8바이트 고정)
+    }
+}
+```
+
+**Box의 역할:**
+- 재귀적 구조의 크기 문제 해결
+- 힙 메모리에 데이터 할당
+- 스택 오버플로우 방지 (깊은 트리도 안전)
+
+---
+
+## 🎯 좌측 결합 vs 우측 결합
+
+### 좌측 결합 (Left-Associative)
+
+```
+1 - 2 - 3
+= (1 - 2) - 3
+= (-1) - 3
+= -4
+```
+
+**구현:**
+```rust
+let right = self.parse_expression(cur_precedence)?;
+// cur_precedence를 그대로 사용
+// 같은 우선순위 연산자가 왼쪽으로 몰림
+```
+
+### 우측 결합 (Right-Associative)
+
+```
+2 ^ 3 ^ 2     // 거듭제곱
+= 2 ^ (3 ^ 2)
+= 2 ^ 9
+= 512
+```
+
+**구현:**
+```rust
+// 우선순위를 하나 낮춰서 재귀
+let right = self.parse_expression(Precedence(cur_precedence as i32 - 1))?;
+// 같은 우선순위 연산자가 오른쪽으로 몰림
+```
+
+---
+
+## 🚀 Parser 구조
+
+```rust
+pub struct Parser {
+    lexer: Lexer,
+    cur_token: Token,
+    peek_token: Token,
+}
+
+impl Parser {
+    pub fn new(mut lexer: Lexer) -> Self {
+        let cur_token = lexer.next_token();
+        let peek_token = lexer.next_token();
+        Parser {
+            lexer,
+            cur_token,
+            peek_token,
+        }
+    }
+
+    pub fn parse_program(&mut self) -> Vec<Expression> {
+        let mut expressions = Vec::new();
+
+        while !self.is_at_end() {
+            if let Some(expr) = self.parse_expression(Precedence::Lowest) {
+                expressions.push(expr);
+            }
+            self.next_token(); // Skip ;
+        }
+
+        expressions
+    }
+
+    fn next_token(&mut self) {
+        self.cur_token = self.peek_token.clone();
+        self.peek_token = self.lexer.next_token();
+    }
+
+    fn peek_precedence(&self) -> Precedence {
+        self.token_precedence(&self.peek_token)
+    }
+
+    fn cur_precedence(&self) -> Precedence {
+        self.token_precedence(&self.cur_token)
+    }
+
+    fn token_precedence(&self, token: &Token) -> Precedence {
+        match token {
+            Token::Plus | Token::Minus => Precedence::Sum,
+            Token::Star | Token::Slash => Precedence::Product,
+            Token::EqualEqual | Token::NotEqual => Precedence::Equality,
+            Token::Less | Token::Greater | Token::LessEqual | Token::GreaterEqual => {
+                Precedence::Comparison
+            }
+            _ => Precedence::Lowest,
+        }
+    }
+}
+```
+
+---
+
+## 🧪 테스트 케이스
+
+### 1. 단순 연산
+```
+Input: 5;
+AST: Literal(5)
+```
+
+### 2. 덧셈
+```
+Input: 2 + 3;
+AST: Infix(Literal(2), Plus, Literal(3))
+```
+
+### 3. 우선순위 (곱셈 > 덧셈)
+```
+Input: 2 + 3 * 4;
+AST: Infix(Literal(2), Plus, Infix(Literal(3), Multiply, Literal(4)))
+평가: 2 + 12 = 14
+```
+
+### 4. 괄호
+```
+Input: (2 + 3) * 4;
+AST: Infix(Infix(Literal(2), Plus, Literal(3)), Multiply, Literal(4))
+평가: 5 * 4 = 20
+```
+
+### 5. 부호
+```
+Input: -5 + 3;
+AST: Infix(Prefix(Minus, Literal(5)), Plus, Literal(3))
+평가: -5 + 3 = -2
+```
+
+### 6. 여러 연산자
+```
+Input: 1 + 2 + 3;
+AST: Infix(Infix(Literal(1), Plus, Literal(2)), Plus, Literal(3))
+평가: (1 + 2) + 3 = 6
+```
+
+### 7. 복합 식
+```
+Input: 5 + 10 * 2;
+AST: Infix(Literal(5), Plus, Infix(Literal(10), Multiply, Literal(2)))
+평가: 5 + 20 = 25
+```
+
+### 8. 깊은 중첩
+```
+Input: 1 + 2 * 3 + 4 * 5;
+AST: Infix(
+  Infix(Literal(1), Plus, Infix(Literal(2), Multiply, Literal(3))),
+  Plus,
+  Infix(Literal(4), Multiply, Literal(5))
+)
+평가: (1 + 6) + 20 = 27
+```
+
+---
+
+## 📈 성능 분석
+
+| 작업 | 시간 복잡도 | 공간 복잡도 | 특징 |
+|------|-----------|-----------|------|
+| parse_expression | O(n) | O(d) | n = 토큰 수, d = 트리 깊이 |
+| parse_prefix | O(1) | O(1) | 상수 시간 |
+| parse_infix | O(n) | O(d) | 재귀 호출 |
+| 전체 파싱 | O(n) | O(d) | 선형 시간 |
+
+**성능 특징:**
+- 한 번의 왼쪽-오른쪽 스캔
+- 재귀 깊이 = AST 깊이
+- 좌측 재귀 문제 없음 (Pratt의 장점)
+
+---
+
+## 🎓 교육적 가치
+
+1. **우선순위 이해** - 수학적 정확성
+2. **재귀 설계** - 자연스러운 구조화
+3. **AST 생성** - 다음 단계(평가, 코드생성) 준비
+4. **Box<T> 활용** - Rust의 메모리 관리
+5. **컴파일러 아키텍처** - 파서의 고급 기법
+
+---
+
+## 🔗 컴파일 파이프라인 진행
+
+```
+Source Code
+    ↓
+[v14.0 Lexer] → Token Stream
+    ↓
+[v14.2 Parser] ← 현재 단계
+    ↓
+Abstract Syntax Tree (AST)
+    ↓
+[v14.3 Evaluator/Interpreter]
+    ↓
+계산 결과
+```
+
+---
+
+**설계 철학 요약:**
+> "연산자의 결합력을 비교하며, 우선순위 높은 것부터 트리의 깊은 곳에 배치한다. 이것이 프랫 파싱의 우아함이다."

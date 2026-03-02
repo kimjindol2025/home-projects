@@ -1,0 +1,374 @@
+/**
+ * KimSearch Mobile - SQLite Database Manager
+ *
+ * 기능:
+ * - 코드 인덱스 저장
+ * - 검색 쿼리 캐싱
+ * - 오프라인 동기화
+ *
+ * Author: Claude (Haiku 4.5)
+ * Date: 2026-02-26
+ */
+
+import SQLite from 'react-native-sqlite-storage';
+
+SQLite.enablePromise(true);
+
+class DatabaseManager {
+  constructor() {
+    this.db = null;
+  }
+
+  /**
+   * 데이터베이스 초기화
+   */
+  async initDB() {
+    try {
+      this.db = await SQLite.openDatabase({
+        name: 'kimsearch.db',
+        location: 'default',
+        createFromLocation: '~www/kimsearch.db'
+      });
+      console.log('✅ 데이터베이스 연결 성공');
+      await this.createTables();
+    } catch (error) {
+      console.error('❌ 데이터베이스 초기화 실패:', error);
+    }
+  }
+
+  /**
+   * 테이블 생성
+   */
+  async createTables() {
+    try {
+      // 코드 인덱스 테이블
+      await this.db.executeSql(`
+        CREATE TABLE IF NOT EXISTS code_index (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          path TEXT UNIQUE,
+          file_name TEXT,
+          extension TEXT,
+          functions TEXT,
+          classes TEXT,
+          content TEXT,
+          lines_count INTEGER,
+          quality_stars INTEGER,
+          quality_category TEXT,
+          last_modified TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 검색 히스토리 테이블
+      await this.db.executeSql(`
+        CREATE TABLE IF NOT EXISTS search_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          query TEXT,
+          results_count INTEGER,
+          search_time INTEGER,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 캐시 테이블
+      await this.db.executeSql(`
+        CREATE TABLE IF NOT EXISTS cache (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          key TEXT UNIQUE,
+          value TEXT,
+          expires_at TIMESTAMP,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      console.log('✅ 테이블 생성 성공');
+    } catch (error) {
+      console.error('❌ 테이블 생성 실패:', error);
+    }
+  }
+
+  /**
+   * 코드 인덱스 추가
+   */
+  async addCodeIndex(codeData) {
+    try {
+      await this.db.executeSql(`
+        INSERT INTO code_index
+        (path, file_name, extension, functions, classes, content, lines_count, quality_stars, quality_category, last_modified)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        codeData.path,
+        codeData.file_name,
+        codeData.extension,
+        JSON.stringify(codeData.functions || []),
+        JSON.stringify(codeData.classes || []),
+        codeData.content,
+        codeData.lines_count,
+        codeData.quality?.stars || 0,
+        codeData.quality?.category || 'unknown',
+        codeData.last_modified
+      ]);
+      return true;
+    } catch (error) {
+      console.error('❌ 코드 인덱스 추가 실패:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 일괄 추가 (성능 최적화)
+   */
+  async batchAddCodeIndex(codeDataArray) {
+    try {
+      await this.db.transaction(async (tx) => {
+        for (const codeData of codeDataArray) {
+          await tx.executeSql(`
+            INSERT OR REPLACE INTO code_index
+            (path, file_name, extension, functions, classes, content, lines_count, quality_stars, quality_category, last_modified)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
+            codeData.path,
+            codeData.file_name,
+            codeData.extension,
+            JSON.stringify(codeData.functions || []),
+            JSON.stringify(codeData.classes || []),
+            codeData.content,
+            codeData.lines_count,
+            codeData.quality?.stars || 0,
+            codeData.quality?.category || 'unknown',
+            codeData.last_modified
+          ]);
+        }
+      });
+      console.log(`✅ ${codeDataArray.length}개 항목 추가 완료`);
+      return true;
+    } catch (error) {
+      console.error('❌ 일괄 추가 실패:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 코드 검색
+   */
+  async searchCode(query, options = {}) {
+    try {
+      let sql = 'SELECT * FROM code_index WHERE 1=1';
+      const params = [];
+
+      // 텍스트 검색
+      if (query) {
+        sql += ` AND (path LIKE ? OR file_name LIKE ? OR content LIKE ?)`;
+        const searchTerm = `%${query}%`;
+        params.push(searchTerm, searchTerm, searchTerm);
+      }
+
+      // 확장자 필터
+      if (options.extension) {
+        sql += ` AND extension = ?`;
+        params.push(options.extension);
+      }
+
+      // 별점 필터
+      if (options.minStars) {
+        sql += ` AND quality_stars >= ?`;
+        params.push(options.minStars);
+      }
+
+      // 카테고리 필터
+      if (options.category) {
+        sql += ` AND quality_category = ?`;
+        params.push(options.category);
+      }
+
+      // 정렬
+      if (options.sort === 'quality') {
+        sql += ` ORDER BY quality_stars DESC, path ASC`;
+      } else if (options.sort === 'recent') {
+        sql += ` ORDER BY last_modified DESC`;
+      } else {
+        sql += ` ORDER BY path ASC`;
+      }
+
+      // 제한
+      if (options.limit) {
+        sql += ` LIMIT ?`;
+        params.push(options.limit);
+      }
+
+      const results = await this.db.executeSql(sql, params);
+
+      // 결과 파싱
+      const data = [];
+      for (let i = 0; i < results[0].rows.length; i++) {
+        const row = results[0].rows.item(i);
+        data.push({
+          id: row.id,
+          path: row.path,
+          file_name: row.file_name,
+          extension: row.extension,
+          functions: JSON.parse(row.functions || '[]'),
+          classes: JSON.parse(row.classes || '[]'),
+          content: row.content,
+          lines_count: row.lines_count,
+          quality: {
+            stars: row.quality_stars,
+            category: row.quality_category
+          },
+          last_modified: row.last_modified
+        });
+      }
+
+      // 검색 히스토리 저장
+      await this.addSearchHistory(query, data.length);
+
+      return data;
+    } catch (error) {
+      console.error('❌ 검색 실패:', error);
+      return [];
+    }
+  }
+
+  /**
+   * 검색 히스토리 저장
+   */
+  async addSearchHistory(query, resultCount) {
+    try {
+      await this.db.executeSql(`
+        INSERT INTO search_history (query, results_count, search_time)
+        VALUES (?, ?, ?)
+      `, [query, resultCount, Date.now()]);
+    } catch (error) {
+      console.error('❌ 히스토리 저장 실패:', error);
+    }
+  }
+
+  /**
+   * 검색 히스토리 조회
+   */
+  async getSearchHistory(limit = 10) {
+    try {
+      const results = await this.db.executeSql(`
+        SELECT * FROM search_history
+        ORDER BY created_at DESC
+        LIMIT ?
+      `, [limit]);
+
+      const data = [];
+      for (let i = 0; i < results[0].rows.length; i++) {
+        data.push(results[0].rows.item(i));
+      }
+      return data;
+    } catch (error) {
+      console.error('❌ 히스토리 조회 실패:', error);
+      return [];
+    }
+  }
+
+  /**
+   * 캐시 저장 (30초 TTL)
+   */
+  async setCache(key, value, ttl = 30000) {
+    try {
+      const expiresAt = new Date(Date.now() + ttl).toISOString();
+      await this.db.executeSql(`
+        INSERT OR REPLACE INTO cache (key, value, expires_at)
+        VALUES (?, ?, ?)
+      `, [key, JSON.stringify(value), expiresAt]);
+    } catch (error) {
+      console.error('❌ 캐시 저장 실패:', error);
+    }
+  }
+
+  /**
+   * 캐시 조회
+   */
+  async getCache(key) {
+    try {
+      const results = await this.db.executeSql(`
+        SELECT * FROM cache
+        WHERE key = ? AND expires_at > datetime('now')
+      `, [key]);
+
+      if (results[0].rows.length > 0) {
+        return JSON.parse(results[0].rows.item(0).value);
+      }
+      return null;
+    } catch (error) {
+      console.error('❌ 캐시 조회 실패:', error);
+      return null;
+    }
+  }
+
+  /**
+   * 통계 조회
+   */
+  async getStats() {
+    try {
+      const countResult = await this.db.executeSql(
+        'SELECT COUNT(*) as count FROM code_index'
+      );
+      const totalFiles = countResult[0].rows.item(0).count;
+
+      const extensionResult = await this.db.executeSql(
+        'SELECT extension, COUNT(*) as count FROM code_index GROUP BY extension'
+      );
+      const byExtension = {};
+      for (let i = 0; i < extensionResult[0].rows.length; i++) {
+        const row = extensionResult[0].rows.item(i);
+        byExtension[row.extension] = row.count;
+      }
+
+      const qualityResult = await this.db.executeSql(
+        'SELECT quality_stars, COUNT(*) as count FROM code_index GROUP BY quality_stars'
+      );
+      const byQuality = {};
+      for (let i = 0; i < qualityResult[0].rows.length; i++) {
+        const row = qualityResult[0].rows.item(i);
+        byQuality[row.quality_stars] = row.count;
+      }
+
+      return {
+        total_files: totalFiles,
+        by_extension: byExtension,
+        by_quality: byQuality,
+        last_updated: new Date().toISOString()
+      };
+    } catch (error) {
+      console.error('❌ 통계 조회 실패:', error);
+      return null;
+    }
+  }
+
+  /**
+   * 데이터베이스 초기화 (모든 데이터 삭제)
+   */
+  async resetDatabase() {
+    try {
+      await this.db.executeSql('DELETE FROM code_index');
+      await this.db.executeSql('DELETE FROM search_history');
+      await this.db.executeSql('DELETE FROM cache');
+      console.log('✅ 데이터베이스 초기화 완료');
+      return true;
+    } catch (error) {
+      console.error('❌ 초기화 실패:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 데이터베이스 종료
+   */
+  async closeDatabase() {
+    try {
+      if (this.db) {
+        await this.db.close();
+        console.log('✅ 데이터베이스 연결 해제');
+      }
+    } catch (error) {
+      console.error('❌ 연결 해제 실패:', error);
+    }
+  }
+}
+
+export default new DatabaseManager();

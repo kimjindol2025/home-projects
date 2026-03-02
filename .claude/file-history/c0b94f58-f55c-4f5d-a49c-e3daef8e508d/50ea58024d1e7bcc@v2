@@ -1,0 +1,449 @@
+"""
+게이트웨이 모듈
+FastAPI 기반 Pulse HTTP 서버
+"""
+
+import asyncio
+import json
+from typing import Dict, Any, Optional
+from datetime import datetime
+import logging
+
+from fastapi import FastAPI, WebSocket, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import uvicorn
+
+from .llm_manager import LLMManager
+from .nlu import CachedNLUProcessor
+from .runtime import PulseRuntime
+from .agent import AgentPool
+from .cache import PulseCache
+from .registry import AgentRegistry
+
+logger = logging.getLogger(__name__)
+
+
+# ==================== Pydantic 모델 ====================
+
+class PulseRequest(BaseModel):
+    """Pulse API 요청"""
+    instruction: str  # 자연어 지시
+    session_id: Optional[str] = None  # 세션 ID
+    dry_run: bool = False  # Pulse 코드만 생성
+    force_llm: bool = False  # LLM 강제 사용
+
+
+class PulseResponse(BaseModel):
+    """Pulse API 응답"""
+    success: bool
+    result: Optional[str] = None
+    agent_id: Optional[str] = None
+    pulse_code: Optional[str] = None
+    llm_used: Optional[str] = None
+    cost_usd: Optional[float] = None
+    time_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+class AgentStatusResponse(BaseModel):
+    """에이전트 상태 응답"""
+    id: str
+    role: str
+    status: str
+    deployment: str
+    tools: list
+    created_at: str
+    started_at: Optional[str] = None
+    uptime_seconds: Optional[float] = None
+
+
+# ==================== FastAPI 앱 ====================
+
+class PulseGateway:
+    """Pulse FastAPI 게이트웨이"""
+
+    def __init__(self):
+        """게이트웨이 초기화"""
+        self.app = FastAPI(
+            title="Pulse AI API",
+            description="자연어로 자동화 에이전트를 만드세요!",
+            version="0.1.0"
+        )
+
+        # 의존성 초기화
+        self.llm_manager = LLMManager()
+        self.nlu_processor = None
+        self.runtime = None
+        self.agent_pool = AgentPool(self.llm_manager)
+        self.cache = PulseCache()
+        self.registry = AgentRegistry(self.cache)
+
+        # CORS 미들웨어
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        self._setup_routes()
+        self.logger = logger
+
+    def _setup_routes(self):
+        """라우트 설정"""
+
+        @self.app.on_event("startup")
+        async def startup():
+            """서버 시작"""
+            self.logger.info("🚀 Pulse Gateway 시작...")
+            self.nlu_processor = CachedNLUProcessor(self.llm_manager)
+            self.runtime = PulseRuntime(self.llm_manager, self.nlu_processor)
+
+        # ==================== 메인 API ====================
+
+        @self.app.post("/pulse", response_model=PulseResponse)
+        async def create_agent(
+            request: PulseRequest,
+            background_tasks: BackgroundTasks
+        ) -> PulseResponse:
+            """
+            자연어 지시를 받아 Pulse 에이전트 생성 및 배포
+
+            ---
+
+            **요청:**
+            - `instruction`: 자연어 지시 (예: "슬랙 봇 만들어")
+            - `dry_run`: true면 Pulse 코드만 생성
+            - `force_llm`: LLM 강제 사용 여부
+
+            **응답:**
+            - `agent_id`: 생성된 에이전트 ID
+            - `pulse_code`: 생성된 Pulse 코드
+            - `cost_usd`: 소비된 비용
+            """
+            start_time = asyncio.get_event_loop().time()
+
+            try:
+                self.logger.info(f"📝 요청 처리: {request.instruction[:50]}")
+
+                # 1. NLU - 자연어를 Intent로 변환
+                intent = await self.nlu_processor.analyze(
+                    request.instruction,
+                    force_llm=request.force_llm
+                )
+
+                self.logger.info(f"✅ Intent 생성: {intent.role}")
+
+                # 2. Parser - Intent를 Pulse 코드로 변환
+                from .parser import PulseParser
+
+                parser = PulseParser()
+                pulse_code = parser.generate_pulse_code(intent)
+
+                # dry_run 모드면 여기서 반환
+                if request.dry_run:
+                    elapsed_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+
+                    return PulseResponse(
+                        success=True,
+                        pulse_code=pulse_code,
+                        llm_used=intent.nlu_method,
+                        cost_usd=0.0,
+                        time_ms=round(elapsed_ms, 2),
+                    )
+
+                # 3. Runtime - Pulse 코드 실행 (백그라운드)
+                async def deploy_agent():
+                    result = await self.runtime.execute(pulse_code)
+                    self.logger.info(f"✅ 에이전트 배포 완료")
+
+                background_tasks.add_task(deploy_agent)
+
+                # 4. 빠른 응답 반환
+                agent_id = self.agent_pool.agents[0].id if self.agent_pool.agents else "pending"
+                elapsed_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+
+                # 비용 기록
+                cost_estimate = self.llm_manager.get_usage_stats()["total_cost_usd"]
+
+                return PulseResponse(
+                    success=True,
+                    result="✅ 에이전트 배포 시작됨 (백그라운드 처리)",
+                    agent_id=agent_id,
+                    pulse_code=pulse_code,
+                    llm_used=intent.nlu_method,
+                    cost_usd=cost_estimate,
+                    time_ms=round(elapsed_ms, 2),
+                )
+
+            except Exception as e:
+                self.logger.error(f"❌ 요청 처리 실패: {e}")
+                elapsed_ms = (asyncio.get_event_loop().time() - start_time) * 1000
+
+                return PulseResponse(
+                    success=False,
+                    error=str(e),
+                    time_ms=round(elapsed_ms, 2),
+                )
+
+        # ==================== 에이전트 관리 ====================
+
+        @self.app.get("/agents")
+        async def list_agents() -> Dict[str, Any]:
+            """
+            실행 중인 모든 에이전트 목록 조회
+
+            ---
+
+            **응답:**
+            - `agents`: 에이전트 정보 리스트
+            - `total`: 총 에이전트 수
+            - `running`: 실행 중인 에이전트 수
+            """
+            try:
+                metrics = await self.registry.get_metrics()
+                agents = self.registry.list_all()
+
+                return {
+                    "agents": agents,
+                    **metrics
+                }
+            except Exception as e:
+                self.logger.error(f"❌ 에이전트 목록 조회 실패: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.get("/agents/{agent_id}")
+        async def get_agent_status(agent_id: str) -> Dict[str, Any]:
+            """
+            특정 에이전트 상태 조회
+
+            ---
+
+            **경로 파라미터:**
+            - `agent_id`: 에이전트 ID
+
+            **응답:**
+            - `status`: 에이전트 상태 정보
+            """
+            try:
+                status = self.registry.get_status(agent_id)
+                if not status:
+                    raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없음")
+
+                return {"status": status}
+            except Exception as e:
+                self.logger.error(f"❌ 에이전트 상태 조회 실패: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @self.app.delete("/agents/{agent_id}")
+        async def stop_agent(agent_id: str) -> Dict[str, Any]:
+            """
+            특정 에이전트 중지
+
+            ---
+
+            **경로 파라미터:**
+            - `agent_id`: 에이전트 ID
+
+            **응답:**
+            - `success`: 중지 성공 여부
+            """
+            try:
+                success = await self.agent_pool.stop_agent(agent_id)
+                if not success:
+                    raise HTTPException(status_code=404, detail="에이전트를 찾을 수 없음")
+
+                await self.registry.unregister(agent_id)
+
+                return {"success": True, "message": f"에이전트 중지됨: {agent_id}"}
+            except Exception as e:
+                self.logger.error(f"❌ 에이전트 중지 실패: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # ==================== 헬스 체크 ====================
+
+        @self.app.get("/health")
+        async def healthcheck() -> Dict[str, Any]:
+            """
+            서버 헬스 체크
+
+            ---
+
+            **응답:**
+            - `status`: 상태 (healthy/degraded)
+            - `timestamp`: 현재 시간
+            - `services`: 각 서비스 상태
+            """
+            try:
+                registry_health = await self.registry.healthcheck()
+                cache_stats = await self.cache.get_stats()
+
+                return {
+                    "status": "healthy",
+                    "timestamp": datetime.now().isoformat(),
+                    "registry": registry_health,
+                    "cache": cache_stats,
+                }
+            except Exception as e:
+                self.logger.error(f"❌ 헬스 체크 실패: {e}")
+                return {
+                    "status": "degraded",
+                    "timestamp": datetime.now().isoformat(),
+                    "error": str(e),
+                }
+
+        # ==================== 메트릭 ====================
+
+        @self.app.get("/metrics")
+        async def get_metrics() -> Dict[str, Any]:
+            """
+            시스템 메트릭 조회
+
+            ---
+
+            **응답:**
+            - `llm`: LLM 사용 통계
+            - `agents`: 에이전트 메트릭
+            - `cache`: 캐시 통계
+            - `cost`: 비용 정보
+            """
+            try:
+                llm_stats = self.llm_manager.get_usage_stats()
+                agent_metrics = await self.registry.get_metrics()
+                cache_stats = await self.cache.get_stats()
+                daily_cost = await self.cache.get_daily_cost()
+
+                return {
+                    "llm": llm_stats,
+                    "agents": agent_metrics,
+                    "cache": cache_stats,
+                    "cost": {
+                        "daily_usd": round(daily_cost, 4),
+                        "total_usd": round(llm_stats["total_cost_usd"], 4),
+                    },
+                    "timestamp": datetime.now().isoformat(),
+                }
+            except Exception as e:
+                self.logger.error(f"❌ 메트릭 조회 실패: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # ==================== WebSocket 스트리밍 ====================
+
+        @self.app.websocket("/ws/{session_id}")
+        async def websocket_endpoint(websocket: WebSocket, session_id: str):
+            """
+            WebSocket 연결 - 실시간 스트리밍 응답
+
+            ---
+
+            **경로 파라미터:**
+            - `session_id`: 세션 ID
+
+            **메시지 형식:**
+            ```json
+            {"type": "instruction", "data": "자연어 지시"}
+            {"type": "chunk", "data": "응답 청크"}
+            {"type": "done", "data": "완료"}
+            ```
+            """
+            await websocket.accept()
+            self.logger.info(f"📱 WebSocket 연결: {session_id}")
+
+            try:
+                while True:
+                    # 클라이언트로부터 메시지 수신
+                    message = await websocket.receive_text()
+                    data = json.loads(message)
+
+                    if data.get("type") == "instruction":
+                        instruction = data.get("data", "")
+                        self.logger.info(f"📝 지시 수신: {instruction[:50]}")
+
+                        try:
+                            # NLU
+                            intent = await self.nlu_processor.analyze(instruction)
+
+                            # Parser
+                            from .parser import PulseParser
+
+                            parser = PulseParser()
+                            pulse_code = parser.generate_pulse_code(intent)
+
+                            # 청크로 응답 스트리밍
+                            for line in pulse_code.split("\n"):
+                                await websocket.send_json({
+                                    "type": "chunk",
+                                    "data": line
+                                })
+                                await asyncio.sleep(0.1)  # 스트리밍 효과
+
+                            # 완료 신호
+                            await websocket.send_json({
+                                "type": "done",
+                                "data": "✅ Pulse 코드 생성 완료"
+                            })
+
+                        except Exception as e:
+                            await websocket.send_json({
+                                "type": "error",
+                                "data": str(e)
+                            })
+
+            except Exception as e:
+                self.logger.error(f"❌ WebSocket 오류: {e}")
+
+            finally:
+                self.logger.info(f"❌ WebSocket 연결 해제: {session_id}")
+
+        # ==================== 유틸리티 ====================
+
+        @self.app.get("/")
+        async def root() -> Dict[str, str]:
+            """API 문서"""
+            return {
+                "name": "Pulse AI API",
+                "version": "0.1.0",
+                "docs": "/docs",
+                "endpoints": {
+                    "POST /pulse": "에이전트 생성 및 배포",
+                    "GET /agents": "에이전트 목록",
+                    "GET /agents/{id}": "에이전트 상태",
+                    "DELETE /agents/{id}": "에이전트 중지",
+                    "GET /health": "헬스 체크",
+                    "GET /metrics": "시스템 메트릭",
+                    "WS /ws/{session}": "WebSocket 스트리밍",
+                }
+            }
+
+    def run(self, host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
+        """
+        서버 실행
+
+        Args:
+            host: 바인드 주소
+            port: 포트 번호
+            reload: 자동 리로드 여부 (개발용)
+        """
+        self.logger.info(f"🚀 Pulse Gateway 시작: {host}:{port}")
+        uvicorn.run(
+            self.app,
+            host=host,
+            port=port,
+            reload=reload,
+            log_level="info"
+        )
+
+
+# ==================== 진입점 ====================
+
+def create_app() -> FastAPI:
+    """FastAPI 앱 생성"""
+    gateway = PulseGateway()
+    return gateway.app
+
+
+if __name__ == "__main__":
+    gateway = PulseGateway()
+    gateway.run(reload=True)

@@ -1,0 +1,721 @@
+# 📋 Phase 3: Experiments & Performance Analysis
+
+**목표**: Byzantine-Resilient AIOps Federated Learning (BR-AIOpsFL) vs SOTA Baselines 비교 분석
+**기간**: 3주 (2026-03-01 ~ 2026-03-21)
+**산출물**: 논문 등재용 표/그래프/통계 + 재현 가능한 실험 코드
+
+---
+
+## 3.1 Baseline Setup (1주차: 2026-03-01 ~ 2026-03-07)
+
+### 선정 Baselines (6개 + 우리 방법)
+
+| # | 방법명 | 카테고리 | 특징 | 논문 연도 |
+|---|--------|---------|------|---------|
+| 1 | **FedAvg** | Non-robust | 기준선 (no Byzantine defense) | McMahan'17 |
+| 2 | **Krum** | Classic geometric | Single Byzantine 강함, O(n²) | Blanchard'17 |
+| 3 | **Multi-Krum** | Geometric variant | Multi-candidate Krum → avg | Blanchard'17+ |
+| 4 | **Trimmed Mean** | Geometric | 상위/하위 제거 후 평균 | Yin'18 |
+| 5 | **FLGuard** | Signal-based | Multi-signal anomaly detection | Tan'22 |
+| 6 | **OptiGradTrust** | RL-based robust | 2025 SOTA, gradient analysis + RL trust weighting | arXiv'25 |
+| **ours** | **BR-AIOpsFL** | Adaptive + DPoS | Trajectory + Task-aware + DPoS quarantine | 본 논문 |
+
+### 3.1.1 각 Baseline 구현 명세
+
+**파일**: `experiments/baselines.py` (새로 생성)
+
+#### 1️⃣ FedAvg
+```python
+def fedavg_aggregate(client_gradients: List[Gradient], weights: List[float] = None) -> Gradient:
+    """
+    Simple average aggregation (no Byzantine defense)
+
+    Args:
+        client_gradients: List of client gradient vectors
+        weights: Optional client weights (default: uniform)
+
+    Returns:
+        Aggregated gradient (simple average)
+    """
+    if not weights:
+        weights = [1.0 / len(client_gradients)] * len(client_gradients)
+
+    agg = [sum(w * g[i] for w, g in zip(weights, client_gradients))
+           for i in range(len(client_gradients[0]))]
+    return agg
+```
+
+#### 2️⃣ Krum
+```python
+def krum_aggregate(client_gradients: List[Gradient], byzantine_count: int) -> Gradient:
+    """
+    Krum: select gradient closest to mean of its k nearest neighbors
+
+    Complexity: O(n² × d)
+    - n: number of clients
+    - d: gradient dimension
+
+    Args:
+        client_gradients: gradients
+        byzantine_count: max Byzantine clients (determines k)
+
+    Returns:
+        Selected gradient (most Byzantine-robust)
+    """
+    n = len(client_gradients)
+    k = n - byzantine_count - 2  # neighbors to consider
+
+    distances = {}
+    for i, grad_i in enumerate(client_gradients):
+        # Euclidean distance to all others
+        dists = [euclidean_dist(grad_i, grad_j)
+                 for j, grad_j in enumerate(client_gradients) if j != i]
+        dists.sort()
+        distances[i] = sum(dists[:k])  # sum of k nearest
+
+    # Return gradient with smallest score
+    selected_idx = min(distances, key=distances.get)
+    return client_gradients[selected_idx]
+
+def euclidean_dist(g1, g2):
+    return sum((a - b) ** 2 for a, b in zip(g1, g2)) ** 0.5
+```
+
+#### 3️⃣ Multi-Krum
+```python
+def multi_krum_aggregate(client_gradients: List[Gradient],
+                        byzantine_count: int,
+                        m: int = 2) -> Gradient:
+    """
+    Multi-Krum: select top-m candidates via Krum, then average
+
+    Args:
+        client_gradients: gradients
+        byzantine_count: max Byzantine clients
+        m: number of candidates to select (default: 2)
+
+    Returns:
+        Average of top-m Krum-selected gradients
+    """
+    n = len(client_gradients)
+    k = n - byzantine_count - 2
+
+    # Score each client
+    scores = {}
+    for i, grad_i in enumerate(client_gradients):
+        dists = [euclidean_dist(grad_i, grad_j)
+                 for j, grad_j in enumerate(client_gradients) if j != i]
+        dists.sort()
+        scores[i] = sum(dists[:k])
+
+    # Select top-m
+    selected_indices = sorted(scores.keys(), key=lambda x: scores[x])[:m]
+    selected_grads = [client_gradients[i] for i in selected_indices]
+
+    # Average
+    return fedavg_aggregate(selected_grads)
+```
+
+#### 4️⃣ Trimmed Mean
+```python
+def trimmed_mean_aggregate(client_gradients: List[Gradient],
+                          byzantine_count: int) -> Gradient:
+    """
+    Coordinate-wise trimmed mean: remove top/bottom β fraction per dimension
+
+    Args:
+        client_gradients: gradients (n_clients × d)
+        byzantine_count: max Byzantine clients
+
+    Returns:
+        Aggregated gradient (trimmed per coordinate)
+    """
+    n = len(client_gradients)
+    d = len(client_gradients[0])
+    beta = (byzantine_count + 1) / n  # fraction to trim per side
+    trim_count = int(beta * n)  # how many to remove
+
+    aggregated = []
+    for coord_idx in range(d):
+        values = [g[coord_idx] for g in client_gradients]
+        values.sort()
+        trimmed = values[trim_count:-trim_count if trim_count > 0 else None]
+        aggregated.append(sum(trimmed) / len(trimmed) if trimmed else 0)
+
+    return aggregated
+```
+
+#### 5️⃣ FLGuard
+```python
+def flguard_aggregate(client_gradients: List[Gradient],
+                     client_states: Dict[str, ClientState],
+                     detection_threshold: float = 0.7) -> Tuple[Gradient, Set[str]]:
+    """
+    FLGuard: Multi-signal anomaly detection (gradient magnitude + cosine similarity + variance)
+
+    Args:
+        client_gradients: gradients
+        client_states: client historical data for pattern analysis
+        detection_threshold: anomaly score threshold
+
+    Returns:
+        (aggregated_gradient, detected_malicious_set)
+    """
+    n = len(client_gradients)
+
+    # Signal 1: Gradient magnitude (L2 norm)
+    magnitudes = [sum(g**2 for g in grad) ** 0.5 for grad in client_gradients]
+    mag_mean = sum(magnitudes) / n
+    mag_std = (sum((m - mag_mean)**2 for m in magnitudes) / n) ** 0.5
+
+    # Signal 2: Cosine similarity to global mean
+    global_mean = fedavg_aggregate(client_gradients)
+    cosines = []
+    for grad in client_gradients:
+        dot = sum(g * m for g, m in zip(grad, global_mean))
+        norm_g = sum(g**2 for g in grad) ** 0.5
+        norm_m = sum(m**2 for m in global_mean) ** 0.5
+        cosine = dot / (norm_g * norm_m + 1e-10)
+        cosines.append(cosine)
+
+    cosine_mean = sum(cosines) / n
+    cosine_std = (sum((c - cosine_mean)**2 for c in cosines) / n) ** 0.5
+
+    # Anomaly scores
+    detected = set()
+    for i, (mag, cos) in enumerate(zip(magnitudes, cosines)):
+        mag_zscore = abs((mag - mag_mean) / (mag_std + 1e-10))
+        cos_zscore = abs((cos - cosine_mean) / (cosine_std + 1e-10))
+        anomaly_score = (mag_zscore + cos_zscore) / 2
+
+        if anomaly_score > detection_threshold:
+            detected.add(f"client_{i}")
+
+    # Aggregate (exclude detected)
+    honest_grads = [g for i, g in enumerate(client_gradients)
+                    if f"client_{i}" not in detected]
+    agg = fedavg_aggregate(honest_grads) if honest_grads else global_mean
+
+    return agg, detected
+```
+
+#### 6️⃣ OptiGradTrust (2025 SOTA - 간단 구현)
+```python
+def optgradtrust_aggregate(client_gradients: List[Gradient],
+                          client_history: Dict[str, List[Gradient]],
+                          trust_decay: float = 0.95) -> Tuple[Gradient, Dict[str, float]]:
+    """
+    OptiGradTrust: RL-based trust weighting with gradient analysis
+    (Simplified version: gradient consistency + historical trust)
+
+    Args:
+        client_gradients: current round gradients
+        client_history: past gradients for each client
+        trust_decay: exponential moving average decay factor
+
+    Returns:
+        (weighted_aggregate, trust_scores)
+    """
+    n = len(client_gradients)
+    trust_scores = {}
+
+    # Trust signal 1: Gradient consistency (low variance across rounds)
+    for i, client_id in enumerate(range(n)):
+        if client_history:
+            # Calculate variance of gradient norms over time
+            historical_norms = [sum(g**2 for g in hist) ** 0.5
+                               for hist in client_history.get(f"client_{i}", [])]
+            current_norm = sum(client_gradients[i]**2 for g in client_gradients[i]) ** 0.5
+
+            if historical_norms:
+                consistency = 1.0 / (1.0 + sum((n - current_norm)**2 for n in historical_norms))
+            else:
+                consistency = 0.5
+        else:
+            consistency = 0.5
+
+        # Trust signal 2: Alignment with peer gradients
+        alignment = 0.0
+        for j, other_grad in enumerate(client_gradients):
+            if i != j:
+                cos_sim = (sum(g * o for g, o in zip(client_gradients[i], other_grad)) /
+                          (sum(g**2 for g in client_gradients[i])**0.5 *
+                           sum(o**2 for o in other_grad)**0.5 + 1e-10))
+                alignment += cos_sim
+        alignment /= (n - 1) if n > 1 else 1
+        alignment = max(0, min(1, (alignment + 1) / 2))  # Normalize to [0,1]
+
+        # Combined trust score
+        trust_scores[f"client_{i}"] = 0.6 * consistency + 0.4 * alignment
+
+    # Normalize trust scores
+    total_trust = sum(trust_scores.values())
+    normalized_trust = {k: v / total_trust for k, v in trust_scores.items()}
+
+    # Weighted aggregation
+    weights = list(normalized_trust.values())
+    agg = [sum(w * g[i] for w, g in zip(weights, client_gradients))
+           for i in range(len(client_gradients[0]))]
+
+    return agg, trust_scores
+```
+
+---
+
+## 3.2 Attack Simulation Framework (1주차 병렬 ~ 2주차)
+
+**파일**: `experiments/attacks.py` (새로 생성)
+
+### 5가지 Adaptive Attack Injectors
+
+#### Attack 1: RMC (Reconnecting Malicious Client)
+```python
+def inject_rmc_attack(gradients: List[Gradient],
+                      client_ids: List[str],
+                      round_num: int,
+                      quarantined_clients: Set[str],
+                      release_rounds: Dict[str, int],
+                      reconnect_probability: float = 0.8) -> Tuple[List[Gradient], Set[str]]:
+    """
+    RMC: Quarantined client attempts rejoining after 3~5 rounds
+    Strategy: Use modified gradient (flip ratio +5~10%) to evade re-detection
+
+    AIOps Impact: Peak-time re-infiltration, sustained alert fatigue
+    """
+    poisoned_grads = gradients.copy()
+    active_rmc_clients = set()
+
+    for i, client_id in enumerate(client_ids):
+        if client_id in quarantined_clients:
+            release_round = release_rounds.get(client_id, float('inf'))
+            if round_num >= release_round and random.random() < reconnect_probability:
+                # Rejoin + modify gradient slightly
+                active_rmc_clients.add(client_id)
+                perturbation = 1.0 + random.uniform(0.05, 0.1)
+                poisoned_grads[i] = [g * perturbation for g in gradients[i]]
+
+    return poisoned_grads, active_rmc_clients
+```
+
+#### Attack 2: Delayed Poisoning
+```python
+def inject_delayed_poisoning(gradients: List[Gradient],
+                            client_ids: List[str],
+                            malicious_clients: Set[str],
+                            round_num: int,
+                            trigger_round: int = 100,
+                            poison_type: str = "label_flip") -> List[Gradient]:
+    """
+    Delayed Poisoning: Honest behavior → trigger_round → attack starts
+
+    Phases:
+      - Round 1~trigger-1: All honest gradients
+      - Round trigger+: Start poisoning (label flip or sign flip)
+
+    AIOps Impact: Undetected drift during normal operation, sudden failure
+
+    Args:
+        poison_type: "label_flip" or "sign_flip"
+    """
+    poisoned_grads = gradients.copy()
+
+    if round_num >= trigger_round:
+        for client_id in malicious_clients:
+            try:
+                idx = client_ids.index(client_id)
+            except ValueError:
+                continue
+
+            if poison_type == "label_flip":
+                # Flip sign of entire gradient
+                poisoned_grads[idx] = [-g for g in gradients[idx]]
+            elif poison_type == "sign_flip":
+                # Randomly flip subset of coordinates
+                flip_ratio = 0.3
+                for i in range(len(poisoned_grads[idx])):
+                    if random.random() < flip_ratio:
+                        poisoned_grads[idx][i] *= -1
+
+    return poisoned_grads
+```
+
+#### Attack 3: Strategy-Evolution
+```python
+def inject_strategy_evolution(gradients: List[Gradient],
+                             client_ids: List[str],
+                             malicious_clients: Set[str],
+                             round_num: int,
+                             evolution_interval: int = 20) -> List[Gradient]:
+    """
+    Strategy-Evolution: Attacker observes model state, adapts attack vector dynamically
+
+    Evolution phases (every evolution_interval rounds):
+      - Phase 1 (0~20): Gaussian noise (high variance, easy to detect)
+      - Phase 2 (20~40): Sign-flip (different evasion technique)
+      - Phase 3 (40~60): Adaptive magnitude scaling (matches honest gradient scale)
+      - Phase 4+ (60~): Random strategy switching
+
+    AIOps Impact: Evasion of fixed-threshold detection, detection accuracy degradation
+    """
+    poisoned_grads = gradients.copy()
+
+    phase = (round_num // evolution_interval) % 4
+
+    for client_id in malicious_clients:
+        try:
+            idx = client_ids.index(client_id)
+        except ValueError:
+            continue
+
+        if phase == 0:
+            # High-variance Gaussian
+            poisoned_grads[idx] = [g + random.gauss(0, 1.0) for g in gradients[idx]]
+        elif phase == 1:
+            # Sign-flip
+            poisoned_grads[idx] = [-g for g in gradients[idx]]
+        elif phase == 2:
+            # Adaptive magnitude (scale to match others)
+            honest_magnitude = sum(gradients[i]**2 for i, cid in enumerate(client_ids)
+                                  if cid not in malicious_clients) ** 0.5
+            current_magnitude = sum(g**2 for g in gradients[idx]) ** 0.5
+            scale = honest_magnitude / (current_magnitude + 1e-10)
+            poisoned_grads[idx] = [g * scale for g in gradients[idx]]
+        else:
+            # Random perturbation
+            poisoned_grads[idx] = [g * random.uniform(0.9, 1.1) for g in gradients[idx]]
+
+    return poisoned_grads
+```
+
+#### Attack 4: Collusion + Sybil
+```python
+def inject_collusion_sybil(gradients: List[Gradient],
+                          client_ids: List[str],
+                          malicious_group: Set[str],
+                          sybil_multiplier: int = 3) -> Tuple[List[Gradient], List[str]]:
+    """
+    Collusion+Sybil: Coordinated malicious group + fake client IDs
+
+    Strategy:
+      - Malicious group (15% of clients) coordinates poisoning
+      - Each quarantined malicious client spawns 2-3 Sybil (fake) identities
+      - Sybils use coordinated poisoning gradients
+
+    AIOps Impact: Amplified model poisoning, distributed attack nodes
+
+    Returns:
+        (augmented_gradients, augmented_client_ids)
+    """
+    poisoned_grads = gradients.copy()
+    poisoned_ids = client_ids.copy()
+
+    # Coordinated attack: amplify malicious gradient
+    coordinated_scale = 1.5 + len(malicious_group) * 0.1
+
+    for client_id in malicious_group:
+        try:
+            idx = client_ids.index(client_id)
+        except ValueError:
+            continue
+
+        poisoned_grads[idx] = [g * coordinated_scale for g in gradients[idx]]
+
+        # Add Sybil identities
+        for sybil_num in range(sybil_multiplier):
+            sybil_id = f"{client_id}_sybil_{sybil_num}"
+            poisoned_ids.append(sybil_id)
+            # Sybils use slightly perturbed poisoned gradient
+            perturbation = random.uniform(0.95, 1.05)
+            poisoned_grads.append([g * perturbation for g in poisoned_grads[idx]])
+
+    return poisoned_grads, poisoned_ids
+```
+
+#### Attack 5: Task-Specific Poisoning with Cross-Task Propagation
+```python
+def inject_task_specific_attack(task_gradients: Dict[str, List[Gradient]],
+                                client_ids: List[str],
+                                malicious_clients: Set[str],
+                                target_task: str = "rca",
+                                cross_task_leak_ratio: float = 0.15) -> Dict[str, List[Gradient]]:
+    """
+    Task-Specific: Poison only RCA task, leak to other tasks via gradient mixing
+
+    Strategy:
+      - Malicious clients: Poison RCA (anomaly detection task) with high amplitude
+      - Gradient mixing: 15% of poisoned RCA gradient leaks to forecasting/detection tasks
+      - Bypass: Multi-task quarantine may not catch task-specific bias
+
+    AIOps Impact: Compromised root cause analysis → wrong remediation, cascading failures
+    """
+    poisoned_task_grads = {task: grads.copy() for task, grads in task_gradients.items()}
+
+    # Poison target task (e.g., RCA)
+    if target_task in poisoned_task_grads:
+        target_grads = poisoned_task_grads[target_task]
+        for client_id in malicious_clients:
+            try:
+                idx = client_ids.index(client_id)
+                # Amplify target task gradient
+                target_grads[idx] = [g * 2.0 for g in target_grads[idx]]
+            except ValueError:
+                continue
+
+    # Cross-task leakage
+    for task in poisoned_task_grads:
+        if task != target_task:
+            target_task_grads = poisoned_task_grads[target_task]
+            for i in range(len(poisoned_task_grads[task])):
+                if client_ids[i] in malicious_clients:
+                    # Mix target task poison into other tasks
+                    leak = [g * cross_task_leak_ratio for g in target_task_grads[i]]
+                    poisoned_task_grads[task][i] = [
+                        orig + leak_val
+                        for orig, leak_val in zip(poisoned_task_grads[task][i], leak)
+                    ]
+
+    return poisoned_task_grads
+```
+
+---
+
+## 3.3 Experiment Configuration (Phase 3 설정)
+
+**파일**: `experiments/config.py` (새로 생성)
+
+```python
+# ============= Experiment Configuration =============
+
+EXPERIMENT_CONFIG = {
+    # System parameters
+    "num_clients": 100,                   # Total federated clients
+    "num_tasks": 3,                       # Multi-task: anomaly-det, forecasting, RCA
+    "num_rounds": 200,                    # Training rounds
+    "num_seeds": 10,                      # Random seeds for statistical significance
+
+    # Byzantine parameters
+    "byzantine_fractions": [0.1, 0.2, 0.3, 0.4],  # 10%, 20%, 30%, 40% Byzantine
+    "byzantine_types": ["rmc", "delayed", "strategy_evo", "collusion_sybil", "task_specific", "mix"],
+
+    # Attack parameters
+    "rmc": {
+        "reconnect_probability": 0.8,
+        "reconnect_after_epochs": 3,
+        "perturbation_ratio": [0.05, 0.15],
+    },
+    "delayed_poisoning": {
+        "trigger_round": 100,
+        "poison_types": ["label_flip", "sign_flip"],
+    },
+    "strategy_evolution": {
+        "evolution_interval": 20,
+    },
+    "collusion_sybil": {
+        "collusion_ratio": 0.15,
+        "sybil_multiplier": 3,
+    },
+    "task_specific": {
+        "target_tasks": ["rca"],
+        "cross_task_leak_ratio": 0.15,
+    },
+
+    # Baseline hyperparameters
+    "baselines": {
+        "fedavg": {},
+        "krum": {"byzantine_count": None},  # Auto-set
+        "multi_krum": {"byzantine_count": None, "m": 2},
+        "trimmed_mean": {"byzantine_count": None},
+        "flguard": {"detection_threshold": 0.7},
+        "optgradtrust": {"trust_decay": 0.95},
+    },
+
+    # Our method parameters
+    "br_aiopsi_fl": {
+        "isolation_forest_contamination": 0.1,
+        "trajectory_window_size": 5,
+        "trajectory_detection_threshold": 0.7,
+        "dpos_validators": 21,
+        "dpos_slash_rate": 0.05,
+        "dpos_quarantine_duration": 3,
+    },
+
+    # Metrics to collect
+    "metrics": [
+        "model_accuracy",
+        "model_f1",
+        "model_mae",
+        "detection_precision",
+        "detection_recall",
+        "detection_f1",
+        "mttr",  # Mean Time To Recovery (rounds)
+        "evasion_rate",  # % Byzantine that evaded detection
+        "comm_cost",  # Total bytes transmitted
+        "aggregation_time_ms",
+    ],
+}
+```
+
+---
+
+## 3.4 Performance Analysis & Metrics Collection
+
+**파일**: `experiments/runner.py` (새로 생성)
+
+### 주요 Metrics 정의
+
+| Metric | 의미 | 계산 방식 | 목표 |
+|--------|------|---------|------|
+| **Model Accuracy** | 전체 모델 성능 | (TP+TN)/(TP+TN+FP+FN) | >92% (no attack) |
+| **Detection F1** | 악의적 클라이언트 탐지 | 2×(P×R)/(P+R) | >0.95 (RMC) |
+| **MTTR** | 공격 후 회복 시간 | rounds until accuracy >90% | <10 rounds |
+| **Evasion Rate** | 탐지 회피 악의적 비율 | 미탐지_수 / 총_악의_수 | <5% (ours) |
+| **Comm Cost** | 통신 오버헤드 | bytes × rounds | minimize |
+
+### 실험 메트릭 수집 함수
+
+```python
+def run_federated_round(baseline_method,
+                       attack_type,
+                       byzantine_fraction,
+                       round_num,
+                       seed):
+    """
+    Single federated learning round with attack injection
+
+    Returns:
+        metrics_dict = {
+            'round': int,
+            'baseline': str,
+            'attack': str,
+            'byzantine_frac': float,
+            'model_acc': float,
+            'model_f1': float,
+            'model_mae': float,
+            'detected_byzantine': Set[str],
+            'detection_precision': float,
+            'detection_recall': float,
+            'detection_f1': float,
+            'true_byzantine': Set[str],
+            'evasion_count': int,
+            'mttr': int,
+            'comm_bytes': int,
+            'agg_time_ms': float,
+        }
+    """
+    pass
+
+def aggregate_results(all_rounds_metrics):
+    """
+    Aggregate metrics across multiple rounds and seeds
+
+    Returns:
+        summary = {
+            'method': str,
+            'attack': str,
+            'avg_accuracy': float,
+            'avg_accuracy_std': float,
+            'avg_f1': float,
+            'avg_f1_std': float,
+            'avg_mttr': float,
+            'avg_evasion_rate': float,
+            'statistical_significance': bool,  # p-value < 0.01
+        }
+    """
+    pass
+```
+
+---
+
+## 3.5 실험 결과 표 (예상)
+
+### 📊 Table 1: Robustness under Byzantine Attacks (20% malicious, 200 rounds)
+
+| Method | No Attack | RMC | Delayed | Str-Evo | Collusion | Task-Spec | Mix (all 5) |
+|--------|-----------|-----|---------|---------|-----------|-----------|------------|
+| FedAvg | 92.5% | 45.3% | 38.7% | 42.1% | 41.8% | 55.2% | 38.5% |
+| Krum | 91.8% | 68.9% | 65.2% | 63.4% | 62.1% | 71.5% | 61.8% |
+| Multi-Krum | 91.9% | 71.2% | 68.1% | 66.7% | 64.9% | 73.2% | 64.5% |
+| Trimmed Mean | 92.1% | 73.5% | 70.8% | 69.2% | 67.4% | 75.1% | 66.8% |
+| FLGuard | 92.2% | 84.6% | 82.1% | 79.3% | 76.8% | 82.4% | 77.5% |
+| OptiGradTrust | 92.0% | 85.9% | 84.7% | 81.5% | 79.2% | 84.1% | 79.8% |
+| **BR-AIOpsFL (ours)** | **92.3%** | **89.7%** | **88.9%** | **87.2%** | **86.5%** | **87.9%** | **86.1%** |
+
+### 📊 Table 2: Detection Performance (Detection F1 Score)
+
+| Method | RMC | Delayed | Str-Evo | Collusion | Task-Spec | Mix |
+|--------|-----|---------|---------|-----------|-----------|-----|
+| FLGuard | 0.72 | 0.68 | 0.65 | 0.62 | 0.58 | 0.61 |
+| OptiGradTrust | 0.85 | 0.83 | 0.79 | 0.76 | 0.72 | 0.74 |
+| **BR-AIOpsFL** | **0.97** | **0.96** | **0.94** | **0.92** | **0.89** | **0.91** |
+
+### 📊 Table 3: Recovery Metrics (MTTR, Evasion Rate)
+
+| Method | MTTR (rounds) | Evasion % | Recovery Success |
+|--------|---------------|-----------|------------------|
+| Krum | 45 ± 8 | 12.3% | 73% |
+| FLGuard | 18 ± 4 | 8.5% | 85% |
+| OptiGradTrust | 12 ± 3 | 5.2% | 92% |
+| **BR-AIOpsFL** | **4 ± 1** | **<1%** | **98%** |
+
+---
+
+## 3.6 실험 일정 (상세)
+
+| 주차 | 작업 | 산출물 | 완료일 |
+|-----|------|--------|--------|
+| **주1 (03/01~03/07)** | Baseline 6개 구현 | `baselines.py` (500줄) | 2026-03-07 |
+| **주1~2 (03/01~03/14)** | Attack injector 5개 구현 | `attacks.py` (600줄) | 2026-03-14 |
+| **주2 (03/08~03/14)** | 실험 프레임워크 + 환경 설정 | `runner.py`, `config.py` (400줄) | 2026-03-14 |
+| **주2~3 (03/08~03/17)** | Full experiments (5 seeds × 6 baselines × 6 attacks) | `results/` CSV + plots | 2026-03-17 |
+| **주3 (03/15~03-21)** | 통계 분석 + 가설 검정 | `experiments/analysis.py` (300줄) | 2026-03-21 |
+
+---
+
+## 3.7 코드 구조 (Phase 3)
+
+```
+experiments/
+├── plan.md                    # 이 파일
+├── config.py                  # 실험 설정 (configs)
+├── baselines.py              # 6개 baseline 구현 (FedAvg~OptiGradTrust)
+├── attacks.py                # 5가지 attack injectors
+├── runner.py                 # Main 실험 프레임워크 & metric collection
+├── analysis.py               # Statistical analysis & plotting
+├── __init__.py
+└── results/
+    ├── seed_0/
+    │   ├── baseline_vs_attacks.csv
+    │   ├── detection_metrics.csv
+    │   └── plots/
+    ├── seed_1/
+    └── ...
+    ├── summary.csv           # All seeds aggregated
+    └── plots/
+        ├── accuracy_comparison.png
+        ├── detection_f1.png
+        ├── mttr_boxplot.png
+        └── evasion_rate.png
+```
+
+---
+
+## 3.8 Success Criteria
+
+✅ **Phase 3 완성 조건**:
+
+1. **Baselines**: 6개 baseline 모두 구현 & 테스트 PASS
+2. **Attacks**: 5개 adaptive attack 완전히 주입 & 검증
+3. **Experiments**: 5 seeds × 6 baselines × 6 attack types 완료
+4. **Results**:
+   - 우리 방법이 모든 metrics에서 SOTA 초과
+   - 특히 **Detection F1 > 0.90** for all attacks
+   - **MTTR < 10 rounds** for mixed attacks
+   - **Evasion rate < 5%** (CorollARY 검증)
+5. **Stats**: p-value < 0.01으로 statistical significance 확인
+6. **Reproducibility**: 모든 코드 + 설정 공개, seed 고정
+
+---
+
+**다음 단계**: Phase 3.1 Baseline 구현 시작 (2026-03-01)
+**병렬**: Phase 4.1 Paper Abstract + Introduction 쓰기
+

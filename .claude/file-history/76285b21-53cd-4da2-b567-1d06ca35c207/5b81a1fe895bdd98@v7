@@ -1,0 +1,287 @@
+# Phase 5.5.4 — Full Generic (TypeVar) Type System
+
+## 컨텍스트
+
+**목표**: Phase 5.5.3 (파라미터 타입 어노테이션) 완료 후, Phase 5.5.4에서 진정한 제네릭 타입 변수(TypeVar)를 구현한다.
+`fn identity<T>(x: T) { x }` 형식 지원 + 호출 시 TypeVar Instantiation.
+
+**현재 GAP**:
+- `type-system.ts`: Type 유니온에 `{ kind: "typevar" }` 없음 → 제네릭 표현 불가
+- `ast.ts`: fn 노드에 `typeParams` 필드 없음
+- `parser.ts`: `<T, U>` 파싱 코드 없음. 또한 `parseParams()`의 `.toLowerCase()`가 TypeVar `T`를 `"t"`로 변환
+- `type-checker.ts`: call-site TypeVar Instantiation(substitution) 없음
+- `type-system.ts`의 `parseType("T")` → UNKNOWN으로 fallback (TypeVar로 처리되지 않음)
+
+---
+
+## 수정 대상 파일
+
+| 파일 | 작업 |
+|------|------|
+| `src/type-system.ts` | TypeVar 타입 노드 추가 + parseType/typesCompatible/typeToString 수정 |
+| `src/ast.ts` | fn 노드에 `typeParams?: string[]` 추가 |
+| `src/parser.ts` | `parseTypeParams()` 추가 + parseFnStmt/parseFnExpr 수정 + `.toLowerCase()` 제거 |
+| `src/type-checker.ts` | TypeVar Instantiation + typeParams 보존 |
+| `src/vm-generic-test.ts` | 신규 15개 테스트 |
+
+---
+
+## Step 1: type-system.ts — TypeVar 타입 노드 추가
+
+### 1-1: Type 유니온 확장 (Line 23 뒤)
+
+```typescript
+// Before:
+  | { kind: "never" };
+
+// After:
+  | { kind: "never" }
+  | { kind: "typevar"; name: string };  // Phase 5.5.4: TypeVar
+```
+
+### 1-2: fn 타입에 typeParams 추가 (Line 21)
+
+```typescript
+// Before:
+| { kind: "fn"; paramTypes: Type[]; returnType: Type; capabilities?: Capability[] }
+// After:
+| { kind: "fn"; paramTypes: Type[]; returnType: Type; capabilities?: Capability[]; typeParams?: string[] }
+```
+
+### 1-3: parseType() 수정 — 단일 대문자/소문자 → TypeVar (Line 148 이전에 삽입)
+
+```typescript
+// parseType() 내, 첫 번째 switch 분기 앞에 삽입:
+// Phase 5.5.4: 단일 문자 (T, U, A-Z 또는 t, u, a-z) → TypeVar
+// parseParams()가 toLowerCase()를 제거했으므로 원래 대문자로 들어오지만
+// 소문자 단일 문자도 안전하게 처리
+const nonTypeAnnotations = ["num","str","bool","null","unknown"];
+if (/^[a-zA-Z]$/.test(trimmed) && !nonTypeAnnotations.includes(trimmed.toLowerCase())) {
+  return { kind: "typevar", name: trimmed.toUpperCase() };
+}
+```
+
+### 1-4: typesCompatible() 수정 (Line 84 이후, 첫 번째 분기 앞)
+
+```typescript
+// Phase 5.5.4: TypeVar는 어떤 타입과도 호환 (인스턴스화 전)
+if (type1.kind === "typevar" || type2.kind === "typevar") return true;
+```
+
+### 1-5: typeToString() 수정 — typevar 케이스 추가
+
+```typescript
+// case "never": 뒤에 추가:
+case "typevar":
+  return type.name;
+```
+
+---
+
+## Step 2: ast.ts — fn 노드 typeParams 추가
+
+### 2-1: Expr fn 노드 (Line 20)
+
+```typescript
+// Before:
+| { kind: "fn"; name: string | null; params: Param[]; body: Stmt[] }
+// After:
+| { kind: "fn"; name: string | null; params: Param[]; body: Stmt[]; typeParams?: string[] }
+```
+
+### 2-2: Stmt fn 노드 (Line 51)
+
+```typescript
+// Before:
+| { kind: "fn"; name: string; params: Param[]; body: Stmt[]; annotations?: CapabilityAnnotation[] }
+// After:
+| { kind: "fn"; name: string; params: Param[]; body: Stmt[]; annotations?: CapabilityAnnotation[]; typeParams?: string[] }
+```
+
+---
+
+## Step 3: parser.ts — <T, U> 파싱 지원
+
+### 3-1: parseTypeParams() 헬퍼 추가 (parseParams() 앞)
+
+```typescript
+// Phase 5.5.4: 제네릭 타입 파라미터 <T, U, ...> 파싱
+function parseTypeParams(): string[] {
+  if (!at(T.Lt)) return [];
+  advance(); // <
+  const typePs: string[] = [];
+  while (!at(T.Gt) && !at(T.EOF)) {
+    typePs.push(expect(T.Ident, "Expected type parameter name").value);
+    if (!at(T.Gt)) match(T.Comma);
+  }
+  expect(T.Gt); // >
+  return typePs;
+}
+```
+
+**핵심**: `fn name<T>` 맥락에서만 호출되므로 비교연산자 `<`와 충돌 없음.
+
+### 3-2: parseFnStmt() 수정 (Line 102-125)
+
+```typescript
+// Line 104 (name 읽기) 바로 뒤:
+const name = expect(T.Ident, "Expected function name").value;
+const typeParams = parseTypeParams();  // Phase 5.5.4: <T, U> 파싱
+expect(T.LParen);
+
+// 반환 시 typeParams 추가:
+return { kind: "fn", name, params, body, annotations, typeParams };
+```
+
+### 3-3: parseFnExpr() 수정 (Line 660-671)
+
+```typescript
+// optional Ident 읽기 후:
+if (at(T.Ident)) name = advance().value;
+const typeParams = parseTypeParams();  // Phase 5.5.4
+expect(T.LParen);
+
+// 반환 시:
+return { kind: "fn", name, params, body, typeParams };
+```
+
+### 3-4: parseParams() — `.toLowerCase()` 제거 (Line 689)
+
+```typescript
+// Before:
+typeAnnotation = typeParts.join("").toLowerCase();
+// After:
+typeAnnotation = typeParts.join("");  // Phase 5.5.4: 대문자 TypeVar T, U 보존
+```
+
+**안전성**: 기존 어노테이션 `num`, `str`, `bool`은 이미 소문자이므로 영향 없음.
+
+---
+
+## Step 4: type-checker.ts — TypeVar Instantiation
+
+### 4-1: registerFunctionType() — typeParams 저장 (Line 97-103)
+
+```typescript
+const fnType: Type = {
+  kind: "fn",
+  paramTypes,
+  returnType,
+  capabilities,
+  typeParams: fnStmt.typeParams || [],  // Phase 5.5.4: typeParams 보존
+}
+```
+
+### 4-2: checkStmt case "fn" — returnType 갱신 시 typeParams 보존 (Line 167-173)
+
+```typescript
+this.functionTypes.set(fnStmt.name, {
+  kind: "fn",
+  paramTypes: existingFnType.paramTypes,
+  returnType: inferredReturn,
+  capabilities: existingFnType.capabilities,
+  typeParams: (existingFnType as any).typeParams,  // Phase 5.5.4: typeParams 보존
+})
+```
+
+### 4-3: checkExpr case "call" — TypeVar Instantiation (Line 455-504)
+
+현재 call 검증 루프 앞에 삽입:
+
+```typescript
+// Phase 5.5.4: Step 1 — 모든 arg 타입 미리 계산 (중복 호출 방지)
+const argTypes: Type[] = (callExpr.args || []).map((arg: any) => this.checkExpr(arg));
+
+// Phase 5.5.4: Step 2 — TypeVar substitution map 생성
+const substitution = new Map<string, Type>();
+if ((fnType.typeParams || []).length > 0) {
+  for (let i = 0; i < argTypes.length; i++) {
+    const paramType = fnType.paramTypes[i];
+    if (paramType && paramType.kind === "typevar" && !substitution.has(paramType.name)) {
+      substitution.set(paramType.name, argTypes[i]);
+    }
+  }
+}
+
+// 인자 타입 검사 (기존 루프 수정):
+for (let i = 0; i < argTypes.length; i++) {
+  const paramType = fnType.paramTypes[i] || BUILTIN_TYPES.UNKNOWN;
+  const resolvedParamType = (paramType.kind === "typevar" && substitution.has(paramType.name))
+    ? substitution.get(paramType.name)!
+    : paramType;
+  if (!typesCompatible(argTypes[i], resolvedParamType)) {
+    this.addError(...);
+  }
+}
+
+// Phase 5.5.4: Step 3 — returnType에 TypeVar가 있으면 substitution 적용
+const retType = fnType.returnType;
+if (retType.kind === "typevar" && substitution.has(retType.name)) {
+  return substitution.get(retType.name)!;
+}
+```
+
+---
+
+## Step 5: vm-generic-test.ts — 15개 테스트
+
+```
+Suite A: 제네릭 함수 정의 (5개)
+  1. fn identity<T>(x: T) { x } → 컴파일 성공
+  2. fn pair<A, B>(a: A, b: B) { a } → 컴파일 성공
+  3. 단일 TypeVar 어노테이션 파싱 확인
+  4. 다중 TypeVar 선언 확인
+  5. typeParams 없는 일반 함수 → 정상 동작 (호환성)
+
+Suite B: 호출 시 타입 인스턴스화 (5개)
+  6. identity(42) → num 타입 반환
+  7. identity("hi") → str 타입 반환
+  8. identity(42) + identity("hi") 연속 호출 → 모두 성공
+  9. 어노테이션 없는 fn → UNKNOWN (기존 동작)
+  10. typeParams 없는 fn 호출 → substitution 없이 정상 동작
+
+Suite C: 통합 & 호환성 (5개)
+  11. 기존 162개 테스트 패턴 호환성 유지
+  12. fn swap<A, B>(a: A, b: B) → A, B 각각 바인딩
+  13. 제네릭 + num 어노테이션 혼합 fn
+  14. 빈 body 제네릭 fn → null 반환
+  15. end-to-end: 제네릭 선언 + 호출 + 타입 전파
+```
+
+---
+
+## 검증 순서
+
+```bash
+npm run build
+node dist/vm-generic-test.js   # 신규 15개
+bash /tmp/run_all_tests.sh     # 전체 177개 (162 + 15)
+```
+
+목표: **177/177 전체 통과**
+
+---
+
+## 구현 순서
+
+```
+1. type-system.ts  — TypeVar 노드 + 4개 함수 수정 (모든 파일이 의존)
+2. ast.ts          — typeParams 필드 추가
+3. parser.ts       — parseTypeParams() + parseFnStmt/parseFnExpr + .toLowerCase() 제거
+4. type-checker.ts — TypeVar Instantiation + typeParams 보존
+5. vm-generic-test.ts — 15개 테스트 신규 작성
+6. npm run build → 전체 테스트
+```
+
+---
+
+## 리스크 통제
+
+| 리스크 | 대책 |
+|--------|------|
+| `<T>` vs 비교연산자 `<` 충돌 | parseTypeParams()는 parseFnStmt/parseFnExpr에서만 호출, 비교연산자와 맥락 분리 |
+| `.toLowerCase()` 제거 영향 | 기존 어노테이션(`num`, `str`, `bool`)은 이미 소문자 → 영향 없음 |
+| TypeVar `T` vs 변수명 `t` 혼동 | parseType()에서 단일 문자 + 예약어 제외 로직으로 처리 |
+| typeToString() exhaustive switch | `typevar` 케이스 필수 추가 (TypeScript 컴파일 오류 방지) |
+| 기존 162개 테스트 회귀 | UNKNOWN과 TypeVar의 typesCompatible 동작 동일하게 유지 |
+| checkExpr 이중 호출 방지 | argTypes 배열로 미리 계산 후 재사용 |

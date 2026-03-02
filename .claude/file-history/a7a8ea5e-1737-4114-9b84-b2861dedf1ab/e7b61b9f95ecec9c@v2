@@ -1,0 +1,280 @@
+"""
+메시지 브로커 - 생산자와 소비자 사이의 중간 완충 지대
+
+핵심: 시스템 간의 느슨한 결합(Loose Coupling)을 통해
+서로 다른 속도의 시스템들이 안정적으로 협력하도록 함
+"""
+
+import asyncio
+from collections import deque
+from typing import Any, Callable, Optional, List, Dict
+from dataclasses import dataclass, field
+from datetime import datetime
+import logging
+
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Message:
+    """메시지 데이터 구조"""
+    id: str
+    payload: Any
+    priority: int = 0  # 0: 낮음, 1: 중간, 2: 높음
+    timestamp: datetime = field(default_factory=datetime.now)
+    retry_count: int = 0
+    max_retries: int = 3
+
+    def can_retry(self) -> bool:
+        """재시도 가능 여부"""
+        return self.retry_count < self.max_retries
+
+    def increment_retry(self):
+        """재시도 카운트 증가"""
+        self.retry_count += 1
+
+
+class GogsMessageBroker:
+    """메시지 브로커 - 생산자와 소비자 사이의 중간 저장소
+
+    역할:
+    1. 생산자로부터 메시지 받기
+    2. 메시지 저장소에 보관
+    3. 소비자의 요청에 따라 메시지 전달
+    4. 처리 실패 시 재시도 관리
+    """
+
+    def __init__(self, max_queue_size: Optional[int] = None):
+        """
+        Args:
+            max_queue_size: 최대 큐 크기 (None이면 무제한)
+        """
+        self.queue: deque = deque(maxlen=max_queue_size)
+        self.dead_letter_queue: deque = deque()  # 처리 실패 메시지
+        self.condition = asyncio.Condition()
+        self.message_count = 0
+        self.processed_count = 0
+        self.failed_count = 0
+
+    async def produce(self, message: Message) -> bool:
+        """생산자가 메시지를 브로커에 제출
+
+        Args:
+            message: 처리할 메시지
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            async with self.condition:
+                self.queue.append(message)
+                self.message_count += 1
+
+                logger.info(
+                    f"📥 [PRODUCER] 메시지 투입: {message.id} "
+                    f"(우선순위: {message.priority})"
+                )
+
+                # 대기 중인 소비자들에게 알림
+                self.condition.notify_all()
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [ERROR] 메시지 투입 실패: {e}")
+            return False
+
+    async def consume(self, worker_name: str, timeout: Optional[float] = None) -> Optional[Message]:
+        """소비자가 브로커에서 메시지를 가져옴
+
+        Args:
+            worker_name: 작업자 이름
+            timeout: 대기 타임아웃 (초)
+
+        Returns:
+            Optional[Message]: 메시지 (없으면 None)
+        """
+        try:
+            async with self.condition:
+                # 타임아웃이 있으면 대기
+                if timeout:
+                    try:
+                        await asyncio.wait_for(
+                            self._wait_for_message(),
+                            timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        return None
+                else:
+                    # 메시지가 올 때까지 무한 대기
+                    while not self.queue:
+                        await self.condition.wait()
+
+                if self.queue:
+                    message = self.queue.popleft()
+                    logger.info(f"📤 [CONSUMER-{worker_name}] 메시지 수신: {message.id}")
+                    return message
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ [ERROR] 메시지 수신 실패: {e}")
+            return None
+
+    async def _wait_for_message(self):
+        """메시지 대기 헬퍼"""
+        while not self.queue:
+            await self.condition.wait()
+
+    async def acknowledge(self, message: Message) -> bool:
+        """메시지 처리 완료 확인
+
+        Args:
+            message: 처리 완료된 메시지
+
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            self.processed_count += 1
+            logger.info(f"✅ [ACK] 메시지 처리 완료: {message.id}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ [ERROR] ACK 실패: {e}")
+            return False
+
+    async def nack(self, message: Message) -> bool:
+        """메시지 처리 실패 확인 (음수 확인)
+
+        Args:
+            message: 처리 실패한 메시지
+
+        Returns:
+            bool: 재시도 여부
+        """
+        try:
+            if message.can_retry():
+                message.increment_retry()
+                async with self.condition:
+                    self.queue.append(message)
+                    logger.warning(
+                        f"🔄 [NACK] 메시지 재시도: {message.id} "
+                        f"({message.retry_count}/{message.max_retries})"
+                    )
+                    self.condition.notify_all()
+                return True
+            else:
+                # 재시도 횟수 초과 → Dead Letter Queue로 이동
+                self.dead_letter_queue.append(message)
+                self.failed_count += 1
+                logger.error(
+                    f"☠️  [DLQ] 메시지 처리 포기: {message.id} "
+                    f"(재시도 횟수 초과)"
+                )
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ [ERROR] NACK 실패: {e}")
+            return False
+
+    async def get_queue_status(self) -> Dict:
+        """큐의 현재 상태 조회
+
+        Returns:
+            Dict: 상태 정보
+        """
+        async with self.condition:
+            return {
+                "queue_size": len(self.queue),
+                "dead_letter_size": len(self.dead_letter_queue),
+                "total_messages": self.message_count,
+                "processed": self.processed_count,
+                "failed": self.failed_count,
+                "pending": len(self.queue)
+            }
+
+    async def purge(self):
+        """큐 비우기"""
+        async with self.condition:
+            self.queue.clear()
+            logger.info("🗑️  큐를 비웠습니다")
+
+    def get_stats(self) -> Dict:
+        """통계 정보"""
+        return {
+            "total_messages": self.message_count,
+            "processed": self.processed_count,
+            "failed": self.failed_count,
+            "success_rate": (
+                (self.processed_count / self.message_count * 100)
+                if self.message_count > 0 else 0
+            )
+        }
+
+
+class PriorityMessageBroker(GogsMessageBroker):
+    """우선순위 기반 메시지 브로커
+
+    높은 우선순위 메시지가 먼저 처리됨
+    """
+
+    def __init__(self, max_queue_size: Optional[int] = None):
+        super().__init__(max_queue_size)
+        self.priority_queue: Dict[int, deque] = {0: deque(), 1: deque(), 2: deque()}
+
+    async def produce(self, message: Message) -> bool:
+        """우선순위에 따라 분류하여 저장"""
+        try:
+            async with self.condition:
+                priority = min(max(message.priority, 0), 2)
+                self.priority_queue[priority].append(message)
+                self.message_count += 1
+
+                logger.info(
+                    f"📥 [PRIORITY-PRODUCER] 메시지 투입: {message.id} "
+                    f"(우선순위: {priority})"
+                )
+
+                self.condition.notify_all()
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ [ERROR] 메시지 투입 실패: {e}")
+            return False
+
+    async def consume(self, worker_name: str, timeout: Optional[float] = None) -> Optional[Message]:
+        """높은 우선순위부터 소비"""
+        try:
+            async with self.condition:
+                if timeout:
+                    try:
+                        await asyncio.wait_for(
+                            self._wait_for_message(),
+                            timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        return None
+
+                # 높은 우선순위부터 확인
+                for priority in [2, 1, 0]:
+                    if self.priority_queue[priority]:
+                        message = self.priority_queue[priority].popleft()
+                        logger.info(
+                            f"📤 [PRIORITY-CONSUMER-{worker_name}] "
+                            f"메시지 수신: {message.id} (우선순위: {priority})"
+                        )
+                        return message
+
+            return None
+
+        except Exception as e:
+            logger.error(f"❌ [ERROR] 메시지 수신 실패: {e}")
+            return None
+
+    async def _wait_for_message(self):
+        """메시지 대기 헬퍼 (우선순위 큐 버전)"""
+        while not any(self.priority_queue.values()):
+            await self.condition.wait()

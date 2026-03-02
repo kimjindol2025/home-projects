@@ -1,0 +1,646 @@
+# v14.0 Lexer (어휘 분석기) 아키텍처
+
+## 🎯 목표
+
+Gogs-Lang 컴파일러의 첫 번째 단계인 **어휘 분석(Lexical Analysis)**을 구현한다.
+
+- 소스코드의 문자열을 **의미 있는 최소 단위인 토큰**으로 분해
+- 위치 정보(행, 열)를 함께 추적하여 에러 메시지 지원
+- 주석과 공백 자동 제거
+- 유한 상태 기계(FSM) 기반 설계로 선형 시간 O(n) 성능 달성
+
+---
+
+## 📊 아키텍처 개요
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SOURCE CODE (String)                                       │
+│  "let x = 10; // 주석"                                       │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+                     ┌─────────────────────┐
+                     │   Lexer (FSM)       │
+                     │  한 글자씩 조사     │
+                     │  상태 추적          │
+                     └─────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  TOKEN STREAM (Vec<TokenWithPos>)                           │
+│  [Let(1:1), Ident("x")(1:5), Assign(1:9), Int(10)(1:11),   │
+│   Semicolon(1:14), EOF]                                     │
+└─────────────────────────────────────────────────────────────┘
+                               ↓
+                    [Parser로 전달 (v14.1)]
+```
+
+---
+
+## 🔧 핵심 컴포넌트
+
+### 1. Token 열거형 (token.rs)
+
+**역할**: 소스코드를 구성하는 의미 있는 최소 단위 정의
+
+```rust
+pub enum Token {
+    // 키워드 (14개)
+    Let, Fn, If, Else, Return, While, For, Break, Continue,
+    Const, Mut, True, False, Null,
+
+    // 식별자 & 리터럴 (5개)
+    Ident(String),  // 변수명, 함수명
+    Int(i64),       // 정수
+    Float(f64),     // 실수
+    String(String), // 문자열
+    Char(char),     // 문자
+
+    // 연산자 (16개)
+    Plus, Minus, Asterisk, Slash, Percent,
+    Assign, EqualEqual, NotEqual, Less, Greater,
+    LessEqual, GreaterEqual, Bang,
+    Ampersand, Pipe, Caret, LeftShift, RightShift,
+    PlusAssign, MinusAssign, AsteriskAssign, SlashAssign,
+
+    // 구두점 (11개)
+    LeftParen, RightParen, LeftBrace, RightBrace,
+    LeftBracket, RightBracket, Semicolon, Colon,
+    Comma, Dot, Arrow, FatArrow, Ellipsis,
+
+    // 특수
+    Newline, EOF, Unknown(char),
+}
+```
+
+**설계 원칙**:
+- 명확한 의미 단위: 각 토큰은 언어의 최소 의미 요소
+- 리터럴 값 포함: `Int(42)`, `String("hello")` 같이 값 자체를 저장
+- 확장성: 새로운 키워드나 연산자 추가 용이
+
+---
+
+### 2. Position 구조체 (token.rs)
+
+**역할**: 토큰의 위치 정보 추적 (에러 메시지용)
+
+```rust
+pub struct Position {
+    pub line: usize,        // 줄 번호 (1부터 시작)
+    pub column: usize,      // 열 번호 (1부터 시작)
+    pub byte_offset: usize, // 바이트 오프셋
+}
+```
+
+**사용 예**:
+```
+에러 메시지: "Line 3, Column 5: Unknown character '@'"
+```
+
+---
+
+### 3. TokenWithPos 래퍼 (token.rs)
+
+**역할**: 토큰과 위치 정보를 함께 관리
+
+```rust
+pub struct TokenWithPos {
+    pub token: Token,
+    pub position: Position,
+}
+
+// 예: TokenWithPos::new(Token::Let, Position::new(1, 1, 0))
+//     [1:1] Let
+```
+
+---
+
+### 4. Lexer 구조체 (lexer.rs)
+
+**역할**: 유한 상태 기계 기반 토큰화 엔진
+
+```rust
+pub struct Lexer {
+    input: Vec<char>,        // 소스코드를 문자 배열로 변환
+    position: usize,         // 현재 읽은 위치
+    read_position: usize,    // 다음 읽을 위치
+    ch: char,                // 현재 조사 중인 문자
+    line: usize,             // 현재 줄 번호
+    column: usize,           // 현재 열 번호
+}
+```
+
+**상태 추적 방식**:
+```
+입력: "let x = 10;"
+      0   1 2 3 4 5 ...
+
+position = 0  (현재 읽은 위치)
+read_position = 1 (다음 읽을 위치)
+ch = 'l' (현재 문자)
+```
+
+---
+
+## 🎬 Lexer 동작 흐름 (FSM)
+
+### 초기화 단계
+
+```rust
+let mut lexer = Lexer::new("let x = 10;".to_string());
+// 내부: read_char() 호출로 첫 문자 'l' 로드
+```
+
+### 토큰화 루프
+
+```
+┌─────────────────────────────────────┐
+│  next_token() 호출                  │
+├─────────────────────────────────────┤
+│ 1. skip_whitespace_and_comments()   │
+│    (공백, 주석 제거)                 │
+├─────────────────────────────────────┤
+│ 2. current_position() 저장          │
+│    (토큰의 위치 기록)                 │
+├─────────────────────────────────────┤
+│ 3. match ch 로직                    │
+│    문자별로 토큰 결정                 │
+├─────────────────────────────────────┤
+│ 4. read_char() 호출                 │
+│    (다음 문자로 진행)                 │
+├─────────────────────────────────────┤
+│ 5. TokenWithPos 반환                │
+└─────────────────────────────────────┘
+```
+
+---
+
+## 🔑 주요 메서드 설명
+
+### read_char()
+**기능**: 다음 문자로 이동
+
+```rust
+fn read_char(&mut self) {
+    if self.read_position >= self.input.len() {
+        self.ch = '\0';  // EOF 표시
+    } else {
+        self.ch = self.input[self.read_position];
+    }
+
+    // 행/열 추적
+    if self.ch == '\n' {
+        self.line += 1;
+        self.column = 1;
+    } else {
+        self.column += 1;
+    }
+
+    self.position = self.read_position;
+    self.read_position += 1;
+}
+```
+
+**특징**:
+- 자동 행/열 추적
+- EOF 감지 (`\0`)
+- 단방향 진행만 가능
+
+---
+
+### peek_char()
+**기능**: 다음 문자를 미리 보기 (현재 문자 변경 X)
+
+```rust
+fn peek_char(&self) -> char {
+    if self.read_position >= self.input.len() {
+        '\0'
+    } else {
+        self.input[self.read_position]
+    }
+}
+```
+
+**용도**: 2글자 연산자 구분
+```
+'=' 다음이 '='인가? → peek_char() 확인 → EqualEqual 결정
+'-' 다음이 '>'인가? → peek_char() 확인 → Arrow 결정
+```
+
+---
+
+### skip_whitespace_and_comments()
+**기능**: 공백과 주석 자동 제거
+
+```rust
+fn skip_whitespace_and_comments(&mut self) {
+    loop {
+        match self.ch {
+            ' ' | '\t' | '\n' | '\r' => {
+                self.read_char();  // 공백 무시
+            }
+            '/' if self.peek_char() == '/' => {
+                // 한 줄 주석: // 이후 모든 문자 무시
+                while self.ch != '\n' && self.ch != '\0' {
+                    self.read_char();
+                }
+            }
+            '/' if self.peek_char() == '*' => {
+                // 블록 주석: /* ... */ 무시
+                self.read_char();  // '/'
+                self.read_char();  // '*'
+                while self.ch != '\0' {
+                    if self.ch == '*' && self.peek_char() == '/' {
+                        self.read_char();  // '*'
+                        self.read_char();  // '/'
+                        break;
+                    }
+                    self.read_char();
+                }
+            }
+            _ => break,
+        }
+    }
+}
+```
+
+**특징**:
+- 무한 루프로 연속 공백/주석 처리
+- 중첩 주석은 미지원 (단순성 유지)
+
+---
+
+### read_identifier()
+**기능**: 식별자 또는 키워드 읽기
+
+```rust
+fn read_identifier(&mut self) -> String {
+    let pos = self.position;
+    while self.ch.is_alphanumeric() || self.ch == '_' {
+        self.read_char();
+    }
+    self.input[pos..self.position].iter().collect()
+}
+
+// 용도
+let ident = self.read_identifier();  // "let", "x", "foo123"
+match ident.as_str() {
+    "let" => Token::Let,
+    "fn" => Token::Fn,
+    _ => Token::Ident(ident),  // 일반 식별자
+}
+```
+
+---
+
+### read_number()
+**기능**: 정수 또는 실수 읽기
+
+```rust
+fn read_number(&mut self) -> (Token, bool) {
+    let pos = self.position;
+    let mut is_float = false;
+
+    // 정수 부분
+    while self.ch.is_numeric() {
+        self.read_char();
+    }
+
+    // 소수점 검사
+    if self.ch == '.' && self.peek_char().is_numeric() {
+        is_float = true;
+        self.read_char();
+        while self.ch.is_numeric() {
+            self.read_char();
+        }
+    }
+
+    let num_str: String = self.input[pos..self.position].iter().collect();
+
+    if is_float {
+        (Token::Float(num_str.parse::<f64>().unwrap_or(0.0)), true)
+    } else {
+        (Token::Int(num_str.parse::<i64>().unwrap_or(0)), true)
+    }
+}
+```
+
+**특징**:
+- "3.14" 처리 O
+- "3." 처리 X (소수점 다음에 숫자 필요)
+- 오버플로우 처리: `unwrap_or(0)`
+
+---
+
+### read_string()
+**기능**: 문자열 읽기 + 이스케이프 시퀀스 처리
+
+```rust
+fn read_string(&mut self, quote_char: char) -> Option<String> {
+    let mut result = String::new();
+    self.read_char();  // 여는 따옴표 건너뛰기
+
+    while self.ch != quote_char && self.ch != '\0' {
+        if self.ch == '\\' {
+            self.read_char();  // 역슬래시 건너뛰기
+            match self.ch {
+                'n' => result.push('\n'),
+                't' => result.push('\t'),
+                '\\' => result.push('\\'),
+                '\"' => result.push('\"'),
+                '\'' => result.push('\''),
+                _ => {
+                    result.push('\\');
+                    result.push(self.ch);
+                }
+            }
+        } else {
+            result.push(self.ch);
+        }
+        self.read_char();
+    }
+
+    if self.ch == quote_char {
+        self.read_char();  // 닫는 따옴표 건너뛰기
+        Some(result)
+    } else {
+        None  // 닫히지 않은 문자열
+    }
+}
+```
+
+**이스케이프 시퀀스**:
+- `\n` → 줄바꿈
+- `\t` → 탭
+- `\\` → 역슬래시
+- `\"` → 큰따옴표
+- `\'` → 작은따옴표
+
+---
+
+### next_token()
+**기능**: 다음 토큰 하나 추출
+
+```rust
+pub fn next_token(&mut self) -> TokenWithPos {
+    self.skip_whitespace_and_comments();
+
+    let pos = self.current_position();
+    let token = match self.ch {
+        '+' => {
+            if self.peek_char() == '=' {
+                self.read_char();
+                Token::PlusAssign
+            } else {
+                Token::Plus
+            }
+        }
+        '-' => {
+            if self.peek_char() == '>' {
+                self.read_char();
+                Token::Arrow
+            } else {
+                Token::Minus
+            }
+        }
+        // ... 모든 단일 문자 처리 ...
+        _ => {
+            if self.ch.is_alphabetic() || self.ch == '_' {
+                let ident = self.read_identifier();
+                return TokenWithPos::new(Self::keyword_or_ident(ident), pos);
+            } else if self.ch.is_numeric() {
+                let (token, _) = self.read_number();
+                return TokenWithPos::new(token, pos);
+            } else if self.ch == '\0' {
+                Token::EOF
+            } else {
+                Token::Unknown(self.ch)
+            }
+        }
+    };
+
+    self.read_char();
+    TokenWithPos::new(token, pos)
+}
+```
+
+**특징**:
+- 식별자/숫자: 즉시 반환 (후속 처리 생략)
+- 다른 토큰: `read_char()` 후 반환
+- 위치 정보 자동 저장
+
+---
+
+### tokenize()
+**기능**: 모든 토큰 추출 (편의 메서드)
+
+```rust
+pub fn tokenize(&mut self) -> Vec<TokenWithPos> {
+    let mut tokens = Vec::new();
+    loop {
+        let token_with_pos = self.next_token();
+        let is_eof = token_with_pos.token == Token::EOF;
+        tokens.push(token_with_pos);
+        if is_eof {
+            break;
+        }
+    }
+    tokens
+}
+```
+
+---
+
+## ⚡ 성능 특성
+
+### 시간 복잡도: O(n)
+- 각 문자를 정확히 1회 조사
+- n = 소스코드 길이
+
+### 공간 복잡도: O(k)
+- k = 추출된 토큰 개수
+- 일반적으로 n ≈ 3k (주석과 공백 제외)
+
+### 특징
+- **선형 성능**: 소스코드 크기에 선형
+- **단방향**: 토큰을 되돌아가며 확인할 수 없음
+- **스트림 처리 가능**: 메모리에 전체 토큰 로드 불필요
+
+---
+
+## 🎓 설계 패턴
+
+### 1. 유한 상태 기계 (FSM)
+```
+[초기] → [char 읽기] → [분류] → [토큰 생성] → [다음 char]
+```
+
+### 2. Peeking 패턴
+```
+현재: '-'
+다음: '>' → Arrow 토큰
+다음: '=' → MinusAssign 토큰
+다음: 기타 → Minus 토큰
+```
+
+### 3. 키워드 vs 식별자
+```
+읽은 문자열: "let"
+↓
+keyword_or_ident() 함수
+↓
+미리 정의된 키워드? → Token::Let
+아니면 → Token::Ident("let")
+```
+
+---
+
+## 🔄 토큰화 예시
+
+### 입력
+```
+let x = 10 + 20;
+```
+
+### 처리 과정
+
+1. **초기화**: `position=0, ch='l'`
+2. **'l'**: 식별자 시작 → read_identifier() → "let"
+3. **keyword_or_ident("let")**: 키워드 확인 → `Token::Let`
+4. **공백**: skip_whitespace_and_comments() → 무시
+5. **'x'**: 식별자 → `Token::Ident("x")`
+6. **'='**: 단일 문자 → `Token::Assign`
+7. **'1'**: 숫자 시작 → read_number() → `Token::Int(10)`
+8. **'+'**: 단일 문자 → `Token::Plus`
+9. **'2'**: 숫자 → `Token::Int(20)`
+10. **';'**: 단일 문자 → `Token::Semicolon`
+11. **EOF**: `Token::EOF`
+
+### 출력
+```
+TokenWithPos {
+    token: Let,
+    position: Position { line: 1, column: 1, byte_offset: 0 }
+},
+TokenWithPos {
+    token: Ident("x"),
+    position: Position { line: 1, column: 5, byte_offset: 4 }
+},
+// ... 더 많은 토큰들 ...
+```
+
+---
+
+## 📋 토큰 분류 체계
+
+```
+Token (40가지)
+├── 키워드 (14)
+│   └── let, fn, if, else, return, while, for, break, continue,
+│       const, mut, true, false, null
+├── 리터럴 (5)
+│   ├── Ident(String)
+│   ├── Int(i64)
+│   ├── Float(f64)
+│   ├── String(String)
+│   └── Char(char)
+├── 연산자 (21)
+│   ├── 산술: +, -, *, /, %
+│   ├── 비교: ==, !=, <, >, <=, >=
+│   ├── 논리: !, &, |, ^, <<, >>
+│   └── 할당: =, +=, -=, *=, /=
+├── 구두점 (11)
+│   ├── 괄호: (, ), {, }, [, ]
+│   ├── 구분: ;, :, ,, .
+│   └── 연결: ->, =>, ...
+└── 특수 (3)
+    ├── Newline
+    ├── EOF
+    └── Unknown(char)
+```
+
+---
+
+## 🚀 다음 단계: v14.1 Parser
+
+Lexer가 생성한 토큰 스트림을 입력으로 받아 **추상 구문 트리(AST)**를 구축합니다.
+
+```
+Tokens (from v14.0 Lexer)
+        ↓
+    Parser (v14.1)
+        ↓
+AST (Abstract Syntax Tree)
+```
+
+---
+
+## 💡 확장성 고려사항
+
+### 1. 새로운 키워드 추가
+```rust
+fn keyword_or_ident(ident: String) -> Token {
+    match ident.as_str() {
+        "let" => Token::Let,
+        "fn" => Token::Fn,
+        "match" => Token::Match,  // 새로 추가
+        _ => Token::Ident(ident),
+    }
+}
+```
+
+### 2. 새로운 연산자 추가
+```rust
+'&' => {
+    if self.peek_char() == '&' {
+        self.read_char();
+        Token::LogicalAnd  // 새로 추가
+    } else {
+        Token::Ampersand
+    }
+}
+```
+
+### 3. 새로운 리터럴 타입 (예: 16진수)
+```rust
+if self.ch == '0' && self.peek_char() == 'x' {
+    // 16진수 파싱
+    self.read_char();  // '0'
+    self.read_char();  // 'x'
+    let hex = self.read_hex_number();
+}
+```
+
+---
+
+## 🎯 설계 철학
+
+1. **단일 책임**: Lexer는 토큰화만 담당
+2. **상태 추적**: 행/열 정보로 정확한 에러 메시지 지원
+3. **Peeking**: 2글자 연산자 등을 정확히 구분
+4. **성능**: 선형 시간에 완료
+5. **확장성**: 새로운 토큰 타입 추가 용이
+
+---
+
+## 📚 참고 자료
+
+- Lexer 구현: `src/lexer.rs`
+- Token 정의: `src/token.rs`
+- 사용 예: `src/main.rs` (12개 섹션)
+- 모듈 조직: `src/lib.rs`
+
+---
+
+**Gogs-Lang 컴파일러 파이프라인**
+
+```
+v14.0: Lexer          ← 소스코드를 토큰으로 변환
+        ↓
+v14.1: Parser         ← 토큰을 AST로 변환
+        ↓
+v14.2: Semantic Analyzer ← AST를 검증하고 타입 확인
+        ↓
+v14.3: Code Generator ← AST를 기계어로 변환
+```
+
+Gogs-Lang 컴파일러의 첫 번째 단계, Lexer가 완성되었습니다! 🎉

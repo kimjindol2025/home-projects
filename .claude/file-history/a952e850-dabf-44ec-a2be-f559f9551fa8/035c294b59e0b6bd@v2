@@ -1,0 +1,629 @@
+/**
+ * FreeLang v4 ORM — 종합 테스트 (40+ 케이스)
+ * Model, CRUD, QueryBuilder, JOIN, EagerLoad, Transaction, BulkInsert
+ */
+
+import { ORMEngine, ORM } from "../src/orm-engine";
+
+// ============================================================
+// 테스트 헬퍼
+// ============================================================
+
+let passed = 0;
+let failed = 0;
+const failures: string[] = [];
+
+function test(name: string, fn: () => void): void {
+  try {
+    fn();
+    process.stdout.write(`  ✓ ${name}\n`);
+    passed++;
+  } catch (e: any) {
+    process.stdout.write(`  ✗ ${name}\n    → ${e.message}\n`);
+    failures.push(`${name}: ${e.message}`);
+    failed++;
+  }
+}
+
+function assert(cond: boolean, msg?: string): void {
+  if (!cond) throw new Error(msg ?? "assertion failed");
+}
+
+function eq<T>(a: T, b: T, msg?: string): void {
+  if (JSON.stringify(a) !== JSON.stringify(b)) {
+    throw new Error(`${msg ?? ""} expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
+  }
+}
+
+function section(title: string): void {
+  console.log(`\n[${title}]`);
+}
+
+// ============================================================
+// 공통 ORM 팩토리
+// ============================================================
+
+function userORM() {
+  const orm = new ORMEngine();
+  orm.define("users", {
+    name:  { type: "string" },
+    age:   { type: "i32" },
+    email: { type: "string" },
+    score: { type: "f64", nullable: true },
+  });
+  return orm;
+}
+
+function seedUsers(orm: ORMEngine, count = 5) {
+  for (let i = 1; i <= count; i++) {
+    orm.insert("users", {
+      name:  `User${i}`,
+      age:   20 + i,
+      email: `user${i}@test.com`,
+      score: i * 10.5,
+    });
+  }
+}
+
+// ============================================================
+// 1. Model 정의 (5 tests)
+// ============================================================
+section("1. Model 정의");
+
+test("단일 테이블 정의", () => {
+  const orm = new ORMEngine();
+  orm.define("items", { name: { type: "string" } });
+  assert(orm.tableNames().includes("items"));
+});
+
+test("복수 테이블 정의", () => {
+  const orm = new ORMEngine();
+  orm.define("a", { x: { type: "i32" } });
+  orm.define("b", { y: { type: "string" } });
+  orm.define("c", { z: { type: "bool" } });
+  eq(orm.tableNames().sort(), ["a", "b", "c"]);
+});
+
+test("중복 테이블 에러", () => {
+  const orm = new ORMEngine();
+  orm.define("t", { x: { type: "i32" } });
+  let threw = false;
+  try { orm.define("t", { x: { type: "i32" } }); } catch { threw = true; }
+  assert(threw);
+});
+
+test("없는 테이블 접근 에러", () => {
+  const orm = new ORMEngine();
+  let threw = false;
+  try { orm.findAll("ghost"); } catch { threw = true; }
+  assert(threw);
+});
+
+test("nullable 필드 정의", () => {
+  const orm = new ORMEngine();
+  orm.define("t", { name: { type: "string" }, bio: { type: "string", nullable: true } });
+  const row = orm.insert("t", { name: "Alice", bio: null as any });
+  assert("bio" in row);
+});
+
+// ============================================================
+// 2. CRUD — INSERT (7 tests)
+// ============================================================
+section("2. CRUD — INSERT");
+
+test("자동 ID 시작값 1", () => {
+  const orm = userORM();
+  const r = orm.insert("users", { name: "A", age: 20, email: "a@t.com", score: 1.0 });
+  eq(r.id, 1);
+});
+
+test("연속 INSERT ID 증가", () => {
+  const orm = userORM();
+  const ids = [1, 2, 3, 4, 5].map((i) => {
+    return orm.insert("users", { name: `U${i}`, age: 20 + i, email: `u${i}@t.com`, score: i * 1.0 }).id;
+  });
+  eq(ids, [1, 2, 3, 4, 5]);
+});
+
+test("INSERT 후 원본 불변 (immutable copy)", () => {
+  const orm = userORM();
+  const data = { name: "Alice", age: 30, email: "a@t.com", score: 1.0 };
+  const row = orm.insert("users", data);
+  data.name = "MUTATED";
+  eq(orm.findById("users", row.id)!.name, "Alice");
+});
+
+test("INSERT 반환값에 id 포함", () => {
+  const orm = userORM();
+  const row = orm.insert("users", { name: "X", age: 1, email: "x@t.com", score: 0.0 });
+  assert("id" in row && typeof row.id === "number");
+});
+
+test("COUNT 정확성", () => {
+  const orm = userORM();
+  eq(orm.count("users"), 0);
+  seedUsers(orm, 10);
+  eq(orm.count("users"), 10);
+});
+
+test("INSERT 후 findById 즉시 조회", () => {
+  const orm = userORM();
+  const row = orm.insert("users", { name: "Bob", age: 25, email: "b@t.com", score: 5.5 });
+  const found = orm.findById("users", row.id);
+  assert(found !== null);
+  eq(found!.name, "Bob");
+});
+
+test("다른 테이블 ID는 독립적", () => {
+  const orm = new ORMEngine();
+  orm.define("a", { x: { type: "i32" } });
+  orm.define("b", { y: { type: "i32" } });
+  const a1 = orm.insert("a", { x: 1 });
+  const b1 = orm.insert("b", { y: 1 });
+  eq(a1.id, 1);
+  eq(b1.id, 1);
+});
+
+// ============================================================
+// 3. CRUD — READ (6 tests)
+// ============================================================
+section("3. CRUD — READ");
+
+test("findById 존재하는 레코드", () => {
+  const orm = userORM();
+  seedUsers(orm, 3);
+  const row = orm.findById("users", 2);
+  assert(row !== null && row.name === "User2");
+});
+
+test("findById 없는 레코드 → null", () => {
+  const orm = userORM();
+  eq(orm.findById("users", 999), null);
+});
+
+test("findAll 전체 반환", () => {
+  const orm = userORM();
+  seedUsers(orm, 5);
+  eq(orm.findAll("users").length, 5);
+});
+
+test("findAll 빈 테이블 → []", () => {
+  const orm = userORM();
+  eq(orm.findAll("users"), []);
+});
+
+test("findAll 반환값 독립성 (원본 수정 불가)", () => {
+  const orm = userORM();
+  seedUsers(orm, 2);
+  const rows = orm.findAll("users");
+  rows[0].name = "HACKED";
+  eq(orm.findById("users", 1)!.name, "User1");
+});
+
+test("where — 조건 없이 전체 반환 (= 와일드카드 없음)", () => {
+  const orm = userORM();
+  seedUsers(orm, 3);
+  const all = orm.where("users", "age", ">=", 0);
+  eq(all.length, 3);
+});
+
+// ============================================================
+// 4. CRUD — UPDATE (5 tests)
+// ============================================================
+section("4. CRUD — UPDATE");
+
+test("UPDATE 성공 반환 true", () => {
+  const orm = userORM();
+  seedUsers(orm, 2);
+  eq(orm.update("users", 1, { age: 99 }), true);
+});
+
+test("UPDATE 실제 값 변경 확인", () => {
+  const orm = userORM();
+  seedUsers(orm, 1);
+  orm.update("users", 1, { name: "Updated", age: 55 });
+  const row = orm.findById("users", 1)!;
+  eq(row.name, "Updated");
+  eq(row.age, 55);
+});
+
+test("UPDATE 다른 필드 유지", () => {
+  const orm = userORM();
+  seedUsers(orm, 1);
+  orm.update("users", 1, { age: 100 });
+  const row = orm.findById("users", 1)!;
+  eq(row.email, "user1@test.com"); // 원래 이메일 유지
+});
+
+test("UPDATE 없는 ID → false", () => {
+  const orm = userORM();
+  eq(orm.update("users", 999, { age: 1 }), false);
+});
+
+test("UPDATE ID 변경 불가 (id 필드 유지)", () => {
+  const orm = userORM();
+  seedUsers(orm, 1);
+  orm.update("users", 1, { id: 999, age: 50 });
+  const row = orm.findById("users", 1);
+  assert(row !== null); // id=1 여전히 조회됨
+  eq(row!.id, 1);
+});
+
+// ============================================================
+// 5. CRUD — DELETE (4 tests)
+// ============================================================
+section("5. CRUD — DELETE");
+
+test("DELETE 성공 → true, count 감소", () => {
+  const orm = userORM();
+  seedUsers(orm, 3);
+  assert(orm.delete("users", 2));
+  eq(orm.count("users"), 2);
+});
+
+test("DELETE 후 findById → null", () => {
+  const orm = userORM();
+  seedUsers(orm, 1);
+  orm.delete("users", 1);
+  eq(orm.findById("users", 1), null);
+});
+
+test("DELETE 없는 ID → false", () => {
+  const orm = userORM();
+  eq(orm.delete("users", 99), false);
+});
+
+test("DELETE 후 나머지 레코드 정상 조회", () => {
+  const orm = userORM();
+  seedUsers(orm, 3);
+  orm.delete("users", 2);
+  assert(orm.findById("users", 1) !== null);
+  assert(orm.findById("users", 3) !== null);
+});
+
+// ============================================================
+// 6. Query Builder (8 tests)
+// ============================================================
+section("6. Query Builder");
+
+function productORM() {
+  const orm = new ORMEngine();
+  orm.define("products", {
+    name:  { type: "string" },
+    price: { type: "i32" },
+    cat:   { type: "string" },
+    stock: { type: "i32" },
+  });
+  const data = [
+    { name: "Apple",   price: 1200, cat: "fruit",  stock: 100 },
+    { name: "Banana",  price: 800,  cat: "fruit",  stock: 50  },
+    { name: "Carrot",  price: 500,  cat: "veggie", stock: 200 },
+    { name: "Daikon",  price: 300,  cat: "veggie", stock: 80  },
+    { name: "Egg",     price: 200,  cat: "dairy",  stock: 500 },
+    { name: "Figs",    price: 3000, cat: "fruit",  stock: 20  },
+    { name: "Grape",   price: 2500, cat: "fruit",  stock: 30  },
+  ];
+  orm.bulkInsert("products", data);
+  return orm;
+}
+
+test("단순 filter (=)", () => {
+  const orm = productORM();
+  const fruits = orm.where("products", "cat", "=", "fruit");
+  eq(fruits.length, 4);
+  assert(fruits.every((r) => r.cat === "fruit"));
+});
+
+test("filter > 범위", () => {
+  const orm = productORM();
+  const expensive = orm.where("products", "price", ">", 2000);
+  eq(expensive.length, 2);
+});
+
+test("filter <= 범위", () => {
+  const orm = productORM();
+  const cheap = orm.where("products", "price", "<=", 500);
+  eq(cheap.length, 3);
+});
+
+test("filter != 제외", () => {
+  const orm = productORM();
+  const notFruit = orm.where("products", "cat", "!=", "fruit");
+  eq(notFruit.length, 3);
+});
+
+test("filter like 문자열 포함", () => {
+  const orm = productORM();
+  const rows = orm.where("products", "name", "like", "a"); // Apple, Banana, Daikon, Grape
+  assert(rows.length >= 3);
+});
+
+test("order asc 정렬", () => {
+  const orm = productORM();
+  let q = orm.query("products");
+  q = orm.orderBy(q, "price", "asc");
+  const rows = orm.exec(q);
+  for (let i = 1; i < rows.length; i++) {
+    assert(rows[i - 1].price <= rows[i].price);
+  }
+});
+
+test("order desc + limit", () => {
+  const orm = productORM();
+  let q = orm.query("products");
+  q = orm.orderBy(q, "price", "desc");
+  q = orm.limit(q, 3);
+  const rows = orm.exec(q);
+  eq(rows.length, 3);
+  eq(rows[0].name, "Figs"); // 가장 비쌈
+});
+
+test("offset + limit 페이징", () => {
+  const orm = productORM();
+  let q = orm.query("products");
+  q = orm.orderBy(q, "id", "asc");
+  q = orm.offset(q, 2);
+  q = orm.limit(q, 3);
+  const rows = orm.exec(q);
+  eq(rows.length, 3);
+  eq(rows[0].id, 3);
+});
+
+// ============================================================
+// 7. JOIN (5 tests)
+// ============================================================
+section("7. JOIN");
+
+function joinORM() {
+  const orm = new ORMEngine();
+  orm.define("users",  { name: { type: "string" } });
+  orm.define("orders", { user_id: { type: "i32" }, product: { type: "string" }, amount: { type: "i32" } });
+  orm.insert("users",  { name: "Alice" });
+  orm.insert("users",  { name: "Bob" });
+  orm.insert("users",  { name: "Carol" }); // 주문 없음
+  orm.insert("orders", { user_id: 1, product: "A", amount: 5000 });
+  orm.insert("orders", { user_id: 1, product: "B", amount: 3000 });
+  orm.insert("orders", { user_id: 2, product: "C", amount: 8000 });
+  return orm;
+}
+
+test("INNER JOIN 행 수", () => {
+  const orm = joinORM();
+  const rows = orm.join("orders", "users", "user_id", "id");
+  eq(rows.length, 3);
+});
+
+test("INNER JOIN 필드 병합 prefix", () => {
+  const orm = joinORM();
+  const rows = orm.join("orders", "users", "user_id", "id");
+  assert(rows.every((r) => "users__name" in r));
+});
+
+test("INNER JOIN Alice 주문 2건", () => {
+  const orm = joinORM();
+  const rows = orm.join("orders", "users", "user_id", "id");
+  eq(rows.filter((r) => r["users__name"] === "Alice").length, 2);
+});
+
+test("LEFT JOIN Carol 포함 (주문 없는 유저)", () => {
+  const orm = joinORM();
+  const rows = orm.leftJoin("users", "orders", "id", "user_id");
+  // Alice 2건, Bob 1건, Carol 1건(null)
+  const carols = rows.filter((r) => r.name === "Carol");
+  assert(carols.length >= 1);
+  // Carol의 orders 필드는 null
+  assert(carols[0]["orders__product"] === null || carols[0]["orders__product"] === undefined);
+});
+
+test("LEFT JOIN 행 수 >= INNER JOIN", () => {
+  const orm = joinORM();
+  const inner = orm.join("orders", "users", "user_id", "id");
+  const left  = orm.leftJoin("users", "orders", "id", "user_id");
+  assert(left.length >= inner.length);
+});
+
+// ============================================================
+// 8. Eager Loading / N+1 방지 (5 tests)
+// ============================================================
+section("8. Eager Loading / N+1");
+
+function relORM() {
+  const orm = new ORMEngine();
+  orm.define("authors", { name: { type: "string" } });
+  orm.define("books",   { title: { type: "string" }, author_id: { type: "i32" } });
+  orm.define("tags",    { book_id: { type: "i32" }, label: { type: "string" } });
+  orm.insert("authors", { name: "Alice" });
+  orm.insert("authors", { name: "Bob" });
+  orm.insert("books",   { title: "Book A", author_id: 1 });
+  orm.insert("books",   { title: "Book B", author_id: 1 });
+  orm.insert("books",   { title: "Book C", author_id: 2 });
+  orm.insert("tags",    { book_id: 1, label: "fiction" });
+  orm.insert("tags",    { book_id: 1, label: "scifi" });
+  orm.insert("tags",    { book_id: 3, label: "nonfiction" });
+  orm.belongsTo("books", "authors", "author_id", "author");
+  orm.hasMany("authors", "books", "author_id", "books");
+  orm.hasMany("books", "tags", "book_id", "tags");
+  return orm;
+}
+
+test("belongs_to eager load — author 필드 존재", () => {
+  const orm = relORM();
+  const loaded = orm.eagerLoad(orm.findAll("books"), "author");
+  assert(loaded.every((r) => "author" in r));
+});
+
+test("belongs_to — 올바른 저자 매칭", () => {
+  const orm = relORM();
+  const loaded = orm.eagerLoad(orm.findAll("books"), "author");
+  const bookA = loaded.find((r) => r.title === "Book A")!;
+  eq(bookA.author.name, "Alice");
+});
+
+test("has_many — Alice 책 2권", () => {
+  const orm = relORM();
+  const loaded = orm.eagerLoad(orm.findAll("authors"), "books");
+  const alice = loaded.find((r) => r.name === "Alice")!;
+  eq(alice.books.length, 2);
+});
+
+test("has_many — 관계 없는 경우 빈 배열", () => {
+  const orm = relORM();
+  const loaded = orm.eagerLoad(orm.findAll("books"), "tags");
+  const bookB = loaded.find((r) => r.title === "Book B")!;
+  eq(bookB.tags, []);
+});
+
+test("batchLoad — IN 쿼리 정확성", () => {
+  const orm = relORM();
+  const rows = orm.batchLoad("books", "author_id", [1, 2]);
+  eq(rows.length, 3);
+});
+
+// ============================================================
+// 9. 트랜잭션 (8 tests)
+// ============================================================
+section("9. 트랜잭션");
+
+test("begin/commit — 변경 확정", () => {
+  const orm = userORM();
+  seedUsers(orm, 2);
+  orm.begin();
+  orm.insert("users", { name: "TxUser", age: 99, email: "tx@t.com", score: 0.0 });
+  orm.commit();
+  eq(orm.count("users"), 3); // 커밋 후 반영
+});
+
+test("begin/rollback — INSERT 취소", () => {
+  const orm = userORM();
+  seedUsers(orm, 2);
+  orm.begin();
+  orm.insert("users", { name: "TxUser", age: 99, email: "tx@t.com", score: 0.0 });
+  eq(orm.count("users"), 3); // 트랜잭션 중
+  orm.rollback();
+  eq(orm.count("users"), 2); // 롤백 후 원복
+});
+
+test("rollback — UPDATE 취소", () => {
+  const orm = userORM();
+  seedUsers(orm, 1);
+  orm.begin();
+  orm.update("users", 1, { name: "CHANGED" });
+  orm.rollback();
+  eq(orm.findById("users", 1)!.name, "User1");
+});
+
+test("rollback — DELETE 취소", () => {
+  const orm = userORM();
+  seedUsers(orm, 3);
+  orm.begin();
+  orm.delete("users", 2);
+  eq(orm.count("users"), 2);
+  orm.rollback();
+  eq(orm.count("users"), 3);
+  assert(orm.findById("users", 2) !== null);
+});
+
+test("commit 후 isInTransaction = false", () => {
+  const orm = userORM();
+  orm.begin();
+  assert(orm.isInTransaction);
+  orm.commit();
+  assert(!orm.isInTransaction);
+});
+
+test("rollback 후 isInTransaction = false", () => {
+  const orm = userORM();
+  orm.begin();
+  orm.rollback();
+  assert(!orm.isInTransaction);
+});
+
+test("중복 begin 에러", () => {
+  const orm = userORM();
+  orm.begin();
+  let threw = false;
+  try { orm.begin(); } catch { threw = true; }
+  orm.rollback();
+  assert(threw);
+});
+
+test("트랜잭션 없이 commit 에러", () => {
+  const orm = userORM();
+  let threw = false;
+  try { orm.commit(); } catch { threw = true; }
+  assert(threw);
+});
+
+// ============================================================
+// 10. Bulk Insert + Truncate (3 tests)
+// ============================================================
+section("10. Bulk Insert / Truncate");
+
+test("bulkInsert 개수 정확성", () => {
+  const orm = userORM();
+  const records = Array.from({ length: 100 }, (_, i) => ({
+    name: `U${i}`, age: 20 + (i % 50), email: `u${i}@t.com`, score: i * 0.1,
+  }));
+  orm.bulkInsert("users", records);
+  eq(orm.count("users"), 100);
+});
+
+test("bulkInsert ID 연속성", () => {
+  const orm = userORM();
+  const records = Array.from({ length: 5 }, (_, i) => ({
+    name: `U${i}`, age: 20, email: `u${i}@t.com`, score: 0.0,
+  }));
+  const rows = orm.bulkInsert("users", records);
+  eq(rows.map((r) => r.id), [1, 2, 3, 4, 5]);
+});
+
+test("truncate 후 count=0, autoId 재시작", () => {
+  const orm = userORM();
+  seedUsers(orm, 5);
+  orm.truncate("users");
+  eq(orm.count("users"), 0);
+  const row = orm.insert("users", { name: "Fresh", age: 1, email: "f@t.com", score: 0.0 });
+  eq(row.id, 1);
+});
+
+// ============================================================
+// 11. ORM Factory Namespace (Phase 3.1 - 새 API)
+// ============================================================
+section("11. ORM Factory Namespace (Phase 3.1)");
+
+test("ORM.create() — 새로운 인스턴스 생성", () => {
+  const orm1 = ORM.create();
+  const orm2 = ORM.create();
+  assert(orm1 !== orm2, "각 호출마다 새로운 인스턴스여야 함");
+  assert(orm1 instanceof ORMEngine);
+  assert(orm2 instanceof ORMEngine);
+});
+
+test("ORM.create() — 독립적인 데이터", () => {
+  const orm1 = ORM.create();
+  const orm2 = ORM.create();
+  orm1.define("test", { value: { type: "i32" } });
+  assert(orm1.tableNames().length === 1);
+  assert(orm2.tableNames().length === 0, "orm2는 orm1의 테이블을 갖지 않아야 함");
+});
+
+test("ORM namespace 객체 존재 확인", () => {
+  assert(typeof ORM === "object");
+  assert(ORM.create !== undefined);
+  assert(typeof ORM.create === "function");
+});
+
+// ============================================================
+// 결과
+// ============================================================
+
+const total = passed + failed;
+console.log(`\n${"=".repeat(55)}`);
+console.log(`테스트 결과: ${passed}/${total} 통과`);
+if (failed > 0) {
+  console.log(`\n실패 목록:`);
+  failures.forEach((f) => console.log(`  - ${f}`));
+  process.exit(1);
+} else {
+  console.log("모든 테스트 통과! ✓");
+}

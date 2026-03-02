@@ -1,0 +1,517 @@
+# Phase 14 v15.2: 조건부 분기와 백필링
+
+## 🎯 설계 철학
+
+**"미래의 주소 확정"**
+
+지금까지의 바이트코드는 **선형(Linear)**이었습니다.
+이제 우리는 **비선형(Non-linear)** 실행 흐름을 만들어야 합니다.
+
+```
+선형 (v15.1):
+  0000 OpConstant 0
+  0003 OpConstant 1
+  0006 OpAdd
+  0007 OpReturn
+
+비선형 (v15.2):
+  0000 OpConstant 0       (조건식)
+  0003 OpJumpNotTruthy 7  ← 거짓이면 7번지로 점프
+  0006 OpPop              (참 블록)
+  0007 OpConstant 1       ← 거짓 블록 시작 (점프 대상)
+  0010 OpReturn
+```
+
+**문제**: 컴파일러가 코드를 생성하는 시점에, 점프할 주소를 모릅니다.
+
+```
+compile_if_expression():
+  1. 조건식 컴파일
+  2. OpJumpNotTruthy 명령어 내보내기
+     → 점프할 주소는? 아직 모름!
+  3. 참 블록 컴파일
+  4. 이제 주소를 알았으니 뒤돌아가 수정 ← 백필링!
+```
+
+**해결**: **백필링(Backfilling/Patching)** - 나중에 돌아가서 수정
+
+---
+
+## 📌 핵심 개념
+
+### 1. Jump Instruction 확장
+
+```rust
+pub enum OpCode {
+    // 기존
+    OpConstant,
+    OpAdd, OpSubtract, OpMultiply, OpDivide,
+    OpEqual, OpNotEqual, OpGreaterThan, OpLessThan,
+    OpLessThanOrEqual, OpGreaterThanOrEqual,
+    OpNot,
+    OpReturn,
+    OpPop,
+
+    // 새로 추가 (v15.2)
+    OpJump,            // 무조건 점프
+    OpJumpNotTruthy,   // 스택 탑이 거짓이면 점프
+}
+```
+
+**OpCode 값**:
+```
+OpJump = 0x0E
+OpJumpNotTruthy = 0x0F
+```
+
+### 2. 백필링 메커니즘
+
+**핵심 메서드**:
+
+```rust
+impl Compiler {
+    /// 명령어를 내보내고 시작 위치 반환
+    fn emit(&mut self, op: OpCode, operands: &[u16]) -> usize
+
+    /// 이미 내보낸 명령어의 피연산자를 수정
+    fn change_operand(&mut self, pos: usize, operand: u16)
+
+    /// 점프하지 않는 위치 기록 (스택)
+    fn emit_jump_placeholder(&mut self) -> usize
+}
+```
+
+**백필링 흐름**:
+
+```
+① emit(OpJumpNotTruthy, [0, 0])  ← 임시 주소 (0x0000)
+   ↓ 반환: 명령어 시작 위치 (예: 3)
+
+② compile(consequence)           ← 참 블록 컴파일
+   ↓ 명령어 3개 추가됨
+
+③ current_pos = instructions.len()  ← 현재 위치 (예: 15)
+
+④ change_operand(3, 15)          ← 위치 3의 피연산자를 15로 수정
+   ↓ instructions[4..6] = 15.to_be_bytes()
+```
+
+### 3. 조건문 컴파일
+
+```rust
+fn compile_if_expression(&mut self, node: IfExpression) {
+    // 1. 조건식 컴파일 (결과 = 스택의 탑)
+    self.compile(&node.condition)?;
+
+    // 2. 거짓이면 점프 (목표: 아직 모름)
+    let jump_not_truthy_pos = self.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+    //                                               ↑ 임시값
+    //                                               백필링 대상!
+
+    // 3. 참 블록 컴파일
+    self.compile_statements(&node.consequence)?;
+
+    // 4. 참 블록이 끝났으니 주소 확정
+    let after_consequence_pos = self.instructions.len();
+
+    // 5. [백필링 핵심] 뒤돌아가서 수정!
+    self.change_operand(jump_not_truthy_pos, after_consequence_pos as u16);
+
+    // 6. else 블록 처리 (있으면)
+    if let Some(alternative) = &node.alternative {
+        // else로 점프
+        let jump_pos = self.emit(OpCode::OpJump, &[0, 0]);
+        self.compile_statements(alternative)?;
+        self.change_operand(jump_pos, self.instructions.len() as u16);
+    } else {
+        // else 없으면 null 푸시
+        self.emit(OpCode::OpConstant, &[/* null_index */ 0]);
+    }
+}
+```
+
+### 4. 루프 컴파일 (While)
+
+루프는 **후방 점프(Backward Jump)**를 사용:
+
+```rust
+fn compile_while_expression(&mut self, node: WhileExpression) {
+    // 1. 루프 시작 위치 기록
+    let loop_start = self.instructions.len();
+
+    // 2. 조건식 컴파일
+    self.compile(&node.condition)?;
+
+    // 3. 거짓이면 루프 탈출 (목표: 아직 모름)
+    let exit_jump_pos = self.emit(OpCode::OpJumpNotTruthy, &[0, 0]);
+
+    // 4. 루프 본체 컴파일
+    self.compile_statements(&node.body)?;
+
+    // 5. 루프 시작으로 돌아가기 (후방 점프)
+    //    ← 이곳은 백필링 필요 없음 (이미 알고 있음!)
+    self.emit(OpCode::OpJump, &[loop_start as u16]);
+
+    // 6. 루프 탈출 위치 확정 (전방 백필링)
+    let after_loop_pos = self.instructions.len();
+    self.change_operand(exit_jump_pos, after_loop_pos as u16);
+}
+```
+
+### 5. Change Operand 구현
+
+핵심 기술 - 이미 내보낸 명령어를 수정:
+
+```rust
+fn change_operand(&mut self, pos: usize, operand: u16) {
+    // pos: 수정할 OpCode의 위치
+    // operand: 새로운 u16 값
+
+    // OpCode는 1바이트, 피연산자는 2바이트 (big-endian)
+    // 구조: [OpCode, operand_hi, operand_lo]
+    //       pos    pos+1    pos+2
+
+    let bytes = operand.to_be_bytes(); // Big-Endian 변환
+    self.instructions[pos + 1] = bytes[0];
+    self.instructions[pos + 2] = bytes[1];
+}
+```
+
+**예시**:
+
+```
+변경 전:
+  [3] = 0x0F (OpJumpNotTruthy)
+  [4] = 0x00 (임시 값)
+  [5] = 0x00 (임시 값)
+
+change_operand(3, 15):
+  15.to_be_bytes() = [0x00, 0x0F]
+
+변경 후:
+  [3] = 0x0F (OpJumpNotTruthy)
+  [4] = 0x00 (수정됨)
+  [5] = 0x0F (수정됨)
+```
+
+---
+
+## 🔄 컴파일 흐름 (예제)
+
+### 예제 1: 단순 if
+
+```
+코드:
+  if (5 > 3) {
+    10
+  } else {
+    20
+  }
+
+컴파일 과정:
+
+Step 1. 조건식 (5 > 3)
+  0000 OpConstant 0   (5)
+  0003 OpConstant 1   (3)
+  0006 OpGreaterThan
+
+Step 2. 거짓 점프 명령 내보내기
+  0007 OpJumpNotTruthy [0, 0]  ← 위치 7, 피연산자 임시
+  ↓ jump_not_truthy_pos = 7
+
+Step 3. 참 블록 (10)
+  0010 OpConstant 2   (10)
+  0013 OpPop          ← 참 블록 끝
+
+Step 4. 참 블록 끝났으니 백필링
+  after_consequence_pos = 14
+  change_operand(7, 14)
+  ↓ instructions[8..10] = 14.to_be_bytes()
+
+Step 5. else로 점프
+  0014 OpJump [0, 0]  ← 위치 14
+  ↓ jump_pos = 14
+
+Step 6. 거짓 블록 (20)
+  0017 OpConstant 3   (20)
+  0020 OpPop          ← 거짓 블록 끝
+
+Step 7. 거짓 블록 끝났으니 백필링
+  after_alternative_pos = 21
+  change_operand(14, 21)
+
+최종 바이트코드:
+  0000 OpConstant 0   (5)
+  0003 OpConstant 1   (3)
+  0006 OpGreaterThan
+  0007 OpJumpNotTruthy 14  ← 수정됨! (원래 [0,0])
+  0010 OpConstant 2   (10)
+  0013 OpPop
+  0014 OpJump 21       ← 수정됨! (원래 [0,0])
+  0017 OpConstant 3   (20)
+  0020 OpPop
+  0021 OpReturn
+```
+
+### 예제 2: 중첩 if
+
+```
+코드:
+  if (x > 0) {
+    if (y > 0) {
+      "both positive"
+    }
+  }
+
+컴파일 스택:
+  - if (x > 0) {
+      jump_not_truthy_pos_1 = 7
+    - if (y > 0) {
+        jump_not_truthy_pos_2 = 14
+      }
+      change_operand(14, ...)  ← 안쪽 if 먼저 닫음
+  }
+  change_operand(7, ...)       ← 바깥쪽 if 나중에 닫음
+
+특징: 백필링은 재귀적으로 작동
+```
+
+### 예제 3: While 루프
+
+```
+코드:
+  while (i < 10) {
+    i = i + 1
+  }
+
+컴파일:
+
+Step 1. 루프 시작 위치 기록
+  loop_start = 0
+
+Step 2. 조건식 (i < 10)
+  0000 OpGetLocal 0    (i)
+  0003 OpConstant 0    (10)
+  0006 OpLessThan
+
+Step 3. 루프 탈출 점프 (거짓이면 나감)
+  0007 OpJumpNotTruthy [0, 0]  ← 위치 7
+  ↓ exit_jump_pos = 7
+
+Step 4. 루프 본체
+  0010 OpGetLocal 0    (i)
+  0013 OpConstant 1    (1)
+  0016 OpAdd
+  0017 OpSetLocal 0    (i = ...)
+
+Step 5. 루프 처음으로 돌아가기 (후방 점프)
+  0018 OpJump 0        ← loop_start 사용 (이미 알고 있음!)
+
+Step 6. 루프 탈출 위치 확정
+  after_loop_pos = 21
+  change_operand(7, 21)
+
+최종 바이트코드:
+  0000 OpGetLocal 0
+  0003 OpConstant 0    (10)
+  0006 OpLessThan
+  0007 OpJumpNotTruthy 21  ← 수정됨!
+  0010 OpGetLocal 0
+  0013 OpConstant 1
+  0016 OpAdd
+  0017 OpSetLocal 0
+  0018 OpJump 0        ← 후방 점프 (원본 루프 시작)
+  0021 OpReturn
+```
+
+---
+
+## 📊 Compiler 상태 관리
+
+```rust
+pub struct Compiler {
+    instructions: Vec<u8>,
+    constants: Vec<CompileObject>,
+
+    // 점프 위치 스택 (백필링용)
+    scopes: Vec<CompilationScope>,
+    scope_index: usize,
+}
+
+pub struct CompilationScope {
+    instructions: Vec<u8>,
+    last_instruction: EmittedInstruction,
+    previous_instruction: EmittedInstruction,
+
+    // v15.2: 백필링 메타데이터
+    jump_patches: Vec<JumpPatch>,  // 수정할 점프 위치 목록
+}
+
+pub struct JumpPatch {
+    position: usize,          // 수정할 명령어 위치
+    target_type: JumpType,    // 전방/후방
+}
+
+pub enum JumpType {
+    Forward,   // if/else: 미래 주소 기다려야 함
+    Backward,  // while: 과거 주소 이미 알고 있음
+}
+```
+
+---
+
+## 🧪 테스트 케이스
+
+### 1. 단순 조건문
+
+```
+코드: if true { 10 }
+검증: 바이트코드에 OpJumpNotTruthy 포함
+     true는 skip되지 않음
+```
+
+### 2. 거짓 조건
+
+```
+코드: if false { 10 } else { 20 }
+검증: false이므로 else로 점프
+```
+
+### 3. 중첩 if
+
+```
+코드: if (1 > 0) { if (2 > 1) { 100 } }
+검증: 2개의 OpJumpNotTruthy, 2개의 백필링
+```
+
+### 4. while 루프
+
+```
+코드: while (true) { break }  ← 실무는 VM이 처리
+검증: OpJumpNotTruthy 0 (루프 처음으로)
+```
+
+### 5. 백필링 정확성
+
+```
+코드: if cond { consequence }
+검증:
+  - OpJumpNotTruthy 명령 위치 = 점프 시작
+  - 피연산자 = consequence 끝 위치
+  - consequence 코드가 건너뛰어짐
+```
+
+### 6. 점프 거리 계산
+
+```
+코드: if (expr) { long_body }
+검증: 점프 거리 정확성 (오버플로우 없음)
+```
+
+### 7. 다중 분기
+
+```
+코드:
+  if a { } else if b { } else { }
+검증: 3개의 점프, 모두 올바른 위치로
+```
+
+### 8. 조건문 + 루프
+
+```
+코드: while cond { if inner { x } }
+검증: 후방/전방 점프 혼합
+```
+
+### 9. 상대 주소
+
+```
+코드: jump 거리 계산
+검증: 절대 주소 vs 상대 주소
+     현재 구현은 절대 주소 사용
+```
+
+### 10. 점프 최적화
+
+```
+코드: if true { ... }
+검증: Dead code elimination 가능
+     점프 자체를 제거할 수 있음
+```
+
+---
+
+## 💡 핵심 설계 철학
+
+> **"두 번의 패스(Two-Pass Compilation)"**
+>
+> 첫 번째 패스:
+> - 조건식 컴파일
+> - 점프 명령어 내보내기 (주소는 임시값)
+>
+> 두 번째 패스:
+> - 분기 컴파일 (실제 크기 결정)
+> - 임시 주소를 실제 주소로 교체 (백필링)
+
+---
+
+## 📈 성능 특성
+
+| 항목 | 성능 |
+|------|------|
+| 점프 오버헤드 | O(1) |
+| 백필링 오버헤드 | O(1) |
+| 메모리 사용 | 상수 추가 |
+| 컴파일 속도 | 거의 변화 없음 |
+
+---
+
+## 🎓 교육적 가치
+
+1. **컴파일러 설계**: 두 번의 패스 개념 이해
+2. **메모리 관리**: 버퍼 수정의 안전성
+3. **주소 계산**: 바이트 레벨 오프셋 관리
+4. **제어 흐름**: 비선형 실행의 구현
+5. **백트래킹**: 이미 생성된 코드 수정
+
+---
+
+## 🔗 파이프라인 진화
+
+```
+v15.1 (선형):
+  Source → Lexer → Parser → AST → Compiler → Bytecode (선형)
+                                    ↓
+                                선형 명령어만 생성
+
+v15.2 (비선형):
+  Source → Lexer → Parser → AST → Compiler → Bytecode (비선형)
+                                    ↓
+                                조건/루프 지원
+                                ↓
+                                백필링으로 점프 구현
+```
+
+---
+
+## 🚀 다음 단계
+
+v15.3: 가비지 컬렉션 기초
+- 메모리 할당/해제
+- 마크 & 스윕 알고리즘
+- 제너레이셔널 GC
+
+---
+
+**설계 완료 상태:**
+
+- ✅ OpJump, OpJumpNotTruthy 추가
+- ✅ change_operand() 메서드
+- ✅ compile_if_expression() 백필링
+- ✅ compile_while_expression() 후방 점프
+- ✅ 다중 분기 처리
+- ✅ 중첩 조건문
+- ✅ 점프 주소 계산
+- ✅ 상대/절대 주소 선택
+
+**저장 필수: 너는 기록이 증명이다. gogs**

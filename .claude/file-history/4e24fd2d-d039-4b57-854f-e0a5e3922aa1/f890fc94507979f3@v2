@@ -1,0 +1,685 @@
+# 🎓 Go 201-2-4: 고루틴 생명주기 제어 - Context와 WaitGroup
+
+> **전공 201: 고성능 병행 시스템 및 분산 아키텍처**
+>
+> 저자: Claude Haiku 4.5
+> 수준: 대학원 고급 (시스템 아키텍트 수준)
+> 이전 학습: Go 201-2-3 Mutex와 Atomic 완료
+
+---
+
+## 🎯 핵심 철학
+
+```
+고루틴 = 일꾼
+종료 신호 = 작업 중단 신호
+
+고루틴을 시작했으면, 반드시 종료해야 합니다.
+종료되지 않은 고루틴은 좀비처럼 메모리를 잠식합니다.
+
+이를 '고루틴 누수(Goroutine Leak)'라고 합니다.
+```
+
+**고루틴 누수의 위험:**
+```
+메모리 누적 → 응답 지연 → OOM(Out of Memory) → 서버 다운
+대학원/실무 코드 리뷰에서 가장 흔한 탈락 사유
+```
+
+---
+
+## 📚 학습 목표
+
+이 레슨을 마치면 다음을 이해하게 됩니다:
+
+1. **WaitGroup**: 여러 고루틴의 완료 대기
+2. **Context**: 고루틴 라이프사이클 제어
+3. **타임아웃**: 시간 제한으로 무한 대기 방지
+4. **취소 신호**: 트리 구조로 모든 하위 고루틴에 전파
+5. **고루틴 누수**: 원인 파악 및 방지
+6. **메타데이터**: Context를 통한 요청 정보 전달
+
+---
+
+## 1️⃣ sync.WaitGroup: 모두 끝날 때까지 기다려라
+
+### 📋 기본 개념
+
+```
+WaitGroup = "모두 끝날 때까지 기다리는 개찰구"
+
+카운터: 활성 고루틴 수
+Add(n): 카운터에 n 추가
+Done(): 카운터에서 1 감소
+Wait(): 카운터가 0이 될 때까지 블로킹
+```
+
+### 🔧 기본 사용법
+
+```go
+import "sync"
+
+var wg sync.WaitGroup
+
+// 패턴 1: 기본 사용
+for i := 0; i < 3; i++ {
+    wg.Add(1)  // "일꾼 1명이 추가됨" 신호
+    go func(id int) {
+        defer wg.Done()  // "작업 완료" 신호
+        fmt.Printf("고루틴 %d: 작업 중...\n", id)
+        time.Sleep(100 * time.Millisecond)
+    }(i)
+}
+
+wg.Wait()  // 모든 고루틴이 Done()을 호출할 때까지 대기
+fmt.Println("모든 작업 완료!")
+```
+
+### 📊 실행 흐름 시각화
+
+```
+시간 →
+
+main():
+├─ wg.Add(1)                    고루틴1 시작
+├─ go func() {...}(0)
+│
+├─ wg.Add(1)                    고루틴2 시작
+├─ go func() {...}(1)
+│
+├─ wg.Add(1)                    고루틴3 시작
+├─ go func() {...}(2)
+│
+└─ wg.Wait()                    여기서 대기 ⏸️
+   │ (고루틴 1,2,3 중 하나라도 Done() 호출하면 카운터 -1)
+   │ (카운터가 0이 되면 Wait() 해제)
+   └─ continue 🎉
+
+고루틴1: defer wg.Done()        카운터 3→2
+고루틴2: defer wg.Done()        카운터 2→1
+고루틴3: defer wg.Done()        카운터 1→0 → Wait() 해제!
+```
+
+### ⚠️ WaitGroup 오용: Race Condition
+
+**위험한 패턴 1: Add()를 고루틴 내부에서 호출**
+```go
+// ❌ WRONG - Race Condition!
+for i := 0; i < 3; i++ {
+    go func(id int) {
+        wg.Add(1)        // 위험: 경쟁 상태 발생!
+        defer wg.Done()
+        // 작업...
+    }(i)
+}
+wg.Wait()
+
+// main에서 Wait() 호출
+// 고루틴이 아직 Add(1)을 실행하지 않았는데 Wait() 해제될 수 있음
+```
+
+**올바른 패턴: Add()는 고루틴 생성 직전에**
+```go
+// ✓ CORRECT
+for i := 0; i < 3; i++ {
+    wg.Add(1)  // 고루틴 생성 전에 반드시 실행
+    go func(id int) {
+        defer wg.Done()
+        // 작업...
+    }(i)
+}
+wg.Wait()
+```
+
+### 📊 벤치마크: WaitGroup 성능
+
+```
+고루틴 1,000개 동시 시작 및 완료 대기
+
+시간: ~50ms
+메모리: ~2MB (고루틴 당 ~2KB)
+```
+
+---
+
+## 2️⃣ Context: 이제 그만하고 철수하라
+
+### 📋 개념
+
+```
+Context = "요청의 맥락" + "종료 신호 전달 채널"
+
+특징:
+- 트리 구조 (부모 → 자식 계층)
+- 취소 신호 전파 (위에서 아래로)
+- 타임아웃 자동 처리
+- 메타데이터 포함
+```
+
+### 🏗️ Context 종류
+
+```
+context.Background()
+└─ 루트 Context (모든 Context의 부모)
+
+WithCancel(parent)
+└─ cancel() 함수로 수동 취소
+
+WithTimeout(parent, duration)
+└─ 일정 시간 후 자동 취소
+
+WithDeadline(parent, time)
+└─ 특정 시점까지 유효
+
+WithValue(parent, key, value)
+└─ 메타데이터 저장 (읽기 전용)
+```
+
+### 🔧 WithCancel: 수동 취소
+
+```go
+import "context"
+
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()  // 중요: 리소스 정리
+
+go func(ctx context.Context) {
+    select {
+    case <-time.After(2 * time.Second):
+        fmt.Println("작업 완료")
+    case <-ctx.Done():
+        fmt.Printf("취소됨: %v\n", ctx.Err())  // context canceled
+    }
+}(ctx)
+
+// 1초 후 취소
+time.Sleep(1 * time.Second)
+cancel()  // 모든 하위 Context에 취소 신호 전파
+
+time.Sleep(2 * time.Second)
+```
+
+### ⏱️ WithTimeout: 자동 타임아웃
+
+```go
+ctx, cancel := context.WithTimeout(
+    context.Background(),
+    2 * time.Second,  // 2초 후 자동 취소
+)
+defer cancel()
+
+go func(ctx context.Context) {
+    select {
+    case <-time.After(5 * time.Second):
+        fmt.Println("작업 완료")
+    case <-ctx.Done():
+        fmt.Printf("타임아웃: %v\n", ctx.Err())  // context deadline exceeded
+    }
+}(ctx)
+
+time.Sleep(3 * time.Second)
+```
+
+### 📅 WithDeadline: 특정 시점
+
+```go
+deadline := time.Now().Add(2 * time.Second)
+ctx, cancel := context.WithDeadline(context.Background(), deadline)
+defer cancel()
+
+go func(ctx context.Context) {
+    select {
+    case <-time.After(5 * time.Second):
+        fmt.Println("작업 완료")
+    case <-ctx.Done():
+        fmt.Printf("기한 초과: %v\n", ctx.Err())
+    }
+}(ctx)
+
+time.Sleep(3 * time.Second)
+```
+
+### 💾 WithValue: 메타데이터
+
+```go
+type RequestID string
+const requestIDKey RequestID = "requestID"
+
+// 메타데이터 추가
+ctx := context.WithValue(context.Background(), requestIDKey, "req-12345")
+ctx = context.WithValue(ctx, "userID", 42)
+
+// 하위 함수에서 조회
+func doWork(ctx context.Context) {
+    requestID := ctx.Value(requestIDKey).(string)
+    userID := ctx.Value("userID").(int)
+
+    fmt.Printf("요청 ID: %s, 사용자: %d\n", requestID, userID)
+}
+
+doWork(ctx)
+```
+
+### 🌳 Context 트리: 취소 신호 전파
+
+```
+Background (루트)
+    ├─ ctx1 (WithTimeout 2s)
+    │   ├─ ctx1-1 (자식)
+    │   ├─ ctx1-2 (자식)
+    │   └─ ctx1-3 (자식)
+    │       └─ ctx1-3-1 (손자)
+    │
+    ├─ ctx2 (WithCancel)
+    │   ├─ ctx2-1 (자식)
+    │   └─ ctx2-2 (자식)
+    │
+
+cancel(ctx1) 호출
+→ ctx1, ctx1-1, ctx1-2, ctx1-3, ctx1-3-1 모두에 취소 신호 전파!
+→ 계층 구조의 모든 하위 Context 영향받음
+```
+
+---
+
+## 3️⃣ 고루틴 누수(Goroutine Leak): 원인과 해결
+
+### 🔴 누수 원인 1: 채널 대기
+
+```go
+// ❌ 위험: 고루틴 누수!
+func leakyWorker(jobs <-chan int) {
+    for job := range jobs {
+        fmt.Printf("작업 %d 처리\n", job)
+    }
+    // jobs 채널이 닫히지 않으면 여기서 영원히 대기
+}
+
+for i := 0; i < 1000; i++ {
+    go leakyWorker(jobs)
+}
+// jobs 채널을 닫지 않으면 1,000개 고루틴이 메모리에 남음!
+```
+
+**해결: 채널 명시적 종료**
+```go
+// ✓ 올바름
+for i := 0; i < 1000; i++ {
+    go leakyWorker(jobs)
+}
+close(jobs)  // 모든 고루틴이 for range 루프 종료
+time.Sleep(100 * time.Millisecond)  // 완료 대기
+```
+
+### 🔴 누수 원인 2: Context 미사용
+
+```go
+// ❌ 위험: 고루틴 누수!
+func backgroundWorker() {
+    for {
+        // ctx 없음 → 종료 신호 받을 수 없음
+        fmt.Println("작업 중...")
+        time.Sleep(1 * time.Second)
+    }
+}
+
+go backgroundWorker()
+// 프로그램이 종료되어도 고루틴이 계속 실행!
+```
+
+**해결: Context로 취소 신호 처리**
+```go
+// ✓ 올바름
+func backgroundWorker(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            fmt.Println("종료됨")
+            return  // 고루틴 종료!
+        default:
+            fmt.Println("작업 중...")
+            time.Sleep(1 * time.Second)
+        }
+    }
+}
+
+ctx, cancel := context.WithCancel(context.Background())
+go backgroundWorker(ctx)
+
+time.Sleep(3 * time.Second)
+cancel()  // 고루틴 종료 신호
+time.Sleep(100 * time.Millisecond)
+```
+
+### 🔴 누수 원인 3: WaitGroup 미사용
+
+```go
+// ❌ 위험: 고루틴 완료 미확인
+func spawnWorkers() {
+    for i := 0; i < 100; i++ {
+        go func(id int) {
+            fmt.Printf("고루틴 %d\n", id)
+            time.Sleep(100 * time.Millisecond)
+        }(i)
+    }
+    // 고루틴이 완료되지 않았는데 main 함수 종료!
+    // 프로그램 종료 시 고루틴도 강제 종료 (데이터 손실 가능)
+}
+```
+
+**해결: WaitGroup으로 완료 대기**
+```go
+// ✓ 올바름
+func spawnWorkers() {
+    var wg sync.WaitGroup
+
+    for i := 0; i < 100; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            fmt.Printf("고루틴 %d\n", id)
+            time.Sleep(100 * time.Millisecond)
+        }(i)
+    }
+
+    wg.Wait()  // 모든 고루틴 완료 대기
+}
+```
+
+### 📊 고루틴 누수 탐지
+
+```bash
+# 고루틴 개수 확인
+runtime.NumGoroutine()
+
+# 프로파일링
+import _ "net/http/pprof"
+go http.ListenAndServe(":6060", nil)
+
+# 브라우저에서 http://localhost:6060/debug/pprof/goroutine 접속
+```
+
+---
+
+## 4️⃣ 실전 패턴: 타임아웃 서버
+
+### 📋 HTTP 핸들러 with Context
+
+```go
+import "net/http"
+
+func heavyWorkHandler(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+    defer cancel()
+
+    result := make(chan string, 1)
+    go func() {
+        // 무거운 작업 (5초 걸림)
+        time.Sleep(5 * time.Second)
+        result <- "완료"
+    }()
+
+    select {
+    case res := <-result:
+        w.WriteHeader(http.StatusOK)
+        fmt.Fprintf(w, "결과: %s\n", res)
+    case <-ctx.Done():
+        w.WriteHeader(http.StatusGatewayTimeout)
+        fmt.Fprintf(w, "타임아웃\n")
+    }
+}
+
+http.HandleFunc("/work", heavyWorkHandler)
+http.ListenAndServe(":8080", nil)
+```
+
+### 🔗 Context 전파
+
+```go
+func parentTask(ctx context.Context) error {
+    ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+    defer cancel()
+
+    // 여러 자식 작업 동시 실행
+    var wg sync.WaitGroup
+    var mu sync.Mutex
+    var result []string
+
+    for i := 0; i < 5; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            if err := childTask(ctx, id); err == nil {
+                mu.Lock()
+                result = append(result, fmt.Sprintf("child-%d OK", id))
+                mu.Unlock()
+            }
+        }(i)
+    }
+
+    wg.Wait()
+    fmt.Printf("결과: %v\n", result)
+    return nil
+}
+
+func childTask(ctx context.Context, id int) error {
+    select {
+    case <-time.After(1 * time.Second):
+        fmt.Printf("Child %d: 완료\n", id)
+        return nil
+    case <-ctx.Done():
+        fmt.Printf("Child %d: 취소됨\n", id)
+        return ctx.Err()
+    }
+}
+```
+
+---
+
+## 5️⃣ Assignment 2-4: 생명주기 설계
+
+### 📝 Assignment 2-4-1: 타임아웃 서버
+
+**요구사항:**
+1. HTTP 핸들러에서 무거운 작업 수행
+2. 3초 타임아웃 제한
+3. Context를 통한 작업 강제 중단
+4. 타임아웃 시 "Timeout" 응답
+
+**구현 예:**
+```go
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+    defer cancel()
+
+    done := make(chan error, 1)
+    go func() {
+        // 무거운 작업: DB 쿼리, API 호출 등
+        time.Sleep(5 * time.Second)  // 5초 (타임아웃 초과)
+        done <- nil
+    }()
+
+    select {
+    case err := <-done:
+        w.WriteHeader(http.StatusOK)
+        fmt.Fprintf(w, "완료: %v\n", err)
+    case <-ctx.Done():
+        w.WriteHeader(http.StatusGatewayTimeout)
+        fmt.Fprintf(w, "Timeout\n")
+    }
+}
+```
+
+### 📝 Assignment 2-4-2: WaitGroup 오용 분석
+
+**위험한 패턴:**
+```go
+// ❌ Race Condition!
+for i := 0; i < 1000; i++ {
+    go func(id int) {
+        wg.Add(1)        // 위험
+        defer wg.Done()
+        // 작업...
+    }(i)
+}
+wg.Wait()
+
+// main 고루틴: wg.Wait() 호출
+// go 고루틴들: wg.Add(1) 아직 미실행
+// → Wait() 해제, 고루틴이 Add(1) 실행 중 프로그램 종료!
+```
+
+**왜 위험한가:**
+1. 경쟁 상태 발생 가능
+2. Wait() 호출 시점과 Add(1) 실행 시점 불일치
+3. 고루틴이 완료되지 않은 상태로 프로그램 종료 가능
+4. 메모리 누수 또는 데이터 손상
+
+**올바른 패턴:**
+```go
+// ✓ 안전함
+for i := 0; i < 1000; i++ {
+    wg.Add(1)  // 고루틴 생성 전 카운터 증가
+    go func(id int) {
+        defer wg.Done()
+        // 작업...
+    }(i)
+}
+wg.Wait()  // 모든 카운터가 카운트된 후 대기
+```
+
+---
+
+## 6️⃣ 종합 패턴: Context + WaitGroup + Timeout
+
+```go
+func orchestrateWork(ctx context.Context) error {
+    // 타임아웃 추가
+    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+    defer cancel()
+
+    var wg sync.WaitGroup
+    errChan := make(chan error, 5)
+
+    // 5개의 병렬 작업 시작
+    for i := 0; i < 5; i++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+
+            select {
+            case <-time.After(2 * time.Second):
+                fmt.Printf("작업 %d 완료\n", id)
+                errChan <- nil
+            case <-ctx.Done():
+                fmt.Printf("작업 %d 취소: %v\n", id, ctx.Err())
+                errChan <- ctx.Err()
+            }
+        }(i)
+    }
+
+    // 모든 고루틴 완료 대기
+    go func() {
+        wg.Wait()
+        close(errChan)
+    }()
+
+    // 에러 수집
+    for err := range errChan {
+        if err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+```
+
+---
+
+## 7️⃣ 고급: Context를 활용한 로깅 추적
+
+```go
+type contextKey string
+
+const (
+    requestIDKey contextKey = "requestID"
+    userIDKey    contextKey = "userID"
+)
+
+func logWithContext(ctx context.Context, msg string) {
+    reqID := ctx.Value(requestIDKey).(string)
+    userID := ctx.Value(userIDKey).(int)
+    fmt.Printf("[%s] [User:%d] %s\n", reqID, userID, msg)
+}
+
+func main() {
+    ctx := context.Background()
+    ctx = context.WithValue(ctx, requestIDKey, "req-001")
+    ctx = context.WithValue(ctx, userIDKey, 42)
+
+    logWithContext(ctx, "작업 시작")
+    // 출력: [req-001] [User:42] 작업 시작
+}
+```
+
+---
+
+## 📊 성능 비교
+
+```
+시나리오: 고루틴 10,000개 × 1초 작업
+
+| 패턴 | 시간 | 메모리 | 안전성 |
+|-----|------|--------|--------|
+| 무기한 대기 | ∞ | 계속 증가 | ✗ 누수 |
+| WaitGroup | 1s | ~20MB | ✓ 안전 |
+| Context | 1s | ~20MB | ✓ 안전 + 취소 |
+| Context + Timeout | 1s | ~20MB | ✓ 안전 + 자동 취소 |
+```
+
+---
+
+## 🎓 학습 체크리스트
+
+- [ ] WaitGroup의 Add/Done/Wait 패턴 이해
+- [ ] Context의 4가지 종류 구분
+- [ ] 취소 신호의 트리 구조 이해
+- [ ] 고루틴 누수의 3가지 원인 인식
+- [ ] 타임아웃 서버 구현 가능
+- [ ] WaitGroup 오용 시 Race Condition 이해
+- [ ] Context를 통한 메타데이터 전달
+- [ ] 실전 패턴 (Context + WaitGroup + Timeout)
+
+---
+
+## 🚀 다음 Lesson 2-5 예고
+
+**[2-5: 리플렉션과 제네릭 - 유연한 코드의 극치]**
+
+```
+Go 201 과정의 대미를 장식할 주제입니다.
+
+- 리플렉션(Reflection): 런타임 타입 정보 조회
+- 제네릭(Generics): Go 1.18+ 타입 파라미터
+- 범용 시스템: 어떤 타입이든 처리 가능한 설계
+- 제약과 한계: 리플렉션의 성능 비용
+```
+
+---
+
+## 💡 핵심 요약
+
+```
+WaitGroup: 여러 고루틴의 완료를 기다리는 방법
+Context: 고루틴의 라이프사이클을 제어하는 방법
+
+모든 고루틴은 종료 조건을 가져야 합니다.
+Context.Done() 채널을 항상 모니터링하세요.
+고루틴 누수는 메모리 고갈로 이어집니다.
+
+단순함은 복잡함을 다스리는 궁극의 도구다.
+체계적인 생명주기 관리가 견고한 시스템을 만듭니다.
+
+Your record is your proof. (기록이 증명이다.)
+```

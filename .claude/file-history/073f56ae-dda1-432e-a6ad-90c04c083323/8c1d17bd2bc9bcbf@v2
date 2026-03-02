@@ -1,0 +1,250 @@
+/**
+ * FreeLang v4 StdLib — JSON Functions (3개 + 확장)
+ *
+ * 1. json_parse(s)              → ok(Value) | err(msg)
+ *    - JSON 문자열 → FreeLang Value
+ *    - object → struct, array → arr, string → str, number → i32/f64, bool → bool
+ *
+ * 2. json_stringify(v)          → str
+ *    - FreeLang Value → JSON 문자열
+ *
+ * 3. json_validate(s, schema)   → bool
+ *    - JSON 스키마 기반 검증
+ *    - schema: { type, required?, properties? }
+ *
+ * + json_pretty(v)              → str   (들여쓰기 2칸)
+ * + json_get(v, path)           → some(Value) | none   (점 경로 접근)
+ * + json_merge(a, b)            → ok(Value) | err
+ */
+
+import { Value, V, assertStr } from "./types";
+
+// ============================================================
+// JSON → Value 변환
+// ============================================================
+
+function jsToValue(js: unknown): Value {
+  if (js === null)              return V.none();
+  if (typeof js === "boolean")  return V.bool(js);
+  if (typeof js === "string")   return V.str(js);
+  if (typeof js === "number") {
+    return Number.isInteger(js) ? V.i32(js) : V.f64(js);
+  }
+  if (Array.isArray(js)) {
+    return V.arr(js.map(jsToValue));
+  }
+  if (typeof js === "object") {
+    const fields = new Map<string, Value>();
+    for (const [k, v] of Object.entries(js as Record<string, unknown>)) {
+      fields.set(k, jsToValue(v));
+    }
+    return { tag: "struct", fields };
+  }
+  return V.none();
+}
+
+// ============================================================
+// Value → JS 변환
+// ============================================================
+
+function valueToJs(v: Value): unknown {
+  switch (v.tag) {
+    case "i32":
+    case "f64":    return v.val;
+    case "str":    return v.val;
+    case "bool":   return v.val;
+    case "arr":    return (v as Extract<Value, { tag: "arr" }>).elements.map(valueToJs);
+    case "struct": {
+      const obj: Record<string, unknown> = {};
+      for (const [k, val] of (v as Extract<Value, { tag: "struct" }>).fields) {
+        obj[k] = valueToJs(val);
+      }
+      return obj;
+    }
+    case "ok":   return valueToJs((v as Extract<Value, { tag: "ok" }>).val);
+    case "err":  return { error: (v as Extract<Value, { tag: "err" }>).val };
+    case "some": return valueToJs((v as Extract<Value, { tag: "some" }>).val);
+    case "none": return null;
+    case "void": return null;
+  }
+}
+
+// ============================================================
+// 1. json_parse
+// ============================================================
+
+export function json_parse(s: Value): Value {
+  const str = assertStr(s, "json_parse");
+  try {
+    const parsed = globalThis.JSON.parse(str);
+    return V.ok(jsToValue(parsed));
+  } catch (e: any) {
+    return V.err(`json_parse: ${e.message}`);
+  }
+}
+
+// ============================================================
+// 2. json_stringify
+// ============================================================
+
+export function json_stringify(v: Value): Value {
+  try {
+    return V.str(globalThis.JSON.stringify(valueToJs(v)));
+  } catch (e: any) {
+    return V.err(`json_stringify: ${e.message}`);
+  }
+}
+
+// ============================================================
+// 3. json_validate — 간단한 스키마 검증
+// ============================================================
+
+/**
+ * schema 형식:
+ * {
+ *   "type":       "object" | "array" | "string" | "number" | "boolean",
+ *   "required":   ["key1", "key2"],      // object 전용
+ *   "properties": { "key": { "type": "..." } }  // object 전용
+ *   "minLength":  5,                     // string 전용
+ *   "minimum":    0,                     // number 전용
+ *   "maximum":    100,                   // number 전용
+ *   "minItems":   1,                     // array 전용
+ * }
+ */
+export function json_validate(s: Value, schema: Value): Value {
+  const str = assertStr(s, "json_validate");
+
+  // 스키마 파싱
+  const schemaStr = (schema.tag === "str")
+    ? (schema as Extract<Value, { tag: "str" }>).val
+    : globalThis.JSON.stringify(valueToJs(schema));
+
+  let parsed: unknown;
+  let schemaObj: Record<string, unknown>;
+
+  try {
+    parsed    = globalThis.JSON.parse(str);
+    schemaObj = globalThis.JSON.parse(schemaStr) as Record<string, unknown>;
+  } catch {
+    return V.bool(false);
+  }
+
+  return V.bool(validateAgainstSchema(parsed, schemaObj));
+}
+
+function validateAgainstSchema(value: unknown, schema: Record<string, unknown>): boolean {
+  const type = schema["type"] as string | undefined;
+
+  if (type) {
+    switch (type) {
+      case "object":
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+        // required 키 확인
+        const required = schema["required"] as string[] | undefined;
+        if (required) {
+          for (const k of required) {
+            if (!Object.prototype.hasOwnProperty.call(value, k)) return false;
+          }
+        }
+        // properties 재귀 검증
+        const props = schema["properties"] as Record<string, Record<string, unknown>> | undefined;
+        if (props) {
+          for (const [k, subSchema] of Object.entries(props)) {
+            const obj = value as Record<string, unknown>;
+            if (k in obj && !validateAgainstSchema(obj[k], subSchema)) return false;
+          }
+        }
+        break;
+      case "array":
+        if (!Array.isArray(value)) return false;
+        const minItems = schema["minItems"] as number | undefined;
+        if (minItems !== undefined && (value as unknown[]).length < minItems) return false;
+        break;
+      case "string":
+        if (typeof value !== "string") return false;
+        const minLen = schema["minLength"] as number | undefined;
+        if (minLen !== undefined && value.length < minLen) return false;
+        break;
+      case "number":
+      case "integer":
+        if (typeof value !== "number") return false;
+        const min = schema["minimum"] as number | undefined;
+        const max = schema["maximum"] as number | undefined;
+        if (min !== undefined && value < min) return false;
+        if (max !== undefined && value > max) return false;
+        break;
+      case "boolean":
+        if (typeof value !== "boolean") return false;
+        break;
+    }
+  }
+  return true;
+}
+
+// ============================================================
+// 4. json_pretty — 들여쓰기 포함 JSON
+// ============================================================
+
+export function json_pretty(v: Value, indent: Value = V.i32(2)): Value {
+  const spaces = (indent.tag === "i32") ? (indent as Extract<Value, { tag: "i32" }>).val : 2;
+  try {
+    return V.str(globalThis.JSON.stringify(valueToJs(v), undefined, spaces));
+  } catch (e: any) {
+    return V.err(`json_pretty: ${e.message}`);
+  }
+}
+
+// ============================================================
+// 5. json_get — 점 경로로 값 접근 ("user.name.first")
+// ============================================================
+
+export function json_get(v: Value, path: Value): Value {
+  const pathStr = assertStr(path, "json_get");
+  const keys    = pathStr.split(".");
+  let   current: Value = v;
+
+  for (const key of keys) {
+    if (current.tag === "struct") {
+      const fields = (current as Extract<Value, { tag: "struct" }>).fields;
+      const next   = fields.get(key);
+      if (next === undefined) return V.none();
+      current = next;
+    } else if (current.tag === "arr") {
+      const idx = parseInt(key, 10);
+      const els = (current as Extract<Value, { tag: "arr" }>).elements;
+      if (isNaN(idx) || idx < 0 || idx >= els.length) return V.none();
+      current = els[idx];
+    } else {
+      return V.none();
+    }
+  }
+
+  return V.some(current);
+}
+
+// ============================================================
+// 6. json_merge — 두 struct 병합 (b가 우선)
+// ============================================================
+
+export function json_merge(a: Value, b: Value): Value {
+  if (a.tag !== "struct" || b.tag !== "struct") {
+    return V.err("json_merge: 두 인수 모두 struct이어야 합니다");
+  }
+  const af = (a as Extract<Value, { tag: "struct" }>).fields;
+  const bf = (b as Extract<Value, { tag: "struct" }>).fields;
+  const merged = new Map<string, Value>([...af, ...bf]);
+  return V.ok({ tag: "struct", fields: merged });
+}
+
+// ============================================================
+// 🆕 JSON Namespace Object (Phase 2)
+// ============================================================
+
+export const JSON = {
+  parse: (s: Value): Value => json_parse(s),
+  stringify: (v: Value): Value => json_stringify(v),
+  validate: (s: Value, schema: Value): Value => json_validate(s, schema),
+  pretty: (v: Value, indent?: Value): Value => json_pretty(v, indent),
+  get: (v: Value, path: Value): Value => json_get(v, path),
+  merge: (a: Value, b: Value): Value => json_merge(a, b),
+} as const;

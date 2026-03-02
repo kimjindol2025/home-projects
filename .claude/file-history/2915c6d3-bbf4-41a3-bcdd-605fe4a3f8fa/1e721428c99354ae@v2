@@ -1,0 +1,388 @@
+/**
+ * KimSearch Mobile - DatabaseManager 테스트
+ *
+ * 테스트 범위:
+ * - DB 초기화 및 테이블 생성
+ * - 코드 인덱스 추가/조회
+ * - 검색 및 필터링
+ * - 캐시 관리
+ * - 통계 조회
+ * - DB 초기화
+ *
+ * Author: Claude (Haiku 4.5)
+ * Date: 2026-02-26
+ */
+
+// Mock SQLite
+const mockDb = {
+  executeSql: jest.fn(),
+  transaction: jest.fn(),
+  close: jest.fn()
+};
+
+jest.mock('react-native-sqlite-storage', () => ({
+  openDatabase: jest.fn(() => Promise.resolve(mockDb)),
+  enablePromise: jest.fn()
+}));
+
+import DatabaseManager from '../src/database';
+
+describe('DatabaseManager', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockDb.executeSql.mockResolvedValue([{ rows: { length: 0 } }]);
+  });
+
+  describe('초기화 (initDB & createTables)', () => {
+    test('✅ DB 초기화 성공', async () => {
+      mockDb.executeSql.mockResolvedValue([{ rows: { item: () => ({}) } }]);
+      await DatabaseManager.initDB();
+      expect(mockDb.executeSql).toHaveBeenCalled();
+    });
+
+    test('✅ 3개 테이블 생성', async () => {
+      await DatabaseManager.createTables();
+      expect(mockDb.executeSql).toHaveBeenCalledTimes(3);
+
+      const calls = mockDb.executeSql.mock.calls;
+      expect(calls[0][0]).toContain('code_index');
+      expect(calls[1][0]).toContain('search_history');
+      expect(calls[2][0]).toContain('cache');
+    });
+  });
+
+  describe('코드 인덱스 추가', () => {
+    test('✅ 단일 코드 추가', async () => {
+      const testCode = {
+        path: 'src/utils/math.js',
+        file_name: 'math.js',
+        extension: '.js',
+        functions: ['add', 'multiply'],
+        classes: [],
+        content: 'const add = (a, b) => a + b;',
+        lines_count: 1,
+        quality: { stars: 5, category: 'excellent' },
+        last_modified: '2026-02-26'
+      };
+
+      mockDb.executeSql.mockResolvedValue([{ rowsAffected: 1 }]);
+      const result = await DatabaseManager.addCodeIndex(testCode);
+
+      expect(result).toBe(true);
+      expect(mockDb.executeSql).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO code_index'),
+        expect.any(Array)
+      );
+    });
+
+    test('✅ 대량 추가 (트랜잭션)', async () => {
+      const testCodes = [
+        {
+          path: 'src/a.js',
+          file_name: 'a.js',
+          extension: '.js',
+          functions: [],
+          classes: [],
+          content: 'code',
+          lines_count: 10,
+          quality: { stars: 4, category: 'good' },
+          last_modified: '2026-02-26'
+        },
+        {
+          path: 'src/b.js',
+          file_name: 'b.js',
+          extension: '.js',
+          functions: ['func'],
+          classes: [],
+          content: 'more code',
+          lines_count: 20,
+          quality: { stars: 5, category: 'excellent' },
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      mockDb.transaction.mockResolvedValue(true);
+      const result = await DatabaseManager.batchAddCodeIndex(testCodes);
+
+      expect(result).toBe(true);
+      expect(mockDb.transaction).toHaveBeenCalled();
+    });
+
+    test('✅ 추가 실패 처리', async () => {
+      mockDb.executeSql.mockRejectedValue(new Error('DB error'));
+      const result = await DatabaseManager.addCodeIndex({
+        path: 'test.js',
+        file_name: 'test.js',
+        extension: '.js',
+        functions: [],
+        classes: [],
+        content: 'code',
+        lines_count: 1,
+        quality: { stars: 3, category: 'ok' },
+        last_modified: '2026-02-26'
+      });
+
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('검색 (searchCode)', () => {
+    test('✅ 기본 검색 (텍스트 매치)', async () => {
+      const mockResults = [
+        {
+          id: 1,
+          path: 'src/math.js',
+          file_name: 'math.js',
+          extension: '.js',
+          functions: '["add"]',
+          classes: '[]',
+          content: 'const add = () => {}',
+          lines_count: 5,
+          quality_stars: 5,
+          quality_category: 'excellent',
+          last_modified: '2026-02-26'
+        }
+      ];
+
+      mockDb.executeSql.mockResolvedValue([{
+        rows: {
+          length: 1,
+          item: (i) => mockResults[i]
+        }
+      }]);
+
+      const results = await DatabaseManager.searchCode('add', {
+        limit: 10
+      });
+
+      expect(results).toHaveLength(1);
+      expect(results[0].file_name).toBe('math.js');
+      expect(results[0].functions).toContain('add');
+    });
+
+    test('✅ 언어 필터', async () => {
+      await DatabaseManager.searchCode('func', {
+        extension: '.js',
+        limit: 10
+      });
+
+      const sqlCall = mockDb.executeSql.mock.calls[0][0];
+      expect(sqlCall).toContain('extension = ?');
+    });
+
+    test('✅ 별점 필터', async () => {
+      await DatabaseManager.searchCode('code', {
+        minStars: 4,
+        limit: 10
+      });
+
+      const sqlCall = mockDb.executeSql.mock.calls[0][0];
+      expect(sqlCall).toContain('quality_stars >= ?');
+    });
+
+    test('✅ 정렬 (quality)', async () => {
+      await DatabaseManager.searchCode('test', {
+        sort: 'quality',
+        limit: 10
+      });
+
+      const sqlCall = mockDb.executeSql.mock.calls[0][0];
+      expect(sqlCall).toContain('ORDER BY quality_stars DESC');
+    });
+
+    test('✅ 정렬 (recent)', async () => {
+      await DatabaseManager.searchCode('test', {
+        sort: 'recent',
+        limit: 10
+      });
+
+      const sqlCall = mockDb.executeSql.mock.calls[0][0];
+      expect(sqlCall).toContain('ORDER BY last_modified DESC');
+    });
+
+    test('✅ 복합 필터', async () => {
+      mockDb.executeSql.mockResolvedValue([{
+        rows: { length: 0, item: () => ({}) }
+      }]);
+
+      await DatabaseManager.searchCode('function', {
+        extension: '.py',
+        minStars: 3,
+        sort: 'quality',
+        limit: 5
+      });
+
+      const sqlCall = mockDb.executeSql.mock.calls[0][0];
+      expect(sqlCall).toContain('content LIKE');
+      expect(sqlCall).toContain('extension = ?');
+      expect(sqlCall).toContain('quality_stars >= ?');
+      expect(sqlCall).toContain('LIMIT ?');
+    });
+  });
+
+  describe('캐시 관리 (Cache)', () => {
+    test('✅ 캐시 저장 (TTL)', async () => {
+      mockDb.executeSql.mockResolvedValue([{ rowsAffected: 1 }]);
+
+      const cacheData = { results: [{ id: 1, name: 'test' }] };
+      await DatabaseManager.setCache('key1', cacheData, 30000);
+
+      const call = mockDb.executeSql.mock.calls[0];
+      expect(call[0]).toContain('INSERT OR REPLACE INTO cache');
+      expect(call[1][0]).toBe('key1');
+    });
+
+    test('✅ 캐시 조회 (유효함)', async () => {
+      const cachedValue = { results: [{ id: 1 }] };
+      mockDb.executeSql.mockResolvedValue([{
+        rows: {
+          length: 1,
+          item: () => ({ value: JSON.stringify(cachedValue) })
+        }
+      }]);
+
+      const result = await DatabaseManager.getCache('key1');
+      expect(result).toEqual(cachedValue);
+    });
+
+    test('✅ 캐시 조회 (만료됨)', async () => {
+      mockDb.executeSql.mockResolvedValue([{
+        rows: { length: 0, item: () => null }
+      }]);
+
+      const result = await DatabaseManager.getCache('expired_key');
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('검색 히스토리', () => {
+    test('✅ 히스토리 저장', async () => {
+      mockDb.executeSql.mockResolvedValue([{ rowsAffected: 1 }]);
+
+      await DatabaseManager.addSearchHistory('test query', 5);
+
+      expect(mockDb.executeSql).toHaveBeenCalledWith(
+        expect.stringContaining('INSERT INTO search_history'),
+        expect.any(Array)
+      );
+    });
+
+    test('✅ 히스토리 조회', async () => {
+      const mockHistory = [
+        { id: 1, query: 'test', results_count: 5, created_at: '2026-02-26' },
+        { id: 2, query: 'function', results_count: 10, created_at: '2026-02-26' }
+      ];
+
+      mockDb.executeSql.mockResolvedValue([{
+        rows: {
+          length: 2,
+          item: (i) => mockHistory[i]
+        }
+      }]);
+
+      const history = await DatabaseManager.getSearchHistory(10);
+      expect(history).toHaveLength(2);
+      expect(history[0].query).toBe('test');
+    });
+  });
+
+  describe('통계 (getStats)', () => {
+    test('✅ 전체 파일 수', async () => {
+      mockDb.executeSql
+        .mockResolvedValueOnce([{ rows: { item: () => ({ count: 42 }) } }])
+        .mockResolvedValueOnce([{ rows: { length: 0, item: () => ({}) } }])
+        .mockResolvedValueOnce([{ rows: { length: 0, item: () => ({}) } }]);
+
+      const stats = await DatabaseManager.getStats();
+      expect(stats.total_files).toBe(42);
+    });
+
+    test('✅ 확장자별 통계', async () => {
+      mockDb.executeSql
+        .mockResolvedValueOnce([{ rows: { item: () => ({ count: 50 }) } }])
+        .mockResolvedValueOnce([{
+          rows: {
+            length: 2,
+            item: (i) => i === 0
+              ? { extension: '.js', count: 30 }
+              : { extension: '.py', count: 20 }
+          }
+        }])
+        .mockResolvedValueOnce([{ rows: { length: 0, item: () => ({}) } }]);
+
+      const stats = await DatabaseManager.getStats();
+      expect(stats.by_extension['.js']).toBe(30);
+      expect(stats.by_extension['.py']).toBe(20);
+    });
+
+    test('✅ 품질별 통계', async () => {
+      mockDb.executeSql
+        .mockResolvedValueOnce([{ rows: { item: () => ({ count: 50 }) } }])
+        .mockResolvedValueOnce([{ rows: { length: 0, item: () => ({}) } }])
+        .mockResolvedValueOnce([{
+          rows: {
+            length: 3,
+            item: (i) => {
+              const data = [
+                { quality_stars: 5, count: 20 },
+                { quality_stars: 4, count: 15 },
+                { quality_stars: 3, count: 15 }
+              ];
+              return data[i];
+            }
+          }
+        }]);
+
+      const stats = await DatabaseManager.getStats();
+      expect(stats.by_quality[5]).toBe(20);
+      expect(stats.by_quality[4]).toBe(15);
+    });
+  });
+
+  describe('DB 초기화 & 종료', () => {
+    test('✅ 모든 데이터 삭제', async () => {
+      mockDb.executeSql.mockResolvedValue([{ rowsAffected: 100 }]);
+
+      const result = await DatabaseManager.resetDatabase();
+      expect(result).toBe(true);
+      expect(mockDb.executeSql).toHaveBeenCalledWith('DELETE FROM code_index');
+      expect(mockDb.executeSql).toHaveBeenCalledWith('DELETE FROM search_history');
+      expect(mockDb.executeSql).toHaveBeenCalledWith('DELETE FROM cache');
+    });
+
+    test('✅ 초기화 실패', async () => {
+      mockDb.executeSql.mockRejectedValue(new Error('Delete failed'));
+
+      const result = await DatabaseManager.resetDatabase();
+      expect(result).toBe(false);
+    });
+
+    test('✅ DB 연결 해제', async () => {
+      await DatabaseManager.closeDatabase();
+      expect(mockDb.close).toHaveBeenCalled();
+    });
+  });
+
+  describe('에러 처리', () => {
+    test('✅ 검색 실패 시 빈 배열 반환', async () => {
+      mockDb.executeSql.mockRejectedValue(new Error('Query failed'));
+
+      const results = await DatabaseManager.searchCode('test');
+      expect(results).toEqual([]);
+    });
+
+    test('✅ 캐시 조회 실패', async () => {
+      mockDb.executeSql.mockRejectedValue(new Error('Cache lookup failed'));
+
+      const result = await DatabaseManager.getCache('key');
+      expect(result).toBeNull();
+    });
+
+    test('✅ 통계 조회 실패', async () => {
+      mockDb.executeSql.mockRejectedValue(new Error('Stats failed'));
+
+      const stats = await DatabaseManager.getStats();
+      expect(stats).toBeNull();
+    });
+  });
+});

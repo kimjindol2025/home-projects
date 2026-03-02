@@ -1,0 +1,570 @@
+// ============================================================================
+// VM: Virtual Machine - 바이트코드 실행 엔진 with GC (v16.0 - 로컬 변수 지원)
+// ============================================================================
+
+use crate::bytecode::Bytecode;
+use crate::opcode::OpCode;
+use crate::value::Value;
+use crate::gc_object::{ObjectHeap, GcData};
+use std::collections::HashMap;
+
+/// 가상 머신 with GC
+pub struct VM {
+    bytecode: Bytecode,
+    stack: Vec<Value>,
+    ip: usize, // Instruction Pointer
+    heap: ObjectHeap, // GC 힙
+    locals: Vec<Value>, // [NEW v16.0] 로컬 변수 저장소 (256 슬롯)
+}
+
+impl VM {
+    /// 새로운 VM 생성
+    pub fn new(bytecode: Bytecode) -> Self {
+        VM {
+            bytecode,
+            stack: Vec::with_capacity(256),
+            ip: 0,
+            heap: ObjectHeap::new(),
+            locals: vec![Value::Null; 256], // [NEW] 256 슬롯 사전 초기화
+        }
+    }
+
+    /// 새로운 VM 생성 (커스텀 GC 임계값)
+    pub fn with_gc_threshold(bytecode: Bytecode, threshold: usize) -> Self {
+        VM {
+            bytecode,
+            stack: Vec::with_capacity(256),
+            ip: 0,
+            heap: ObjectHeap::with_threshold(threshold),
+            locals: vec![Value::Null; 256], // [NEW] 256 슬롯 사전 초기화
+        }
+    }
+
+    /// 바이트코드 실행
+    pub fn run(&mut self) -> Result<Value, String> {
+        while self.ip < self.bytecode.instructions.len() {
+            let op_byte = self.bytecode.instructions[self.ip];
+            self.ip += 1;
+
+            let op = OpCode::from_byte(op_byte).ok_or(format!("Unknown opcode: {}", op_byte))?;
+
+            match op {
+                OpCode::OpConstant => {
+                    let idx = self.read_u16() as usize;
+                    let val = self
+                        .bytecode
+                        .get_constant(idx)
+                        .ok_or(format!("Constant index out of bounds: {}", idx))?;
+                    self.stack.push(Value::Int(val));
+                }
+
+                OpCode::OpAdd => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    match (left, right) {
+                        (Value::Int(l), Value::Int(r)) => {
+                            self.stack.push(Value::Int(l + r));
+                        }
+                        _ => return Err("Cannot add non-integers".to_string()),
+                    }
+                }
+
+                OpCode::OpSub => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    match (left, right) {
+                        (Value::Int(l), Value::Int(r)) => {
+                            self.stack.push(Value::Int(l - r));
+                        }
+                        _ => return Err("Cannot subtract non-integers".to_string()),
+                    }
+                }
+
+                OpCode::OpMul => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    match (left, right) {
+                        (Value::Int(l), Value::Int(r)) => {
+                            self.stack.push(Value::Int(l * r));
+                        }
+                        _ => return Err("Cannot multiply non-integers".to_string()),
+                    }
+                }
+
+                OpCode::OpDiv => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    match (left, right) {
+                        (Value::Int(l), Value::Int(r)) => {
+                            if r == 0 {
+                                return Err("Division by zero".to_string());
+                            }
+                            self.stack.push(Value::Int(l / r));
+                        }
+                        _ => return Err("Cannot divide non-integers".to_string()),
+                    }
+                }
+
+                OpCode::OpTrue => {
+                    self.stack.push(Value::Bool(true));
+                }
+
+                OpCode::OpFalse => {
+                    self.stack.push(Value::Bool(false));
+                }
+
+                OpCode::OpEqual => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    self.stack.push(Value::Bool(left == right));
+                }
+
+                OpCode::OpNotEqual => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    self.stack.push(Value::Bool(left != right));
+                }
+
+                OpCode::OpLessThan => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    match (left, right) {
+                        (Value::Int(l), Value::Int(r)) => {
+                            self.stack.push(Value::Bool(l < r));
+                        }
+                        _ => return Err("Cannot compare non-integers".to_string()),
+                    }
+                }
+
+                OpCode::OpGreaterThanOrEqual => {
+                    let right = self.stack_pop()?;
+                    let left = self.stack_pop()?;
+                    match (left, right) {
+                        (Value::Int(l), Value::Int(r)) => {
+                            self.stack.push(Value::Bool(l >= r));
+                        }
+                        _ => return Err("Cannot compare non-integers".to_string()),
+                    }
+                }
+
+                OpCode::OpBang => {
+                    let val = self.stack_pop()?;
+                    self.stack.push(Value::Bool(!val.is_truthy()));
+                }
+
+                OpCode::OpMinus => {
+                    let val = self.stack_pop()?;
+                    match val {
+                        Value::Int(n) => self.stack.push(Value::Int(-n)),
+                        _ => return Err("Cannot negate non-integer".to_string()),
+                    }
+                }
+
+                OpCode::OpJump => {
+                    let target = self.read_u16() as usize;
+                    self.ip = target;
+                }
+
+                OpCode::OpJumpNotTruthy => {
+                    let target = self.read_u16() as usize;
+                    let cond = self.stack_pop()?;
+                    if !cond.is_truthy() {
+                        self.ip = target;
+                    }
+                }
+
+                OpCode::OpNull => {
+                    self.stack.push(Value::Null);
+                }
+
+                OpCode::OpPop => {
+                    let _ = self.stack_pop()?;
+                }
+
+                OpCode::OpArray => {
+                    let count = self.read_u16() as usize;
+                    let mut arr = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        arr.push(self.stack_pop()?);
+                    }
+                    arr.reverse();
+
+                    // GC 실행 여부 확인
+                    if self.heap.should_collect() {
+                        let stats = self.heap.collect_garbage(&self.stack);
+                        eprintln!(
+                            "[GC #{}: {} → {} ({} freed)]",
+                            stats.gc_count, stats.objects_before, stats.objects_after, stats.objects_freed
+                        );
+                    }
+
+                    // 배열을 GC 힙에 할당
+                    let gc_ref = self.heap.alloc(GcData::Array(arr));
+                    self.stack.push(Value::Array(gc_ref));
+                }
+
+                OpCode::OpHash => {
+                    let count = self.read_u16() as usize;
+                    let mut map = HashMap::new();
+                    for _ in 0..count {
+                        let val = self.stack_pop()?;
+                        let key = match self.stack_pop()? {
+                            Value::Int(n) => n.to_string(),
+                            _ => return Err("Hash keys must be integers".to_string()),
+                        };
+                        map.insert(key, val);
+                    }
+
+                    // GC 실행 여부 확인
+                    if self.heap.should_collect() {
+                        let stats = self.heap.collect_garbage(&self.stack);
+                        eprintln!(
+                            "[GC #{}: {} → {} ({} freed)]",
+                            stats.gc_count, stats.objects_before, stats.objects_after, stats.objects_freed
+                        );
+                    }
+
+                    // 해시맵을 GC 힙에 할당
+                    let gc_ref = self.heap.alloc(GcData::HashMap(map));
+                    self.stack.push(Value::HashMap(gc_ref));
+                }
+
+                OpCode::OpIndex => {
+                    let idx = self.stack_pop()?;
+                    let container = self.stack_pop()?;
+
+                    match (container, idx) {
+                        (Value::Array(gc_ref), Value::Int(i)) => {
+                            // GC 힙에서 배열 조회
+                            let obj = self
+                                .heap
+                                .get(gc_ref)
+                                .ok_or(format!("Dangling array reference: {}", gc_ref))?;
+
+                            match &obj.data {
+                                GcData::Array(arr) => {
+                                    let idx = if i < 0 {
+                                        (arr.len() as i64 + i) as usize
+                                    } else {
+                                        i as usize
+                                    };
+
+                                    if idx < arr.len() {
+                                        self.stack.push(arr[idx].clone());
+                                    } else {
+                                        self.stack.push(Value::Null);
+                                    }
+                                }
+                                _ => {
+                                    return Err(
+                                        "Type error: expected array but got different type"
+                                            .to_string(),
+                                    )
+                                }
+                            }
+                        }
+                        (Value::HashMap(gc_ref), key_val) => {
+                            // GC 힙에서 해시맵 조회
+                            let obj = self
+                                .heap
+                                .get(gc_ref)
+                                .ok_or(format!("Dangling hashmap reference: {}", gc_ref))?;
+
+                            match &obj.data {
+                                GcData::HashMap(map) => {
+                                    let key = match key_val {
+                                        Value::Int(n) => n.to_string(),
+                                        _ => return Err("Hash keys must be integers".to_string()),
+                                    };
+
+                                    match map.get(&key) {
+                                        Some(val) => self.stack.push(val.clone()),
+                                        None => self.stack.push(Value::Null),
+                                    }
+                                }
+                                _ => {
+                                    return Err(
+                                        "Type error: expected hashmap but got different type"
+                                            .to_string(),
+                                    )
+                                }
+                            }
+                        }
+                        _ => return Err("Invalid indexing operation".to_string()),
+                    }
+                }
+
+                OpCode::OpReturnValue | OpCode::OpReturn => {
+                    if let OpCode::OpReturnValue = op {
+                        return self.stack_pop();
+                    } else {
+                        return Ok(Value::Null);
+                    }
+                }
+
+                // [NEW v16.0] 로컬 변수 지원
+                OpCode::OpSetLocal => {
+                    let idx = self.read_u8() as usize;
+                    let val = self.stack_pop()?; // 팝 후 로컬 저장소에 저장
+                    if idx < self.locals.len() {
+                        self.locals[idx] = val;
+                    } else {
+                        return Err(format!("Local index out of bounds: {}", idx));
+                    }
+                }
+
+                OpCode::OpGetLocal => {
+                    let idx = self.read_u8() as usize;
+                    if idx < self.locals.len() {
+                        self.stack.push(self.locals[idx].clone());
+                    } else {
+                        return Err(format!("Local index out of bounds: {}", idx));
+                    }
+                }
+
+                OpCode::OpEnd => {
+                    break;
+                }
+
+                OpCode::OpCall => {
+                    // v15.3 호환성: Call 오류
+                    return Err("OpCall not yet implemented in VM".to_string());
+                }
+            }
+        }
+
+        // 스택에 값이 남아있으면 반환
+        if !self.stack.is_empty() {
+            self.stack_pop()
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    /// 스택에서 2바이트 읽기 (Big-Endian)
+    fn read_u16(&mut self) -> u16 {
+        let high = self.bytecode.instructions[self.ip] as u16;
+        let low = self.bytecode.instructions[self.ip + 1] as u16;
+        self.ip += 2;
+        (high << 8) | low
+    }
+
+    /// 스택에서 1바이트 읽기 [NEW v16.0]
+    fn read_u8(&mut self) -> u8 {
+        let byte = self.bytecode.instructions[self.ip];
+        self.ip += 1;
+        byte
+    }
+
+    /// 스택에서 값 팝
+    fn stack_pop(&mut self) -> Result<Value, String> {
+        self.stack.pop().ok_or_else(|| "Stack underflow".to_string())
+    }
+
+    /// 스택의 최상단 값 조회 (팝하지 않음)
+    pub fn stack_peek(&self) -> Option<&Value> {
+        self.stack.last()
+    }
+
+    /// 스택 상태 확인
+    pub fn stack(&self) -> &[Value] {
+        &self.stack
+    }
+
+    /// GC 힙 참조
+    pub fn heap(&self) -> &ObjectHeap {
+        &self.heap
+    }
+
+    /// GC 힙 가변 참조
+    pub fn heap_mut(&mut self) -> &mut ObjectHeap {
+        &mut self.heap
+    }
+
+    /// 로컬 변수 조회 (테스트용)
+    pub fn get_local(&self, idx: usize) -> Option<&Value> {
+        if idx < self.locals.len() {
+            Some(&self.locals[idx])
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_constant_integer() {
+        let mut bytecode = Bytecode::new();
+        let idx = bytecode.add_constant(42);
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx >> 8) as u8);
+        bytecode.add_instruction((idx & 0xFF) as u8);
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn test_arithmetic() {
+        let mut bytecode = Bytecode::new();
+        let idx5 = bytecode.add_constant(5);
+        let idx3 = bytecode.add_constant(3);
+
+        // PUSH 5
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx5 >> 8) as u8);
+        bytecode.add_instruction((idx5 & 0xFF) as u8);
+
+        // PUSH 3
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx3 >> 8) as u8);
+        bytecode.add_instruction((idx3 & 0xFF) as u8);
+
+        // ADD
+        bytecode.add_instruction(OpCode::OpAdd.as_byte());
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        assert_eq!(result, Value::Int(8));
+    }
+
+    #[test]
+    fn test_boolean() {
+        let mut bytecode = Bytecode::new();
+        bytecode.add_instruction(OpCode::OpTrue.as_byte());
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
+    fn test_local_variable_set_get() {
+        let mut bytecode = Bytecode::new();
+        let idx42 = bytecode.add_constant(42);
+
+        // PUSH 42
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx42 >> 8) as u8);
+        bytecode.add_instruction((idx42 & 0xFF) as u8);
+
+        // SET_LOCAL 0
+        bytecode.add_instruction(OpCode::OpSetLocal.as_byte());
+        bytecode.add_instruction(0);
+
+        // GET_LOCAL 0
+        bytecode.add_instruction(OpCode::OpGetLocal.as_byte());
+        bytecode.add_instruction(0);
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        assert_eq!(result, Value::Int(42));
+        assert_eq!(*vm.get_local(0).unwrap(), Value::Int(42));
+    }
+
+    #[test]
+    fn test_array_with_gc() {
+        let mut bytecode = Bytecode::new();
+        let idx1 = bytecode.add_constant(1);
+        let idx2 = bytecode.add_constant(2);
+        let idx3 = bytecode.add_constant(3);
+
+        // PUSH 1
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx1 >> 8) as u8);
+        bytecode.add_instruction((idx1 & 0xFF) as u8);
+
+        // PUSH 2
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx2 >> 8) as u8);
+        bytecode.add_instruction((idx2 & 0xFF) as u8);
+
+        // PUSH 3
+        bytecode.add_instruction(OpCode::OpConstant.as_byte());
+        bytecode.add_instruction((idx3 >> 8) as u8);
+        bytecode.add_instruction((idx3 & 0xFF) as u8);
+
+        // ARRAY 3
+        bytecode.add_instruction(OpCode::OpArray.as_byte());
+        bytecode.add_instruction(0);
+        bytecode.add_instruction(3);
+
+        let mut vm = VM::new(bytecode);
+        let result = vm.run().unwrap();
+
+        // 결과는 GcRef를 가진 Value::Array
+        match result {
+            Value::Array(gc_ref) => {
+                let obj = vm.heap().get(gc_ref).unwrap();
+                match &obj.data {
+                    GcData::Array(arr) => {
+                        assert_eq!(arr.len(), 3);
+                        assert_eq!(arr[0], Value::Int(1));
+                        assert_eq!(arr[1], Value::Int(2));
+                        assert_eq!(arr[2], Value::Int(3));
+                    }
+                    _ => panic!("Expected array data"),
+                }
+            }
+            _ => panic!("Expected array value"),
+        }
+    }
+
+    #[test]
+    fn test_is_truthy() {
+        assert!(Value::Bool(true).is_truthy());
+        assert!(!Value::Bool(false).is_truthy());
+        assert!(Value::Int(1).is_truthy());
+        assert!(!Value::Int(0).is_truthy());
+    }
+
+    #[test]
+    fn test_vm_gc_does_not_free_stack_objects() {
+        let mut vm = VM::with_gc_threshold(Bytecode::new(), 2);
+
+        // 스택에 배열 참조 추가
+        let arr_ref1 = vm.heap_mut().alloc(GcData::Array(vec![Value::Int(1)]));
+        vm.stack.push(Value::Array(arr_ref1));
+
+        let arr_ref2 = vm.heap_mut().alloc(GcData::Array(vec![Value::Int(2)]));
+        vm.stack.push(Value::Array(arr_ref2));
+
+        // GC 발동
+        let stack_copy = vm.stack.clone();
+        let stats = vm.heap_mut().collect_garbage(&stack_copy);
+
+        // 스택에 있는 객체들은 살아야 함
+        assert_eq!(stats.objects_before, 2);
+        assert_eq!(stats.objects_after, 2);
+        assert_eq!(stats.objects_freed, 0);
+    }
+
+    #[test]
+    fn test_vm_gc_frees_unreachable_objects() {
+        let mut vm = VM::with_gc_threshold(Bytecode::new(), 100);
+
+        // 힙에 객체 3개 할당
+        let _arr_ref1 = vm.heap_mut().alloc(GcData::Array(vec![Value::Int(1)]));
+        let arr_ref2 = vm.heap_mut().alloc(GcData::Array(vec![Value::Int(2)]));
+        let _arr_ref3 = vm.heap_mut().alloc(GcData::Array(vec![Value::Int(3)]));
+
+        // 오직 arr_ref2만 스택에 추가
+        vm.stack.push(Value::Array(arr_ref2));
+
+        // GC 발동
+        let stack_copy = vm.stack.clone();
+        let stats = vm.heap_mut().collect_garbage(&stack_copy);
+
+        // 2개는 해제되어야 함
+        assert_eq!(stats.objects_freed, 2);
+        assert_eq!(stats.objects_after, 1);
+    }
+}

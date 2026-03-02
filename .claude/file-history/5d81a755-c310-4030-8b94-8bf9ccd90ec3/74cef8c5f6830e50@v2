@@ -1,0 +1,360 @@
+"""
+v8.2 통합 테스트
+- 엔진과 분할기 통합
+- 프로세서 통합
+- 스토리지 통합
+- 모니터링 통합
+- 전체 시스템 워크플로우
+"""
+
+import unittest
+import tempfile
+import shutil
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
+
+from v8_2_data_lake.core.engine import GogsDataLakeEngine
+from v8_2_data_lake.core.partition import DataPartitioner, PartitioningStrategy
+from v8_2_data_lake.processors.map_reduce import WordCountProcessor
+from v8_2_data_lake.storage.lake import DataLake, DataFormat
+from v8_2_data_lake.monitoring.monitor import DistributedSystemMonitor
+
+
+class TestEnginePartitionIntegration(unittest.TestCase):
+    """엔진과 분할기 통합 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.engine = GogsDataLakeEngine(num_workers=2)
+        self.partitioner = DataPartitioner(num_partitions=4)
+
+    def test_partition_then_process(self):
+        """분할 후 처리 테스트"""
+        data = list(range(1000))
+
+        # 데이터 분할
+        partitions = self.partitioner.range_partition(data, key_func=lambda x: x)
+
+        # 각 파티션에 대해 처리
+        results = []
+        for partition in partitions:
+            # 맵 연산
+            def mapper(x):
+                return x * 2
+
+            mapped = self.engine.map_phase(partition, mapper)
+            results.extend(mapped)
+
+        self.assertEqual(len(results), 1000)
+
+    def test_skew_aware_partition_with_processing(self):
+        """Skew-Aware 분할과 처리 통합 테스트"""
+        # 불균형 데이터
+        skewed_data = [0] * 500 + list(range(1, 100))
+
+        partitions = self.partitioner.skew_aware_partition(skewed_data)
+
+        # 각 파티션 처리
+        def counter(x):
+            return 1
+
+        for partition in partitions:
+            result = self.engine.map_phase(partition, counter)
+            self.assertTrue(len(result) > 0)
+
+
+class TestEndToEndMapReduce(unittest.TestCase):
+    """MapReduce 전체 워크플로우 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.processor = WordCountProcessor()
+        self.monitor = DistributedSystemMonitor("Word Count Job")
+
+    def test_word_count_workflow(self):
+        """Word Count 전체 워크플로우 테스트"""
+        text = """
+        the quick brown fox
+        the lazy dog
+        the quick fox
+        """
+
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+        # Word Count 처리
+        results = self.processor.count_words(lines)
+
+        # 결과 확인
+        self.assertIn("the", results)
+        self.assertEqual(results["the"], 3)
+
+        self.assertIn("quick", results)
+        self.assertEqual(results["quick"], 2)
+
+    def test_large_text_processing(self):
+        """대규모 텍스트 처리 테스트"""
+        # 대규모 텍스트 시뮬레이션
+        data = ["word " * 100 for _ in range(50)]
+
+        results = self.processor.count_words(data)
+
+        self.assertIn("word", results)
+        self.assertEqual(results["word"], 5000)
+
+
+class TestStorageIntegration(unittest.TestCase):
+    """스토리지 통합 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.temp_dir = tempfile.mkdtemp()
+        self.lake = DataLake(base_path=self.temp_dir)
+        self.partitioner = DataPartitioner(num_partitions=4)
+
+    def tearDown(self):
+        """테스트 종료 후 정리"""
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_partition_storage_workflow(self):
+        """분할-저장 워크플로우 테스트"""
+        # 데이터셋 생성
+        self.lake.create_dataset("large_dataset", DataFormat.JSON)
+
+        # 데이터 분할
+        data = list(range(1000))
+        partitions = self.partitioner.range_partition(data, key_func=lambda x: x)
+
+        # 각 파티션 저장
+        for i, partition in enumerate(partitions):
+            self.lake.store_partition("large_dataset", i, partition)
+
+        # 전체 데이터 로드
+        loaded_data = self.lake.load_dataset("large_dataset")
+
+        self.assertEqual(len(loaded_data), 1000)
+
+    def test_multiple_format_storage(self):
+        """다중 포맷 저장 테스트"""
+        formats_to_test = [
+            DataFormat.JSON,
+            DataFormat.TEXT,
+            DataFormat.BINARY
+        ]
+
+        data = [{"id": i, "value": i*2} for i in range(100)]
+
+        for fmt in formats_to_test:
+            dataset_id = f"dataset_{fmt.value}"
+            self.lake.create_dataset(dataset_id, fmt)
+            self.lake.store_partition(dataset_id, 0, data)
+
+            # 로드 확인
+            loaded = self.lake.load_dataset(dataset_id)
+            self.assertEqual(len(loaded), 100)
+
+
+class TestMonitoringIntegration(unittest.TestCase):
+    """모니터링 통합 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.monitor = DistributedSystemMonitor("Integrated Job")
+        self.engine = GogsDataLakeEngine(num_workers=4)
+        self.partitioner = DataPartitioner()
+
+    def test_full_job_monitoring(self):
+        """전체 작업 모니터링 테스트"""
+        data = list(range(10000))
+
+        # 분할 단계
+        partitions = self.partitioner.range_partition(data, 4)
+        self.monitor.log_event("PARTITION", "Data partitioned into 4 parts")
+
+        # Map 단계
+        self.monitor.record_map_phase(100.0, len(data))
+
+        # Shuffle & Sort 단계
+        self.monitor.record_shuffle_sort_phase(50.0, len(data))
+
+        # Reduce 단계
+        self.monitor.record_reduce_phase(75.0, len(data) // 10)
+
+        # 성능 메트릭
+        self.monitor.set_performance_metrics({
+            "total_time_ms": 225.0,
+            "speedup_factor": 4.0
+        })
+
+        # 요약 확인
+        summary = self.monitor.get_summary()
+
+        self.assertEqual(summary["performance"]["speedup_factor"], 4.0)
+        self.assertGreater(summary["event_count"], 0)
+
+    def test_error_handling_monitoring(self):
+        """오류 처리 모니터링 테스트"""
+        # 오류 발생
+        self.monitor.record_error("mapper", "Mapper task failed")
+        self.monitor.record_error("worker_failure", "Worker node crashed")
+
+        # 복구
+        self.monitor.record_recovery("Mapper task retried successfully")
+        self.monitor.record_recovery("Worker node restarted")
+
+        summary = self.monitor.get_summary()
+
+        self.assertEqual(summary["errors"]["total"], 2)
+        self.assertEqual(summary["errors"]["recovery_count"], 2)
+
+
+class TestFullSystemWorkflow(unittest.TestCase):
+    """전체 시스템 워크플로우 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.temp_dir = tempfile.mkdtemp()
+        self.engine = GogsDataLakeEngine(num_workers=2)
+        self.partitioner = DataPartitioner()
+        self.lake = DataLake(base_path=self.temp_dir)
+        self.monitor = DistributedSystemMonitor("Full System")
+        self.processor = WordCountProcessor()
+
+    def tearDown(self):
+        """테스트 종료 후 정리"""
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_end_to_end_pipeline(self):
+        """전체 파이프라인 테스트"""
+        # 1단계: 데이터 생성 및 분할
+        raw_text = [
+            "distributed systems are complex",
+            "distributed systems require monitoring",
+            "systems need good architecture",
+            "good design requires planning"
+        ]
+
+        self.monitor.log_event("INPUT", "Input data created")
+
+        # 2단계: 데이터 저장
+        self.lake.create_dataset("input_data", DataFormat.TEXT)
+        self.lake.store_partition("input_data", 0, raw_text)
+        self.monitor.log_event("STORE", "Data stored in data lake")
+
+        # 3단계: 데이터 분할
+        data_indices = list(range(len(raw_text)))
+        partitions = self.partitioner.round_robin_partition(data_indices, 2)
+        self.monitor.log_event("PARTITION", f"Data split into {len(partitions)} partitions")
+
+        # 4단계: Map Phase
+        self.monitor.record_map_phase(50.0, len(raw_text))
+
+        # 5단계: Processing
+        results = self.processor.process(raw_text)
+        self.monitor.log_event("PROCESS", f"Processed {len(results)} unique words")
+
+        # 6단계: 결과 저장
+        self.lake.create_dataset("output_data", DataFormat.JSON)
+        output_data = [{"word": k, "count": v} for k, v in results.items()]
+        self.lake.store_partition("output_data", 0, output_data)
+        self.monitor.log_event("SAVE_RESULT", "Results saved")
+
+        # 7단계: 성능 메트릭 설정
+        self.monitor.set_performance_metrics({
+            "total_time_ms": 200.0,
+            "speedup_factor": 2.0
+        })
+
+        # 최종 확인
+        summary = self.monitor.get_summary()
+
+        self.assertGreater(summary["event_count"], 0)
+        self.assertEqual(summary["performance"]["speedup_factor"], 2.0)
+
+        # 결과 데이터 검증
+        loaded_results = self.lake.load_dataset("output_data")
+        self.assertEqual(len(loaded_results), len(results))
+
+    def test_fault_tolerance_workflow(self):
+        """장애 복구 워크플로우 테스트"""
+        # 정상 작업
+        self.monitor.log_event("START", "Job started")
+
+        # 첫 번째 시도
+        self.monitor.log_event("MAP_START", "Map phase started")
+        self.monitor.record_error("worker_failure", "Worker 1 failed")
+        self.monitor.log_event("RETRY", "Retrying failed tasks")
+
+        # 복구
+        self.monitor.record_recovery("Worker 1 restarted")
+        self.monitor.record_map_phase(100.0, 1000)
+
+        # 계속 진행
+        self.monitor.record_shuffle_sort_phase(50.0, 500)
+        self.monitor.record_reduce_phase(75.0, 100)
+
+        summary = self.monitor.get_summary()
+
+        self.assertEqual(summary["errors"]["total"], 1)
+        self.assertEqual(summary["errors"]["recovery_count"], 1)
+        self.assertGreater(summary["event_count"], 0)
+
+
+class TestScalability(unittest.TestCase):
+    """확장성 테스트"""
+
+    def setUp(self):
+        """테스트 시작 전 설정"""
+        self.engine = GogsDataLakeEngine(num_workers=4)
+        self.partitioner = DataPartitioner(num_partitions=4)
+
+    def test_large_dataset_processing(self):
+        """대규모 데이터셋 처리 테스트"""
+        sizes = [1000, 10000]
+
+        for size in sizes:
+            data = list(range(size))
+
+            # 분할
+            partitioner = DataPartitioner(num_partitions=4)
+            partitions = partitioner.range_partition(data, key_func=lambda x: x)
+
+            # 처리
+            def doubler(x):
+                return x * 2
+
+            for partition in partitions:
+                results = self.engine.map_phase(partition, doubler)
+                self.assertEqual(len(results), len(partition))
+
+    def test_high_partition_count(self):
+        """높은 파티션 수 테스트"""
+        data = list(range(10000))
+
+        # 100개 파티션
+        partitioner = DataPartitioner(num_partitions=100)
+        partitions = partitioner.round_robin_partition(data)
+
+        self.assertEqual(len(partitions), 100)
+
+        # 모든 데이터가 분할되었는지 확인
+        total = sum(len(p) for p in partitions)
+        self.assertEqual(total, len(data))
+
+    def test_many_workers(self):
+        """많은 워커 테스트"""
+        engine = GogsDataLakeEngine(num_workers=16)
+
+        data = list(range(100000))
+
+        def compute_intensive(x):
+            return x * x
+
+        results = engine.map_phase(data, compute_intensive)
+
+        self.assertEqual(len(results), len(data))
+
+
+if __name__ == "__main__":
+    unittest.main()

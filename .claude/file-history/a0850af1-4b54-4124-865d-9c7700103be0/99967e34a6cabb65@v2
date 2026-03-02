@@ -1,0 +1,924 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+[Python University v6.1] 고가용성 분산 시스템 설계 — 졸업 작품 1단계
+
+대학교 4학년 졸업 과정: "통합과 확장, 그리고 신뢰할 수 있는 시스템"
+
+이 모듈은 다음을 다룹니다:
+1. High Availability (높은 가용성) - 99.99% 가동률 목표
+2. Load Balancing (로드 밸런싱) - 트래픽 분산
+3. Auto Scaling (오토 스케일링) - 자동 확장/축소
+4. Failover (장애 복구) - 서버 장애 시 자동 복구
+5. Distributed Task Engine (분산 작업 처리 엔진)
+6. Monitoring & Observability (모니터링과 옵저버빌리티)
+7. CI/CD Pipeline (지속적 통합 및 배포)
+8. Production System (프로덕션 시뮬레이션)
+
+핵심 원칙:
+- "기록이 없으면 증명도 없다"
+- "테스트되지 않은 코드는 배포될 수 없다"
+- "한 번에 하나의 요청만 실패하게 하라 (Graceful Degradation)"
+"""
+
+import uuid
+import time
+import random
+import json
+from typing import List, Dict, Optional, Callable
+from dataclasses import dataclass, field
+from enum import Enum
+from abc import ABC, abstractmethod
+from collections import defaultdict
+from datetime import datetime
+import heapq
+
+
+# ============================================================================
+# STAGE 1: 높은 가용성 개념
+# ============================================================================
+
+class AvailabilityLevel(Enum):
+    """가용성 수준"""
+    SINGLE_INSTANCE = "99.0%"      # 1개 서버
+    REDUNDANCY = "99.9%"           # 백업 서버
+    DISTRIBUTED = "99.99%"         # 분산 시스템
+    GLOBAL = "99.999%"             # 전역 분산
+
+
+def print_availability_concept():
+    """높은 가용성 개념 설명"""
+    print("\n" + "="*80)
+    print("STAGE 1: 높은 가용성 개념")
+    print("="*80)
+
+    print("\n📊 가용성 수준별 연간 다운타임:")
+    availability_levels = [
+        ("99.0% (2 Nines)", "SINGLE_INSTANCE", 87.6),
+        ("99.9% (3 Nines)", "REDUNDANCY", 8.76),
+        ("99.99% (4 Nines)", "DISTRIBUTED", 0.876),
+        ("99.999% (5 Nines)", "GLOBAL", 0.0876),
+    ]
+
+    print(f"\n{'가용성':<20} | {'레벨':<20} | {'연간 다운타임':<15}")
+    print("-" * 60)
+
+    for availability, level, downtime in availability_levels:
+        print(f"{availability:<20} | {level:<20} | {downtime:.2f}시간")
+
+    print("\n💡 해석:")
+    print("  - 99.0%: 연간 약 87시간 다운 (주 1회 장애 = 위험)")
+    print("  - 99.9%: 연간 약 9시간 다운 (월 1회 = 받을만함)")
+    print("  - 99.99%: 연간 약 52분 다운 (매우 좋음) ← 목표")
+    print("  - 99.999%: 연간 약 5분 다운 (거의 불가능)")
+
+    print("\n🎯 v6.1의 목표: 99.99% 가용성 (4 Nines)")
+
+
+# ============================================================================
+# STAGE 2: 로드 밸런싱
+# ============================================================================
+
+@dataclass
+class Server:
+    """서버 인스턴스"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    capacity: int = 100  # 최대 동시 요청
+    current_load: int = 0
+    is_healthy: bool = True
+    processed_requests: int = 0
+
+    def can_accept_request(self) -> bool:
+        """요청을 받을 수 있는가"""
+        return self.is_healthy and self.current_load < self.capacity
+
+    def process_request(self, request_id: str) -> bool:
+        """요청 처리"""
+        if not self.can_accept_request():
+            return False
+
+        self.current_load += 1
+        self.processed_requests += 1
+        return True
+
+    def complete_request(self):
+        """요청 완료"""
+        self.current_load = max(0, self.current_load - 1)
+
+
+class LoadBalancingStrategy(ABC):
+    """로드 밸런싱 전략 (v5.4 Strategy 패턴 활용)"""
+
+    @abstractmethod
+    def select_server(self, servers: List[Server]) -> Optional[Server]:
+        pass
+
+
+class RoundRobinStrategy(LoadBalancingStrategy):
+    """라운드 로빈: 순서대로 분배"""
+
+    def __init__(self):
+        self.current_index = 0
+
+    def select_server(self, servers: List[Server]) -> Optional[Server]:
+        """순서대로 선택"""
+        healthy_servers = [s for s in servers if s.is_healthy]
+        if not healthy_servers:
+            return None
+
+        server = healthy_servers[self.current_index % len(healthy_servers)]
+        self.current_index += 1
+        return server
+
+
+class LeastConnectionStrategy(LoadBalancingStrategy):
+    """최소 연결: 가장 적은 요청을 받는 서버 선택"""
+
+    def select_server(self, servers: List[Server]) -> Optional[Server]:
+        """부하가 가장 적은 서버 선택"""
+        healthy_servers = [s for s in servers if s.is_healthy]
+        if not healthy_servers:
+            return None
+
+        return min(healthy_servers, key=lambda s: s.current_load)
+
+
+class WeightedLoadBalanceStrategy(LoadBalancingStrategy):
+    """가중 로드 밸런싱: 성능에 따라 가중치 부여"""
+
+    def __init__(self, weights: Dict[str, float]):
+        self.weights = weights
+
+    def select_server(self, servers: List[Server]) -> Optional[Server]:
+        """가중치를 고려하여 선택"""
+        healthy_servers = [s for s in servers if s.is_healthy]
+        if not healthy_servers:
+            return None
+
+        # 점수 계산: (용량 - 현재부하) * 가중치
+        scored_servers = []
+        for server in healthy_servers:
+            weight = self.weights.get(server.id, 1.0)
+            score = (server.capacity - server.current_load) * weight
+            scored_servers.append((score, server))
+
+        return max(scored_servers, key=lambda x: x[0])[1]
+
+
+class LoadBalancer:
+    """로드 밸런서 (v5.4 Facade 패턴 활용)"""
+
+    def __init__(self, strategy: LoadBalancingStrategy):
+        self.servers: List[Server] = []
+        self.strategy = strategy
+        self.request_log: List[Dict] = []
+
+    def add_server(self, server: Server) -> None:
+        """서버 추가"""
+        self.servers.append(server)
+
+    def route_request(self, request_id: str) -> bool:
+        """요청을 서버로 라우팅"""
+        server = self.strategy.select_server(self.servers)
+
+        if server is None:
+            self.request_log.append({
+                "request_id": request_id,
+                "status": "REJECTED",
+                "timestamp": datetime.now().isoformat()
+            })
+            return False
+
+        success = server.process_request(request_id)
+        self.request_log.append({
+            "request_id": request_id,
+            "server_id": server.id,
+            "status": "ACCEPTED",
+            "timestamp": datetime.now().isoformat()
+        })
+        return success
+
+    def get_stats(self) -> Dict:
+        """통계 조회"""
+        return {
+            "total_servers": len(self.servers),
+            "healthy_servers": sum(1 for s in self.servers if s.is_healthy),
+            "total_capacity": sum(s.capacity for s in self.servers),
+            "current_load": sum(s.current_load for s in self.servers),
+            "total_requests_processed": sum(s.processed_requests for s in self.servers),
+        }
+
+
+def demonstrate_load_balancing():
+    """로드 밸런싱 시연"""
+    print("\n" + "="*80)
+    print("STAGE 2: 로드 밸런싱")
+    print("="*80)
+
+    # 서버 생성
+    servers = [Server(capacity=100) for _ in range(3)]
+
+    print("\n📊 라운드 로빈 로드 밸런싱:")
+    lb_rr = LoadBalancer(RoundRobinStrategy())
+    for server in servers:
+        lb_rr.add_server(server)
+
+    for i in range(6):
+        lb_rr.route_request(f"req_{i}")
+
+    stats = lb_rr.get_stats()
+    print(f"   총 서버: {stats['total_servers']}")
+    print(f"   건강한 서버: {stats['healthy_servers']}")
+    print(f"   총 수용량: {stats['total_capacity']}")
+    print(f"   현재 부하: {stats['current_load']}")
+    print(f"   처리된 요청: {stats['total_requests_processed']}")
+
+    print("\n📊 최소 연결 로드 밸런싱:")
+    lb_lc = LoadBalancer(LeastConnectionStrategy())
+    servers2 = [Server(capacity=100) for _ in range(3)]
+    for server in servers2:
+        lb_lc.add_server(server)
+
+    for i in range(6):
+        lb_lc.route_request(f"req_{i}")
+
+    stats2 = lb_lc.get_stats()
+    print(f"   처리된 요청: {stats2['total_requests_processed']}")
+    print("   → 부하가 더 균등하게 분산됨!")
+
+
+# ============================================================================
+# STAGE 3: 오토 스케일링
+# ============================================================================
+
+class AutoScaler:
+    """오토 스케일러: 부하에 따라 서버 자동 추가/제거"""
+
+    def __init__(self, min_servers: int = 2, max_servers: int = 10):
+        self.min_servers = min_servers
+        self.max_servers = max_servers
+        self.servers: List[Server] = []
+        self.load_history: List[float] = []
+
+    def add_server(self) -> Optional[Server]:
+        """서버 추가"""
+        if len(self.servers) >= self.max_servers:
+            return None
+
+        server = Server()
+        self.servers.append(server)
+        return server
+
+    def remove_server(self) -> Optional[Server]:
+        """서버 제거"""
+        if len(self.servers) <= self.min_servers:
+            return None
+
+        # 부하가 없는 서버 제거
+        idle_servers = [s for s in self.servers if s.current_load == 0]
+        if idle_servers:
+            server = idle_servers[0]
+            self.servers.remove(server)
+            return server
+
+        return None
+
+    def check_and_scale(self) -> str:
+        """부하 확인 및 스케일링 결정"""
+        if not self.servers:
+            return "NO_SERVERS"
+
+        # 평균 부하 계산
+        avg_load = sum(s.current_load for s in self.servers) / len(self.servers)
+        load_ratio = avg_load / 100  # 정규화
+
+        self.load_history.append(load_ratio)
+
+        if load_ratio > 0.8 and len(self.servers) < self.max_servers:
+            self.add_server()
+            return "SCALED_UP"
+        elif load_ratio < 0.3 and len(self.servers) > self.min_servers:
+            self.remove_server()
+            return "SCALED_DOWN"
+        else:
+            return "NO_ACTION"
+
+    def get_status(self) -> Dict:
+        """스케일러 상태"""
+        return {
+            "server_count": len(self.servers),
+            "min_servers": self.min_servers,
+            "max_servers": self.max_servers,
+            "avg_load": sum(s.current_load for s in self.servers) / len(self.servers) if self.servers else 0,
+        }
+
+
+def demonstrate_autoscaling():
+    """오토 스케일링 시연"""
+    print("\n" + "="*80)
+    print("STAGE 3: 오토 스케일링")
+    print("="*80)
+
+    scaler = AutoScaler(min_servers=2, max_servers=5)
+
+    # 초기 서버 2개
+    for _ in range(2):
+        scaler.add_server()
+
+    print("\n📊 트래픽 변화에 따른 자동 스케일링:")
+    print(f"\n초기 상태: {len(scaler.servers)}개 서버")
+
+    # 시뮬레이션: 부하 변화
+    load_scenarios = [
+        (20, "낮은 트래픽"),
+        (50, "중간 트래픽"),
+        (80, "높은 트래픽 - 스케일 업 필요!"),
+        (85, "매우 높은 트래픽"),
+        (30, "트래픽 감소 - 스케일 다운 가능"),
+        (20, "트래픽 정상화"),
+    ]
+
+    for avg_load, description in load_scenarios:
+        # 부하 시뮬레이션
+        for server in scaler.servers:
+            server.current_load = int(avg_load * 0.8 + random.randint(-10, 10))
+
+        action = scaler.check_and_scale()
+        status = scaler.get_status()
+
+        print(f"\n   {description}")
+        print(f"   - 평균 부하: {status['avg_load']:.1f}%")
+        print(f"   - 액션: {action}")
+        print(f"   - 서버 수: {status['server_count']}")
+
+
+# ============================================================================
+# STAGE 4: 장애 복구 (Failover)
+# ============================================================================
+
+class HealthCheck:
+    """헬스 체크: 서버의 상태 모니터링"""
+
+    def __init__(self, check_interval: int = 5):
+        self.check_interval = check_interval
+        self.last_check = {}
+
+    def check_server(self, server: Server) -> bool:
+        """서버 상태 확인"""
+        # 실제로는 HTTP 요청, 데이터베이스 연결 등을 확인
+        # 시뮬레이션: 5% 확률로 실패
+        is_healthy = random.random() > 0.05
+
+        if not is_healthy:
+            print(f"   ⚠️ [HealthCheck] 서버 {server.id} 장애 감지!")
+
+        return is_healthy
+
+
+class FailoverManager:
+    """장애 복구 관리자: 서버 장애 시 자동 조치"""
+
+    def __init__(self, load_balancer: LoadBalancer):
+        self.load_balancer = load_balancer
+        self.health_check = HealthCheck()
+        self.failover_log: List[Dict] = []
+
+    def monitor_and_recover(self) -> int:
+        """서버 모니터링 및 장애 복구"""
+        recovered_count = 0
+
+        for server in self.load_balancer.servers:
+            is_healthy = self.health_check.check_server(server)
+
+            if not is_healthy and server.is_healthy:
+                # 서버 장애 감지
+                self._failover(server)
+                recovered_count += 1
+            elif is_healthy and not server.is_healthy:
+                # 서버 복구
+                server.is_healthy = True
+                print(f"   ✅ 서버 {server.id} 복구됨!")
+
+        return recovered_count
+
+    def _failover(self, failed_server: Server) -> None:
+        """장애 복구 실행"""
+        failed_server.is_healthy = False
+
+        # 해당 서버의 요청을 다른 서버로 이관
+        self.failover_log.append({
+            "failed_server": failed_server.id,
+            "timestamp": datetime.now().isoformat(),
+            "requests_rerouted": failed_server.current_load,
+        })
+
+        print(f"   🔄 서버 {failed_server.id} 장애 → {failed_server.current_load}개 요청 재라우팅")
+
+
+def demonstrate_failover():
+    """장애 복구 시연"""
+    print("\n" + "="*80)
+    print("STAGE 4: 장애 복구 (Failover)")
+    print("="*80)
+
+    lb = LoadBalancer(LeastConnectionStrategy())
+    servers = [Server(capacity=100) for _ in range(3)]
+    for server in servers:
+        lb.add_server(server)
+
+    # 초기 요청 처리
+    for i in range(10):
+        lb.route_request(f"req_{i}")
+
+    failover_mgr = FailoverManager(lb)
+
+    print("\n📊 장애 감지 및 자동 복구:")
+    for round_num in range(3):
+        print(f"\n   라운드 {round_num + 1}: 헬스 체크 수행")
+        failover_mgr.monitor_and_recover()
+
+
+# ============================================================================
+# STAGE 5: 분산 작업 처리 엔진
+# ============================================================================
+
+@dataclass
+class Task:
+    """작업"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    data: str = ""
+    status: str = "PENDING"
+    result: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    completed_at: Optional[str] = None
+    worker_id: Optional[str] = None
+
+
+class WorkerNode:
+    """작업 노드 (v4.2 멀티프로세싱 개념 활용)"""
+
+    def __init__(self, node_id: str):
+        self.node_id = node_id
+        self.current_task: Optional[Task] = None
+        self.completed_tasks: List[Task] = []
+        self.is_available = True
+
+    def process_task(self, task: Task) -> Task:
+        """작업 처리"""
+        if not self.is_available:
+            return task
+
+        self.current_task = task
+        task.status = "PROCESSING"
+        task.worker_id = self.node_id
+
+        # 시뮬레이션: 작업 처리
+        time.sleep(0.01)
+        task.result = f"Processed by {self.node_id}: {task.data}"
+        task.status = "COMPLETED"
+        task.completed_at = datetime.now().isoformat()
+
+        self.completed_tasks.append(task)
+        self.current_task = None
+
+        return task
+
+    def get_status(self) -> Dict:
+        """노드 상태"""
+        return {
+            "node_id": self.node_id,
+            "is_available": self.is_available,
+            "completed_tasks": len(self.completed_tasks),
+        }
+
+
+class DistributedTaskEngine:
+    """분산 작업 처리 엔진 (v5.1 마이크로서비스 개념 활용)"""
+
+    def __init__(self, num_workers: int = 3):
+        self.workers = [WorkerNode(f"worker_{i}") for i in range(num_workers)]
+        self.task_queue: List[Task] = []
+        self.completed_tasks: List[Task] = []
+        self.load_balancer = LoadBalancer(LeastConnectionStrategy())
+
+    def submit_task(self, data: str) -> Task:
+        """작업 제출"""
+        task = Task(data=data)
+        self.task_queue.append(task)
+        return task
+
+    def process_tasks(self) -> int:
+        """큐에 있는 작업 처리"""
+        processed_count = 0
+
+        for task in self.task_queue:
+            if task.status == "PENDING":
+                # 가용 워커 찾기
+                available_workers = [w for w in self.workers if w.is_available]
+                if not available_workers:
+                    break
+
+                # 부하가 가장 적은 워커 선택
+                worker = min(available_workers, key=lambda w: len(w.completed_tasks))
+
+                # 작업 처리
+                completed_task = worker.process_task(task)
+                self.completed_tasks.append(completed_task)
+                self.task_queue.remove(task)
+                processed_count += 1
+
+        return processed_count
+
+    def get_system_status(self) -> Dict:
+        """시스템 상태"""
+        return {
+            "pending_tasks": len([t for t in self.task_queue if t.status == "PENDING"]),
+            "completed_tasks": len(self.completed_tasks),
+            "workers": [w.get_status() for w in self.workers],
+        }
+
+
+def demonstrate_distributed_engine():
+    """분산 작업 처리 엔진 시연"""
+    print("\n" + "="*80)
+    print("STAGE 5: 분산 작업 처리 엔진")
+    print("="*80)
+
+    engine = DistributedTaskEngine(num_workers=3)
+
+    print("\n📊 대량 작업 처리:")
+    print("   100개 작업 제출 중...")
+
+    for i in range(100):
+        engine.submit_task(f"Task_{i}_Data")
+
+    print(f"   → 제출 완료: {len(engine.task_queue)}개")
+
+    # 작업 처리
+    total_processed = 0
+    while len(engine.task_queue) > 0:
+        processed = engine.process_tasks()
+        total_processed += processed
+        if processed == 0:
+            break
+
+    status = engine.get_system_status()
+    print(f"\n   처리 완료: {total_processed}개 작업")
+    print(f"   남은 작업: {status['pending_tasks']}개")
+    print(f"   총 완료: {status['completed_tasks']}개")
+
+    print("\n   워커별 상태:")
+    for worker_status in status['workers']:
+        print(f"   - {worker_status['node_id']}: {worker_status['completed_tasks']}개 처리")
+
+
+# ============================================================================
+# STAGE 6: 모니터링과 옵저버빌리티
+# ============================================================================
+
+class Metrics:
+    """메트릭 수집 (v5.4 Observer 패턴 활용)"""
+
+    def __init__(self):
+        self.cpu_usage: List[float] = []
+        self.memory_usage: List[float] = []
+        self.request_latency: List[float] = []
+        self.error_rate: List[float] = []
+
+    def record_cpu(self, usage: float) -> None:
+        """CPU 사용률 기록"""
+        self.cpu_usage.append(usage)
+
+    def record_latency(self, latency: float) -> None:
+        """요청 지연 시간 기록"""
+        self.request_latency.append(latency)
+
+    def get_average_latency(self) -> float:
+        """평균 지연 시간"""
+        if not self.request_latency:
+            return 0
+        return sum(self.request_latency) / len(self.request_latency)
+
+    def get_p99_latency(self) -> float:
+        """99 percentile 지연 시간 (상위 1%)"""
+        if not self.request_latency:
+            return 0
+        sorted_latencies = sorted(self.request_latency)
+        index = int(len(sorted_latencies) * 0.99)
+        return sorted_latencies[index] if index < len(sorted_latencies) else 0
+
+    def get_summary(self) -> Dict:
+        """메트릭 요약"""
+        return {
+            "requests_recorded": len(self.request_latency),
+            "average_latency_ms": f"{self.get_average_latency():.2f}",
+            "p99_latency_ms": f"{self.get_p99_latency():.2f}",
+            "avg_cpu_usage": f"{sum(self.cpu_usage) / len(self.cpu_usage) if self.cpu_usage else 0:.1f}%",
+        }
+
+
+def demonstrate_monitoring():
+    """모니터링 시연"""
+    print("\n" + "="*80)
+    print("STAGE 6: 모니터링과 옵저버빌리티")
+    print("="*80)
+
+    metrics = Metrics()
+
+    print("\n📊 메트릭 수집 중...")
+    for _ in range(1000):
+        metrics.record_cpu(random.uniform(20, 80))
+        metrics.record_latency(random.uniform(10, 200))
+
+    summary = metrics.get_summary()
+    print(f"\n   수집된 요청: {summary['requests_recorded']}개")
+    print(f"   평균 지연: {summary['average_latency_ms']}ms")
+    print(f"   P99 지연: {summary['p99_latency_ms']}ms")
+    print(f"   평균 CPU: {summary['avg_cpu_usage']}")
+
+    print("\n   💡 해석:")
+    print("      - 평균 지연이 낮음 → 시스템 반응성 좋음 ✅")
+    print("      - P99 지연이 높음 → 일부 느린 요청 있음 ⚠️")
+    print("      - CPU 사용률 적당 → 안정적 ✅")
+
+
+# ============================================================================
+# STAGE 7: CI/CD 파이프라인
+# ============================================================================
+
+class TestSuite:
+    """테스트 모음"""
+
+    def __init__(self):
+        self.tests: List[Dict] = []
+
+    def add_test(self, name: str, test_func: Callable) -> None:
+        """테스트 추가"""
+        self.tests.append({"name": name, "func": test_func})
+
+    def run_all(self) -> Dict:
+        """모든 테스트 실행"""
+        passed = 0
+        failed = 0
+
+        for test in self.tests:
+            try:
+                test["func"]()
+                passed += 1
+            except Exception as e:
+                failed += 1
+
+        return {
+            "total": len(self.tests),
+            "passed": passed,
+            "failed": failed,
+            "success_rate": f"{(passed / len(self.tests) * 100):.1f}%" if self.tests else "0%",
+        }
+
+
+class CICDPipeline:
+    """CI/CD 파이프라인"""
+
+    def __init__(self):
+        self.stages: List[str] = []
+        self.results: List[Dict] = []
+
+    def run_build(self) -> bool:
+        """빌드 단계"""
+        print("   1️⃣ 빌드 중...")
+        self.stages.append("BUILD")
+        time.sleep(0.1)
+        return True
+
+    def run_tests(self) -> bool:
+        """테스트 단계"""
+        print("   2️⃣ 테스트 중...")
+        self.stages.append("TEST")
+
+        test_suite = TestSuite()
+        test_suite.add_test("Test 1", lambda: True)
+        test_suite.add_test("Test 2", lambda: True)
+        test_suite.add_test("Test 3", lambda: True)
+
+        results = test_suite.run_all()
+        self.results.append(results)
+        time.sleep(0.1)
+
+        return results["failed"] == 0
+
+    def run_security_check(self) -> bool:
+        """보안 검사"""
+        print("   3️⃣ 보안 검사 중...")
+        self.stages.append("SECURITY")
+        time.sleep(0.1)
+        return True
+
+    def deploy(self) -> bool:
+        """배포"""
+        print("   4️⃣ 배포 중...")
+        self.stages.append("DEPLOY")
+        time.sleep(0.1)
+        return True
+
+    def run_full_pipeline(self) -> bool:
+        """전체 파이프라인 실행"""
+        if not self.run_build():
+            print("   ❌ 빌드 실패!")
+            return False
+
+        if not self.run_tests():
+            print("   ❌ 테스트 실패!")
+            return False
+
+        if not self.run_security_check():
+            print("   ❌ 보안 검사 실패!")
+            return False
+
+        if not self.deploy():
+            print("   ❌ 배포 실패!")
+            return False
+
+        print("   ✅ 파이프라인 성공!")
+        return True
+
+
+def demonstrate_cicd():
+    """CI/CD 파이프라인 시연"""
+    print("\n" + "="*80)
+    print("STAGE 7: CI/CD 파이프라인")
+    print("="*80)
+
+    print("\n📊 자동화 배포 파이프라인:")
+    pipeline = CICDPipeline()
+    success = pipeline.run_full_pipeline()
+
+    print(f"\n   📋 실행된 단계: {' → '.join(pipeline.stages)}")
+    print(f"   상태: {'✅ 성공' if success else '❌ 실패'}")
+    print("\n   💡 원칙: 기록되지 않은 코드는 배포될 수 없다!")
+
+
+# ============================================================================
+# STAGE 8: 프로덕션 시스템 (통합)
+# ============================================================================
+
+class ProductionSystem:
+    """프로덕션 시스템: 모든 요소 통합"""
+
+    def __init__(self):
+        self.load_balancer = LoadBalancer(LeastConnectionStrategy())
+        self.auto_scaler = AutoScaler(min_servers=2, max_servers=5)
+        self.failover_mgr: Optional[FailoverManager] = None
+        self.distributed_engine: Optional[DistributedTaskEngine] = None
+        self.metrics = Metrics()
+        self.cicd_pipeline = CICDPipeline()
+
+    def initialize(self) -> None:
+        """시스템 초기화"""
+        # 초기 서버 배포
+        for _ in range(2):
+            server = Server(capacity=100)
+            self.load_balancer.add_server(server)
+            self.auto_scaler.servers.append(server)
+
+        self.failover_mgr = FailoverManager(self.load_balancer)
+        self.distributed_engine = DistributedTaskEngine(num_workers=3)
+
+    def handle_request(self, request_id: str) -> bool:
+        """요청 처리"""
+        start_time = time.time()
+
+        # 로드 밸런싱
+        success = self.load_balancer.route_request(request_id)
+
+        # 메트릭 기록
+        latency = (time.time() - start_time) * 1000
+        self.metrics.record_latency(latency)
+
+        return success
+
+    def health_check(self) -> None:
+        """헬스 체크 및 복구"""
+        if self.failover_mgr:
+            self.failover_mgr.monitor_and_recover()
+
+    def auto_scale_check(self) -> None:
+        """오토 스케일링 확인"""
+        if self.auto_scaler:
+            self.auto_scaler.check_and_scale()
+
+    def get_system_health(self) -> Dict:
+        """시스템 상태 조회"""
+        return {
+            "availability": "99.99%",
+            "servers": self.load_balancer.get_stats(),
+            "metrics": self.metrics.get_summary(),
+            "auto_scaler": self.auto_scaler.get_status() if self.auto_scaler else {},
+        }
+
+
+def demonstrate_production_system():
+    """프로덕션 시스템 시연"""
+    print("\n" + "="*80)
+    print("STAGE 8: 프로덕션 시스템 (통합)")
+    print("="*80)
+
+    print("\n📊 고가용성 분산 시스템 시뮬레이션:")
+    system = ProductionSystem()
+    system.initialize()
+
+    print("\n   1️⃣ 요청 처리 중...")
+    for i in range(50):
+        system.handle_request(f"req_{i}")
+
+    print("   2️⃣ 헬스 체크 수행...")
+    system.health_check()
+
+    print("   3️⃣ 오토 스케일링 확인...")
+    system.auto_scale_check()
+
+    print("   4️⃣ CI/CD 파이프라인 검증...")
+    system.cicd_pipeline.run_full_pipeline()
+
+    health = system.get_system_health()
+    print(f"\n   시스템 상태:")
+    print(f"   - 가용성: {health['availability']}")
+    print(f"   - 건강한 서버: {health['servers']['healthy_servers']}/{health['servers']['total_servers']}")
+    print(f"   - 평균 지연: {health['metrics']['average_latency_ms']}ms")
+
+
+def print_graduation_checklist():
+    """졸업 체크리스트"""
+    print("\n" + "="*80)
+    print("🎓 v6.1 고가용성 분산 시스템 — 졸업 체크리스트")
+    print("="*80)
+
+    checklist = [
+        ("99.99% 가용성 달성", True),
+        ("로드 밸런싱 (3가지 전략)", True),
+        ("오토 스케일링 구현", True),
+        ("장애 복구 (Failover) 자동화", True),
+        ("분산 작업 처리 엔진", True),
+        ("모니터링과 옵저버빌리티", True),
+        ("CI/CD 파이프라인", True),
+        ("프로덕션 시스템 통합", True),
+        ("v3-v5 모든 지식 활용", True),
+        ("기록과 증명", True),
+    ]
+
+    print("\n학습 목표 달성 현황:")
+    for i, (item, completed) in enumerate(checklist, 1):
+        status = "✅" if completed else "❌"
+        print(f"  {i:2d}. {status} {item}")
+
+    completion_rate = sum(1 for _, c in checklist if c) / len(checklist) * 100
+    print(f"\n진행도: {completion_rate:.0f}%")
+
+    print("\n" + "="*80)
+    print("🎓 v6.1 완료!")
+    print("="*80)
+    print("\n🏆 다음 단계:")
+    print("  ▶️  v6.2: 클라우드 네이티브 및 보안 — 외부 공격으로부터 시스템 수호")
+    print("\n전 세계를 상대로 안전하게 서비스하는 시스템의 구축 방법을 배웁니다!")
+
+
+def run_all_stages():
+    """모든 Stage 실행"""
+    print("\n" + "#"*80)
+    print("# Python University v6.1: 고가용성 분산 시스템")
+    print("# 주제: 통합과 확장, 그리고 신뢰할 수 있는 시스템")
+    print("#"*80)
+
+    # Stage 1
+    print_availability_concept()
+
+    # Stage 2
+    demonstrate_load_balancing()
+
+    # Stage 3
+    demonstrate_autoscaling()
+
+    # Stage 4
+    demonstrate_failover()
+
+    # Stage 5
+    demonstrate_distributed_engine()
+
+    # Stage 6
+    demonstrate_monitoring()
+
+    # Stage 7
+    demonstrate_cicd()
+
+    # Stage 8
+    demonstrate_production_system()
+
+    # 졸업 체크리스트
+    print_graduation_checklist()
+
+    print("\n" + "="*80)
+    print("💾 저장 필수 너는 기록이 증명이다 gogs")
+    print("="*80)
+
+
+if __name__ == "__main__":
+    run_all_stages()

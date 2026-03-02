@@ -1,0 +1,395 @@
+# knex-c SQL 인젝션 취약점 분석 - 정직한 보고서
+
+**날짜**: 2026년 2월 21일
+**심각도**: 🔴 **CRITICAL** (즉시 수정 필요)
+**평가 방식**: 정적 코드 분석 (실제 공격 검증 없음)
+
+---
+
+## 🚨 요약
+
+knex-c는 헤더에서 "**파라미터화된 쿼리 (SQL 주입 방지)**"라고 명시하지만, **실제로는 SQL 주입을 전혀 방지하지 않습니다**.
+
+```
+주장:       "SQL 주입 방지"
+현실:       "모든 입력을 그대로 SQL에 삽입"
+신뢰도:     0% (거짓 주장)
+위험도:     100% (완전히 취약함)
+```
+
+---
+
+## 🔍 발견된 취약점
+
+### 1. WHERE 절 직접 삽입 (Line 42)
+
+```c
+kknex_query_t* kknex_where(kknex_query_t *q, const char *condition) {
+    if (!q || !condition) return q;
+    strcpy(q->where_clause, condition);  // ❌ 직접 삽입
+    return q;
+}
+```
+
+**문제점**:
+- `strcpy()`: 경계 검사 없음 (버퍼 오버플로우)
+- `condition`: SQL 이스케이핑 없음 (SQL 인젝션)
+- `where_clause`: 512바이트 고정 버퍼 (크기 초과 위험)
+
+**공격 예시**:
+```c
+kknex_query_t *q = kknex_new();
+kknex_table(q, "users");
+kknex_where(q, "id=1' OR '1'='1");  // SQL 인젝션
+char *sql = kknex_to_select(q);
+// 결과: SELECT * FROM users WHERE id=1' OR '1'='1
+// 결과: ✅ 모든 사용자 탈취 가능
+```
+
+---
+
+### 2. AND/OR WHERE 절 연결 (Lines 49-51, 59-61)
+
+```c
+kknex_query_t* kknex_and_where(kknex_query_t *q, const char *condition) {
+    if (!q || !condition) return q;
+    if (q->where_clause[0] != '\0') {
+        strcat(q->where_clause, " AND ");  // ❌ strcat (경계 검사 없음)
+    }
+    strcat(q->where_clause, condition);     // ❌ 직접 연결
+    return q;
+}
+```
+
+**문제점**:
+- `strcat()`: 경계 검사 없음 (버퍼 오버플로우)
+- 반복 호출 시 누적 오버플로우 위험
+- SQL 인젉션 입력 그대로 연결
+
+**공격 예시**:
+```c
+kknex_where(q, "id=1");
+kknex_and_where(q, "name='admin'; DROP TABLE users;--");
+// 결과: id=1 AND name='admin'; DROP TABLE users;--
+// 결과: ✅ 테이블 삭제 가능
+```
+
+---
+
+### 3. JOIN 절에 직접 테이블명 삽입 (Lines 73, 79)
+
+```c
+kknex_query_t* kknex_join(kknex_query_t *q, const char *table, const char *condition) {
+    if (!q || !table || !condition) return q;
+    sprintf(q->join_clause + strlen(q->join_clause),
+            "INNER JOIN %s ON %s ", table, condition);  // ❌ 직접 삽입
+    return q;
+}
+```
+
+**문제점**:
+- `sprintf()`: 경계 검사 없음 (버퍼 오버플로우)
+- `table`: 이스케이핑 없음 (테이블명 인젝션)
+- `condition`: 이스케이핑 없음 (WHERE 조건 인젝션)
+
+**공격 예시**:
+```c
+kknex_join(q, "admin'; --", "id=1");
+// 결과: INNER JOIN admin'; -- ON id=1
+// 결과: ✅ 문법 오류로 쿼리 변조 가능
+```
+
+---
+
+### 4. GROUP BY 직접 삽입 (Line 85)
+
+```c
+kknex_query_t* kknex_group_by(kknex_query_t *q, const char *columns) {
+    if (!q || !columns) return q;
+    strcpy(q->group_by, columns);  // ❌ 직접 삽입
+    return q;
+}
+```
+
+**문제점**:
+- `strcpy()`: 경계 검사 없음
+- `group_by`: 256바이트만 가능 (제약 적음)
+- SQL 인젝션 가능
+
+---
+
+### 5. ORDER BY 직접 삽입 (Line 91)
+
+```c
+kknex_query_t* kknex_order_by(kknex_query_t *q, const char *column,
+                              const char *direction) {
+    if (!q || !column) return q;
+    sprintf(q->order_by, "%s %s", column, direction ? direction : "ASC");  // ❌ 직접 삽입
+    return q;
+}
+```
+
+**문제점**:
+- 컬럼명: 이스케이핑 없음
+- direction: 이스케이핑 없음
+- SQL 인젝션 가능
+
+**공격 예시**:
+```c
+kknex_order_by(q, "name; DROP TABLE users;--", NULL);
+// 결과: ORDER BY name; DROP TABLE users;-- ASC
+// 결과: ✅ 테이블 삭제 가능
+```
+
+---
+
+### 6. INSERT VALUES 직접 삽입 (Line 148)
+
+```c
+char* kknex_insert(kknex_query_t *q, const char *columns, const char *values) {
+    if (!q || !columns || !values) return NULL;
+
+    char *result = (char *)malloc(1024);
+    sprintf(result, "INSERT INTO %s (%s) VALUES (%s)",
+            q->table, columns, values);  // ❌ 모두 직접 삽입
+    return result;
+}
+```
+
+**문제점**:
+- `columns`: 이스케이핑 없음
+- `values`: 이스케이핑 없음 (가장 위험)
+- `malloc(1024)`: 버퍼 오버플로우 위험
+
+**공격 예시**:
+```c
+kknex_insert(q, "name, age", "'admin', 999); DROP TABLE users;--");
+// 결과: INSERT INTO users (name, age) VALUES ('admin', 999); DROP TABLE users;--
+// 결과: ✅ 테이블 삭제 + 데이터 삽입
+```
+
+---
+
+### 7. UPDATE SET 직접 삽입 (Line 157)
+
+```c
+char* kknex_update(kknex_query_t *q, const char *set_clause) {
+    if (!q || !set_clause) return NULL;
+
+    char *result = (char *)malloc(1024);
+    sprintf(result, "UPDATE %s SET %s", q->table, set_clause);  // ❌ 직접 삽입
+
+    if (q->where_clause[0] != '\0') {
+        strcat(result, " WHERE ");
+        strcat(result, q->where_clause);  // ❌ where_clause도 미검증
+    }
+    return result;
+}
+```
+
+**문제점**:
+- `set_clause`: 이스케이핑 없음
+- `strcat()`: 경계 검사 없음
+- WHERE 절도 미검증
+
+---
+
+### 8. DELETE 직접 삽입 (Line 171)
+
+```c
+char* kknex_delete(kknex_query_t *q) {
+    if (!q) return NULL;
+
+    char *result = (char *)malloc(1024);
+    sprintf(result, "DELETE FROM %s", q->table);  // ❌ 직접 삽입
+
+    if (q->where_clause[0] != '\0') {
+        strcat(result, " WHERE ");
+        strcat(result, q->where_clause);  // ❌ where_clause도 미검증
+    }
+    return result;
+}
+```
+
+**문제점**:
+- `table`: 테이블명 인젝션 가능
+- WHERE 절도 미검증
+
+---
+
+## 🎭 거짓 보안: kknex_bind() 함수
+
+```c
+kknex_query_t* kknex_bind(kknex_query_t *q, const char *value) {
+    if (!q || !value || q->param_count >= 1024) return q;
+    strncpy(q->params[q->param_count], value, sizeof(q->params[0]) - 1);
+    q->param_count++;
+    return q;
+}
+```
+
+**거짓 보안의 증거**:
+
+1. **바인딩된 파라미터는 절대 사용되지 않음**
+   - `q->params[]` 배열에 저장됨
+   - `q->param_count` 증가함
+   - **하지만 어느 함수에서도 이 파라미터를 사용하지 않음**
+
+2. **쿼리 생성 함수들이 파라미터를 무시**
+   - `kknex_to_select()`: `param_count` 확인 안 함
+   - `kknex_insert()`: `params[]` 사용 안 함
+   - `kknex_update()`: `params[]` 사용 안 함
+   - `kknex_delete()`: `params[]` 사용 안 함
+
+3. **결과**:
+   - `kknex_bind()`는 아무것도 하지 않음
+   - SQL 인젝션 방지 효과: 0%
+   - 사용자에게 거짓 안도감 제공
+
+**거짓 사용 예**:
+```c
+// 개발자 의도 (파라미터 사용)
+kknex_query_t *q = kknex_new();
+kknex_table(q, "users");
+kknex_where(q, "id=?");      // 플레이스홀더 없음
+kknex_bind(q, "123");        // 파라미터 저장만 함
+char *sql = kknex_to_select(q);
+// 결과: SELECT * FROM users WHERE id=?
+// 문제: ? 플레이스홀더가 그대로 남음
+// 파라미터 바인딩 안 됨
+```
+
+---
+
+## 📊 취약점 요약
+
+### 위험 코드 패턴
+
+| 패턴 | 개수 | 함수 | 위험도 |
+|------|------|------|--------|
+| `strcpy()` | 2 | kknex_where, kknex_group_by | 🔴 높음 |
+| `strcat()` | 4 | kknex_and_where, kknex_or_where, kknex_update, kknex_delete | 🔴 높음 |
+| `sprintf()` | 7 | 모든 쿼리 생성 함수 | 🔴 높음 |
+| **직접 SQL 삽입** | **13** | 모든 쿼리 생성 | 🔴 CRITICAL |
+
+### 취약한 입력점
+
+| 입력점 | 타입 | 이스케이핑 | SQL 인젉션 | 버퍼 오버플로우 |
+|--------|------|-----------|----------|-------------|
+| WHERE condition | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| JOIN table | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| JOIN condition | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| GROUP BY columns | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| ORDER BY column | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| ORDER BY direction | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| INSERT columns | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| INSERT values | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+| UPDATE set_clause | 사용자 입력 | ❌ 없음 | ⚠️ 가능 | ⚠️ 가능 |
+
+---
+
+## 🔴 심각도 평가
+
+### SQL 인젉션 가능성
+
+| 공격 유형 | 가능성 | 영향 | 예시 |
+|----------|--------|------|------|
+| **SELECT 문 변조** | ⚠️ 100% | 데이터 유출 | WHERE에 OR '1'='1 |
+| **UPDATE/DELETE 전체 행** | ⚠️ 100% | 데이터 손실 | WHERE 조건 제거 |
+| **테이블 삭제** | ⚠️ 100% | 데이터 손실 | DROP TABLE |
+| **코드 실행** | ⚠️ DB 의존 | DB 장악 | UDF 실행 등 |
+
+### 버퍼 오버플로우 가능성
+
+| 버퍼 | 크기 | 입력 제한 | 오버플로우 |
+|------|------|---------|-----------|
+| where_clause | 512 | 없음 | ⚠️ 가능 |
+| join_clause | 512 | 없음 | ⚠️ 가능 |
+| group_by | 256 | 없음 | ⚠️ 가능 |
+| order_by | 256 | 없음 | ⚠️ 가능 |
+| insert/update/delete result | 1024 | 없음 | ⚠️ 가능 |
+
+---
+
+## 📋 정직한 평가
+
+### ❌ 할 수 없는 말
+
+- ~~"이 라이브러리는 SQL 인젝션으로부터 안전합니다"~~ (완전히 거짓)
+- ~~"파라미터화된 쿼리를 사용합니다"~~ (파라미터가 사용되지 않음)
+- ~~"SQL 주입 방지"~~ (전혀 방지 안 함)
+
+### ✅ 할 수 있는 말
+
+1. **"13개 입력점에서 SQL 인젉션 가능성이 확인되었습니다"**
+   - 사실: 정적 분석으로 확인 (실제 공격 테스트는 안 함)
+
+2. **"kknex_bind() 함수는 실제로 파라미터를 사용하지 않습니다"**
+   - 사실: 코드 검토로 확인
+
+3. **"strcpy/strcat로 인한 버퍼 오버플로우 위험이 있습니다"**
+   - 사실: 코드 검토로 확인
+
+---
+
+## 🎯 위험도 점수 재평가
+
+### Before: 0% (자동 스캔 점수)
+- sprintf×13: -10×13 = -130
+- strcpy×2: -15×2 = -30
+- 합계: 100 - 130 - 30 = -60 → 0% (최소값)
+
+### After: **100% 위험 (정적 분석 재평가)**
+- 13개 직접 SQL 삽입 지점 확인
+- 파라미터 바인딩 미구현 확인
+- 모든 입력에 SQL 인젉션 가능
+- **신뢰도**: 100% (코드 검토)
+
+---
+
+## 🚀 수정 필요사항
+
+### Phase 1: 긴급 (24시간 내)
+
+```c
+// 필요: SQL 이스케이핑 함수 구현
+char* sql_escape(const char *input) {
+    // ', ", \, %, _ 등 이스케이프
+}
+
+// 필요: snprintf 사용으로 버퍼 오버플로우 방지
+snprintf(q->where_clause, sizeof(q->where_clause),
+         "%s", escaped_condition);
+
+// 필요: 실제 파라미터 바인딩 구현
+// ? 플레이스홀더 지원
+// 파라미터 배열과 매칭
+```
+
+### Phase 2: 중요 (1주일 내)
+
+```c
+// 필요: 모든 함수에 SQL 이스케이핑 적용
+// 필요: 경계 검사 추가
+// 필요: API 변경 (파라미터 방식)
+```
+
+---
+
+## 결론
+
+**knex-c는 프로덕션 환경에서 사용할 수 없습니다.**
+
+- 🔴 SQL 인젝션 방어 불가능
+- 🔴 버퍼 오버플로우 위험
+- 🔴 API가 거짓 보안을 약속
+- 🔴 kknex_bind()는 무용지물
+
+**평가**: **100% 위험** (Critical)
+
+---
+
+**검증 방법**: 정적 코드 분석
+**신뢰도**: 90% (코드 검토 기반, 실제 공격 테스트는 미수행)
+**다음 단계**: 전체 재설계 필요
+

@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""
+Ablation Study Runner for BR-AIOpsFL
+======================================
+Evaluates impact of removing each module:
+1. Full BR-AIOpsFL (all modules enabled)
+2. w/o TrajectoryDetector (single-round Isolation Forest only)
+3. w/o TaskAwareAggregator (naive averaging across tasks)
+4. w/o DPoSQuarantine (simple binary exclusion, no slashing)
+
+Generates ablation_results.csv with detailed metrics per variant.
+"""
+
+import sys
+import os
+import csv
+import json
+import random
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+from enum import Enum
+
+# Add parent directory to path
+sys.path.insert(0, str(Path(__file__).parent.parent / "code"))
+
+from university_v16_BYZANTINE_RESILIENT_FL import (
+    IsolationForest,
+    TrajectoryDetector,
+    TaskAwareAggregator,
+    DPoSQuarantine,
+    BRAAIOpsFL
+)
+
+@dataclass
+class AblationConfig:
+    """Configuration for ablation variant"""
+    variant_name: str
+    use_trajectory: bool = True
+    use_task_aware: bool = True
+    use_dpos: bool = True
+
+class AblationRunner:
+    def __init__(self, output_dir: str = "results"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+
+        self.variants = [
+            AblationConfig(
+                variant_name="Full BR-AIOpsFL",
+                use_trajectory=True,
+                use_task_aware=True,
+                use_dpos=True
+            ),
+            AblationConfig(
+                variant_name="w/o TrajectoryDetector",
+                use_trajectory=False,
+                use_task_aware=True,
+                use_dpos=True
+            ),
+            AblationConfig(
+                variant_name="w/o TaskAwareAggregator",
+                use_trajectory=True,
+                use_task_aware=False,
+                use_dpos=True
+            ),
+            AblationConfig(
+                variant_name="w/o DPoSQuarantine",
+                use_trajectory=True,
+                use_task_aware=True,
+                use_dpos=False
+            ),
+        ]
+
+        self.results = []
+
+    def run_ablation_study(self, num_clients: int = 100, num_tasks: int = 3,
+                          num_rounds: int = 50, num_seeds: int = 5,
+                          byzantine_fractions: List[float] = [0.1, 0.2, 0.3]):
+        """
+        Execute ablation study across all variants and configurations.
+
+        Args:
+            num_clients: Total number of clients
+            num_tasks: Number of federated tasks
+            num_rounds: Training rounds per configuration
+            num_seeds: Number of random seeds
+            byzantine_fractions: Byzantine client fractions to test
+        """
+
+        print(f"🧪 BR-AIOpsFL Ablation Study Runner")
+        print(f"{'='*60}")
+        print(f"Variants: {len(self.variants)}")
+        print(f"Byzantine Fractions: {byzantine_fractions}")
+        print(f"Seeds: {num_seeds}")
+        print(f"Total Runs: {len(self.variants)} × {len(byzantine_fractions)} × {num_seeds} = {len(self.variants) * len(byzantine_fractions) * num_seeds}")
+        print(f"{'='*60}\n")
+
+        total_runs = len(self.variants) * len(byzantine_fractions) * num_seeds
+        current_run = 0
+
+        for variant in self.variants:
+            print(f"\n📊 Variant: {variant.variant_name}")
+            print(f"  Trajectory: {variant.use_trajectory}")
+            print(f"  TaskAware: {variant.use_task_aware}")
+            print(f"  DPoS: {variant.use_dpos}")
+
+            variant_results = {
+                'variant': variant.variant_name,
+                'accuracy_list': [],
+                'detection_f1_list': [],
+                'mttr_list': [],
+                'evasion_list': []
+            }
+
+            for byz_frac in byzantine_fractions:
+                for seed in range(num_seeds):
+                    current_run += 1
+                    progress = (current_run / total_runs) * 100
+
+                    # Run simulation with this configuration
+                    try:
+                        metrics = self._run_single_config(
+                            variant=variant,
+                            num_clients=num_clients,
+                            num_tasks=num_tasks,
+                            num_rounds=num_rounds,
+                            byzantine_fraction=byz_frac,
+                            seed=seed
+                        )
+
+                        variant_results['accuracy_list'].append(metrics['accuracy'])
+                        variant_results['detection_f1_list'].append(metrics['detection_f1'])
+                        variant_results['mttr_list'].append(metrics['mttr'])
+                        variant_results['evasion_list'].append(metrics['evasion_count'])
+
+                        print(f"  [{progress:5.1f}%] Byz={byz_frac*100:.0f}% Seed={seed}: "
+                              f"Acc={metrics['accuracy']:.4f}, "
+                              f"F1={metrics['detection_f1']:.4f}, "
+                              f"MTTR={metrics['mttr']:.1f}R")
+
+                    except Exception as e:
+                        print(f"  [{progress:5.1f}%] ❌ ERROR: {e}")
+                        continue
+
+            # Aggregate results for this variant
+            self._aggregate_variant_results(variant_results)
+
+        # Write final ablation results to CSV
+        self._write_ablation_results()
+        print(f"\n✅ Ablation study complete! Results saved to {self.output_dir}/ablation_results.csv")
+
+    def _run_single_config(self, variant: AblationConfig, num_clients: int,
+                          num_tasks: int, num_rounds: int,
+                          byzantine_fraction: float, seed: int) -> Dict:
+        """
+        Run a single configuration and return metrics.
+        """
+        random.seed(seed)
+
+        # Create system with disabled modules as needed
+        system = BRAAIOpsFL(
+            num_clients=num_clients,
+            num_tasks=num_tasks,
+            byzantine_fraction=byzantine_fraction,
+            seed=seed
+        )
+
+        # Disable modules based on variant
+        if not variant.use_trajectory:
+            system.detector = None  # Disable TrajectoryDetector
+        if not variant.use_task_aware:
+            system.aggregator = TaskAwareAggregator(enabled=False)  # Simple averaging
+        if not variant.use_dpos:
+            system.quarantine = None  # Disable DPoS
+
+        # Run simulation
+        metrics = system.run_simulation(num_rounds=num_rounds)
+
+        return metrics
+
+    def _aggregate_variant_results(self, variant_results: Dict):
+        """Compute statistics for a single variant."""
+        import statistics
+
+        variant_name = variant_results['variant']
+
+        accuracy_mean = statistics.mean(variant_results['accuracy_list'])
+        accuracy_std = statistics.stdev(variant_results['accuracy_list']) if len(variant_results['accuracy_list']) > 1 else 0
+
+        detection_f1_mean = statistics.mean(variant_results['detection_f1_list'])
+        detection_f1_std = statistics.stdev(variant_results['detection_f1_list']) if len(variant_results['detection_f1_list']) > 1 else 0
+
+        mttr_mean = statistics.mean(variant_results['mttr_list'])
+        mttr_std = statistics.stdev(variant_results['mttr_list']) if len(variant_results['mttr_list']) > 1 else 0
+
+        evasion_mean = statistics.mean(variant_results['evasion_list'])
+        evasion_std = statistics.stdev(variant_results['evasion_list']) if len(variant_results['evasion_list']) > 1 else 0
+
+        # 95% Confidence intervals
+        import math
+        n = len(variant_results['accuracy_list'])
+        confidence_z = 1.96  # 95% CI
+
+        accuracy_ci = confidence_z * accuracy_std / math.sqrt(n) if n > 1 else 0
+        mttr_ci = confidence_z * mttr_std / math.sqrt(n) if n > 1 else 0
+
+        self.results.append({
+            'variant': variant_name,
+            'accuracy_mean': accuracy_mean,
+            'accuracy_std': accuracy_std,
+            'accuracy_ci': accuracy_ci,
+            'detection_f1_mean': detection_f1_mean,
+            'detection_f1_std': detection_f1_std,
+            'mttr_mean': mttr_mean,
+            'mttr_std': mttr_std,
+            'mttr_ci': mttr_ci,
+            'evasion_mean': evasion_mean,
+            'evasion_std': evasion_std,
+        })
+
+        print(f"\n  📈 {variant_name} AGGREGATE RESULTS:")
+        print(f"     Accuracy:  {accuracy_mean:.4f} ± {accuracy_std:.4f} (95% CI: ±{accuracy_ci:.4f})")
+        print(f"     Detection F1: {detection_f1_mean:.4f} ± {detection_f1_std:.4f}")
+        print(f"     MTTR:      {mttr_mean:.2f} ± {mttr_std:.2f} rounds (95% CI: ±{mttr_ci:.2f})")
+        print(f"     Evasion:   {evasion_mean*100:.1f}% ± {evasion_std*100:.1f}%")
+
+    def _write_ablation_results(self):
+        """Write aggregated results to CSV."""
+        output_file = self.output_dir / "ablation_results.csv"
+
+        with open(output_file, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'variant', 'accuracy_mean', 'accuracy_std', 'accuracy_ci',
+                'detection_f1_mean', 'detection_f1_std',
+                'mttr_mean', 'mttr_std', 'mttr_ci',
+                'evasion_mean', 'evasion_std'
+            ])
+            writer.writeheader()
+            writer.writerows(self.results)
+
+        print(f"\n✅ Ablation results written to {output_file}")
+        print("\n📊 Summary Table:")
+        print("─" * 110)
+        for result in self.results:
+            print(f"  {result['variant']:30} | Acc: {result['accuracy_mean']:.4f}±{result['accuracy_std']:.4f} | "
+                  f"F1: {result['detection_f1_mean']:.4f}±{result['detection_f1_std']:.4f} | "
+                  f"MTTR: {result['mttr_mean']:.1f}±{result['mttr_std']:.1f}R")
+
+
+if __name__ == "__main__":
+    runner = AblationRunner(output_dir="results")
+
+    # Run ablation study with reasonable defaults
+    runner.run_ablation_study(
+        num_clients=100,
+        num_tasks=3,
+        num_rounds=50,
+        num_seeds=5,
+        byzantine_fractions=[0.1, 0.2, 0.3]
+    )

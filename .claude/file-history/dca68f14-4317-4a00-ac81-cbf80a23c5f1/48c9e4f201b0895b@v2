@@ -1,0 +1,241 @@
+// ════════════════════════════════════════════════════════════════
+// 🔐 v2.K — Kernel/Policy 분리 설계 고정
+// ════════════════════════════════════════════════════════════════
+// Agent Kernel을 전략 불변(core)으로 고정
+// 모든 실행 전략을 Policy 계층으로 외부화
+
+// ─────────────────────────────────────────────────────────────
+// 설계 원칙
+// ─────────────────────────────────────────────────────────────
+
+// ❗ 핵심 원칙 1: KERNEL은 "결정"하지 않는다
+// ❗ 핵심 원칙 2: KERNEL은 "집행"만 한다
+// ❗ 핵심 원칙 3: POLICY는 모든 "판단"을 한다
+
+// ─────────────────────────────────────────────────────────────
+// KERNEL 책임 (변하지 않는 것 — Core)
+// ─────────────────────────────────────────────────────────────
+//
+// ✓ 상태 머신: Idle → Planning → Executing → Reflecting → Complete/Failed
+// ✓ DAG 실행 엔진: 의존성 기반 Task 스케줄링
+// ✓ Task 생명주기: Pending → Ready → Running → Done/Error/Blocked
+// ✓ Memory 관리: Append-only observation 저장
+// ✓ Constraint 강제: MaxSteps, TimeLimit, OutputFormat (hard stop)
+// ✓ 이벤트 발생: onTaskStart, onTaskEnd, onTaskFail, onPlanEnd
+//
+// ✗ Kernel은 "Retry 여부"를 결정하지 않는다
+// ✗ Kernel은 "Replan 여부"를 결정하지 않는다
+// ✗ Kernel은 "실패 전파 범위"를 결정하지 않는다
+// ✗ Kernel은 "MaxParallel 값"을 정하지 않는다
+
+// ─────────────────────────────────────────────────────────────
+// POLICY 책임 (전략 영역 — 교체 가능)
+// ─────────────────────────────────────────────────────────────
+//
+// ✓ Retry 여부 결정 (recoverable error vs fatal error)
+// ✓ Replan 허용 여부 (dynamic plan modification)
+// ✓ 실패 전파 범위 (FAIL_FAST vs FAIL_CONTINUE)
+// ✓ MaxParallel 값 (동시 실행 수 제한)
+// ✓ Scheduler 전략 (FIFO / Priority / Cost-based)
+// ✓ Abort vs Continue 결정 (graceful shutdown)
+// ✓ 모든 "판단"을 수행
+//
+// ✗ Policy는 "집행"하지 않는다
+// ✗ Policy는 DAG를 수정하지 않는다
+// ✗ Policy는 상태 머신을 제어하지 않는다
+
+// ─────────────────────────────────────────────────────────────
+// 구조 분리 전략
+// ─────────────────────────────────────────────────────────────
+
+// (1) Execution Loop 재설계
+//
+// 기존 (Kernel에 판단 로직 포함):
+// while has_ready_tasks {
+//   task = dequeue()
+//   result = execute(task)
+//   if result.failed {
+//     if retry_allowed {  // ← Kernel이 판단 (나쁨)
+//       retry(task)
+//     } else {
+//       abort()
+//     }
+//   }
+// }
+//
+// 변경 (Policy 주입):
+// while has_ready_tasks {
+//   task = dequeue()
+//   result = execute(task)
+//   decision = policy.onTaskEnd(task, result)  // ← Policy가 판단 (좋음)
+//   kernel.apply(decision)
+// }
+
+// (2) Replanner 이동
+//
+// 기존:
+//   Kernel 구성요소: [State, DAG, Task, Memory, Constraint, Replanner]
+//                                                             ↑ 판단 로직
+//
+// 변경:
+//   Kernel: [State, DAG, Task, Memory, Constraint] (순수 집행)
+//   Policy: [Replanner, RetryLogic, FailurePolicy, Scheduler] (판단)
+
+// (3) ReflectionResult → PolicyDecision 통합
+//
+// 기존 ReflectionResult (단순):
+// enum ReflectionResult {
+//   Continue
+//   Retry
+//   Abort
+// }
+//
+// 새로운 PolicyDecision (포괄적):
+// enum PolicyDecision {
+//   Proceed              // 정상 진행
+//   Retry(task_id)       // Task 재실행
+//   Replan(plan_delta)   // 동적 재계획
+//   Abort(reason)        // 중단 (reason 포함)
+// }
+
+// ─────────────────────────────────────────────────────────────
+// 인터페이스: AgentPolicy (Policy 계층의 표준)
+// ─────────────────────────────────────────────────────────────
+//
+// fn policy_onTaskSuccess(task_id, output) -> PolicyDecision
+//   Task 성공 후 다음 행동 결정
+//   - Proceed: 다음 ready Task 실행
+//   - Replan: 새로운 Task 추가 가능
+//
+// fn policy_onTaskFailure(task_id, error) -> PolicyDecision
+//   Task 실패 후 다음 행동 결정
+//   - Retry(task_id): 같은 Task 재실행
+//   - Replan(delta): 새로운 계획으로 복구
+//   - Abort(reason): 전체 중단
+//
+// fn policy_onConstraintViolation(constraint_name) -> PolicyDecision
+//   Constraint 위반 발생
+//   - Abort: Constraint는 hard stop (항상 Abort)
+//
+// fn policy_selectNextTask(ready_queue) -> task_id
+//   Ready 중인 여러 Task 중 실행할 Task 선택
+//   - FIFO: ReadyQueue 순서대로
+//   - Priority: 우선도 기반
+//   - Cost-based: 비용 기반
+
+// ─────────────────────────────────────────────────────────────
+// Kernel 인터페이스 (Policy 주입 필수)
+// ─────────────────────────────────────────────────────────────
+//
+// fn Kernel_initialize(policy)
+//   Policy를 주입받음 (필수)
+//   → Policy 없이는 Kernel 실행 불가
+//
+// fn Kernel_apply(decision)
+//   Policy가 내린 결정을 집행
+//   - Proceed: ReadyQueue에서 다음 Task 실행
+//   - Retry: 같은 Task를 다시 ready 상태로
+//   - Replan: plan_delta를 DAG에 적용
+//   - Abort: 상태 머신을 Failed로 전이
+
+// ─────────────────────────────────────────────────────────────
+// 고정 완료 체크리스트
+// ─────────────────────────────────────────────────────────────
+
+// ✅ Kernel 코드에 retry/replan 판단 로직 없음
+// ✅ Policy 없이 Kernel 실행 불가능
+// ✅ Policy 교체 시 Kernel 수정 0줄
+// ✅ 모든 "판단"이 PolicyDecision으로 표현 가능
+// ✅ 모든 "집행"이 kernel.apply()로 가능
+// ✅ Constraint 위반은 Kernel에서 hard stop (Policy 개입 불가)
+// ✅ Event 기반 Policy 호출 (Kernel → Policy → Kernel 순환)
+
+// ─────────────────────────────────────────────────────────────
+// 다음 단계: v2.K.1 — Sequential Conservative Policy
+// ─────────────────────────────────────────────────────────────
+//
+// 기본 정책:
+// - Retry: MaxRetry=1 (한 번만)
+// - Replan: 불허 (재계획 금지)
+// - Failure: FAIL_FAST (첫 실패 시 중단)
+// - MaxParallel: 1 (순차 실행)
+// - Scheduler: FIFO (큐 순서대로)
+// - Abort 조건: Task 실패 또는 Constraint 위반
+//
+// 이 정책을 v2.K.1에서 구현하고 테스트
+// Policy 교체 가능성 검증 (Kernel 수정 없음)
+
+// ─────────────────────────────────────────────────────────────
+// 설계 명시 (FreeLang 주석으로 표현)
+// ─────────────────────────────────────────────────────────────
+
+fn design_kernel_policy_separation() {
+  println("")
+  println("╔════════════════════════════════════════════════════════════╗")
+  println("║  🔐 v2.K — Kernel/Policy 분리 설계 고정                  ║")
+  println("╚════════════════════════════════════════════════════════════╝")
+  println("")
+
+  println("【 핵심 원칙 】")
+  println("1. Kernel은 '결정'하지 않는다 (순수 집행)")
+  println("2. Kernel은 '집행'만 한다")
+  println("3. Policy는 모든 '판단'을 한다")
+  println("")
+
+  println("【 Kernel 책임 (Core — 변하지 않음) 】")
+  println("✓ 상태 머신")
+  println("✓ DAG 실행 엔진")
+  println("✓ Task 생명주기 관리")
+  println("✓ Memory append-only 저장")
+  println("✓ Constraint 강제 (hard stop)")
+  println("✓ 이벤트 발생 (onTaskStart/End/Fail)")
+  println("")
+
+  println("【 Policy 책임 (전략 — 교체 가능) 】")
+  println("✓ Retry 여부")
+  println("✓ Replan 허용 여부")
+  println("✓ 실패 전파 범위")
+  println("✓ MaxParallel 값")
+  println("✓ Scheduler 전략")
+  println("✓ Abort vs Continue 결정")
+  println("")
+
+  println("【 PolicyDecision (통합 표현) 】")
+  println("• Proceed: 정상 진행")
+  println("• Retry(task_id): Task 재실행")
+  println("• Replan(plan_delta): 동적 재계획")
+  println("• Abort(reason): 중단")
+  println("")
+
+  println("【 인터페이스: AgentPolicy 】")
+  println("• policy_onTaskSuccess(task_id, output)")
+  println("• policy_onTaskFailure(task_id, error)")
+  println("• policy_onConstraintViolation(constraint_name)")
+  println("• policy_selectNextTask(ready_queue)")
+  println("")
+
+  println("【 고정 완료 조건 】")
+  println("✅ Kernel 코드에 retry/replan 판단 로직 없음")
+  println("✅ Policy 없이 Kernel 실행 불가")
+  println("✅ Policy 교체 시 Kernel 수정 0줄")
+  println("")
+
+  println("【 다음 단계: v2.K.1 】")
+  println("Sequential Conservative Policy 구현")
+  println("- MaxRetry=1, Replan=불허")
+  println("- FAIL_FAST, MaxParallel=1, FIFO")
+  println("")
+}
+
+// 설계 검증 (형식 확인용)
+println("")
+println("╔════════════════════════════════════════════════════════════╗")
+println("║  🔐 v2.K — Kernel/Policy 분리 설계 파일                  ║")
+println("╚════════════════════════════════════════════════════════════╝")
+println("")
+println("이 파일은 설계 명시 문서입니다.")
+println("구현은 v2.K.1에서 시작합니다.")
+println("")
+println("✅ 설계 고정 완료")
+println("✅ 다음: v2.K.1 — Sequential Conservative Policy v1")
+println("")

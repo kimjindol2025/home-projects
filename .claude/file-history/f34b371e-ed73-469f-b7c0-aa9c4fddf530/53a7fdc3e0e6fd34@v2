@@ -1,0 +1,1012 @@
+# v5.1 분산 시스템 (Distributed Systems) — 심화 가이드
+
+**주제:** 복잡성 속의 질서: 거대한 시스템을 설계하는 법
+**난이도:** 대학교 3학년 전공 필수
+**학습 시간:** 12시간 (이론 6시간 + 실습 6시간)
+
+---
+
+## 📚 목차
+
+1. [고등학교 vs 대학교](#고등학교-vs-대학교)
+2. [Message Broker 패턴의 실체](#message-broker-패턴의-실체)
+3. [Service Registry와 동적 발견](#service-registry와-동적-발견)
+4. [Circuit Breaker 심화](#circuit-breaker-심화)
+5. [분산 시스템 설계 사례](#분산-시스템-설계-사례)
+6. [실전 문제 해결](#실전-문제-해결)
+7. [성능 최적화 전략](#성능-최적화-전략)
+8. [모니터링과 관찰성](#모니터링과-관찰성)
+
+---
+
+## 고등학교 vs 대학교
+
+### 고등학교: 단일 서버 사고
+
+```python
+# 고등학교 방식: 모든 코드가 한 프로세스에 있음
+class WebServer:
+    def handle_request(self, request):
+        # 로그인 처리
+        user = self.authenticate(request.user)
+
+        # 결제 처리 (같은 프로세스)
+        result = self.process_payment(user, request.amount)
+
+        # 배송 처리 (같은 프로세스)
+        shipment = self.create_shipment(user, request.order)
+
+        # 한 부분이 느려지면 전체가 느려짐
+        # 한 부분이 고장나면 전체가 다운됨
+        return result
+
+# 문제점:
+# ❌ 트래픽 급증 → 전체 서버 다운
+# ❌ 결제 시스템 버그 → 전체 시스템 중단
+# ❌ 데이터베이스 쿼리 느림 → 모든 사용자 영향
+```
+
+### 대학교: 분산 시스템 사고
+
+```python
+# 대학교 방식: 각 기능이 독립적인 서비스
+#
+# ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+# │ Auth Service │     │Payment Service│    │ Ship Service │
+# │  (포트 5001) │     │  (포트 5002)   │    │  (포트 5003) │
+# └──────┬───────┘     └──────┬────────┘    └──────┬───────┘
+#        │                    │                    │
+#        └────────────────────┼────────────────────┘
+#                             │
+#                    ┌────────▼────────┐
+#                    │ Message Broker  │
+#                    │  (RabbitMQ)     │
+#                    └─────────────────┘
+#
+# 장점:
+# ✅ Auth Service 과부하 → 다른 서비스는 정상
+# ✅ Payment Service 버그 → Auth는 계속 동작
+# ✅ 각 서비스 독립적 확장 가능
+
+# 구현:
+class AuthService:
+    def authenticate(self, user, password):
+        # 인증만 담당
+        if self.verify_password(user, password):
+            self.broker.publish({
+                'event': 'user.authenticated',
+                'user_id': user.id
+            })
+
+class PaymentService:
+    def on_authenticated(self, event):
+        # 인증 이벤트 감지하면 결제 처리
+        user_id = event['user_id']
+        self.process_payment(user_id)
+```
+
+---
+
+## Message Broker 패턴의 실체
+
+### 1. Broker의 역할
+
+```python
+# Message Broker는 "비동기 우체국"
+#
+# 동기식 (문제: 블로킹)
+# Client → Server1 → wait → Server2 → wait → Client
+#          (느림)        (느림)
+#
+# 비동기식 (Broker)
+# Client → Broker → immediately returns to Client
+#          ↓
+#    Server1 processes when ready
+#    Server2 processes when ready
+
+# 장점:
+# 1. Non-blocking: 발신자가 기다리지 않음
+# 2. Resilience: 수신자 다운 → 메시지 큐에 대기
+# 3. Scalability: 여러 Consumer 추가 가능
+# 4. Decoupling: Producer/Consumer 독립적
+```
+
+### 2. 큐(Queue) 메커니즘
+
+```python
+import queue
+import threading
+import time
+
+class DistributedBroker:
+    """프로덕션 메시지 브로커 시뮬레이션"""
+
+    def __init__(self, max_size=1000):
+        self.messages = queue.Queue(maxsize=max_size)
+        self.processed = []
+        self.lock = threading.Lock()
+
+    def publish(self, message):
+        """메시지 발행 (블로킹 없음, 즉시 반환)"""
+        try:
+            self.messages.put_nowait(message)
+            return True
+        except queue.Full:
+            # 큐가 가득 참 → 백프레셔(backpressure)
+            return False
+
+    def subscribe(self, timeout=5.0):
+        """메시지 구독 (타임아웃 지원)"""
+        try:
+            return self.messages.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def acknowledge(self, message):
+        """메시지 처리 완료 표시"""
+        with self.lock:
+            self.processed.append(message)
+        return True
+
+# 실제 사용:
+broker = DistributedBroker()
+
+# Producer Thread
+def producer():
+    for i in range(5):
+        broker.publish(f"Order-{i+1}")
+        print(f"📬 주문 생성: Order-{i+1}")
+        time.sleep(0.1)
+
+# Consumer Thread
+def consumer():
+    for _ in range(5):
+        msg = broker.subscribe()
+        if msg:
+            print(f"💳 주문 처리: {msg}")
+            time.sleep(0.2)  # 처리 시간
+
+p = threading.Thread(target=producer)
+c = threading.Thread(target=consumer)
+
+p.start()
+c.start()
+p.join()
+c.join()
+
+# 출력:
+# 📬 주문 생성: Order-1
+# 📬 주문 생성: Order-2
+# 💳 주문 처리: Order-1
+# 📬 주문 생성: Order-3
+# 💳 주문 처리: Order-2
+# ...
+
+# 핵심: Producer와 Consumer의 속도가 다르지만 시스템이 안정적
+```
+
+### 3. 메시지 신뢰성
+
+```python
+class ReliableBroker:
+    """신뢰성 있는 메시지 전달"""
+
+    # 메시지 상태
+    # pending → processing → completed
+    #              ↓
+    #           (fail) → retry
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.retry_queue = queue.Queue()
+        self.max_retries = 3
+
+    def publish_with_ack(self, message):
+        """발행 후 확인대기"""
+        self.queue.put({
+            'data': message,
+            'status': 'pending',
+            'retries': 0
+        })
+
+    def consume_with_retry(self):
+        """소비 후 실패시 재시도"""
+        msg = self.queue.get()
+
+        try:
+            # 처리 시도
+            self.process_message(msg['data'])
+            msg['status'] = 'completed'
+            return True
+        except Exception as e:
+            # 실패 → 재시도
+            if msg['retries'] < self.max_retries:
+                msg['retries'] += 1
+                self.retry_queue.put(msg)
+                return False
+            else:
+                # 최대 재시도 초과 → 데드레터 큐
+                self.dead_letter_queue(msg)
+                return False
+
+    def process_message(self, data):
+        # 실제 처리 로직
+        if 'ERROR' in data:
+            raise Exception(f"Processing failed: {data}")
+        return data
+```
+
+---
+
+## Service Registry와 동적 발견
+
+### 1. 문제: 서비스 위치 찾기
+
+```python
+# ❌ 나쁜 방식: 하드코딩
+class PaymentClient:
+    def __init__(self):
+        # 서버가 이전하면? 코드 변경 필요!
+        self.url = "192.168.1.10:5002"  # 하드코딩
+
+    def make_payment(self, amount):
+        return requests.post(self.url + "/pay", json={"amount": amount})
+
+# ✅ 좋은 방식: Registry 사용
+class ServiceRegistry:
+    """서비스 위치 중앙 관리"""
+
+    def __init__(self):
+        self.services = {}
+        self.lock = threading.Lock()
+
+    def register(self, name, host, port, metadata=None):
+        """서비스 등록"""
+        with self.lock:
+            if name not in self.services:
+                self.services[name] = []
+
+            self.services[name].append({
+                'host': host,
+                'port': port,
+                'url': f"http://{host}:{port}",
+                'metadata': metadata or {},
+                'registered_at': time.time()
+            })
+
+    def discover(self, name):
+        """서비스 발견"""
+        with self.lock:
+            if name in self.services:
+                # 여러 인스턴스 중 첫 번째 반환 (실제로는 로드밸런싱)
+                return self.services[name][0]
+            return None
+
+    def deregister(self, name, host):
+        """서비스 등록 해제"""
+        with self.lock:
+            if name in self.services:
+                self.services[name] = [
+                    s for s in self.services[name]
+                    if s['host'] != host
+                ]
+
+# 사용:
+registry = ServiceRegistry()
+
+# 시작 시 등록
+registry.register('payment-service', '192.168.1.10', 5002)
+registry.register('payment-service', '192.168.1.11', 5002)  # 백업
+
+# 필요할 때 발견
+payment_service = registry.discover('payment-service')
+print(f"결제 서비스: {payment_service['url']}")
+
+# 종료 시 등록 해제
+registry.deregister('payment-service', '192.168.1.10')
+```
+
+### 2. 헬스 체크
+
+```python
+import requests
+
+class ServiceRegistry:
+    """헬스 체크 기능 추가"""
+
+    def __init__(self, health_check_interval=30):
+        self.services = {}
+        self.health_check_interval = health_check_interval
+        self.monitoring = threading.Thread(
+            target=self._health_check_loop,
+            daemon=True
+        )
+        self.monitoring.start()
+
+    def _health_check_loop(self):
+        """주기적 헬스 체크"""
+        while True:
+            time.sleep(self.health_check_interval)
+
+            for service_name in list(self.services.keys()):
+                for service in self.services[service_name]:
+                    if not self._is_healthy(service):
+                        # 비활성 서비스 제거
+                        self.services[service_name].remove(service)
+                        print(f"⚠️ 서비스 제거: {service_name} @ {service['host']}")
+
+    def _is_healthy(self, service):
+        """서비스 헬스 상태 확인"""
+        try:
+            url = f"{service['url']}/health"
+            response = requests.get(url, timeout=2)
+            return response.status_code == 200
+        except:
+            return False
+
+# 사용:
+registry = ServiceRegistry()
+registry.register('api-service', 'localhost', 5001)
+# → 30초마다 /health 엔드포인트 호출
+# → 실패하면 자동으로 제거
+```
+
+---
+
+## Circuit Breaker 심화
+
+### 1. 3가지 상태 머신
+
+```python
+from enum import Enum
+import time
+
+class CircuitState(Enum):
+    CLOSED = "정상"      # 모든 요청 통과
+    OPEN = "차단"        # 모든 요청 실패
+    HALF_OPEN = "회복시도" # 일부 요청 시도
+
+class AdvancedCircuitBreaker:
+    """프로덕션 수준의 Circuit Breaker"""
+
+    def __init__(self,
+                 failure_threshold=5,      # 실패 횟수
+                 timeout=60,                # OPEN → HALF_OPEN 대기시간
+                 success_threshold=2):      # HALF_OPEN → CLOSED 성공 횟수
+        self.state = CircuitState.CLOSED
+        self.failure_count = 0
+        self.success_count = 0
+        self.last_failure_time = None
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.success_threshold = success_threshold
+
+    def call(self, func, *args, **kwargs):
+        """Circuit Breaker 래퍼"""
+
+        # 1. OPEN → HALF_OPEN 전환
+        if self.state == CircuitState.OPEN:
+            if time.time() - self.last_failure_time > self.timeout:
+                self.state = CircuitState.HALF_OPEN
+                self.success_count = 0
+                print(f"⚡ 상태 변화: OPEN → HALF_OPEN")
+            else:
+                # 아직 타임아웃 안 됨
+                raise Exception("Circuit breaker is OPEN")
+
+        # 2. 요청 실행
+        try:
+            result = func(*args, **kwargs)
+
+            # 성공
+            if self.state == CircuitState.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.success_threshold:
+                    self.state = CircuitState.CLOSED
+                    self.failure_count = 0
+                    print(f"✅ 상태 변화: HALF_OPEN → CLOSED (복구됨)")
+            elif self.state == CircuitState.CLOSED:
+                self.failure_count = 0
+
+            return result
+
+        except Exception as e:
+            # 실패
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+
+            if self.failure_count >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+                print(f"🔴 상태 변화: CLOSED → OPEN (너무 많은 실패)")
+
+            raise
+
+# 상태 전환 다이어그램:
+#
+# ┌──────────────────────────────────────────────┐
+# │                                              │
+# │  ┌────────────┐     timeout     ┌──────────┐ │
+# │  │  CLOSED    │──────────────▶  │ HALF_OPEN│ │
+# │  │ (정상)     │                 │(회복시도)│ │
+# │  └─────▲──────┘                 └────┬─────┘ │
+# │        │                             │       │
+# │        │ success_threshold           │       │
+# │        │ 달성 시 복구                failure │
+# │        │                             │       │
+# │        │                    ┌────────▼─────┐ │
+# │        └────────────────────│   OPEN       │ │
+# │                             │ (차단)       │ │
+# │                             └──────────────┘ │
+# │                                              │
+# └──────────────────────────────────────────────┘
+
+# 예제:
+cb = AdvancedCircuitBreaker(failure_threshold=3, timeout=5)
+
+def unreliable_api():
+    import random
+    if random.random() < 0.7:  # 70% 실패
+        raise Exception("API Error")
+    return "Success"
+
+# 사용:
+for i in range(10):
+    try:
+        result = cb.call(unreliable_api)
+        print(f"✅ {i}: {result} (상태: {cb.state.value})")
+    except Exception as e:
+        print(f"❌ {i}: {e} (상태: {cb.state.value})")
+    time.sleep(1)
+
+# 출력 예:
+# ❌ 0: API Error (상태: 정상)
+# ❌ 1: API Error (상태: 정상)
+# ❌ 2: API Error (상태: 차단) ← OPEN 상태 전환
+# 🔴 상태 변화: CLOSED → OPEN
+# ❌ 3: Circuit breaker is OPEN (상태: 차단)
+# ✅ 4: Success (상태: 회복시도) ← HALF_OPEN으로 시도
+# ⚡ 상태 변화: OPEN → HALF_OPEN
+# ...
+```
+
+---
+
+## 분산 시스템 설계 사례
+
+### 사례: 전자상거래 플랫폼
+
+```python
+"""
+시나리오: 주문 처리 시스템
+┌─────────────────────────────────────────────────────┐
+│                    User Request                      │
+│              (주문: Product-123, 수량: 2)             │
+└──────────────────────┬────────────────────────────────┘
+                       │
+        ┌──────────────▼──────────────┐
+        │   API Gateway              │
+        │  (요청 라우팅)              │
+        └──────────────┬──────────────┘
+                       │
+        ┌──────────────▼──────────────┐
+        │  Order Service            │
+        │  (주문 생성 & 검증)         │
+        └──────────────┬──────────────┘
+                       │ [메시지 발행]
+        ┌──────────────▼──────────────┐
+        │  Message Broker            │
+        │  ("OrderCreated" 이벤트)    │
+        └──────────────┬──────────────┘
+                       │
+           ┌───────────┼────────────┐
+           │           │            │
+    ┌──────▼────┐ ┌────▼─────┐ ┌───▼──────┐
+    │ Payment   │ │ Inventory│ │ Shipping │
+    │ Service   │ │ Service  │ │ Service  │
+    └──────┬────┘ └────┬─────┘ └───┬──────┘
+           │           │            │
+    [결제 처리]  [재고 업데이트] [배송 준비]
+"""
+
+import threading
+import time
+from queue import Queue
+
+class OrderProcessingSystem:
+    def __init__(self):
+        self.message_broker = Queue()
+        self.orders = []
+        self.payments = []
+        self.inventory = {'Product-123': 100}
+        self.shipments = []
+
+    def order_service(self):
+        """주문 서비스"""
+        while True:
+            # 사용자 요청 수신 (여기서는 시뮬레이션)
+            order = {
+                'order_id': f"ORD-{len(self.orders)+1}",
+                'product': 'Product-123',
+                'quantity': 2,
+                'timestamp': time.time()
+            }
+
+            # 1. 주문 검증
+            if self.inventory.get('Product-123', 0) >= order['quantity']:
+                self.orders.append(order)
+                print(f"📦 [Order Service] 주문 생성: {order['order_id']}")
+
+                # 2. 메시지 발행
+                self.message_broker.put({
+                    'event': 'OrderCreated',
+                    'data': order
+                })
+
+            time.sleep(5)
+
+    def payment_service(self):
+        """결제 서비스"""
+        while True:
+            try:
+                msg = self.message_broker.get(timeout=2)
+                if msg['event'] == 'OrderCreated':
+                    order = msg['data']
+                    payment = {
+                        'order_id': order['order_id'],
+                        'amount': order['quantity'] * 100,  # 각 상품 100원
+                        'status': 'completed'
+                    }
+                    self.payments.append(payment)
+                    print(f"💳 [Payment Service] 결제 완료: {order['order_id']}")
+            except:
+                pass
+            time.sleep(1)
+
+    def inventory_service(self):
+        """재고 서비스"""
+        while True:
+            try:
+                msg = self.message_broker.get(timeout=2)
+                if msg['event'] == 'OrderCreated':
+                    order = msg['data']
+                    # 재고 감소
+                    self.inventory['Product-123'] -= order['quantity']
+                    print(f"📊 [Inventory] 재고 업데이트: {self.inventory['Product-123']}개 남음")
+            except:
+                pass
+            time.sleep(1)
+
+    def shipping_service(self):
+        """배송 서비스"""
+        while True:
+            try:
+                msg = self.message_broker.get(timeout=2)
+                if msg['event'] == 'OrderCreated':
+                    order = msg['data']
+                    shipment = {
+                        'order_id': order['order_id'],
+                        'status': 'preparing',
+                        'estimated_delivery': 'Tomorrow'
+                    }
+                    self.shipments.append(shipment)
+                    print(f"🚚 [Shipping] 배송 준비: {order['order_id']}")
+            except:
+                pass
+            time.sleep(1)
+
+    def run(self):
+        """모든 서비스 병렬 실행"""
+        threads = [
+            threading.Thread(target=self.order_service, daemon=True),
+            threading.Thread(target=self.payment_service, daemon=True),
+            threading.Thread(target=self.inventory_service, daemon=True),
+            threading.Thread(target=self.shipping_service, daemon=True),
+        ]
+
+        for t in threads:
+            t.start()
+
+        # 10초 동안 실행
+        for _ in range(10):
+            time.sleep(1)
+
+        print("\n📊 최종 상태:")
+        print(f"  총 주문: {len(self.orders)}")
+        print(f"  완료된 결제: {len(self.payments)}")
+        print(f"  남은 재고: {self.inventory['Product-123']}개")
+        print(f"  준비 중인 배송: {len(self.shipments)}")
+
+# 실행
+# system = OrderProcessingSystem()
+# system.run()
+```
+
+---
+
+## 실전 문제 해결
+
+### 문제 1: 데드레터 큐 (Dead Letter Queue)
+
+```python
+# 문제: 메시지 처리 실패 후 무한 재시도
+# 해결: 일정 횟수 실패하면 별도 큐로 이동
+
+class RobustBroker:
+    def __init__(self):
+        self.main_queue = Queue()
+        self.dead_letter_queue = Queue()  # 처리 불가능한 메시지
+        self.max_retries = 3
+
+    def process_with_dlq(self):
+        msg = self.main_queue.get()
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                self.process(msg)
+                return True
+            except Exception as e:
+                if attempt == self.max_retries:
+                    # 마지막 시도 실패 → DLQ로 이동
+                    print(f"⚠️ 메시지 DLQ 이동: {msg}")
+                    self.dead_letter_queue.put({
+                        'message': msg,
+                        'error': str(e),
+                        'failed_at': time.time()
+                    })
+                    return False
+                else:
+                    # 재시도 전 대기
+                    wait_time = 2 ** attempt  # 지수 백오프
+                    time.sleep(wait_time)
+```
+
+### 문제 2: 분산 트랜잭션 (Saga Pattern)
+
+```python
+# 문제: 여러 서비스 걸친 트랜잭션 관리
+# 해결: Saga Pattern - 각 단계마다 보상 트랜잭션 정의
+
+class SagaOrchestrator:
+    """Saga 패턴 구현"""
+
+    def process_order(self, order):
+        """주문 처리 - Saga 실행"""
+        saga_id = str(uuid.uuid4())
+        steps = []
+
+        try:
+            # Step 1: 결제
+            print(f"[Saga {saga_id}] Step 1: 결제 처리")
+            payment = self.process_payment(order)
+            steps.append(('payment', payment))
+
+            # Step 2: 재고 예약
+            print(f"[Saga {saga_id}] Step 2: 재고 예약")
+            reservation = self.reserve_inventory(order)
+            steps.append(('inventory', reservation))
+
+            # Step 3: 배송 생성
+            print(f"[Saga {saga_id}] Step 3: 배송 생성")
+            shipment = self.create_shipment(order)
+            steps.append(('shipment', shipment))
+
+            print(f"✅ [Saga {saga_id}] 완료")
+            return True
+
+        except Exception as e:
+            # 보상 트랜잭션 (역순)
+            print(f"❌ [Saga {saga_id}] 실패: {e}. 보상 시작...")
+
+            for step_name, step_data in reversed(steps):
+                if step_name == 'payment':
+                    self.refund_payment(step_data)
+                    print(f"  → 결제 환불")
+                elif step_name == 'inventory':
+                    self.release_inventory(step_data)
+                    print(f"  → 재고 해제")
+                elif step_name == 'shipment':
+                    self.cancel_shipment(step_data)
+                    print(f"  → 배송 취소")
+
+            return False
+```
+
+---
+
+## 성능 최적화 전략
+
+### 1. 캐싱 전략 (LRU + TTL)
+
+```python
+import time
+from collections import OrderedDict
+
+class OptimizedCache:
+    """LRU + TTL 캐시"""
+
+    def __init__(self, max_size=100, ttl=300):
+        self.cache = OrderedDict()
+        self.timestamps = {}
+        self.max_size = max_size
+        self.ttl = ttl
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key):
+        # TTL 확인
+        if key in self.timestamps:
+            if time.time() - self.timestamps[key] > self.ttl:
+                del self.cache[key]
+                del self.timestamps[key]
+                self.misses += 1
+                return None
+
+        # 캐시 히트
+        if key in self.cache:
+            self.cache.move_to_end(key)  # LRU 업데이트
+            self.hits += 1
+            return self.cache[key]
+
+        self.misses += 1
+        return None
+
+    def set(self, key, value):
+        # LRU: 새로운 항목이면 맨 뒤에 추가
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            self.cache[key] = value
+        else:
+            if len(self.cache) >= self.max_size:
+                # 가장 오래된 항목 제거
+                oldest = next(iter(self.cache))
+                del self.cache[oldest]
+                del self.timestamps[oldest]
+
+            self.cache[key] = value
+
+        self.timestamps[key] = time.time()
+
+    def hit_ratio(self):
+        total = self.hits + self.misses
+        return self.hits / total if total > 0 else 0
+
+# 사용:
+cache = OptimizedCache(max_size=5, ttl=10)
+cache.set('user:123', {'name': 'Alice'})
+print(cache.get('user:123'))  # {'name': 'Alice'} - 히트
+print(cache.hit_ratio())      # 1.0 (100% 히트율)
+```
+
+### 2. 배치 처리
+
+```python
+import time
+from typing import List
+
+class BatchProcessor:
+    """배치 처리로 처리량 증가"""
+
+    def __init__(self, batch_size=100, timeout=5.0):
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.batch = []
+        self.last_flush = time.time()
+
+    def add(self, item):
+        """항목 추가"""
+        self.batch.append(item)
+
+        # 조건 1: 배치 크기 도달
+        if len(self.batch) >= self.batch_size:
+            self.flush()
+
+        # 조건 2: 타임아웃 도달
+        elif time.time() - self.last_flush > self.timeout:
+            self.flush()
+
+    def flush(self):
+        """배치 처리"""
+        if not self.batch:
+            return
+
+        # 한 번에 많은 항목 처리 (DB 쿼리 최소화)
+        print(f"⚡ 배치 처리: {len(self.batch)}개 항목")
+        self._bulk_insert(self.batch)
+
+        self.batch = []
+        self.last_flush = time.time()
+
+    def _bulk_insert(self, items: List):
+        """DB에 한 번에 삽입 (시뮬레이션)"""
+        # INSERT INTO table VALUES (...), (...), (...)
+        pass
+
+# 비교:
+# 개별 처리: 1000개 항목 × 10ms = 10,000ms
+# 배치 처리: 10개 배치 × 50ms = 500ms (20배 빠름!)
+```
+
+---
+
+## 모니터링과 관찰성
+
+### 1. 메트릭 수집
+
+```python
+import time
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class ServiceMetric:
+    timestamp: float
+    service_name: str
+    cpu_usage: float        # 0-100%
+    memory_usage: float     # MB
+    response_time_ms: float
+    error_count: int
+    request_count: int
+
+    @property
+    def error_rate(self):
+        return self.error_count / self.request_count if self.request_count > 0 else 0
+
+    @property
+    def availability(self):
+        return (1 - self.error_rate) * 100
+
+class DistributedMonitor:
+    """분산 시스템 모니터링"""
+
+    def __init__(self):
+        self.metrics: List[ServiceMetric] = []
+
+    def record(self, metric: ServiceMetric):
+        """메트릭 기록"""
+        self.metrics.append(metric)
+
+    def get_sla_compliance(self, service_name: str):
+        """SLA 준수율 계산"""
+        # SLA: 99.9% 가용성, 평균 응답시간 < 100ms
+
+        service_metrics = [
+            m for m in self.metrics
+            if m.service_name == service_name
+        ]
+
+        avg_availability = sum(m.availability for m in service_metrics) / len(service_metrics)
+        avg_response_time = sum(m.response_time_ms for m in service_metrics) / len(service_metrics)
+
+        return {
+            'availability': avg_availability,
+            'availability_sla': avg_availability >= 99.9,
+            'response_time_ms': avg_response_time,
+            'response_time_sla': avg_response_time < 100,
+            'overall_sla_met': avg_availability >= 99.9 and avg_response_time < 100
+        }
+
+# 사용:
+monitor = DistributedMonitor()
+
+for i in range(10):
+    metric = ServiceMetric(
+        timestamp=time.time(),
+        service_name='payment-service',
+        cpu_usage=45.2,
+        memory_usage=512.0,
+        response_time_ms=45 + i * 5,
+        error_count=1 if i % 5 == 0 else 0,
+        request_count=100
+    )
+    monitor.record(metric)
+
+compliance = monitor.get_sla_compliance('payment-service')
+print(f"가용성: {compliance['availability']:.2f}%")
+print(f"SLA 준수: {compliance['overall_sla_met']}")
+```
+
+### 2. 분산 추적 (Distributed Tracing)
+
+```python
+import uuid
+
+class TraceContext:
+    """요청 추적"""
+
+    def __init__(self):
+        self.trace_id = str(uuid.uuid4())[:8]
+        self.spans = []
+
+    def start_span(self, operation: str):
+        """작업 시작"""
+        span = {
+            'trace_id': self.trace_id,
+            'operation': operation,
+            'start_time': time.time(),
+            'service': None
+        }
+        self.spans.append(span)
+        return span
+
+    def end_span(self, span: dict, duration: float):
+        """작업 종료"""
+        span['duration_ms'] = duration * 1000
+
+class DistributedTracer:
+    """전체 요청 흐름 추적"""
+
+    def trace_request(self, request_id: str):
+        """요청 흐름:
+
+        User Request
+        ├─ [1] API Gateway (2ms)
+        ├─ [2] Order Service (50ms)
+        │   └─ [2.1] Database Query (30ms)
+        ├─ [3] Payment Service (100ms)
+        │   └─ [3.1] External API Call (80ms)
+        └─ [4] Response (152ms total)
+        """
+
+        trace = TraceContext()
+
+        # Span 1: API Gateway
+        span1 = trace.start_span('API Gateway')
+        time.sleep(0.002)
+        trace.end_span(span1, 0.002)
+
+        # Span 2: Order Service
+        span2 = trace.start_span('Order Service')
+
+        # Span 2.1: DB Query
+        span2_1 = trace.start_span('DB Query')
+        time.sleep(0.030)
+        trace.end_span(span2_1, 0.030)
+
+        time.sleep(0.020)
+        trace.end_span(span2, 0.050)
+
+        # Span 3: Payment Service
+        span3 = trace.start_span('Payment Service')
+
+        # Span 3.1: External API
+        span3_1 = trace.start_span('External API')
+        time.sleep(0.080)
+        trace.end_span(span3_1, 0.080)
+
+        time.sleep(0.020)
+        trace.end_span(span3, 0.100)
+
+        # 출력
+        print(f"\n🔍 Trace ID: {trace.trace_id}")
+        for i, span in enumerate(trace.spans):
+            indent = "  " if span['operation'] in ['DB Query', 'External API'] else ""
+            print(f"{indent}└─ {span['operation']}: {span['duration_ms']:.1f}ms")
+```
+
+---
+
+## 요약
+
+| 개념 | 고등학교 | 대학교 | 효과 |
+|------|--------|-------|------|
+| **구조** | 모놀리식 | 마이크로서비스 | 독립적 확장, 장애 격리 |
+| **통신** | 동기식 (RPC) | 비동기식 (Message Broker) | 논블로킹, 탄력성 |
+| **발견** | 하드코딩 | Service Registry | 동적 서비스 위치 |
+| **안정성** | 없음 | Circuit Breaker | 장애 전파 방지 |
+| **성능** | 직접 캐싱 | 분산 캐싱 (LRU+TTL) | 20~100배 빠름 |
+| **가시성** | 단일 로그 | 분산 추적 (Trace) | 병목지점 식별 |
+
+분산 시스템은 **복잡도**를 증가시키지만, **규모**에서 승리합니다.
+
+> "단순함은 작은 시스템의 축복이고, 복잡도는 큰 시스템의 선택이다."
+
+---
+
+## 다음 단계: v5.2 데이터베이스와 NoSQL
+
+이제 **대규모 데이터**를 효율적으로 저장하고 조회하는 방법을 배웁니다.
+
+- 관계형 데이터베이스 (정규화, 인덱싱)
+- NoSQL 데이터베이스 (CAP 이론의 실제 구현)
+- 캐시 전략 (Redis, Memcached)
+- 데이터 샤딩 (horizontal scaling)

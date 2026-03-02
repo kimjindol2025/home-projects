@@ -1,0 +1,611 @@
+# Phase 12 v13.1: Procedural Macros (절차적 매크로)
+
+> **철학**: "코드를 데이터처럼 주무르기"
+>
+> 선언적 매크로가 단순한 '치환'이라면, 절차적 매크로는 **'러스트 코드를 입력받아 러스트 함수로 분석한 뒤, 완전히 새로운 코드를 출력하는 프로그램'**입니다.
+>
+> 이것은 **컴파일러 내부에서 돌아가는 또 하나의 미니 컴파일러**입니다.
+
+---
+
+## 🎯 v13.1이 해결하는 문제
+
+### 문제 1️⃣: 반복되는 메서드 구현
+
+```rust
+❌ 매크로 없이:
+struct User {
+    id: u32,
+    name: String,
+    email: String,
+}
+
+// 모든 구조체마다 반복해야 함
+impl User {
+    fn debug_info(&self) {
+        println!("User {{ id: {}, name: {}, email: {} }}", self.id, self.name, self.email);
+    }
+}
+
+struct Product {
+    id: u32,
+    title: String,
+    price: f64,
+}
+
+// 동일한 패턴 반복!
+impl Product {
+    fn debug_info(&self) {
+        println!("Product {{ id: {}, title: {}, price: {} }}", self.id, self.title, self.price);
+    }
+}
+
+✅ v13.1 절차적 매크로:
+#[derive(DebugInfo)]
+struct User {
+    id: u32,
+    name: String,
+    email: String,
+}
+
+#[derive(DebugInfo)]
+struct Product {
+    id: u32,
+    title: String,
+    price: f64,
+}
+// 자동으로 debug_info() 메서드 생성!
+```
+
+### 문제 2️⃣: 직렬화/역직렬화의 복잡성
+
+```rust
+❌ 수동 구현:
+impl Serialize for User {
+    fn serialize(&self) -> String {
+        format!("id:{},name:{},email:{}", self.id, self.name, self.email)
+    }
+}
+
+// 필드가 50개면? 유지보수 지옥!
+
+✅ 절차적 매크로:
+#[derive(Serialize)]
+struct User {
+    id: u32,
+    name: String,
+    email: String,
+}
+// 모든 필드를 자동으로 직렬화!
+```
+
+### 문제 3️⃣: 속성 매크로로 함수 변경
+
+```rust
+❌ 수동:
+fn expensive_computation() {
+    // 시간 측정 코드
+    let start = std::time::Instant::now();
+    // ... 본 로직 ...
+    println!("실행 시간: {:?}", start.elapsed());
+}
+
+✅ 속성 매크로:
+#[measure_time]
+fn expensive_computation() {
+    // ... 본 로직 ...
+    // 시간 측정이 자동으로 주입됨!
+}
+```
+
+---
+
+## 📚 핵심 개념: TokenStream → AST → TokenStream
+
+### 1️⃣ 절차적 매크로의 구조
+
+```
+입력 (러스트 코드)
+  ↓
+TokenStream (토큰들의 스트림)
+  ↓
+[syn 라이브러리]
+  ↓
+AST (추상 구문 트리 - 구조화된 데이터)
+  ↓
+[Rust 함수로 분석 및 변환]
+  ↓
+[quote 라이브러리]
+  ↓
+새로운 코드 (TokenStream)
+  ↓
+출력 (완성된 러스트 코드)
+```
+
+### 2️⃣ 세 가지 절차적 매크로 타입
+
+#### 타입 1: Derive 매크로 (#[derive(...)])
+
+```rust
+#[proc_macro_derive(MyTrait)]
+pub fn my_derive(input: TokenStream) -> TokenStream {
+    // 구조체나 열거형에 트레이트를 자동 구현
+}
+
+// 사용
+#[derive(MyTrait)]
+struct MyStruct;
+```
+
+**특징**:
+- 구조체/열거형에 자동으로 트레이트 구현
+- 가장 흔한 형태
+- Debug, Clone, Serialize 등의 원리
+
+#### 타입 2: 속성 매크로 (#[attr(...)])
+
+```rust
+#[proc_macro_attribute]
+pub fn my_attr(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // 함수나 모듈에 코드 주입
+}
+
+// 사용
+#[my_attr(config = "value")]
+fn my_function() { }
+```
+
+**특징**:
+- 함수, 메서드, 모듈에 직접 적용
+- 코드 변환 또는 기능 추가
+- #[tokio::main], #[test] 등의 원리
+
+#### 타입 3: 함수형 매크로 (macro_name!())
+
+```rust
+#[proc_macro]
+pub fn my_macro(input: TokenStream) -> TokenStream {
+    // 모든 코드 위치에서 사용 가능
+}
+
+// 사용
+my_macro!(some_code);
+```
+
+**특징**:
+- 선언적 매크로와 유사하지만 Rust 함수로 구현
+- 더 강력한 코드 분석 가능
+- sql!(), json!() 등의 원리
+
+### 3️⃣ syn 라이브러리 (Parsing)
+
+```rust
+// TokenStream을 AST로 파싱
+
+use syn;
+
+#[proc_macro_derive(GogsInfo)]
+pub fn gogs_info_derive(input: TokenStream) -> TokenStream {
+    // 1. 파싱: TokenStream → DeriveInput (AST)
+    let ast = syn::parse::<syn::DeriveInput>(input)
+        .expect("파싱 실패");
+
+    // 2. 구조체 정보 추출
+    let name = &ast.ident;  // 구조체 이름
+    let fields = match &ast.data {
+        syn::Data::Struct(data) => &data.fields,
+        _ => panic!("Only struct supported"),
+    };
+
+    // 3. 필드 순회
+    for field in fields {
+        if let Some(ident) = &field.ident {
+            println!("필드명: {}", ident);
+            println!("타입: {:?}", field.ty);
+        }
+    }
+
+    // ...
+}
+```
+
+**주요 타입**:
+```rust
+syn::DeriveInput       // #[derive(...)]의 입력 (구조체/열거형)
+syn::ItemFn            // 함수 정의
+syn::ItemStruct        // 구조체 정의
+syn::Ident             // 식별자 (변수명, 타입명)
+syn::Type              // 타입 표기
+syn::Field             // 구조체 필드
+syn::Generics          // 제네릭 파라미터
+```
+
+### 4️⃣ quote! 매크로 (Generation)
+
+```rust
+// 새로운 Rust 코드를 TokenStream으로 생성
+
+use quote::quote;
+
+let name = &ast.ident;
+let fields = get_field_names(&ast);
+
+let expanded = quote! {
+    impl #name {
+        fn print_debug(&self) {
+            println!("Name: {}", stringify!(#name));
+            #(
+                println!("{} = {:?}", stringify!(#fields), self.#fields);
+            )*
+        }
+    }
+};
+
+// expanded는 TokenStream으로 변환됨
+```
+
+**quote! 내의 특수 문법**:
+```rust
+#name              // 변수 삽입
+#(...)* 또는 #(...)+  // 반복 (for 루프 같음)
+stringify!(#ident) // 식별자를 문자열로 변환
+```
+
+### 5️⃣ 절차적 매크로의 생명주기
+
+```
+컴파일 명령
+  ↓
+[1단계] proc-macro 크레이트 컴파일
+  (절차적 매크로 함수들을 별도 프로그램으로 컴파일)
+  ↓
+[2단계] 메인 크레이트의 매크로 호출 코드 분석
+  (사용자가 쓴 #[derive(...)] 등을 찾음)
+  ↓
+[3단계] proc-macro 프로그램 실행
+  (토큰 스트림을 입력받아 새 코드 생성)
+  ↓
+[4단계] 생성된 코드를 메인 크레이트에 주입
+  ↓
+[5단계] 메인 크레이트 컴파일 완료
+```
+
+**중요**: 절차적 매크로는 **다른 크레이트**에서 작성되어야 하며, 컴파일 시간에 별도로 실행됩니다!
+
+---
+
+## 🛠️ v13.1의 5가지 설계 패턴
+
+### 패턴 1: 기본 Derive 매크로
+
+```
+목표: 구조체에 자동으로 메서드 생성
+내용: syn으로 파싱 → 필드명 추출 → quote로 코드 생성
+결과: #[derive(GogsInfo)]로 메타정보 메서드 자동 추가
+학습: "절차적 매크로의 기초"
+```
+
+### 패턴 2: 속성 매크로 (함수 변환)
+
+```
+목표: 함수에 기능 주입 (로깅, 타이밍, 권한 검사 등)
+내용: #[measure_time] 함수를 감싸기
+결과: 원본 함수는 변경 없이 실행 시간 출력
+학습: "코드 변환"
+```
+
+### 패턴 3: 필드 기반 코드 생성
+
+```
+목표: 구조체의 모든 필드를 순회하며 메서드 생성
+내용: for field in fields 루프로 #(...)*로 반복
+결과: Builder 패턴, Getters/Setters 자동 생성
+학습: "반복적 코드 생성"
+```
+
+### 패턴 4: 제네릭 지원
+
+```
+목표: 제네릭 구조체도 매크로로 처리
+내용: generics를 추출하고 quote에 포함
+결과: struct Wrapper<T> { value: T }도 매크로 적용 가능
+학습: "고급 타입 처리"
+```
+
+### 패턴 5: 에러 처리 및 검증
+
+```
+목표: 매크로가 잘못된 사용을 감지하고 컴파일 에러 발생
+내용: compile_error! 또는 syn::Error 사용
+결과: 잘못된 사용이 컴파일 타임에 즉시 감지됨
+학습: "견고한 매크로"
+```
+
+---
+
+## 🏗️ 절차적 매크로의 아키텍처
+
+### 프로젝트 구조
+
+```
+my_project/
+├── Cargo.toml
+├── src/
+│   └── lib.rs              (메인 크레이트)
+└── my_project_macros/      (별도 proc-macro 크레이트)
+    ├── Cargo.toml
+    └── src/
+        └── lib.rs          (매크로 정의)
+```
+
+### 메인 Cargo.toml
+
+```toml
+[package]
+name = "my_project"
+
+[dependencies]
+my_project_macros = { path = "my_project_macros" }
+```
+
+### 매크로 Cargo.toml
+
+```toml
+[package]
+name = "my_project_macros"
+
+[lib]
+proc-macro = true              # ← 핵심: 이것이 절차적 매크로 크레이트임을 선언
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+```
+
+---
+
+## 💭 선언적 vs 절차적 매크로
+
+```
+┌──────────────┬─────────────────┬──────────────────┐
+│ 항목         │ 선언적          │ 절차적           │
+├──────────────┼─────────────────┼──────────────────┤
+│ 문법         │ macro_rules!    │ #[proc_macro...] │
+│ 정의 위치    │ 같은 크레이트   │ 별도 크레이트    │
+│ 입출력       │ TokenStream     │ TokenStream      │
+│ 분석 수준    │ 패턴 매칭       │ AST 파싱         │
+│ 표현력       │ 중간            │ 매우 강력 ✓      │
+│ 빌드 시간    │ 빠름            │ 느림 (별도 컴파일)│
+│ 디버깅       │ 중간            │ 어려움 🔴        │
+│ 학습 난도    │ 쉬움            │ 어려움 🔴        │
+│ 사용 예      │ vec!, println!  │ derive, tokio::main│
+└──────────────┴─────────────────┴──────────────────┘
+```
+
+---
+
+## 🎓 Compiler Designer의 관점
+
+### 절차적 매크로 = 컴파일러의 프론트엔드 시뮬레이션
+
+```
+[전통적인 컴파일러]
+Source Code
+  ↓
+Lexer (토큰화)
+  ↓
+Parser (구문 분석)
+  ↓
+AST (추상 구문 트리)
+  ↓
+의미 분석 및 변환
+  ↓
+Code Generation
+  ↓
+Machine Code
+
+---
+
+[절차적 매크로]
+TokenStream (입력)
+  ↓
+syn::parse (구문 분석, Lexer + Parser 역할)
+  ↓
+AST (DeriveInput, ItemFn 등)
+  ↓
+Rust 함수로 의미 분석 및 변환
+  ↓
+quote! (코드 생성)
+  ↓
+TokenStream (출력)
+```
+
+**깨달음**: syn을 사용하여 코드를 분석하는 경험이 바로 **컴파일러 프론트엔드**를 만드는 과정입니다!
+
+---
+
+## ⚠️ 절차적 매크로의 함정
+
+### 함정 1️⃣: 별도 크레이트 필수
+
+```rust
+❌ 실패:
+// main/lib.rs에서 직접 정의
+#[proc_macro_derive(MyTrait)]
+pub fn my_derive(input: TokenStream) -> TokenStream { }
+// 컴파일 에러! proc-macro 크레이트에서만 가능
+
+✅ 성공:
+// my_macros/lib.rs (proc-macro = true 크레이트)
+#[proc_macro_derive(MyTrait)]
+pub fn my_derive(input: TokenStream) -> TokenStream { }
+```
+
+### 함정 2️⃣: 디버깅의 어려움
+
+```bash
+# 생성된 코드가 실제로 무엇인지 보려면:
+cargo expand
+
+# 또는 std::env::var("PROC_MACRO_LOG")를 사용하여 로깅
+```
+
+### 함정 3️⃣: 빌드 시간 증가
+
+```
+❌ 과도한 사용:
+#[derive(A)]
+#[derive(B)]
+#[derive(C)]
+#[derive(D)]
+#[derive(E)]
+// 매크로가 5개, 각각 컴파일 타임 분석 → 빌드 느려짐!
+
+✅ 필요한 것만:
+#[derive(A, B, C)]  // 하나의 매크로로 여러 트레이트 구현
+// 또는 자주 사용하지 않는 부분만 매크로 사용
+```
+
+### 함정 4️⃣: 에러 메시지의 불명확함
+
+```rust
+// 매크로 내부에서 panic! 하면?
+panic!("필드 'id'가 필요합니다");
+// 사용자는 "매크로가 panic했다"는 메시지만 봄
+// 어느 부분이 잘못됐는지 모름!
+
+// 해결책: compile_error! 또는 syn::Error 사용
+// 사용자에게 명확한 에러 위치를 알려줌
+```
+
+---
+
+## 🔗 다음 단계
+
+```
+v13.1: Procedural Macros ← 현재
+  ↓ [코드 분석 및 재구성]
+  ↓
+v13.2: Attribute Macros & Function Macros
+  ↓ [함수와 모듈에 직접 마법]
+  ↓
+v13.3: Derive Macros Advanced
+  ↓ [복잡한 트레이트 자동 구현]
+  ↓
+[메타 프로그래밍의 완성!]
+  ↓
+Phase 13: Compiler Construction
+  ↓ [실제 컴파일러 구축]
+```
+
+---
+
+## 💡 실전 팁
+
+### 1. syn 파싱 디버깅
+
+```rust
+// 파싱된 AST를 보고 싶다면:
+let ast = syn::parse::<syn::DeriveInput>(input)?;
+eprintln!("{:#?}", ast);  // 예쁘게 출력
+```
+
+### 2. quote!에서 변수 참조
+
+```rust
+let field_name = &field.ident;
+
+// quote!는 Rust의 이중 중괄호 처리
+let expanded = quote! {
+    // #field_name은 자동으로 변수 값으로 치환
+    let value = self.#field_name;
+};
+```
+
+### 3. Span 정보로 에러 위치 명시
+
+```rust
+// 에러가 발생한 정확한 위치 지정
+return Err(syn::Error::new_spanned(
+    &field,
+    "이 필드는 지원되지 않습니다"
+));
+```
+
+### 4. proc-macro 버전 호환성
+
+```toml
+# syn, quote, proc-macro2의 버전을 맞춰야 함
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+# 버전 미스매치 = 컴파일 실패!
+```
+
+---
+
+## 📖 매크로의 진화
+
+```
+매크로_v1: 단순 문자열 치환 (C, C++)
+  └─ 문제: 구문 오류, 타입 안전성 부족
+
+매크로_v2: 토큰 기반 치환 (Rust - 지금!)
+  ├─ 선언적 매크로 (macro_rules!) ← v13.0
+  ├─ 절차적 매크로 (proc-macro) ← v13.1 (현재)
+  └─ 파생 매크로 (derive) ← v13.3
+
+매크로_v3: AST 기반 변환 (고급 컴파일러)
+  └─ 플러그인 아키텍처 (컴파일러 확장)
+
+당신이 배우고 있는 것이 바로 매크로_v2의 핵심입니다!
+```
+
+---
+
+## 🎯 v13.1 목표
+
+> **마스터** ✅
+> - TokenStream의 개념 이해
+> - syn으로 AST 파싱하기
+> - quote!로 코드 생성하기
+> - 세 가지 절차적 매크로 타입 구분
+> - 절차적 매크로 크레이트 설정
+> - 실제 #[derive(...)] 매크로 작성 및 테스트
+
+> **심화** 📚
+> - 에러 처리 (compile_error!, syn::Error)
+> - 속성 매크로로 함수 변환
+> - 제네릭 지원
+> - 성능 최적화 (빌드 시간 단축)
+
+---
+
+**저장 필수 너는 기록이 증명이다 gogs**
+
+---
+
+## 🎓 "강력한 힘에는 책임이 따른다"
+
+```
+절차적 매크로는 강력하지만:
+
+1. 빌드 시간 증가
+   → 꼭 필요한 곳에만 사용
+
+2. 디버깅 어려움
+   → cargo expand로 생성 코드 확인 습관
+
+3. 컴파일러 프론트엔드 지식 필요
+   → syn 문서와 AST 구조 학습 필요
+
+4. 버전 호환성 관리 필수
+   → dependencies를 정확히 관리
+
+이 과정을 즐기며 익히십시오.
+당신은 단순한 프로그래머가 아니라,
+코드를 분석하고 재구성하는 '시스템 설계자'입니다.
+```
+

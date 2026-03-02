@@ -1,0 +1,844 @@
+"""
+v5.2 심화: 데이터베이스 정규화와 NoSQL (Database Normalization & NoSQL)
+주제: "데이터의 무결성과 확장성 사이의 줄타기"
+"""
+
+import sqlite3
+import threading
+import time
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import json
+import hashlib
+from collections import defaultdict
+
+
+# ============================================================================
+# [1] 철학 클래스
+# ============================================================================
+
+class DatabasePhilosophy:
+    """데이터베이스 철학"""
+
+    @staticmethod
+    def acid_principles():
+        """ACID 원칙"""
+        return {
+            "원자성 (Atomicity)": "모든 작업이 성공하거나 모두 실패 (all or nothing)",
+            "일관성 (Consistency)": "트랜잭션 전후로 데이터베이스가 유효한 상태",
+            "고립성 (Isolation)": "동시에 실행되는 트랜잭션은 서로 영향 없음",
+            "지속성 (Durability)": "커밋된 데이터는 시스템 장애 후에도 유지"
+        }
+
+    @staticmethod
+    def normalization_levels():
+        """정규화 레벨"""
+        return {
+            "1NF (First Normal Form)": "각 셀에는 원자값만 (리스트 아님)",
+            "2NF (Second Normal Form)": "1NF + 부분 종속 제거",
+            "3NF (Third Normal Form)": "2NF + 이행 종속 제거",
+            "BCNF": "3NF + 더 엄격한 규칙"
+        }
+
+    @staticmethod
+    def rdbms_vs_nosql():
+        """RDBMS vs NoSQL 비교"""
+        return {
+            "RDBMS": {
+                "특징": "구조화된 데이터, 강한 일관성",
+                "용도": "금융, 전자상거래 (정확성 중요)",
+                "확장": "수직 확장 (한 서버를 강하게)",
+                "성능": "복잡한 쿼리 최적화 가능"
+            },
+            "NoSQL": {
+                "특징": "자유로운 구조, 최종 일관성",
+                "용도": "SNS, 로그, 게임 (속도 중요)",
+                "확장": "수평 확장 (여러 서버에 분산)",
+                "성능": "단순 쿼리, 대량 접속"
+            }
+        }
+
+
+# ============================================================================
+# [2] 데이터 모델
+# ============================================================================
+
+@dataclass
+class User:
+    """사용자 테이블"""
+    id: int
+    name: str
+    email: str
+    created_at: float = field(default_factory=time.time)
+
+@dataclass
+class Account:
+    """계좌 테이블"""
+    id: int
+    user_id: int
+    balance: int
+    account_type: str  # "savings", "checking"
+    created_at: float = field(default_factory=time.time)
+
+@dataclass
+class TransactionLog:
+    """거래 로그"""
+    id: int
+    from_account_id: int
+    to_account_id: int
+    amount: int
+    status: str  # "pending", "completed", "failed"
+    timestamp: float
+    message: str = ""
+
+@dataclass
+class Document:
+    """NoSQL 문서"""
+    doc_id: str
+    collection: str
+    data: Dict[str, Any]
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+# ============================================================================
+# [3] 트랜잭션 관리자
+# ============================================================================
+
+class TransactionManager:
+    """ACID 트랜잭션 관리"""
+
+    def __init__(self):
+        self.conn = sqlite3.connect(':memory:')
+        self.cursor = self.conn.cursor()
+        self.lock = threading.RLock()
+        self.transaction_stack = []
+        self._init_tables()
+
+    def _init_tables(self):
+        """테이블 초기화"""
+        with self.lock:
+            # Users 테이블
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT UNIQUE NOT NULL,
+                    created_at REAL
+                )
+            ''')
+
+            # Accounts 테이블
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    balance INTEGER NOT NULL,
+                    account_type TEXT,
+                    created_at REAL,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            ''')
+
+            # Transactions 테이블
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY,
+                    from_account_id INTEGER,
+                    to_account_id INTEGER,
+                    amount INTEGER,
+                    status TEXT,
+                    timestamp REAL,
+                    message TEXT
+                )
+            ''')
+
+            self.conn.commit()
+
+    def begin_transaction(self):
+        """트랜잭션 시작 (Atomicity)"""
+        with self.lock:
+            self.transaction_stack.append({
+                'start_time': time.time(),
+                'operations': []
+            })
+            return len(self.transaction_stack) - 1
+
+    def add_operation(self, operation: str, params: Tuple = ()):
+        """작업 추가 (Isolation)"""
+        if self.transaction_stack:
+            self.transaction_stack[-1]['operations'].append({
+                'sql': operation,
+                'params': params
+            })
+
+    def commit(self) -> bool:
+        """커밋 (Durability)"""
+        if not self.transaction_stack:
+            return False
+
+        with self.lock:
+            try:
+                current = self.transaction_stack[-1]
+
+                # 모든 작업 실행
+                for op in current['operations']:
+                    self.cursor.execute(op['sql'], op['params'])
+
+                self.conn.commit()
+                self.transaction_stack.pop()
+                return True
+            except Exception as e:
+                self.rollback()
+                return False
+
+    def rollback(self) -> bool:
+        """롤백 (Consistency)"""
+        with self.lock:
+            try:
+                if self.transaction_stack:
+                    self.conn.rollback()
+                    self.transaction_stack.pop()
+                return True
+            except:
+                return False
+
+    def transfer_money(self, from_id: int, to_id: int, amount: int) -> bool:
+        """돈 송금 (트랜잭션 예제)"""
+        tx_id = self.begin_transaction()
+
+        try:
+            # Step 1: 출금 계좌 잔액 감소
+            self.add_operation(
+                'UPDATE accounts SET balance = balance - ? WHERE id = ?',
+                (amount, from_id)
+            )
+
+            # Step 2: 입금 계좌 잔액 증가
+            self.add_operation(
+                'UPDATE accounts SET balance = balance + ? WHERE id = ?',
+                (amount, to_id)
+            )
+
+            # Step 3: 거래 기록
+            self.add_operation(
+                '''INSERT INTO transactions
+                   (from_account_id, to_account_id, amount, status, timestamp)
+                   VALUES (?, ?, ?, 'completed', ?)''',
+                (from_id, to_id, amount, time.time())
+            )
+
+            # 모든 작업이 성공해야만 커밋
+            return self.commit()
+
+        except:
+            self.rollback()
+            return False
+
+    def insert_user(self, name: str, email: str) -> int:
+        """사용자 삽입"""
+        with self.lock:
+            self.cursor.execute(
+                'INSERT INTO users (name, email, created_at) VALUES (?, ?, ?)',
+                (name, email, time.time())
+            )
+            self.conn.commit()
+            return self.cursor.lastrowid
+
+    def insert_account(self, user_id: int, account_type: str, balance: int) -> int:
+        """계좌 삽입"""
+        with self.lock:
+            self.cursor.execute(
+                '''INSERT INTO accounts (user_id, balance, account_type, created_at)
+                   VALUES (?, ?, ?, ?)''',
+                (user_id, balance, account_type, time.time())
+            )
+            self.conn.commit()
+            return self.cursor.lastrowid
+
+    def get_balance(self, account_id: int) -> Optional[int]:
+        """잔액 조회"""
+        with self.lock:
+            self.cursor.execute(
+                'SELECT balance FROM accounts WHERE id = ?',
+                (account_id,)
+            )
+            result = self.cursor.fetchone()
+            return result[0] if result else None
+
+    def get_user(self, user_id: int) -> Optional[User]:
+        """사용자 조회"""
+        with self.lock:
+            self.cursor.execute(
+                'SELECT id, name, email, created_at FROM users WHERE id = ?',
+                (user_id,)
+            )
+            result = self.cursor.fetchone()
+            if result:
+                return User(*result)
+            return None
+
+
+# ============================================================================
+# [4] 인덱스 관리자
+# ============================================================================
+
+class IndexManager:
+    """인덱스 관리 (검색 속도 최적화)"""
+
+    def __init__(self):
+        self.indexes = defaultdict(dict)  # {column_name: {value: [record_ids]}}
+        self.stats = {
+            'index_creation_count': 0,
+            'index_hit_count': 0,
+            'full_scan_count': 0
+        }
+
+    def create_index(self, column_name: str, values_list: List[Tuple[int, Any]]):
+        """인덱스 생성"""
+        # values_list: [(record_id, value), ...]
+        for record_id, value in values_list:
+            if value not in self.indexes[column_name]:
+                self.indexes[column_name][value] = []
+            self.indexes[column_name][value].append(record_id)
+
+        self.stats['index_creation_count'] += 1
+
+    def search_by_index(self, column_name: str, value: Any) -> List[int]:
+        """인덱스로 검색 (빠름)"""
+        if column_name in self.indexes and value in self.indexes[column_name]:
+            self.stats['index_hit_count'] += 1
+            return self.indexes[column_name][value]
+        return []
+
+    def full_scan(self, column_name: str, value: Any, all_records: List[Tuple]) -> List[int]:
+        """전체 스캔 (느림)"""
+        self.stats['full_scan_count'] += 1
+        result = []
+        for record_id, record_value in all_records:
+            if record_value == value:
+                result.append(record_id)
+        return result
+
+    def get_stats(self) -> Dict[str, Any]:
+        """인덱스 통계"""
+        return {
+            'index_count': len(self.indexes),
+            'hit_count': self.stats['index_hit_count'],
+            'full_scan_count': self.stats['full_scan_count'],
+            'hit_ratio': self.stats['index_hit_count'] / (
+                self.stats['index_hit_count'] + self.stats['full_scan_count']
+            ) if (self.stats['index_hit_count'] + self.stats['full_scan_count']) > 0 else 0
+        }
+
+
+# ============================================================================
+# [5] 정규화 데모
+# ============================================================================
+
+class NormalizationDemo:
+    """정규화 기법 시연"""
+
+    @staticmethod
+    def denormalized_data():
+        """❌ 정규화 전 (중복 데이터)"""
+        return [
+            {
+                'user_id': 1,
+                'name': '설계자',
+                'email': 'designer@gogs.io',
+                'accounts': ['123456', '789012'],  # 다중값 (1NF 위반)
+                'account_balances': ['10000', '5000']  # 중복
+            }
+        ]
+
+    @staticmethod
+    def first_normal_form():
+        """✅ 1NF: 원자값만 (각 행은 유일, 각 열은 원자값)"""
+        users = [
+            {'user_id': 1, 'name': '설계자', 'email': 'designer@gogs.io'},
+        ]
+        accounts = [
+            {'account_id': '123456', 'user_id': 1, 'balance': 10000},
+            {'account_id': '789012', 'user_id': 1, 'balance': 5000},
+        ]
+        return {'users': users, 'accounts': accounts}
+
+    @staticmethod
+    def second_normal_form():
+        """✅ 2NF: 1NF + 부분 함수 종속 제거"""
+        users = [
+            {'user_id': 1, 'name': '설계자', 'email': 'designer@gogs.io'},
+        ]
+        accounts = [
+            {'account_id': '123456', 'user_id': 1, 'account_type': 'savings'},
+            {'account_id': '789012', 'user_id': 1, 'account_type': 'checking'},
+        ]
+        balances = [
+            {'account_id': '123456', 'balance': 10000, 'timestamp': time.time()},
+            {'account_id': '789012', 'balance': 5000, 'timestamp': time.time()},
+        ]
+        return {'users': users, 'accounts': accounts, 'balances': balances}
+
+    @staticmethod
+    def third_normal_form():
+        """✅ 3NF: 2NF + 이행 함수 종속 제거"""
+        users = [
+            {'user_id': 1, 'name': '설계자'},
+        ]
+        user_emails = [
+            {'user_id': 1, 'email': 'designer@gogs.io'},
+        ]
+        accounts = [
+            {'account_id': '123456', 'user_id': 1, 'account_type': 'savings'},
+            {'account_id': '789012', 'user_id': 1, 'account_type': 'checking'},
+        ]
+        balances = [
+            {'account_id': '123456', 'balance': 10000},
+            {'account_id': '789012', 'balance': 5000},
+        ]
+        return {
+            'users': users,
+            'user_emails': user_emails,
+            'accounts': accounts,
+            'balances': balances
+        }
+
+
+# ============================================================================
+# [6] NoSQL 문서 저장소
+# ============================================================================
+
+class NoSQLStore:
+    """NoSQL 문서 저장소 (Key-Value + Document)"""
+
+    def __init__(self):
+        self.documents = {}  # {doc_id: Document}
+        self.collections = defaultdict(list)  # {collection_name: [doc_ids]}
+        self.indexes = defaultdict(lambda: defaultdict(list))  # {collection: {field: [doc_ids]}}
+
+    def insert_document(self, collection: str, doc_id: str, data: Dict[str, Any]) -> bool:
+        """문서 삽입"""
+        doc = Document(
+            doc_id=doc_id,
+            collection=collection,
+            data=data
+        )
+        self.documents[doc_id] = doc
+        self.collections[collection].append(doc_id)
+
+        # 자동 인덱싱
+        for key, value in data.items():
+            self.indexes[collection][key].append((doc_id, value))
+
+        return True
+
+    def find_by_id(self, doc_id: str) -> Optional[Document]:
+        """ID로 검색"""
+        return self.documents.get(doc_id)
+
+    def find_in_collection(self, collection: str, query: Dict[str, Any]) -> List[Document]:
+        """컬렉션에서 검색 (query: {field: value})"""
+        result = []
+        for doc_id in self.collections[collection]:
+            doc = self.documents[doc_id]
+            match = True
+            for key, value in query.items():
+                if doc.data.get(key) != value:
+                    match = False
+                    break
+            if match:
+                result.append(doc)
+        return result
+
+    def update_document(self, doc_id: str, update_data: Dict[str, Any]) -> bool:
+        """문서 업데이트"""
+        if doc_id not in self.documents:
+            return False
+
+        doc = self.documents[doc_id]
+        doc.data.update(update_data)
+        doc.updated_at = time.time()
+        return True
+
+    def delete_document(self, doc_id: str) -> bool:
+        """문서 삭제"""
+        if doc_id not in self.documents:
+            return False
+
+        doc = self.documents[doc_id]
+        self.collections[doc.collection].remove(doc_id)
+        del self.documents[doc_id]
+        return True
+
+    def count_collection(self, collection: str) -> int:
+        """컬렉션 크기"""
+        return len(self.collections[collection])
+
+    def aggregate(self, collection: str, pipeline: List[Dict[str, Any]]) -> List[Any]:
+        """집계 쿼리"""
+        result = []
+        for stage in pipeline:
+            if '$match' in stage:
+                result = self.find_in_collection(collection, stage['$match'])
+            elif '$group' in stage:
+                # 간단한 그룹화
+                groups = defaultdict(list)
+                for doc in result:
+                    key = doc.data.get(stage['$group'].get('_id'))
+                    groups[key].append(doc)
+                result = list(groups.values())
+
+        return result
+
+
+# ============================================================================
+# [7] 쿼리 최적화기
+# ============================================================================
+
+class QueryOptimizer:
+    """쿼리 실행 계획 최적화"""
+
+    def __init__(self):
+        self.query_log = []
+        self.stats = {
+            'total_queries': 0,
+            'avg_execution_time_ms': 0
+        }
+
+    def analyze_query(self, query: str) -> Dict[str, Any]:
+        """쿼리 분석"""
+        plan = {
+            'query': query,
+            'type': 'SELECT' if query.startswith('SELECT') else 'OTHER',
+            'estimated_rows': 0,
+            'estimated_cost': 0,
+            'optimization_suggestions': []
+        }
+
+        # 간단한 최적화 제안
+        if 'WHERE' not in query:
+            plan['optimization_suggestions'].append('WHERE 절 추가하면 성능 향상')
+        if 'ORDER BY' in query and 'INDEX' not in query:
+            plan['optimization_suggestions'].append('ORDER BY 칼럼에 인덱스 생성')
+        if 'JOIN' in query:
+            plan['optimization_suggestions'].append('JOIN 순서 재정렬 고려')
+
+        return plan
+
+    def estimate_execution_time(self, query: str, rows: int) -> float:
+        """실행 시간 예측 (밀리초)"""
+        # 매우 간단한 추정
+        base_time = 1.0  # ms
+        if 'JOIN' in query:
+            base_time *= rows * 0.1
+        elif 'WHERE' in query:
+            base_time *= rows * 0.01
+        else:
+            base_time *= rows * 0.001
+
+        return min(base_time, 1000.0)  # 최대 1초
+
+    def log_query(self, query: str, execution_time: float):
+        """쿼리 로깅"""
+        self.query_log.append({
+            'query': query,
+            'execution_time': execution_time,
+            'timestamp': time.time()
+        })
+        self.stats['total_queries'] += 1
+
+    def get_slow_queries(self, threshold_ms: float = 100.0) -> List[Dict[str, Any]]:
+        """느린 쿼리 찾기"""
+        return [q for q in self.query_log if q['execution_time'] > threshold_ms]
+
+
+# ============================================================================
+# [8] 데이터 일관성 검사
+# ============================================================================
+
+class DataConsistencyChecker:
+    """데이터 일관성 검증"""
+
+    def __init__(self, tx_manager: TransactionManager):
+        self.tx_manager = tx_manager
+        self.violations = []
+
+    def check_referential_integrity(self) -> bool:
+        """참조 무결성 검사 (Foreign Key)"""
+        # 모든 user_id가 users 테이블에 존재하는지 확인
+        cursor = self.tx_manager.cursor
+        cursor.execute('''
+            SELECT COUNT(*) FROM accounts a
+            WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = a.user_id)
+        ''')
+        invalid_count = cursor.fetchone()[0]
+        return invalid_count == 0
+
+    def check_balance_consistency(self) -> bool:
+        """잔액 일관성 검사"""
+        cursor = self.tx_manager.cursor
+        cursor.execute('SELECT SUM(balance) FROM accounts')
+        total = cursor.fetchone()[0] or 0
+        return total >= 0  # 음수 잔액 없음
+
+    def check_transaction_integrity(self) -> bool:
+        """거래 무결성 검사"""
+        cursor = self.tx_manager.cursor
+        cursor.execute('''
+            SELECT COUNT(*) FROM transactions
+            WHERE status NOT IN ('pending', 'completed', 'failed')
+        ''')
+        invalid_count = cursor.fetchone()[0]
+        return invalid_count == 0
+
+    def verify_all(self) -> Dict[str, bool]:
+        """모든 검사 실행"""
+        return {
+            'referential_integrity': self.check_referential_integrity(),
+            'balance_consistency': self.check_balance_consistency(),
+            'transaction_integrity': self.check_transaction_integrity()
+        }
+
+
+# ============================================================================
+# [9] 백업 및 복구
+# ============================================================================
+
+class BackupManager:
+    """데이터베이스 백업/복구"""
+
+    def __init__(self, tx_manager: TransactionManager):
+        self.tx_manager = tx_manager
+        self.backups = {}
+
+    def create_backup(self, backup_name: str) -> bool:
+        """백업 생성"""
+        try:
+            cursor = self.tx_manager.cursor
+            backup_data = {
+                'users': cursor.execute('SELECT * FROM users').fetchall(),
+                'accounts': cursor.execute('SELECT * FROM accounts').fetchall(),
+                'transactions': cursor.execute('SELECT * FROM transactions').fetchall(),
+                'timestamp': time.time()
+            }
+            self.backups[backup_name] = backup_data
+            return True
+        except:
+            return False
+
+    def restore_backup(self, backup_name: str) -> bool:
+        """백업 복구"""
+        if backup_name not in self.backups:
+            return False
+
+        try:
+            backup = self.backups[backup_name]
+            cursor = self.tx_manager.cursor
+
+            # 테이블 초기화
+            cursor.execute('DELETE FROM transactions')
+            cursor.execute('DELETE FROM accounts')
+            cursor.execute('DELETE FROM users')
+
+            # 데이터 복구
+            for user in backup['users']:
+                cursor.execute('INSERT INTO users VALUES (?, ?, ?, ?)', user)
+            for account in backup['accounts']:
+                cursor.execute('INSERT INTO accounts VALUES (?, ?, ?, ?, ?)', account)
+            for tx in backup['transactions']:
+                cursor.execute(
+                    'INSERT INTO transactions VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    tx
+                )
+
+            self.tx_manager.conn.commit()
+            return True
+        except:
+            self.tx_manager.conn.rollback()
+            return False
+
+    def get_backup_info(self, backup_name: str) -> Dict[str, Any]:
+        """백업 정보"""
+        if backup_name not in self.backups:
+            return {}
+
+        backup = self.backups[backup_name]
+        return {
+            'name': backup_name,
+            'timestamp': backup['timestamp'],
+            'users_count': len(backup['users']),
+            'accounts_count': len(backup['accounts']),
+            'transactions_count': len(backup['transactions'])
+        }
+
+
+# ============================================================================
+# [10] 연결 풀
+# ============================================================================
+
+class ConnectionPool:
+    """데이터베이스 연결 풀"""
+
+    def __init__(self, pool_size: int = 5):
+        self.pool_size = pool_size
+        self.available = []
+        self.in_use = set()
+        self.lock = threading.Lock()
+
+        # 연결 미리 생성
+        for _ in range(pool_size):
+            conn = sqlite3.connect(':memory:')
+            self.available.append(conn)
+
+    def acquire(self) -> Optional[sqlite3.Connection]:
+        """연결 획득"""
+        with self.lock:
+            if self.available:
+                conn = self.available.pop()
+                self.in_use.add(id(conn))
+                return conn
+            return None
+
+    def release(self, conn: sqlite3.Connection):
+        """연결 반환"""
+        with self.lock:
+            if id(conn) in self.in_use:
+                self.in_use.remove(id(conn))
+                self.available.append(conn)
+
+    def get_stats(self) -> Dict[str, int]:
+        """풀 통계"""
+        with self.lock:
+            return {
+                'total_connections': self.pool_size,
+                'available': len(self.available),
+                'in_use': len(self.in_use)
+            }
+
+
+# ============================================================================
+# [데모 함수들]
+# ============================================================================
+
+def demonstrate_acid_transactions():
+    """ACID 트랜잭션 시연"""
+    tx = TransactionManager()
+
+    # 사용자 및 계좌 생성
+    user_id = tx.insert_user('설계자', 'designer@gogs.io')
+    acc1 = tx.insert_account(user_id, 'savings', 10000)
+    acc2 = tx.insert_account(user_id, 'checking', 5000)
+
+    # 송금 전
+    balance1_before = tx.get_balance(acc1)
+    balance2_before = tx.get_balance(acc2)
+
+    # 송금 (트랜잭션)
+    success = tx.transfer_money(acc1, acc2, 3000)
+
+    # 송금 후
+    balance1_after = tx.get_balance(acc1)
+    balance2_after = tx.get_balance(acc2)
+
+    return {
+        'success': success,
+        'from_before': balance1_before,
+        'from_after': balance1_after,
+        'to_before': balance2_before,
+        'to_after': balance2_after
+    }
+
+
+def demonstrate_normalization():
+    """정규화 시연"""
+    return {
+        '1NF': NormalizationDemo.first_normal_form(),
+        '2NF': NormalizationDemo.second_normal_form(),
+        '3NF': NormalizationDemo.third_normal_form()
+    }
+
+
+def demonstrate_nosql():
+    """NoSQL 시연"""
+    store = NoSQLStore()
+
+    # 문서 삽입
+    store.insert_document('users', 'user1', {
+        'name': '설계자',
+        'email': 'designer@gogs.io',
+        'age': 25
+    })
+    store.insert_document('users', 'user2', {
+        'name': '개발자',
+        'email': 'dev@gogs.io',
+        'age': 28
+    })
+
+    # 검색
+    result = store.find_in_collection('users', {'age': 25})
+
+    return {
+        'total_documents': store.count_collection('users'),
+        'found_documents': len(result),
+        'document_ids': [d.doc_id for d in result]
+    }
+
+
+def demonstrate_indexing():
+    """인덱싱 시연"""
+    index_mgr = IndexManager()
+
+    # 데이터
+    data = [(1, 'Alice'), (2, 'Bob'), (3, 'Alice'), (4, 'Charlie'), (5, 'Alice')]
+
+    # 인덱스 생성
+    index_mgr.create_index('name', data)
+
+    # 검색
+    result1 = index_mgr.search_by_index('name', 'Alice')
+    result2 = index_mgr.full_scan('name', 'Alice', data)
+
+    return {
+        'index_hits': result1,
+        'full_scan_result': result2,
+        'hit_ratio': index_mgr.get_stats()['hit_ratio']
+    }
+
+
+def demonstrate_consistency_check():
+    """일관성 검사 시연"""
+    tx = TransactionManager()
+
+    # 데이터 생성
+    user_id = tx.insert_user('설계자', 'designer@gogs.io')
+    tx.insert_account(user_id, 'savings', 10000)
+
+    # 일관성 검사
+    checker = DataConsistencyChecker(tx)
+    results = checker.verify_all()
+
+    return results
+
+
+def database_normalization_demo():
+    """전체 데이터베이스 데모"""
+    result = {}
+
+    # ACID 트랜잭션
+    result['acid'] = demonstrate_acid_transactions()
+
+    # 정규화
+    result['normalization'] = demonstrate_normalization()
+
+    # NoSQL
+    result['nosql'] = demonstrate_nosql()
+
+    # 인덱싱
+    result['indexing'] = demonstrate_indexing()
+
+    # 일관성 검사
+    result['consistency'] = demonstrate_consistency_check()
+
+    return result

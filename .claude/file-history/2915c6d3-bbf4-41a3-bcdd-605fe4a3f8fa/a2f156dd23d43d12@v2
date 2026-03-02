@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+토폴로지 인식 스케줄러 (Topology-Aware Scheduler)
+
+네트워크 토폴로지를 감지하고 최적의 통신 알고리즘 선택
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+from enum import Enum
+import json
+import math
+
+
+class AllReduceAlgorithm(Enum):
+    """AllReduce 알고리즘"""
+    RING = "ring"
+    TREE = "tree"
+    BUTTERFLY = "butterfly"
+    DIRECT = "direct"
+
+
+@dataclass
+class NetworkLink:
+    """네트워크 링크 정보"""
+    source_device: int
+    target_device: int
+    bandwidth_gbps: float
+    latency_us: float
+
+
+class TopologyDetector:
+    """네트워크 토폴로지 감지"""
+
+    def __init__(self):
+        self.links: List[NetworkLink] = []
+        self.topology_type = None
+        self.adjacency: Dict[int, List[int]] = {}
+
+    def add_link(self,
+                 source_device: int,
+                 target_device: int,
+                 bandwidth_gbps: float,
+                 latency_us: float) -> None:
+        """링크 추가"""
+
+        link = NetworkLink(
+            source_device=source_device,
+            target_device=target_device,
+            bandwidth_gbps=bandwidth_gbps,
+            latency_us=latency_us
+        )
+
+        self.links.append(link)
+
+        # 인접 리스트 업데이트
+        if source_device not in self.adjacency:
+            self.adjacency[source_device] = []
+        self.adjacency[source_device].append(target_device)
+
+    def detect_topology(self, num_devices: int) -> str:
+        """토폴로지 감지"""
+
+        if not self.links:
+            return "unknown"
+
+        # 링크 분석
+        avg_bandwidth = sum(l.bandwidth_gbps for l in self.links) / len(self.links)
+        avg_latency = sum(l.latency_us for l in self.links) / len(self.links)
+
+        # 토폴로지 판정
+        # NVLink: 매우 높은 대역폭 (900+ GB/s), 매우 낮은 지연 (< 1us)
+        # Ethernet: 낮은 대역폭 (100 GB/s), 높은 지연 (100+ us)
+
+        if avg_bandwidth > 500 and avg_latency < 2:
+            self.topology_type = "nvlink_tree"
+            return "nvlink_tree"
+        elif avg_bandwidth > 40 and avg_bandwidth < 200 and avg_latency > 50:
+            self.topology_type = "ethernet_ring"
+            return "ethernet_ring"
+        else:
+            self.topology_type = "custom"
+            return "custom"
+
+    def build_communication_schedule(self,
+                                     num_devices: int) -> Dict:
+        """통신 스케줄 생성"""
+
+        topology = self.topology_type or "unknown"
+
+        return {
+            "topology": topology,
+            "num_devices": num_devices,
+            "avg_bandwidth_gbps": sum(l.bandwidth_gbps for l in self.links) / len(self.links) if self.links else 0,
+            "avg_latency_us": sum(l.latency_us for l in self.links) / len(self.links) if self.links else 0
+        }
+
+
+class CriticalPathScheduler:
+    """임계 경로 스케줄링"""
+
+    def __init__(self, task_graph):
+        self.task_graph = task_graph
+        self.schedule = {}
+        self.device_allocation = {}
+
+    def schedule_tasks_on_devices(self,
+                                  device_ids: List[int],
+                                  device_flops: Dict[int, float]) -> Dict:
+        """작업을 장치에 스케줄"""
+
+        # 위상 정렬
+        sorted_tasks = self.task_graph.topological_sort()
+
+        # 현재 시각 (각 장치별)
+        device_finish_time = {did: 0.0 for did in device_ids}
+
+        for task_id in sorted_tasks:
+            task = self.task_graph.tasks[task_id]
+
+            # 선행 작업 완료 시간 확인
+            max_pred_time = 0.0
+            for pred_id in self.task_graph.get_predecessors(task_id):
+                max_pred_time = max(max_pred_time, self.schedule.get(pred_id, {}).get("finish_time", 0.0))
+
+            # 가장 한가한 장치 선택
+            best_device = min(device_ids, key=lambda d: device_finish_time[d])
+
+            # 작업 시간 계산
+            if task.work_size_flops:
+                compute_time = (task.work_size_flops / (device_flops[best_device] * 1e12)) * 1000
+            else:
+                compute_time = task.estimated_time_ms
+
+            # 스케줄 기록
+            start_time = max(max_pred_time, device_finish_time[best_device])
+            finish_time = start_time + compute_time
+
+            self.schedule[task_id] = {
+                "device": best_device,
+                "start_time_ms": start_time,
+                "finish_time_ms": finish_time,
+                "compute_time_ms": compute_time
+            }
+
+            self.device_allocation[task_id] = best_device
+            device_finish_time[best_device] = finish_time
+
+        return {
+            "total_makespan_ms": max(device_finish_time.values()),
+            "schedule": self.schedule
+        }
+
+
+class CommunicationPlanner:
+    """통신 계획"""
+
+    def __init__(self, topology_detector: TopologyDetector):
+        self.topology_detector = topology_detector
+
+    def plan_all_reduce(self,
+                       num_devices: int,
+                       data_size_bytes: float) -> Dict:
+        """AllReduce 통신 계획"""
+
+        topology = self.topology_detector.topology_type or "unknown"
+
+        if topology == "nvlink_tree":
+            algorithm = AllReduceAlgorithm.TREE
+            # Tree AllReduce: log₂(n) steps
+            num_steps = math.ceil(math.log2(num_devices))
+        elif topology == "ethernet_ring":
+            algorithm = AllReduceAlgorithm.RING
+            # Ring AllReduce: 2(n-1) steps
+            num_steps = 2 * (num_devices - 1)
+        else:
+            algorithm = AllReduceAlgorithm.RING
+            num_steps = 2 * (num_devices - 1)
+
+        # 평균 링크 대역폭
+        avg_bandwidth = sum(l.bandwidth_gbps for l in self.topology_detector.links) / len(self.topology_detector.links) if self.topology_detector.links else 100
+
+        # 통신 시간 추정
+        time_per_step = (data_size_bytes / (avg_bandwidth * 1e9))
+        total_time_ms = num_steps * time_per_step * 1000
+
+        return {
+            "algorithm": algorithm.value,
+            "num_steps": num_steps,
+            "data_size_bytes": data_size_bytes,
+            "bandwidth_gbps": avg_bandwidth,
+            "estimated_time_ms": total_time_ms
+        }
+
+    def optimize_collective_communication(self,
+                                         num_devices: int,
+                                         operation: str) -> Dict:
+        """집합 통신 최적화"""
+
+        if operation == "all_reduce":
+            return self.plan_all_reduce(num_devices, 1e9)  # 1GB 기준
+
+        elif operation == "all_gather":
+            # AllGather: log₂(n) steps
+            num_steps = math.ceil(math.log2(num_devices))
+            return {
+                "operation": "all_gather",
+                "num_steps": num_steps
+            }
+
+        elif operation == "reduce_scatter":
+            # ReduceScatter: log₂(n) steps
+            num_steps = math.ceil(math.log2(num_devices))
+            return {
+                "operation": "reduce_scatter",
+                "num_steps": num_steps
+            }
+
+        else:
+            return {"operation": operation, "unsupported": True}
+
+
+class LoadBalancer:
+    """부하 균형 조정"""
+
+    def __init__(self, device_capabilities: Dict[int, Dict]):
+        self.device_capabilities = device_capabilities
+        self.weights = self._compute_weights()
+
+    def _compute_weights(self) -> Dict[int, float]:
+        """각 장치의 성능 가중치 계산"""
+
+        total_flops = sum(dev["peak_flops_tflops"] for dev in self.device_capabilities.values())
+
+        if total_flops == 0:
+            return {did: 1.0 / len(self.device_capabilities) for did in self.device_capabilities}
+
+        return {
+            did: dev["peak_flops_tflops"] / total_flops
+            for did, dev in self.device_capabilities.items()
+        }
+
+    def compute_weighted_sharding(self, total_work_size: float) -> Dict[int, float]:
+        """성능 비례 작업 분배"""
+
+        return {
+            did: total_work_size * weight
+            for did, weight in self.weights.items()
+        }
+
+    def estimate_execution_time(self,
+                               work_per_device: Dict[int, float]) -> Dict[int, float]:
+        """각 장치의 예상 실행 시간"""
+
+        execution_times = {}
+        for did, work_size in work_per_device.items():
+            if did in self.device_capabilities:
+                flops = self.device_capabilities[did]["peak_flops_tflops"] * 1e12
+                time_ms = (work_size / flops) * 1000
+                execution_times[did] = time_ms
+
+        return execution_times
+
+    def balance_load(self, total_work_size: float) -> Dict:
+        """부하 균형 조정"""
+
+        # 성능 비례 작업 분배
+        sharded_work = self.compute_weighted_sharding(total_work_size)
+
+        # 예상 실행 시간
+        execution_times = self.estimate_execution_time(sharded_work)
+
+        # 병목 시간
+        makespan = max(execution_times.values()) if execution_times else 0
+
+        return {
+            "sharded_work_per_device": sharded_work,
+            "execution_times_ms": execution_times,
+            "total_makespan_ms": makespan,
+            "load_balance_ratio": min(execution_times.values()) / max(execution_times.values()) if execution_times else 1.0
+        }
+
+    def export_to_json(self) -> str:
+        """상태를 JSON으로 내보내기"""
+
+        data = {
+            "num_devices": len(self.device_capabilities),
+            "weights": self.weights,
+            "device_capabilities": self.device_capabilities
+        }
+
+        return json.dumps(data, indent=2)
+

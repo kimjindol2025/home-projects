@@ -1,0 +1,166 @@
+package protocol
+
+import (
+	"testing"
+	"unsafe"
+)
+
+func TestEngineHeaderSize_Is128Bytes(t *testing.T) {
+	h := EngineHeader{}
+	size := unsafe.Sizeof(h)
+	if size != HeaderSize {
+		t.Fatalf("EngineHeader size = %d, want %d", size, HeaderSize)
+	}
+}
+
+func TestEngineHeader_CacheLineAlignment(t *testing.T) {
+	h := EngineHeader{}
+	addr := uintptr(unsafe.Pointer(&h))
+
+	// Magic should be at offset 0
+	if offset := uintptr(unsafe.Pointer(&h.Magic)) - addr; offset != 0 {
+		t.Fatalf("Magic offset = %d, want 0", offset)
+	}
+
+	// State should be at offset 12
+	if offset := uintptr(unsafe.Pointer(&h.State)) - addr; offset != 12 {
+		t.Fatalf("State offset = %d, want 12", offset)
+	}
+
+	// SeqNum should be at offset 16
+	if offset := uintptr(unsafe.Pointer(&h.SeqNum)) - addr; offset != 16 {
+		t.Fatalf("SeqNum offset = %d, want 16", offset)
+	}
+
+	// Total size should be 128 bytes
+	if size := unsafe.Sizeof(h); size != 128 {
+		t.Fatalf("Total size = %d, want 128", size)
+	}
+}
+
+func TestStateFlag_Values(t *testing.T) {
+	states := []StateFlag{StateIdle, StateWriting, StateReady, StateReading}
+	strs := []string{"IDLE", "WRITING", "READY", "READING"}
+
+	for i, s := range states {
+		if s.String() != strs[i] {
+			t.Fatalf("State %d String() = %s, want %s", int32(s), s.String(), strs[i])
+		}
+	}
+}
+
+func TestCASState_IDLE_To_WRITING_Succeeds(t *testing.T) {
+	h := EngineHeader{State: int32(StateIdle)}
+
+	ok := h.CASState(StateIdle, StateWriting)
+	if !ok {
+		t.Fatal("CASState IDLE->WRITING should succeed")
+	}
+
+	if h.LoadState() != StateWriting {
+		t.Fatalf("State after CAS = %v, want %v", h.LoadState(), StateWriting)
+	}
+}
+
+func TestCASState_IDLE_To_READY_Fails(t *testing.T) {
+	h := EngineHeader{State: int32(StateIdle)}
+
+	// Try to CAS from WRITING to READY (but current state is IDLE)
+	ok := h.CASState(StateWriting, StateReady)
+	if ok {
+		t.Fatal("CASState WRITING->READY should fail when state is IDLE")
+	}
+
+	if h.LoadState() != StateIdle {
+		t.Fatalf("State should remain IDLE, but got %v", h.LoadState())
+	}
+}
+
+func TestStoreState_And_LoadState(t *testing.T) {
+	h := EngineHeader{}
+
+	h.StoreState(StateWriting)
+	if h.LoadState() != StateWriting {
+		t.Fatalf("LoadState() = %v, want %v", h.LoadState(), StateWriting)
+	}
+
+	h.StoreState(StateReady)
+	if h.LoadState() != StateReady {
+		t.Fatalf("LoadState() = %v, want %v", h.LoadState(), StateReady)
+	}
+}
+
+func TestSeqNum_Atomic_Operations(t *testing.T) {
+	h := EngineHeader{}
+
+	seq1 := h.AddSeqNum()
+	if seq1 != 1 {
+		t.Fatalf("First AddSeqNum() = %d, want 1", seq1)
+	}
+
+	seq2 := h.AddSeqNum()
+	if seq2 != 2 {
+		t.Fatalf("Second AddSeqNum() = %d, want 2", seq2)
+	}
+
+	loaded := h.LoadSeqNum()
+	if loaded != 2 {
+		t.Fatalf("LoadSeqNum() = %d, want 2", loaded)
+	}
+}
+
+func TestTotalWrites_And_TotalReads(t *testing.T) {
+	h := EngineHeader{}
+
+	w1 := h.AddTotalWrites()
+	if w1 != 1 {
+		t.Fatalf("First AddTotalWrites() = %d, want 1", w1)
+	}
+
+	r1 := h.AddTotalReads()
+	if r1 != 1 {
+		t.Fatalf("First AddTotalReads() = %d, want 1", r1)
+	}
+
+	if h.LoadTotalWrites() != 1 {
+		t.Fatalf("LoadTotalWrites() = %d, want 1", h.LoadTotalWrites())
+	}
+
+	if h.LoadTotalReads() != 1 {
+		t.Fatalf("LoadTotalReads() = %d, want 1", h.LoadTotalReads())
+	}
+}
+
+func TestMagicNumber(t *testing.T) {
+	if MagicNumber != 0x47524945_00000001 {
+		t.Fatalf("MagicNumber = %#x, want %#x", MagicNumber, 0x47524945_00000001)
+	}
+}
+
+func BenchmarkCASState(b *testing.B) {
+	h := EngineHeader{State: int32(StateIdle)}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		h.CASState(StateIdle, StateWriting)
+		h.CASState(StateWriting, StateIdle)
+	}
+}
+
+func BenchmarkLoadState(b *testing.B) {
+	h := EngineHeader{State: int32(StateReady)}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = h.LoadState()
+	}
+}
+
+func BenchmarkAddSeqNum(b *testing.B) {
+	h := EngineHeader{}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = h.AddSeqNum()
+	}
+}

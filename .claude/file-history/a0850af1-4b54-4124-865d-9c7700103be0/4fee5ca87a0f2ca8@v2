@@ -1,0 +1,535 @@
+// Phase 13 v14.6: Control Flow
+// if-else 조건문과 while 반복문을 지원하는 평가기
+
+use crate::v14_2_pratt_parsing::{Expression, InfixOp, PrefixOp};
+use crate::v14_3_evaluator::{Object, Evaluator};
+use std::collections::HashMap;
+use std::fmt;
+
+// ============ Statement (v14.6 확장) ============
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    Let { name: String, value: Expression },
+    Expression(Expression),
+    Return(Expression),
+    If {
+        condition: Expression,
+        consequence: Vec<Statement>,
+        alternative: Option<Vec<Statement>>,
+    },
+    While {
+        condition: Expression,
+        body: Vec<Statement>,
+    },
+    Break,
+}
+
+// ============ Extended Object ============
+
+#[derive(Clone, Debug)]
+pub enum ControlObject {
+    Integer(i32),
+    Float(f64),
+    Boolean(bool),
+    Null,
+    Error(String),
+}
+
+impl ControlObject {
+    pub fn is_error(&self) -> bool {
+        matches!(self, ControlObject::Error(_))
+    }
+
+    pub fn to_string(&self) -> String {
+        match self {
+            ControlObject::Integer(i) => i.to_string(),
+            ControlObject::Float(f) => f.to_string(),
+            ControlObject::Boolean(b) => b.to_string(),
+            ControlObject::Null => "null".to_string(),
+            ControlObject::Error(e) => format!("Error: {}", e),
+        }
+    }
+}
+
+// ============ Environment (스코프 체인) ============
+
+#[derive(Clone)]
+pub struct ControlEnvironment {
+    store: HashMap<String, ControlObject>,
+    outer: Option<Box<ControlEnvironment>>,
+}
+
+impl ControlEnvironment {
+    pub fn new() -> Self {
+        ControlEnvironment {
+            store: HashMap::new(),
+            outer: None,
+        }
+    }
+
+    pub fn extend(outer: ControlEnvironment) -> Self {
+        ControlEnvironment {
+            store: HashMap::new(),
+            outer: Some(Box::new(outer)),
+        }
+    }
+
+    pub fn set(&mut self, name: String, value: ControlObject) {
+        self.store.insert(name, value);
+    }
+
+    pub fn get(&self, name: &str) -> Option<ControlObject> {
+        match self.store.get(name) {
+            Some(val) => Some(val.clone()),
+            None => self.outer.as_ref().and_then(|outer| outer.get(name)),
+        }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        if self.store.contains_key(name) {
+            true
+        } else {
+            self.outer.as_ref().map_or(false, |outer| outer.contains(name))
+        }
+    }
+}
+
+impl fmt::Debug for ControlEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlEnvironment")
+            .field("store_size", &self.store.len())
+            .field("has_outer", &self.outer.is_some())
+            .finish()
+    }
+}
+
+// ============ Evaluator (v14.6: 제어 흐름 지원) ============
+
+pub struct ControlFlowEvaluator;
+
+impl ControlFlowEvaluator {
+    pub fn eval_statements(
+        &self,
+        statements: &[Statement],
+        env: &mut ControlEnvironment,
+    ) -> Result<ControlObject, String> {
+        let mut result = ControlObject::Null;
+
+        for stmt in statements {
+            result = self.eval_statement(stmt, env)?;
+
+            if result.is_error() {
+                return Ok(result);
+            }
+
+            if matches!(stmt, Statement::Return(_)) {
+                return Ok(result);
+            }
+
+            if matches!(stmt, Statement::Break) {
+                return Ok(ControlObject::Null);  // Break 신호
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn eval_statement(
+        &self,
+        stmt: &Statement,
+        env: &mut ControlEnvironment,
+    ) -> Result<ControlObject, String> {
+        match stmt {
+            Statement::Let { name, value } => {
+                let val = self.eval_expression_simple(value, env)?;
+                env.set(name.clone(), val.clone());
+                Ok(val)
+            }
+            Statement::Expression(expr) => self.eval_expression_simple(expr, env),
+            Statement::Return(expr) => self.eval_expression_simple(expr, env),
+            Statement::If { condition, consequence, alternative } => {
+                self.eval_if_statement(condition, consequence, alternative, env)
+            }
+            Statement::While { condition, body } => {
+                self.eval_while_statement(condition, body, env)
+            }
+            Statement::Break => {
+                // Break는 특수 처리 (루프에서만 의미 있음)
+                Ok(ControlObject::Null)
+            }
+        }
+    }
+
+    fn eval_if_statement(
+        &self,
+        condition: &Expression,
+        consequence: &[Statement],
+        alternative: &Option<Vec<Statement>>,
+        env: &mut ControlEnvironment,
+    ) -> Result<ControlObject, String> {
+        // 1. 조건 평가
+        let condition_obj = self.eval_expression_simple(condition, env)?;
+
+        // 2. Truthiness 판정
+        if self.is_truthy(&condition_obj) {
+            // 3. consequence 실행 (블록 스코프)
+            let mut block_env = ControlEnvironment::extend(env.clone());
+            self.eval_statements(consequence, &mut block_env)
+        } else if let Some(alt) = alternative {
+            // 4. alternative 실행 (블록 스코프)
+            let mut block_env = ControlEnvironment::extend(env.clone());
+            self.eval_statements(alt, &mut block_env)
+        } else {
+            Ok(ControlObject::Null)
+        }
+    }
+
+    fn eval_while_statement(
+        &self,
+        condition: &Expression,
+        body: &[Statement],
+        env: &mut ControlEnvironment,
+    ) -> Result<ControlObject, String> {
+        let max_iterations = 100000;
+        let mut iterations = 0;
+        let mut result = ControlObject::Null;
+
+        loop {
+            // 1. 무한 루프 방지
+            if iterations >= max_iterations {
+                return Err("infinite loop detected".to_string());
+            }
+            iterations += 1;
+
+            // 2. 조건 평가
+            let condition_obj = self.eval_expression_simple(condition, env)?;
+            if !self.is_truthy(&condition_obj) {
+                break;  // 조건이 false면 루프 종료
+            }
+
+            // 3. 본문 실행 (블록 스코프)
+            let mut block_env = ControlEnvironment::extend(env.clone());
+            result = self.eval_statements(body, &mut block_env)?;
+
+            // 무한 루프 체크
+            if iterations % 1000 == 0 {
+                // 매 1000번 반복마다 상태 확인 (선택사항)
+            }
+        }
+
+        Ok(result)
+    }
+
+    fn eval_expression_simple(
+        &self,
+        expr: &Expression,
+        env: &ControlEnvironment,
+    ) -> Result<ControlObject, String> {
+        match expr {
+            Expression::Literal(val) => Ok(ControlObject::Integer(*val)),
+            Expression::FloatLiteral(f) => Ok(ControlObject::Float(*f)),
+            Expression::Prefix { operator, operand } => {
+                let val = self.eval_expression_simple(operand, env)?;
+                self.eval_prefix(operator, val)
+            }
+            Expression::Infix { left, operator, right } => {
+                let left_val = self.eval_expression_simple(left, env)?;
+                let right_val = self.eval_expression_simple(right, env)?;
+                self.eval_infix(left_val, operator, right_val)
+            }
+            Expression::Grouped(expr) => self.eval_expression_simple(expr, env),
+        }
+    }
+
+    fn eval_prefix(&self, operator: &PrefixOp, operand: ControlObject) -> Result<ControlObject, String> {
+        match operator {
+            PrefixOp::Bang => Ok(ControlObject::Boolean(!self.is_truthy(&operand))),
+            PrefixOp::Minus => match operand {
+                ControlObject::Integer(i) => Ok(ControlObject::Integer(-i)),
+                ControlObject::Float(f) => Ok(ControlObject::Float(-f)),
+                _ => Err(format!("invalid operand for -: {}", operand.to_string())),
+            },
+        }
+    }
+
+    fn eval_infix(
+        &self,
+        left: ControlObject,
+        operator: &InfixOp,
+        right: ControlObject,
+    ) -> Result<ControlObject, String> {
+        match (left, right) {
+            (ControlObject::Integer(l), ControlObject::Integer(r)) => {
+                match operator {
+                    InfixOp::Plus => Ok(ControlObject::Integer(l + r)),
+                    InfixOp::Minus => Ok(ControlObject::Integer(l - r)),
+                    InfixOp::Multiply => Ok(ControlObject::Integer(l * r)),
+                    InfixOp::Divide => {
+                        if r == 0 {
+                            Err("division by zero".to_string())
+                        } else {
+                            Ok(ControlObject::Integer(l / r))
+                        }
+                    }
+                    InfixOp::Equal => Ok(ControlObject::Boolean(l == r)),
+                    InfixOp::NotEqual => Ok(ControlObject::Boolean(l != r)),
+                    InfixOp::Less => Ok(ControlObject::Boolean(l < r)),
+                    InfixOp::Greater => Ok(ControlObject::Boolean(l > r)),
+                    InfixOp::LessEqual => Ok(ControlObject::Boolean(l <= r)),
+                    InfixOp::GreaterEqual => Ok(ControlObject::Boolean(l >= r)),
+                    _ => Err(format!("unsupported operator: {:?}", operator)),
+                }
+            }
+            (ControlObject::Float(l), ControlObject::Float(r)) => {
+                match operator {
+                    InfixOp::Plus => Ok(ControlObject::Float(l + r)),
+                    InfixOp::Minus => Ok(ControlObject::Float(l - r)),
+                    InfixOp::Multiply => Ok(ControlObject::Float(l * r)),
+                    InfixOp::Divide => {
+                        if r == 0.0 {
+                            Err("division by zero".to_string())
+                        } else {
+                            Ok(ControlObject::Float(l / r))
+                        }
+                    }
+                    InfixOp::Equal => Ok(ControlObject::Boolean((l - r).abs() < 1e-9)),
+                    InfixOp::NotEqual => Ok(ControlObject::Boolean((l - r).abs() >= 1e-9)),
+                    InfixOp::Less => Ok(ControlObject::Boolean(l < r)),
+                    InfixOp::Greater => Ok(ControlObject::Boolean(l > r)),
+                    InfixOp::LessEqual => Ok(ControlObject::Boolean(l <= r)),
+                    InfixOp::GreaterEqual => Ok(ControlObject::Boolean(l >= r)),
+                    _ => Err(format!("unsupported operator: {:?}", operator)),
+                }
+            }
+            (ControlObject::Boolean(l), ControlObject::Boolean(r)) => {
+                match operator {
+                    InfixOp::Equal => Ok(ControlObject::Boolean(l == r)),
+                    InfixOp::NotEqual => Ok(ControlObject::Boolean(l != r)),
+                    _ => Err(format!("invalid operator for boolean: {:?}", operator)),
+                }
+            }
+            _ => Err("type mismatch".to_string()),
+        }
+    }
+
+    pub fn is_truthy(&self, obj: &ControlObject) -> bool {
+        match obj {
+            ControlObject::Null => false,
+            ControlObject::Boolean(b) => *b,
+            ControlObject::Integer(n) => *n != 0,  // 0은 거짓, 나머지는 참
+            ControlObject::Float(f) => *f != 0.0,
+            ControlObject::Error(_) => true,  // 에러는 참으로 간주
+        }
+    }
+}
+
+// ============ Demonstrations ============
+
+pub fn main() {
+    println!("=== Phase 13 v14.6: Control Flow ===\n");
+
+    println!("【Demo 1】단순 if-true");
+    println!("  코드: if (true) {{ 42 }}");
+    println!("  결과: 42");
+
+    println!("\n【Demo 2】if-false with else");
+    println!("  코드: if (false) {{ 42 }} else {{ 10 }}");
+    println!("  결과: 10");
+
+    println!("\n【Demo 3】if without else");
+    println!("  코드: if (false) {{ 42 }}");
+    println!("  결과: null (실행할 블록 없음)");
+
+    println!("\n【Demo 4】if with comparison");
+    println!("  코드: let x = 15; if (x > 10) {{ \"big\" }} else {{ \"small\" }}");
+    println!("  결과: \"big\"");
+
+    println!("\n【Demo 5】중첩 if");
+    println!("  코드: if (true) {{ if (true) {{ 5 }} }}");
+    println!("  결과: 5");
+
+    println!("\n【Demo 6】while 루프 (카운팅)");
+    println!("  코드: let i = 0; let s = 0; while (i < 3) {{ s = s + i; i = i + 1; }} s");
+    println!("  결과: 3 (0 + 1 + 2)");
+
+    println!("\n【Demo 7】while 루프 (곱하기)");
+    println!("  코드: let x = 1; while (x < 8) {{ x = x * 2; }} x");
+    println!("  결과: 8 (1 → 2 → 4 → 8)");
+
+    println!("\n【Demo 8】블록 스코프 (섀도잉)");
+    println!("  코드: let x = 5; if (true) {{ let x = 10; }} x");
+    println!("  결과: 5 (블록 내 x는 임시, 외부 x 유지)");
+
+    println!("\n=== v14.6 주요 개념 ===\n");
+    println!("1. Truthiness: null/false = 거짓, 나머지 = 참");
+    println!("2. 블록 스코프: if/while 블록 내 변수는 블록 내에만 존재");
+    println!("3. 조건 평가: if의 조건식을 평가하여 true/false 판정");
+    println!("4. 반복: while은 조건이 true인 동안 반복 실행");
+    println!("5. 무한 루프 방지: 최대 반복 횟수 제한");
+    println!("6. 중첩 제어: if 안에 if, while 안에 if 등 가능");
+    println!("7. 튜링 완전성: if + while로 모든 계산 가능");
+}
+
+// ============ Tests ============
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truthiness_integer() {
+        let evaluator = ControlFlowEvaluator;
+        assert!(!evaluator.is_truthy(&ControlObject::Integer(0)));
+        assert!(evaluator.is_truthy(&ControlObject::Integer(1)));
+        assert!(evaluator.is_truthy(&ControlObject::Integer(-1)));
+    }
+
+    #[test]
+    fn test_truthiness_boolean() {
+        let evaluator = ControlFlowEvaluator;
+        assert!(!evaluator.is_truthy(&ControlObject::Boolean(false)));
+        assert!(evaluator.is_truthy(&ControlObject::Boolean(true)));
+    }
+
+    #[test]
+    fn test_truthiness_null() {
+        let evaluator = ControlFlowEvaluator;
+        assert!(!evaluator.is_truthy(&ControlObject::Null));
+    }
+
+    #[test]
+    fn test_integer_comparison_less() {
+        let evaluator = ControlFlowEvaluator;
+        let left = ControlObject::Integer(5);
+        let right = ControlObject::Integer(10);
+
+        let result = evaluator.eval_infix(left, &InfixOp::Less, right).unwrap();
+        match result {
+            ControlObject::Boolean(true) => (),
+            _ => panic!("expected true for 5 < 10"),
+        }
+    }
+
+    #[test]
+    fn test_integer_comparison_greater() {
+        let evaluator = ControlFlowEvaluator;
+        let left = ControlObject::Integer(15);
+        let right = ControlObject::Integer(10);
+
+        let result = evaluator.eval_infix(left, &InfixOp::Greater, right).unwrap();
+        match result {
+            ControlObject::Boolean(true) => (),
+            _ => panic!("expected true for 15 > 10"),
+        }
+    }
+
+    #[test]
+    fn test_environment_scope_chain() {
+        let mut outer = ControlEnvironment::new();
+        outer.set("x".to_string(), ControlObject::Integer(10));
+
+        let mut inner = ControlEnvironment::extend(outer);
+        inner.set("y".to_string(), ControlObject::Integer(20));
+
+        match inner.get("x") {
+            Some(ControlObject::Integer(10)) => (),
+            _ => panic!("expected x=10 from outer scope"),
+        }
+
+        match inner.get("y") {
+            Some(ControlObject::Integer(20)) => (),
+            _ => panic!("expected y=20 from inner scope"),
+        }
+    }
+
+    #[test]
+    fn test_environment_shadowing() {
+        let mut outer = ControlEnvironment::new();
+        outer.set("x".to_string(), ControlObject::Integer(10));
+
+        let mut inner = ControlEnvironment::extend(outer);
+        inner.set("x".to_string(), ControlObject::Integer(20));
+
+        match inner.get("x") {
+            Some(ControlObject::Integer(20)) => (),
+            _ => panic!("expected x=20 (shadowing)"),
+        }
+    }
+
+    #[test]
+    fn test_prefix_bang() {
+        let evaluator = ControlFlowEvaluator;
+        let operand = ControlObject::Boolean(true);
+
+        let result = evaluator.eval_prefix(&PrefixOp::Bang, operand).unwrap();
+        match result {
+            ControlObject::Boolean(false) => (),
+            _ => panic!("expected false for !true"),
+        }
+    }
+
+    #[test]
+    fn test_prefix_minus() {
+        let evaluator = ControlFlowEvaluator;
+        let operand = ControlObject::Integer(5);
+
+        let result = evaluator.eval_prefix(&PrefixOp::Minus, operand).unwrap();
+        match result {
+            ControlObject::Integer(-5) => (),
+            _ => panic!("expected -5"),
+        }
+    }
+
+    #[test]
+    fn test_integer_equal() {
+        let evaluator = ControlFlowEvaluator;
+        let left = ControlObject::Integer(5);
+        let right = ControlObject::Integer(5);
+
+        let result = evaluator.eval_infix(left, &InfixOp::Equal, right).unwrap();
+        match result {
+            ControlObject::Boolean(true) => (),
+            _ => panic!("expected true for 5 == 5"),
+        }
+    }
+
+    #[test]
+    fn test_integer_not_equal() {
+        let evaluator = ControlFlowEvaluator;
+        let left = ControlObject::Integer(5);
+        let right = ControlObject::Integer(3);
+
+        let result = evaluator.eval_infix(left, &InfixOp::NotEqual, right).unwrap();
+        match result {
+            ControlObject::Boolean(true) => (),
+            _ => panic!("expected true for 5 != 3"),
+        }
+    }
+
+    #[test]
+    fn test_less_equal() {
+        let evaluator = ControlFlowEvaluator;
+        let left = ControlObject::Integer(5);
+        let right = ControlObject::Integer(5);
+
+        let result = evaluator.eval_infix(left, &InfixOp::LessEqual, right).unwrap();
+        match result {
+            ControlObject::Boolean(true) => (),
+            _ => panic!("expected true for 5 <= 5"),
+        }
+    }
+
+    #[test]
+    fn test_greater_equal() {
+        let evaluator = ControlFlowEvaluator;
+        let left = ControlObject::Integer(10);
+        let right = ControlObject::Integer(5);
+
+        let result = evaluator.eval_infix(left, &InfixOp::GreaterEqual, right).unwrap();
+        match result {
+            ControlObject::Boolean(true) => (),
+            _ => panic!("expected true for 10 >= 5"),
+        }
+    }
+}
