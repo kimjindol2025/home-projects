@@ -86,7 +86,10 @@ pub fn random(_args: Vec<Value>) -> Result<Value, String> {
 
 /// Get CPU count
 pub fn cpu_count(_args: Vec<Value>) -> Result<Value, String> {
-    let count = num_cpus::get();
+    // Use std library to detect CPU count
+    let count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     Ok(Value::Number(count as f64))
 }
 

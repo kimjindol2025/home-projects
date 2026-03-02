@@ -5,6 +5,7 @@ use crate::core::Value;
 use crate::memory::{MemoryAllocator, GarbageCollector, ReferenceCounter, MemoryStats};
 use crate::runtime::context::ExecutionContext;
 use crate::runtime::executor::Executor;
+use crate::stdlib::FunctionRegistry;
 use std::time::Instant;
 
 /// Runtime engine statistics
@@ -22,6 +23,7 @@ pub struct RuntimeEngine {
     refcount: ReferenceCounter,
     context: ExecutionContext,
     executor: Executor,
+    function_registry: FunctionRegistry,
     started_at: Instant,
     execution_count: u64,
 }
@@ -35,6 +37,7 @@ impl RuntimeEngine {
             refcount: ReferenceCounter::new(),
             context: ExecutionContext::new(),
             executor: Executor::new(),
+            function_registry: FunctionRegistry::new(),
             started_at: Instant::now(),
             execution_count: 0,
         }
@@ -65,6 +68,26 @@ impl RuntimeEngine {
     /// Call a function
     pub fn call_function(&mut self, func: Value, args: Vec<Value>) -> Result<Value, String> {
         self.executor.call_function(func, args)
+    }
+
+    /// Call a stdlib function by name
+    pub fn call_stdlib(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        self.function_registry.call(name, args)
+    }
+
+    /// Check if function exists
+    pub fn function_exists(&self, name: &str) -> bool {
+        self.function_registry.exists(name)
+    }
+
+    /// List all available functions
+    pub fn list_functions(&self) -> Vec<&str> {
+        self.function_registry.list_functions()
+    }
+
+    /// Get function count
+    pub fn function_count(&self) -> usize {
+        self.function_registry.function_count()
     }
 
     /// Run garbage collection

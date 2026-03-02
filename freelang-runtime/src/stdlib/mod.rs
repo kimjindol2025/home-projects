@@ -1,5 +1,5 @@
 // Standard Library Module
-// 50+ built-in functions for FreeLang
+// 91 built-in functions for FreeLang
 
 pub mod io;
 pub mod string;
@@ -8,6 +8,9 @@ pub mod math;
 pub mod system;
 pub mod crypto;
 pub mod json;
+pub mod registry;
+
+pub use registry::FunctionRegistry;
 
 /// Register all stdlib functions
 pub fn register_all() {
