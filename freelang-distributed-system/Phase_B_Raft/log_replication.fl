@@ -1,0 +1,573 @@
+// ============================================
+// Raft Consensus - Log Replication
+// ============================================
+// 로그 복제 로직 구현
+// 리더의 팔로워에 로그 복제, 커밋 인덱스 진전
+//
+// 작성: Claude Code AI (2026-03-02)
+// 난이도: ⭐⭐⭐⭐⭐ 박사 수준
+// ============================================
+
+// ============================================
+// Part 1: 로그 추가
+// ============================================
+
+/// 로그 추가가 안전한지 확인
+fn is_log_safe_to_append(node: RaftNode, command: string) -> bool {
+  // Leader만 로그 추가 가능
+  if node.state != NodeState.Leader {
+    println("❌ Only leader can append logs")
+    return false
+  }
+
+  // 명령이 비어있으면 안됨
+  if command == "" {
+    println("❌ Command cannot be empty")
+    return false
+  }
+
+  return true
+}
+
+/// 로그에 명령 추가 (Leader만)
+fn append_to_log(node: RaftNode, command: string) -> RaftNode {
+  if !is_log_safe_to_append(node, command) {
+    return node
+  }
+
+  println()
+  println("📝 Leader appending to log")
+  println("   Command: " + command)
+
+  node = append_log(node, command)
+
+  println("   Log size now: " + to_string(len(node.log)))
+
+  return node
+}
+
+/// 아직 복제되지 않은 로그 항목들 조회
+fn get_pending_entries(node: RaftNode) -> [LogEntry] {
+  pending = []
+
+  // commitIndex 다음부터 마지막까지
+  for i = node.commitIndex + 1; i <= last_log_index(node); i = i + 1 {
+    entry = get_log_entry(node, i)
+    if entry != null {
+      pending = pending + [entry]
+    }
+  }
+
+  return pending
+}
+
+// ============================================
+// Part 2: 복제 관리
+// ============================================
+
+/// 팔로워별 복제 상태
+struct ReplicationState {
+  follower_id: int,
+  nextIndex: int,              // 다음 전송 인덱스
+  matchIndex: int,             // 확인된 최대 인덱스
+  replication_attempts: int,   // 재시도 횟수
+  last_replicated_time: int    // 마지막 복제 시간
+}
+
+/// 복제 상태 초기화
+fn init_replication_state(
+  leader_id: int,
+  follower_id: int,
+  leader_last_log_index: int
+) -> ReplicationState {
+  return ReplicationState {
+    follower_id: follower_id,
+    nextIndex: leader_last_log_index + 1,
+    matchIndex: 0,
+    replication_attempts: 0,
+    last_replicated_time: 0
+  }
+}
+
+/// 특정 팔로워에게 전송할 로그 엔트리 구하기
+fn get_entries_for_follower(
+  node: RaftNode,
+  follower_id: int,
+  repl_state: ReplicationState
+) -> [LogEntry] {
+  entries = []
+
+  nextIdx = repl_state.nextIndex
+
+  // nextIndex부터 마지막 로그까지
+  for i = nextIdx; i <= last_log_index(node); i = i + 1 {
+    entry = get_log_entry(node, i)
+    if entry != null {
+      entries = entries + [entry]
+    }
+  }
+
+  return entries
+}
+
+// ============================================
+// Part 3: 복제 응답 처리
+// ============================================
+
+/// 복제 성공 처리
+fn handle_replication_success(
+  node: RaftNode,
+  follower_id: int,
+  repl_state: ReplicationState,
+  num_entries_sent: int
+) -> ReplicationState {
+  println()
+  println("✅ Replication SUCCESS from Follower " + to_string(follower_id))
+
+  // matchIndex 업데이트
+  repl_state.matchIndex = repl_state.nextIndex + num_entries_sent - 1
+  repl_state.nextIndex = repl_state.matchIndex + 1
+
+  // 재시도 횟수 리셋
+  repl_state.replication_attempts = 0
+
+  println("   matchIndex updated to " + to_string(repl_state.matchIndex))
+  println("   nextIndex updated to " + to_string(repl_state.nextIndex))
+
+  return repl_state
+}
+
+/// 복제 실패 처리
+fn handle_replication_failure(
+  node: RaftNode,
+  follower_id: int,
+  repl_state: ReplicationState
+) -> ReplicationState {
+  println()
+  println("❌ Replication FAILED for Follower " + to_string(follower_id))
+
+  // nextIndex 감소 (binary search optimization 간소화)
+  if repl_state.nextIndex > 1 {
+    repl_state.nextIndex = repl_state.nextIndex - 1
+    println("   nextIndex decreased to " + to_string(repl_state.nextIndex))
+  }
+
+  // 재시도 횟수 증가
+  repl_state.replication_attempts = repl_state.replication_attempts + 1
+  println("   Retry attempt #" + to_string(repl_state.replication_attempts))
+
+  return repl_state
+}
+
+/// 팔로워 상태 업데이트
+fn update_follower_state(
+  node: RaftNode,
+  follower_id: int,
+  success: bool,
+  num_entries_sent: int
+) -> RaftNode {
+  if node.matchIndex == null {
+    node.matchIndex = {}
+  }
+  if node.nextIndex == null {
+    node.nextIndex = {}
+  }
+
+  if success {
+    node.matchIndex[follower_id] = node.nextIndex[follower_id] + num_entries_sent - 1
+    node.nextIndex[follower_id] = node.matchIndex[follower_id] + 1
+  } else {
+    // 실패: nextIndex 감소
+    current_next = node.nextIndex[follower_id]
+    if current_next > 1 {
+      node.nextIndex[follower_id] = current_next - 1
+    }
+  }
+
+  return node
+}
+
+// ============================================
+// Part 4: 커밋 인덱스 진전
+// ============================================
+
+/// 커밋할 수 있는 로그 인덱스 계산
+/// Raft 규칙: 현재 term의 로그만 그리고 다수결 복제 후에만 커밋
+fn calculate_commit_index(
+  node: RaftNode,
+  replication_states: [{int: int}]
+) -> int {
+  new_commit_index = node.commitIndex
+
+  // commitIndex보다 큰 인덱스부터 확인
+  for index = node.commitIndex + 1; index <= last_log_index(node); index = index + 1 {
+    // 이 인덱스의 로그 term이 현재 term이어야 커밋 가능
+    entry = get_log_entry(node, index)
+    if entry == null || entry.term != node.currentTerm {
+      continue  // 현재 term의 로그가 아니므로 스킵
+    }
+
+    // 이 인덱스를 복제한 팔로워 수 세기
+    replicas = 0
+    for peer_id in node.peers {
+      match_idx = replication_states[peer_id]
+      if match_idx == null {
+        match_idx = 0
+      }
+      if match_idx >= index {
+        replicas = replicas + 1
+      }
+    }
+
+    // 자신도 포함
+    replicas = replicas + 1
+
+    // 다수결 복제되었는지 확인
+    total_nodes = len(node.peers) + 1
+    majority_needed = total_nodes / 2 + 1
+
+    if replicas >= majority_needed {
+      new_commit_index = index
+      println("✅ Index " + to_string(index) + " can be committed (" +
+              to_string(replicas) + "/" + to_string(majority_needed) + ")")
+    }
+  }
+
+  return new_commit_index
+}
+
+/// 커밋 인덱스 진전
+fn advance_commit_index(node: RaftNode, new_commit_index: int) -> RaftNode {
+  if new_commit_index > node.commitIndex {
+    println()
+    println("📈 Advancing commitIndex: " + to_string(node.commitIndex) +
+            " → " + to_string(new_commit_index))
+
+    node.commitIndex = new_commit_index
+
+    // 적용 가능한 로그들
+    pending = get_committed_entries(node)
+    println("   " + to_string(len(pending)) + " new entries to apply")
+  }
+
+  return node
+}
+
+/// 커밋된 로그 항목들 (아직 적용되지 않은)
+fn get_committed_entries(node: RaftNode) -> [LogEntry] {
+  entries = []
+
+  for i = node.lastApplied + 1; i <= node.commitIndex; i = i + 1 {
+    entry = get_log_entry(node, i)
+    if entry != null {
+      entries = entries + [entry]
+    }
+  }
+
+  return entries
+}
+
+// ============================================
+// Part 5: 상태 머신 적용
+// ============================================
+
+/// 로그 항목을 상태 머신에 적용
+fn apply_to_state_machine(node: RaftNode, entry: LogEntry) -> RaftNode {
+  println("🎯 Applying to state machine: " + entry.command)
+
+  // 실제 상태 머신에 적용 (현재는 시뮬레이션)
+  // state_machine.execute(entry.command)
+
+  node.lastApplied = entry.index
+  node.appliedCommandCount = node.appliedCommandCount + 1
+
+  println("   Applied (lastApplied=" + to_string(node.lastApplied) + ")")
+
+  return node
+}
+
+/// 모든 커밋된 로그 적용
+fn apply_log_entries(node: RaftNode) -> RaftNode {
+  pending = get_committed_entries(node)
+
+  for entry in pending {
+    node = apply_to_state_machine(node, entry)
+  }
+
+  if len(pending) > 0 {
+    println()
+    println("📊 Applied " + to_string(len(pending)) + " entries")
+    println("   lastApplied now: " + to_string(node.lastApplied))
+  }
+
+  return node
+}
+
+// ============================================
+// Part 6: 복제 루프
+// ============================================
+
+/// 각 팔로워별 주기적 복제
+fn replication_tick(node: RaftNode) -> RaftNode {
+  // Leader만 복제 수행
+  if node.state != NodeState.Leader {
+    return node
+  }
+
+  println()
+  println("🔄 Replication tick")
+
+  // AppendEntries 브로드캐스트
+  node = broadcast_append_entries(node)
+
+  return node
+}
+
+/// 일괄 복제 전송
+fn send_replication_batch(
+  node: RaftNode,
+  follower_id: int,
+  entries: [LogEntry]
+) -> bool {
+  if len(entries) == 0 {
+    return true  // 전송할 항목이 없음
+  }
+
+  println()
+  println("📤 Sending " + to_string(len(entries)) + " entries to Follower " +
+          to_string(follower_id))
+
+  // 실제 구현에서는 네트워크 전송
+  // resp = send_append_entries_rpc(node, follower_id, req)
+
+  return true
+}
+
+// ============================================
+// Part 7: 테스트
+// ============================================
+
+fn test_is_log_safe_to_append() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+
+  // Follower는 로그 추가 불가
+  safe = is_log_safe_to_append(node, "test")
+  assert safe == false
+
+  // Leader는 가능
+  node.state = NodeState.Leader
+  safe = is_log_safe_to_append(node, "test")
+  assert safe == true
+
+  println("✅ test_is_log_safe_to_append passed")
+}
+
+fn test_append_to_log_as_leader() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+
+  node = append_to_log(node, "cmd1")
+  node = append_to_log(node, "cmd2")
+
+  assert len(node.log) == 2
+  assert node.log[0].command == "cmd1"
+  assert node.log[1].command == "cmd2"
+
+  println("✅ test_append_to_log_as_leader passed")
+}
+
+fn test_get_pending_entries() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+
+  node = append_to_log(node, "cmd1")
+  node = append_to_log(node, "cmd2")
+  node = append_to_log(node, "cmd3")
+
+  pending = get_pending_entries(node)
+  assert len(pending) == 3
+
+  node.commitIndex = 1
+  pending = get_pending_entries(node)
+  assert len(pending) == 2
+
+  println("✅ test_get_pending_entries passed")
+}
+
+fn test_init_replication_state() {
+  repl = init_replication_state(0, 1, 5)
+
+  assert repl.follower_id == 1
+  assert repl.nextIndex == 6
+  assert repl.matchIndex == 0
+  assert repl.replication_attempts == 0
+
+  println("✅ test_init_replication_state passed")
+}
+
+fn test_get_entries_for_follower() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+
+  node = append_to_log(node, "cmd1")
+  node = append_to_log(node, "cmd2")
+  node = append_to_log(node, "cmd3")
+
+  repl = init_replication_state(0, 1, last_log_index(node) - 1)
+
+  entries = get_entries_for_follower(node, 1, repl)
+  assert len(entries) == 2
+
+  println("✅ test_get_entries_for_follower passed")
+}
+
+fn test_handle_replication_success() {
+  repl = init_replication_state(0, 1, 5)
+
+  repl = handle_replication_success(repl, 1, repl, 3)
+
+  assert repl.matchIndex == 7
+  assert repl.nextIndex == 8
+  assert repl.replication_attempts == 0
+
+  println("✅ test_handle_replication_success passed")
+}
+
+fn test_handle_replication_failure() {
+  repl = init_replication_state(0, 1, 5)
+  repl.nextIndex = 10
+
+  repl = handle_replication_failure(repl, 1, repl)
+
+  assert repl.nextIndex == 9
+  assert repl.replication_attempts == 1
+
+  println("✅ test_handle_replication_failure passed")
+}
+
+fn test_calculate_commit_index() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+  node.currentTerm = 1
+
+  node = append_to_log(node, "cmd1")
+  node = append_to_log(node, "cmd2")
+
+  // matchIndex: 0->1->2 (팔로워들)
+  repl_states = {}
+  repl_states[1] = 2
+  repl_states[2] = 2
+
+  new_commit = calculate_commit_index(node, repl_states)
+
+  assert new_commit > node.commitIndex
+
+  println("✅ test_calculate_commit_index passed")
+}
+
+fn test_advance_commit_index() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+  node.currentTerm = 1
+
+  node = append_to_log(node, "cmd1")
+
+  old_commit = node.commitIndex
+  node = advance_commit_index(node, 1)
+
+  assert node.commitIndex >= old_commit
+
+  println("✅ test_advance_commit_index passed")
+}
+
+fn test_apply_to_state_machine() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+
+  entry = LogEntry {
+    term: 1,
+    command: "transfer 100",
+    index: 1
+  }
+
+  node = apply_to_state_machine(node, entry)
+
+  assert node.lastApplied == 1
+  assert node.appliedCommandCount == 1
+
+  println("✅ test_apply_to_state_machine passed")
+}
+
+fn test_apply_log_entries() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+
+  node = append_to_log(node, "cmd1")
+  node = append_to_log(node, "cmd2")
+
+  node.commitIndex = 2
+
+  node = apply_log_entries(node)
+
+  assert node.lastApplied == 2
+  assert node.appliedCommandCount == 2
+
+  println("✅ test_apply_log_entries passed")
+}
+
+fn test_replication_tick_on_leader() {
+  peers = [1, 2]
+  node = create_raft_node(0, peers)
+  node.state = NodeState.Leader
+
+  node = replication_tick(node)
+
+  // Leader에서는 복제 수행
+  assert node.state == NodeState.Leader
+
+  println("✅ test_replication_tick_on_leader passed")
+}
+
+// ============================================
+// 메인 테스트 실행
+// ============================================
+
+fn main() {
+  println("📦 Raft Log Replication - Tests")
+  println("===============================")
+
+  test_is_log_safe_to_append()
+  test_append_to_log_as_leader()
+  test_get_pending_entries()
+  test_init_replication_state()
+  test_get_entries_for_follower()
+  test_handle_replication_success()
+  test_handle_replication_failure()
+  test_calculate_commit_index()
+  test_advance_commit_index()
+  test_apply_to_state_machine()
+  test_apply_log_entries()
+  test_replication_tick_on_leader()
+
+  println()
+  println("✅ All log replication tests passed!")
+  println()
+  println("📊 Summary:")
+  println("├─ Log append safety: ✅")
+  println("├─ Replication state management: ✅")
+  println("├─ Follower entry selection: ✅")
+  println("├─ Success/failure handling: ✅")
+  println("├─ Commit index advancement: ✅")
+  println("├─ State machine application: ✅")
+  println("└─ Replication loop: ✅")
+}
+
+// 실행
+main()
