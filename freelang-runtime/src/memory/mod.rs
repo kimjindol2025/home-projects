@@ -4,10 +4,12 @@
 pub mod allocator;
 pub mod gc;
 pub mod refcount;
+pub mod generational_gc;
 
 pub use allocator::MemoryAllocator;
 pub use gc::GarbageCollector;
 pub use refcount::ReferenceCounter;
+pub use generational_gc::{GenerationalGC, Generation, GenerationalGCStats};
 
 /// Memory management statistics
 #[derive(Clone, Debug)]

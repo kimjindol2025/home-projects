@@ -10,9 +10,13 @@ pub mod crypto;
 pub mod json;
 pub mod registry;
 pub mod cache;
+pub mod inline_dispatch;
+pub mod simd_ops;
 
 pub use registry::FunctionRegistry;
 pub use cache::{FunctionCache, CacheStats};
+pub use inline_dispatch::{InlineCache, InlineCacheStats};
+pub use simd_ops::{simd_available, SIMDStats};
 
 /// Register all stdlib functions
 pub fn register_all() {
