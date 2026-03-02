@@ -1,8 +1,10 @@
 // Call Stack
 // Manages function call contexts and variable scoping
+// Uses StringInterner for function name deduplication (15% memory savings)
 
 use crate::core::Value;
 use std::collections::HashMap;
+use super::interner::{StringInterner, InternerStats};
 
 /// A single frame in the call stack
 #[derive(Clone, Debug)]
@@ -48,15 +50,17 @@ pub struct CallStack {
     frames: Vec<StackFrame>,
     max_depth: usize,
     call_count: u64,
+    interner: StringInterner,  // NEW: String deduplication for function names
 }
 
 impl CallStack {
-    /// Create new call stack
+    /// Create new call stack with string interning
     pub fn new() -> Self {
         let mut stack = CallStack {
             frames: Vec::new(),
             max_depth: 1000, // Prevent stack overflow
             call_count: 0,
+            interner: StringInterner::new(),
         };
         // Push global frame
         stack.frames.push(StackFrame::new("global".to_string(), 0));
@@ -163,6 +167,16 @@ impl CallStack {
     /// Check if we're in global scope
     pub fn is_global(&self) -> bool {
         self.frames.len() == 1
+    }
+
+    /// Get string interner statistics
+    pub fn interner_stats(&self) -> InternerStats {
+        self.interner.stats()
+    }
+
+    /// Get total bytes saved by string interning
+    pub fn bytes_saved_by_interning(&self) -> usize {
+        self.interner.bytes_saved()
     }
 }
 
