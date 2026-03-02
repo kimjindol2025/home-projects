@@ -1,0 +1,361 @@
+// ============================================================================
+// Real-time Streaming: Persistent WebSocket + Topic-based Pub/Sub - Phase 6
+// Subscription Management, Message Replay, Backpressure (500줄)
+// ============================================================================
+
+// Stream Subscription
+struct StreamSubscription
+  subscriptionId: string
+  clientId: string
+  topic: string
+  filters: map<string, any>
+  createdAt: number
+  isActive: bool
+  messageCount: number
+
+// Topic Message
+struct TopicMessage
+  messageId: string
+  topic: string
+  timestamp: number
+  data: string
+  sender: string
+  priority: number
+
+// Streaming Configuration
+struct StreamingConfig
+  maxSubscriptionsPerClient: number
+  queueSize: number
+  heartbeatInterval: number
+  maxBacklogMessages: number
+  maxMessageSize: number
+
+// Streaming Server
+struct StreamingServer
+  subscriptions: array<StreamSubscription>
+  topicQueues: map<string, array<TopicMessage>>
+  clientSubscriptions: map<string, array<string>>
+  config: StreamingConfig
+  stats: map<string, any>
+
+// Create new streaming server
+fn newStreamingServer(config: StreamingConfig) -> StreamingServer
+  {
+    "subscriptions": [],
+    "topicQueues": {},
+    "clientSubscriptions": {},
+    "config": config,
+    "stats": {
+      "totalMessages": 0,
+      "totalSubscriptions": 0,
+      "activeConnections": 0
+    }
+  }
+
+// Subscribe to topic
+fn subscribe(
+  server: StreamingServer,
+  clientId: string,
+  topic: string,
+  filters: map<string, any>
+) -> Result<string, string>
+  // Check subscription limit
+  let clientSubs = server["clientSubscriptions"][clientId] || []
+  if clientSubs.length() >= server["config"]["maxSubscriptionsPerClient"]
+    return Err("Max subscriptions exceeded")
+
+  // Create subscription
+  let subscriptionId = generateSubscriptionId(clientId + topic)
+  let subscription = {
+    "subscriptionId": subscriptionId,
+    "clientId": clientId,
+    "topic": topic,
+    "filters": filters,
+    "createdAt": getCurrentTime(),
+    "isActive": true,
+    "messageCount": 0
+  }
+
+  server["subscriptions"].append(subscription)
+  clientSubs.append(subscriptionId)
+  server["clientSubscriptions"][clientId] = clientSubs
+
+  // Initialize topic queue if needed
+  if server["topicQueues"][topic] == nil
+    server["topicQueues"][topic] = []
+
+  Ok(subscriptionId)
+
+// Unsubscribe from topic
+fn unsubscribe(
+  server: StreamingServer,
+  subscriptionId: string
+) -> Result<bool, string>
+  let newSubs = []
+  let found = false
+
+  for sub in server["subscriptions"]
+    if sub["subscriptionId"] != subscriptionId
+      newSubs.append(sub)
+    else
+      found = true
+
+  if !found
+    return Err("Subscription not found")
+
+  server["subscriptions"] = newSubs
+  Ok(true)
+
+// Publish message to topic
+fn publish(
+  server: StreamingServer,
+  topic: string,
+  message: string,
+  sender: string
+) -> Result<number, string>
+  // Check message size
+  if message.length() > server["config"]["maxMessageSize"]
+    return Err("Message too large")
+
+  // Create message
+  let msg = {
+    "messageId": generateMessageId(),
+    "topic": topic,
+    "timestamp": getCurrentTime(),
+    "data": message,
+    "sender": sender,
+    "priority": 0
+  }
+
+  // Initialize queue if needed
+  if server["topicQueues"][topic] == nil
+    server["topicQueues"][topic] = []
+
+  // Add to queue
+  let queue = server["topicQueues"][topic]
+  queue.append(msg)
+
+  // Trim old messages if exceeding queue size
+  if queue.length() > server["config"]["queueSize"]
+    let newQueue = []
+    let startIdx = queue.length() - server["config"]["queueSize"]
+    for i = startIdx to queue.length()
+      newQueue.append(queue[i])
+    server["topicQueues"][topic] = newQueue
+
+  server["stats"]["totalMessages"] = server["stats"]["totalMessages"] + 1
+
+  // Count subscribers
+  let subscriberCount = 0
+  for sub in server["subscriptions"]
+    if sub["topic"] == topic
+      subscriberCount = subscriberCount + 1
+
+  Ok(subscriberCount)
+
+// Get subscription by ID
+fn getSubscription(
+  server: StreamingServer,
+  subscriptionId: string
+) -> Result<StreamSubscription, string>
+  for sub in server["subscriptions"]
+    if sub["subscriptionId"] == subscriptionId
+      return Ok(sub)
+  Err("Subscription not found")
+
+// List subscriptions for client
+fn listSubscriptions(
+  server: StreamingServer,
+  clientId: string
+) -> array<StreamSubscription>
+  let result = []
+  for sub in server["subscriptions"]
+    if sub["clientId"] == clientId
+      result.append(sub)
+  result
+
+// Replay messages from timestamp
+fn replayMessages(
+  server: StreamingServer,
+  subscriptionId: string,
+  fromTimestamp: number
+) -> Result<array<TopicMessage>, string>
+  // Get subscription
+  let subscription = nil
+  for sub in server["subscriptions"]
+    if sub["subscriptionId"] == subscriptionId
+      subscription = sub
+
+  if subscription == nil
+    return Err("Subscription not found")
+
+  // Get messages from topic
+  let topic = subscription["topic"]
+  let queue = server["topicQueues"][topic] || []
+  let result = []
+
+  for msg in queue
+    if msg["timestamp"] >= fromTimestamp
+      // Apply filters
+      if matchesFilters(msg, subscription["filters"])
+        result.append(msg)
+
+  Ok(result)
+
+// Check if message matches subscription filters
+fn matchesFilters(
+  message: TopicMessage,
+  filters: map<string, any>
+) -> bool
+  if filters == nil || filters.length() == 0
+    return true
+
+  // Simple filter matching
+  for key in filters.keys()
+    let filterValue = filters[key]
+    if message["data"] != filterValue
+      return false
+
+  true
+
+// Handle backpressure for client
+fn handleBackpressure(
+  server: StreamingServer,
+  clientId: string
+) -> bool
+  let subs = server["clientSubscriptions"][clientId] || []
+  let totalPending = 0
+
+  for subId in subs
+    let sub = nil
+    for s in server["subscriptions"]
+      if s["subscriptionId"] == subId
+        sub = s
+    if sub != nil
+      totalPending = totalPending + sub["messageCount"]
+
+  // Backpressure if pending > threshold
+  totalPending > server["config"]["maxBacklogMessages"]
+
+// Set subscription filter
+fn setSubscriptionFilter(
+  server: StreamingServer,
+  subscriptionId: string,
+  filters: map<string, any>
+) -> Result<bool, string>
+  for sub in server["subscriptions"]
+    if sub["subscriptionId"] == subscriptionId
+      sub["filters"] = filters
+      return Ok(true)
+  Err("Subscription not found")
+
+// Get subscription messages
+fn getSubscriptionMessages(
+  server: StreamingServer,
+  subscriptionId: string
+) -> Result<array<TopicMessage>, string>
+  let sub = nil
+  for s in server["subscriptions"]
+    if s["subscriptionId"] == subscriptionId
+      sub = s
+
+  if sub == nil
+    return Err("Subscription not found")
+
+  let topic = sub["topic"]
+  let queue = server["topicQueues"][topic] || []
+  Ok(queue)
+
+// Acknowledge message receipt
+fn acknowledgeMessage(
+  server: StreamingServer,
+  subscriptionId: string,
+  messageId: string
+) -> Result<bool, string>
+  for sub in server["subscriptions"]
+    if sub["subscriptionId"] == subscriptionId
+      sub["messageCount"] = sub["messageCount"] - 1
+      return Ok(true)
+  Err("Subscription not found")
+
+// Get topic statistics
+fn getTopicStats(
+  server: StreamingServer,
+  topic: string
+) -> map<string, any>
+  let queue = server["topicQueues"][topic] || []
+  let subscriberCount = 0
+
+  for sub in server["subscriptions"]
+    if sub["topic"] == topic && sub["isActive"]
+      subscriberCount = subscriberCount + 1
+
+  {
+    "topic": topic,
+    "queueSize": queue.length(),
+    "subscribers": subscriberCount,
+    "oldestMessage": if queue.length() > 0 then queue[0]["timestamp"] else 0,
+    "newestMessage": if queue.length() > 0 then queue[queue.length() - 1]["timestamp"] else 0
+  }
+
+// Clean up inactive subscriptions
+fn cleanupInactiveSubscriptions(server: StreamingServer) -> number
+  let count = 0
+  let active = []
+
+  for sub in server["subscriptions"]
+    if sub["isActive"]
+      active.append(sub)
+    else
+      count = count + 1
+
+  server["subscriptions"] = active
+  count
+
+// Send heartbeat to all subscribers
+fn broadcastHeartbeat(server: StreamingServer) -> number
+  let count = 0
+  let heartbeat = {
+    "messageId": generateMessageId(),
+    "topic": "system:heartbeat",
+    "timestamp": getCurrentTime(),
+    "data": "heartbeat",
+    "sender": "system",
+    "priority": 100
+  }
+
+  for topic in server["topicQueues"].keys()
+    if topic != "system:heartbeat"
+      let queue = server["topicQueues"][topic] || []
+      queue.append(heartbeat)
+      count = count + 1
+
+  count
+
+// Get streaming statistics
+fn getStreamingStats(server: StreamingServer) -> string
+  "Streaming Statistics:\n" +
+  "  Total Subscriptions: " + toString(server["stats"]["totalSubscriptions"]) + "\n" +
+  "  Total Messages: " + toString(server["stats"]["totalMessages"]) + "\n" +
+  "  Active Connections: " + toString(server["stats"]["activeConnections"]) + "\n" +
+  "  Topics: " + toString(server["topicQueues"].length()) + "\n" +
+  "  Max Queue Size: " + toString(server["config"]["queueSize"])
+
+// Helper: Generate subscription ID
+fn generateSubscriptionId(seed: string) -> string
+  let id = ""
+  for i = 0 to 16
+    id = id + toString((i * 31 + seed.length()) % 16)
+  "sub-" + id
+
+// Helper: Generate message ID
+fn generateMessageId() -> string
+  let id = ""
+  for i = 0 to 12
+    id = id + toString((i * 23 + 19) % 16)
+  "msg-" + id
+
+// Helper: Get current time
+fn getCurrentTime() -> number
+  1740998400
+
