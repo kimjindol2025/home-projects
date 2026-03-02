@@ -2,21 +2,24 @@
 // Maps function names to stdlib implementations
 
 use crate::core::Value;
-use super::{io, string, array, math, system, crypto, json};
+use super::{io, string, array, math, system, crypto, json, cache};
 use std::collections::HashMap;
+use std::cell::RefCell;
 
 pub type FunctionPointer = fn(Vec<Value>) -> Result<Value, String>;
 
-/// Global function registry
+/// Global function registry with dispatch caching
 pub struct FunctionRegistry {
     functions: HashMap<String, FunctionPointer>,
+    cache: RefCell<cache::FunctionCache>,
 }
 
 impl FunctionRegistry {
-    /// Create new function registry
+    /// Create new function registry with caching enabled
     pub fn new() -> Self {
         let mut registry = FunctionRegistry {
             functions: HashMap::new(),
+            cache: RefCell::new(cache::FunctionCache::new()),
         };
         registry.register_all();
         registry
@@ -124,10 +127,26 @@ impl FunctionRegistry {
         self.functions.insert(name.to_string(), func);
     }
 
-    /// Call a function by name
+    /// Call a function by name with caching
+    /// First checks cache for recently used functions (90%+ hit rate)
+    /// Falls back to registry on cache miss
     pub fn call(&self, name: &str, args: Vec<Value>) -> Result<Value, String> {
+        // Try cache first
+        let mut cache = self.cache.borrow_mut();
+        if let Some(func) = cache.get(name) {
+            drop(cache); // Release borrow before calling
+            return func(args);
+        }
+        drop(cache); // Release borrow
+
+        // Cache miss - look up in registry
         match self.functions.get(name) {
-            Some(func) => func(args),
+            Some(func) => {
+                // Cache the function for future calls
+                let mut cache = self.cache.borrow_mut();
+                cache.insert(name.to_string(), *func);
+                func(args)
+            }
             None => Err(format!("Function not found: {}", name))
         }
     }
@@ -145,6 +164,16 @@ impl FunctionRegistry {
     /// Get function count
     pub fn function_count(&self) -> usize {
         self.functions.len()
+    }
+
+    /// Get cache statistics
+    pub fn cache_stats(&self) -> cache::CacheStats {
+        self.cache.borrow().stats()
+    }
+
+    /// Clear cache (for testing/debugging)
+    pub fn clear_cache(&self) {
+        self.cache.borrow_mut().clear();
     }
 }
 
@@ -256,5 +285,66 @@ mod tests {
         let registry = FunctionRegistry::new();
         assert!(registry.exists("json_parse"));
         assert!(registry.exists("json_stringify"));
+    }
+
+    #[test]
+    fn test_function_cache_hit() {
+        let registry = FunctionRegistry::new();
+
+        // First call - cache miss
+        let _ = registry.call("abs", vec![Value::Number(-5.0)]);
+
+        // Second call - cache hit
+        let _ = registry.call("abs", vec![Value::Number(-10.0)]);
+
+        let stats = registry.cache_stats();
+        assert!(stats.hit_rate > 0.0, "Should have at least one hit");
+    }
+
+    #[test]
+    fn test_function_cache_statistics() {
+        let registry = FunctionRegistry::new();
+
+        for i in 0..100 {
+            let _ = registry.call("abs", vec![Value::Number(-(i as f64))]);
+        }
+
+        let stats = registry.cache_stats();
+        println!("{}", stats);
+        assert!(stats.hit_rate > 90.0, "Should have >90% hit rate for repeated calls");
+    }
+
+    #[test]
+    fn test_function_cache_clear() {
+        let registry = FunctionRegistry::new();
+
+        for i in 0..10 {
+            let _ = registry.call("abs", vec![Value::Number(-(i as f64))]);
+        }
+
+        let stats_before = registry.cache_stats();
+        assert!(stats_before.hits > 0);
+
+        registry.clear_cache();
+        let stats_after = registry.cache_stats();
+        assert_eq!(stats_after.hits, 0);
+        assert_eq!(stats_after.misses, 0);
+    }
+
+    #[test]
+    fn test_function_cache_multiple_functions() {
+        let registry = FunctionRegistry::new();
+
+        // Call different functions
+        for _ in 0..50 {
+            let _ = registry.call("abs", vec![Value::Number(-5.0)]);
+            let _ = registry.call("sqrt", vec![Value::Number(16.0)]);
+            let _ = registry.call("pow", vec![Value::Number(2.0), Value::Number(3.0)]);
+        }
+
+        let stats = registry.cache_stats();
+        println!("Cache stats: {}", stats);
+        assert!(stats.hits > 100, "Should have many cache hits");
+        assert!(stats.hit_rate > 90.0, "Hit rate should be >90%");
     }
 }

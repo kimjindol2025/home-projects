@@ -9,8 +9,10 @@ pub mod system;
 pub mod crypto;
 pub mod json;
 pub mod registry;
+pub mod cache;
 
 pub use registry::FunctionRegistry;
+pub use cache::{FunctionCache, CacheStats};
 
 /// Register all stdlib functions
 pub fn register_all() {
