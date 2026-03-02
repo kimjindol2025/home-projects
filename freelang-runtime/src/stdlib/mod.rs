@@ -19,5 +19,5 @@ pub fn register_all() {
     println!("   ✓ System functions (8)");
     println!("   ✓ Crypto functions (8)");
     println!("   ✓ JSON functions (5)");
-    println!("✅ Total: 81 functions");
+    println!("✅ Total: 91 functions loaded");
 }
