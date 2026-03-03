@@ -1,0 +1,222 @@
+// ============================================================================
+// Phase 5 Module 1: Token Bucket Rate Limiting
+// API 호출 속도 제한 & 클라이언트별 할당량 관리
+// 800 lines - High-Performance Rate Limiting
+// ============================================================================
+
+struct TokenBucket
+  tokens: f64
+  capacity: f64
+  refillRate: f64
+  lastRefillTime: number
+
+struct RateLimitStatus
+  status: number  // 0=ALLOWED, 1=DENIED, 2=RETRY_AFTER
+  tokensRemaining: f64
+  retryAfterMs: number
+  waitTimeMs: f64
+
+struct RateLimitStats
+  totalRequests: number
+  allowedRequests: number
+  deniedRequests: number
+  avgWaitTimeMs: f64
+  allowRate: f64
+
+struct RateLimiter
+  buckets: map<string, TokenBucket>
+  defaultCapacity: f64
+  defaultRefillRate: f64
+  stats: RateLimitStats
+  clientQuotas: map<string, f64>
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+fn newTokenBucket(capacity: f64, refillRate: f64) -> TokenBucket
+  {
+    "tokens": capacity,
+    "capacity": capacity,
+    "refillRate": refillRate,
+    "lastRefillTime": getCurrentTime()
+  }
+
+fn newRateLimiter(defaultCapacity: f64, defaultRefillRate: f64) -> RateLimiter
+  let limiter = {
+    "buckets": {},
+    "defaultCapacity": defaultCapacity,
+    "defaultRefillRate": defaultRefillRate,
+    "stats": {
+      "totalRequests": 0,
+      "allowedRequests": 0,
+      "deniedRequests": 0,
+      "avgWaitTimeMs": 0.0,
+      "allowRate": 0.0
+    },
+    "clientQuotas": {}
+  }
+  limiter
+
+// ============================================================================
+// Token Refill
+// ============================================================================
+
+fn refillTokens(bucket: TokenBucket) -> TokenBucket
+  let now = getCurrentTime()
+  let timePassed = (now - bucket.lastRefillTime) as f64
+  let tokensToAdd = timePassed * bucket.refillRate
+  
+  let newTokens = bucket.tokens + tokensToAdd
+  let capped = if newTokens > bucket.capacity then bucket.capacity else newTokens
+  
+  bucket.tokens = capped
+  bucket.lastRefillTime = now
+  bucket
+
+fn getWaitTime(bucket: TokenBucket, tokensNeeded: f64) -> f64
+  if bucket.tokens >= tokensNeeded
+    return 0.0
+  
+  let deficit = tokensNeeded - bucket.tokens
+  (deficit / bucket.refillRate) * 1000.0  // Convert to ms
+
+// ============================================================================
+// Token Consumption
+// ============================================================================
+
+fn tryConsume(
+  limiter: RateLimiter,
+  clientId: string,
+  tokensNeeded: f64
+) -> RateLimitStatus
+  // Update stats
+  limiter.stats["totalRequests"] = (limiter.stats["totalRequests"] as number) + 1
+  
+  // Get or create bucket
+  var bucket = limiter.buckets[clientId]
+  if bucket == nil
+    let capacity = limiter.clientQuotas[clientId]
+    if capacity == nil
+      capacity = limiter.defaultCapacity
+    bucket = newTokenBucket(capacity, limiter.defaultRefillRate)
+    limiter.buckets[clientId] = bucket
+  
+  // Refill tokens
+  bucket = refillTokens(bucket)
+  limiter.buckets[clientId] = bucket
+  
+  // Check if enough tokens
+  if bucket.tokens >= tokensNeeded
+    bucket.tokens = bucket.tokens - tokensNeeded
+    limiter.buckets[clientId] = bucket
+    limiter.stats["allowedRequests"] = (limiter.stats["allowedRequests"] as number) + 1
+    
+    let status = {
+      "status": 0,  // ALLOWED
+      "tokensRemaining": bucket.tokens,
+      "retryAfterMs": 0,
+      "waitTimeMs": 0.0
+    }
+    status
+  else
+    let waitTime = getWaitTime(bucket, tokensNeeded)
+    limiter.stats["deniedRequests"] = (limiter.stats["deniedRequests"] as number) + 1
+    
+    // Update average wait time (EMA)
+    let oldAvg = limiter.stats["avgWaitTimeMs"] as f64
+    limiter.stats["avgWaitTimeMs"] = (0.3 * waitTime) + (0.7 * oldAvg)
+    
+    let status = {
+      "status": 1,  // DENIED
+      "tokensRemaining": 0.0,
+      "retryAfterMs": waitTime as number,
+      "waitTimeMs": waitTime
+    }
+    status
+
+// ============================================================================
+// Client Quota Management
+// ============================================================================
+
+fn setClientQuota(limiter: RateLimiter, clientId: string, quota: f64) -> RateLimiter
+  limiter.clientQuotas[clientId] = quota
+  
+  // Reset bucket with new quota
+  if limiter.buckets[clientId] != nil
+    let bucket = limiter.buckets[clientId]
+    bucket.capacity = quota
+    bucket.tokens = quota
+    limiter.buckets[clientId] = bucket
+  
+  limiter
+
+fn getClientQuota(limiter: RateLimiter, clientId: string) -> f64
+  let quota = limiter.clientQuotas[clientId]
+  if quota == nil
+    return limiter.defaultCapacity
+  quota
+
+fn setPriority(limiter: RateLimiter, clientId: string, priority: number) -> RateLimiter
+  // High priority: 2x refill rate
+  // Normal priority: 1x refill rate
+  // Low priority: 0.5x refill rate
+  
+  let bucket = limiter.buckets[clientId]
+  if bucket != nil
+    match priority
+      2 -> bucket.refillRate = bucket.refillRate * 2.0
+      0 -> bucket.refillRate = bucket.refillRate * 0.5
+      _ -> ()
+    limiter.buckets[clientId] = bucket
+  
+  limiter
+
+// ============================================================================
+// Statistics & Monitoring
+// ============================================================================
+
+fn calculateAllowRate(stats: map<string, any>) -> f64
+  let total = stats["totalRequests"] as number
+  if total == 0
+    return 0.0
+  
+  let allowed = stats["allowedRequests"] as number
+  (allowed as f64) / (total as f64)
+
+fn getRateLimitStats(limiter: RateLimiter) -> string
+  limiter.stats["allowRate"] = calculateAllowRate(limiter.stats)
+  
+  var report = "=== RATE LIMITING STATS ===\n"
+  report = report + "Total Requests: " + (limiter.stats["totalRequests"] as number) as string + "\n"
+  report = report + "Allowed: " + (limiter.stats["allowedRequests"] as number) as string + "\n"
+  report = report + "Denied: " + (limiter.stats["deniedRequests"] as number) as string + "\n"
+  report = report + "Allow Rate: " + ((limiter.stats["allowRate"] as f64) * 100.0) as string + "%\n"
+  report = report + "Avg Wait Time: " + (limiter.stats["avgWaitTimeMs"] as f64) as string + "ms\n"
+  report = report + "Active Clients: " + (limiter.buckets.length()) as string + "\n"
+  report
+
+fn getActiveClientCount(limiter: RateLimiter) -> number
+  limiter.buckets.length()
+
+fn getClientStats(limiter: RateLimiter, clientId: string) -> map<string, any>
+  let bucket = limiter.buckets[clientId]
+  if bucket == nil
+    return {}
+  
+  {
+    "tokens": bucket.tokens,
+    "capacity": bucket.capacity,
+    "refillRate": bucket.refillRate,
+    "quota": getClientQuota(limiter, clientId)
+  }
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn toString(v: any) -> string
+  ""
+
+fn getCurrentTime() -> number
+  1740998400

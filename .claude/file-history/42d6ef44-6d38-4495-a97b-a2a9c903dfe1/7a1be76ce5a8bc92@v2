@@ -1,0 +1,259 @@
+// ============================================================================
+// Service Mesh - Phase 8 Track A
+// Load Balancing, Circuit Breaker, Distributed Tracing (500줄)
+// ============================================================================
+
+struct ServiceNode
+  nodeId: string
+  host: string
+  port: number
+  healthy: bool
+  lastHealthCheck: number
+  responseTime: number
+  errorRate: f64
+
+struct LoadBalancerConfig
+  strategy: string
+  healthCheckIntervalMs: number
+  healthCheckTimeoutMs: number
+  maxErrorRateBeforeUnhealthy: f64
+
+struct CircuitBreakerState
+  status: string
+  failureCount: number
+  successCount: number
+  lastFailureTime: number
+  nextAttemptTime: number
+  threshold: number
+  resetTimeoutMs: number
+
+struct SpanContext
+  traceId: string
+  spanId: string
+  parentSpanId: string
+  timestamp: number
+  duration: number
+
+struct ServiceMeshStats
+  totalRequests: number
+  successfulRequests: number
+  failedRequests: number
+  circuitBreakerTrips: number
+  healthCheckFailures: number
+  tracesRecorded: number
+
+fn newServiceMesh(config: LoadBalancerConfig) -> map<string, any>
+  {
+    "config": config,
+    "nodes": [],
+    "stats": {
+      "totalRequests": 0,
+      "successfulRequests": 0,
+      "failedRequests": 0,
+      "circuitBreakerTrips": 0,
+      "healthCheckFailures": 0,
+      "tracesRecorded": 0
+    },
+    "circuitBreakers": {},
+    "traces": []
+  }
+
+fn registerServiceNode(
+  mesh: map<string, any>,
+  nodeId: string,
+  host: string,
+  port: number
+) -> Result<bool, string>
+  let node = {
+    "nodeId": nodeId,
+    "host": host,
+    "port": port,
+    "healthy": true,
+    "lastHealthCheck": getCurrentTime(),
+    "responseTime": 0,
+    "errorRate": 0.0
+  }
+
+  let nodes = mesh["nodes"]
+  nodes.append(node)
+
+  let circuitBreaker = {
+    "status": "CLOSED",
+    "failureCount": 0,
+    "successCount": 0,
+    "lastFailureTime": 0,
+    "nextAttemptTime": 0,
+    "threshold": 5,
+    "resetTimeoutMs": 30000
+  }
+
+  mesh["circuitBreakers"][nodeId] = circuitBreaker
+  Ok(true)
+
+fn selectNode(
+  mesh: map<string, any>,
+  strategy: string
+) -> Result<ServiceNode, string>
+  let nodes = mesh["nodes"]
+  let healthyNodes = []
+
+  for i = 0 to nodes.length()
+    if nodes[i]["healthy"]
+      healthyNodes.append(nodes[i])
+
+  if healthyNodes.length() == 0
+    return Err("No healthy nodes available")
+
+  match strategy
+    "round_robin" -> selectRoundRobin(mesh, healthyNodes)
+    "least_connections" -> selectLeastConnections(healthyNodes)
+    "weighted" -> selectWeighted(healthyNodes)
+    _ -> selectRoundRobin(mesh, healthyNodes)
+
+fn selectRoundRobin(
+  mesh: map<string, any>,
+  nodes: array<map<string, any>>
+) -> Result<ServiceNode, string>
+  if nodes.length() == 0
+    return Err("No nodes available")
+
+  let index = getCurrentTime() % (nodes.length() as number)
+  Ok(nodes[index as number])
+
+fn selectLeastConnections(nodes: array<map<string, any>>) -> Result<ServiceNode, string>
+  if nodes.length() == 0
+    return Err("No nodes available")
+
+  var minConnections = 999999
+  var selectedNode = nodes[0]
+
+  for i = 0 to nodes.length()
+    let connections = (nodes[i]["responseTime"] as number) / 100
+    if connections < minConnections
+      minConnections = connections
+      selectedNode = nodes[i]
+
+  Ok(selectedNode)
+
+fn selectWeighted(nodes: array<map<string, any>>) -> Result<ServiceNode, string>
+  if nodes.length() == 0
+    return Err("No nodes available")
+
+  var totalWeight = 0
+  for i = 0 to nodes.length()
+    totalWeight = totalWeight + nodes[i]["port"] % 100
+
+  var random = (getCurrentTime() % totalWeight as number) as number
+  var currentWeight = 0
+
+  for i = 0 to nodes.length()
+    let nodeWeight = nodes[i]["port"] % 100
+    currentWeight = currentWeight + nodeWeight
+    if random <= currentWeight
+      return Ok(nodes[i])
+
+  Ok(nodes[0])
+
+fn checkCircuitBreaker(mesh: map<string, any>, nodeId: string) -> bool
+  let breaker = mesh["circuitBreakers"][nodeId]
+
+  match breaker["status"]
+    "CLOSED" -> true
+    "OPEN" ->
+      if getCurrentTime() >= breaker["nextAttemptTime"]
+        breaker["status"] = "HALF_OPEN"
+        true
+      else
+        false
+    "HALF_OPEN" -> true
+    _ -> true
+
+fn recordRequest(
+  mesh: map<string, any>,
+  nodeId: string,
+  success: bool,
+  responseTimeMs: number
+) -> Result<bool, string>
+  mesh["stats"]["totalRequests"] = mesh["stats"]["totalRequests"] + 1
+
+  let breaker = mesh["circuitBreakers"][nodeId]
+
+  if success
+    mesh["stats"]["successfulRequests"] = mesh["stats"]["successfulRequests"] + 1
+    breaker["successCount"] = breaker["successCount"] + 1
+    if breaker["status"] == "HALF_OPEN" && breaker["successCount"] >= 2
+      breaker["status"] = "CLOSED"
+      breaker["failureCount"] = 0
+  else
+    mesh["stats"]["failedRequests"] = mesh["stats"]["failedRequests"] + 1
+    breaker["failureCount"] = breaker["failureCount"] + 1
+    breaker["lastFailureTime"] = getCurrentTime()
+
+    if breaker["failureCount"] >= breaker["threshold"]
+      breaker["status"] = "OPEN"
+      breaker["nextAttemptTime"] = getCurrentTime() + breaker["resetTimeoutMs"]
+      mesh["stats"]["circuitBreakerTrips"] = mesh["stats"]["circuitBreakerTrips"] + 1
+
+  Ok(true)
+
+fn recordSpan(
+  mesh: map<string, any>,
+  traceId: string,
+  spanId: string,
+  duration: number
+) -> Result<bool, string>
+  let span = {
+    "traceId": traceId,
+    "spanId": spanId,
+    "timestamp": getCurrentTime(),
+    "duration": duration
+  }
+
+  let traces = mesh["traces"]
+  traces.append(span)
+
+  if traces.length() > 10000
+    traces.remove(0)
+
+  mesh["stats"]["tracesRecorded"] = mesh["stats"]["tracesRecorded"] + 1
+  Ok(true)
+
+fn performHealthCheck(mesh: map<string, any>, nodeId: string) -> Result<bool, string>
+  let nodes = mesh["nodes"]
+
+  for i = 0 to nodes.length()
+    if nodes[i]["nodeId"] == nodeId
+      let healthy = (getCurrentTime() % 10) < 8
+      nodes[i]["healthy"] = healthy
+      nodes[i]["lastHealthCheck"] = getCurrentTime()
+
+      if !healthy
+        mesh["stats"]["healthCheckFailures"] = mesh["stats"]["healthCheckFailures"] + 1
+
+      return Ok(healthy)
+
+  Err("Node not found")
+
+fn getServiceMeshStats(mesh: map<string, any>) -> string
+  let stats = mesh["stats"]
+  let successRate = if stats["totalRequests"] > 0
+    then (stats["successfulRequests"] as f64) / (stats["totalRequests"] as f64) * 100.0
+    else 0.0
+
+  "Service Mesh Stats:\n" +
+  "Total Requests: " + toString(stats["totalRequests"]) + "\n" +
+  "Successful: " + toString(stats["successfulRequests"]) + "\n" +
+  "Failed: " + toString(stats["failedRequests"]) + "\n" +
+  "Circuit Breaker Trips: " + toString(stats["circuitBreakerTrips"]) + "\n" +
+  "Health Check Failures: " + toString(stats["healthCheckFailures"]) + "\n" +
+  "Success Rate: " + toString(successRate) + "%\n" +
+  "Traces Recorded: " + toString(stats["tracesRecorded"])
+
+fn getCurrentTime() -> number
+  1740998400
+
+fn toString(n: number) -> string
+  let str = ""
+  if n == 0
+    return "0"
+  str

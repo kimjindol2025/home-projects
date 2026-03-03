@@ -1,0 +1,183 @@
+# Z-Lang 고성능 벡터 연산 라이브러리 구현 계획
+
+## Context
+
+Z-Lang LLVM 1.4가 완성된 상태에서 다음 단계로 **고성능 벡터 연산 라이브러리**를 구현합니다.
+LLVM 백엔드가 `<4 x float>` 등 SIMD 벡터 타입을 기본 지원하므로, Z-Lang 언어 레벨에 벡터 타입을 추가하면
+HybridIndexSystem 핵심 알고리즘의 **10배 성능 향상**이 가능합니다.
+
+현재 Z-Lang의 한계:
+- 복합 할당 버그 (`i = i + 1`이 루프에서 실패)
+- 벡터 타입 없음 (LLVM에는 있음)
+- 구조체 없음
+
+---
+
+## 구현 전략
+
+### Step 1: 버그 수정 (필수 선행)
+
+**파일**: `zlang-project/src/codegen/CodeGenerator.cpp`
+
+복합 할당 버그 수정:
+```cpp
+// 현재: 변수 재할당이 새 레지스터를 생성하여 이전 값 참조 불가
+// 수정: 변수 업데이트 시 기존 레지스터에 store 명령 사용
+case AssignmentExpr:
+    auto reg = vars[node.name];   // 기존 레지스터 재사용
+    code += "  store i64 " + rhs + ", i64* " + reg + "\n";
+```
+
+### Step 2: 벡터 타입 시스템 추가
+
+**파일 수정/추가**:
+
+1. `src/lexer/Token.h` - 벡터 키워드 토큰 추가:
+   ```
+   KW_VEC2I, KW_VEC4I, KW_VEC4F, KW_VEC8I, KW_VEC8F
+   ```
+
+2. `src/codegen/Type.h` - 벡터 타입 구조 추가:
+   ```cpp
+   struct VectorType {
+       ElementType elem_type;  // INT32, FLOAT32, INT64, FLOAT64
+       int lanes;              // 2, 4, 8, 16
+   };
+   ```
+
+3. `src/codegen/CodeGenerator.cpp` - LLVM 벡터 타입 매핑:
+   ```cpp
+   "vec4f" → "<4 x float>"
+   "vec8i" → "<8 x i32>"
+   "vec2f" → "<2 x double>"
+   ```
+
+### Step 3: 벡터 연산 라이브러리 작성
+
+**새 파일**: `src/stdlib/VectorLib.z` (Z-Lang으로 작성)
+
+```z
+// 핵심 벡터 연산 함수들
+fn vec4f_add(a: vec4f, b: vec4f) -> vec4f { a + b }
+fn vec4f_dot(a: vec4f, b: vec4f) -> f32 { ... }
+fn vec4f_normalize(v: vec4f) -> vec4f { ... }
+fn vec4f_scale(v: vec4f, s: f32) -> vec4f { ... }
+
+// 고성능 배열 연산
+fn array_dot_product(a: [f32], b: [f32], n: i64) -> f32 { ... }
+fn array_cosine_similarity(a: [f32], b: [f32], n: i64) -> f32 { ... }
+fn batch_normalize(vecs: [[f32]], n: i64) { ... }
+```
+
+**새 파일**: `src/stdlib/VectorLib.cpp` (C++ 구현, stdlib 연동용)
+- LLVM 내장 함수(`llvm.x86.sse.dp.ps` 등) 활용
+- ARM64 NEON 지원
+
+### Step 4: HybridIndexSystem 알고리즘 재작성
+
+**새 파일**: `src/examples/hybrid_index.z`
+
+```z
+// 기존 Python/TypeScript → Z-Lang LLVM으로 재작성
+// 대상: 코사인 유사도 계산 (벡터 검색의 핵심)
+
+fn cosine_similarity_simd(a: vec4f, b: vec4f) -> f32 {
+    let dot = vec4f_dot(a, b)
+    let mag_a = vec4f_magnitude(a)
+    let mag_b = vec4f_magnitude(b)
+    return dot / (mag_a * mag_b)
+}
+
+fn batch_search(query: vec4f, docs: [vec4f], n: i64) -> i64 {
+    // 병렬 벡터 검색 - LLVM auto-vectorization 활용
+    let best_score: f32 = -1.0
+    let best_idx: i64 = -1
+    let i: i64 = 0
+    while (i < n) {
+        let score = cosine_similarity_simd(query, docs[i])
+        if (score > best_score) {
+            best_score = score
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+```
+
+### Step 5: 성능 벤치마크
+
+**새 파일**: `benchmarks/vector_benchmark.z`
+
+- 기준: Python NumPy 구현 대비
+- 목표: **10배 향상**
+- 측정 항목:
+  - 코사인 유사도: 1M 벡터 쌍 처리 시간
+  - 배치 검색: 1000 쿼리 × 100K 문서
+  - 행렬 곱: 1024×1024
+
+### Step 6: 테스트 스위트
+
+**새 파일**: `tests/test_vector_lib.cpp`
+
+```cpp
+// 정확성 테스트
+TEST(VecDotProduct, BasicValues) { ... }
+TEST(CosineSimilarity, Orthogonal) { ... }
+TEST(CosineSimilarity, Identical) { ... }
+
+// 성능 테스트
+BENCH(BatchSearch, 1M_vectors) { ... }
+BENCH(CosineSim, 100K_pairs) { ... }
+```
+
+---
+
+## 주요 파일 목록
+
+### 수정 파일
+- `src/lexer/Token.h` (벡터 키워드 추가)
+- `src/lexer/Lexer.cpp` (벡터 키워드 렉싱)
+- `src/parser/Parser.cpp` (벡터 타입 파싱)
+- `src/codegen/Type.h` (VectorType 구조체 추가)
+- `src/codegen/CodeGenerator.cpp` (LLVM 벡터 타입 매핑 + 버그 수정)
+
+### 신규 파일
+- `src/stdlib/VectorLib.h` (인터페이스)
+- `src/stdlib/VectorLib.cpp` (C++ 구현)
+- `src/stdlib/VectorLib.z` (Z-Lang 구현 예제)
+- `src/examples/hybrid_index.z` (HybridIndexSystem 재작성)
+- `benchmarks/vector_benchmark.z` (성능 측정)
+- `tests/test_vector_lib.cpp` (테스트 스위트)
+- `VECTOR_LIB_SPEC.md` (라이브러리 명세서)
+
+---
+
+## 단계별 일정
+
+| 단계 | 기간 | 산출물 |
+|------|------|--------|
+| Step 1: 버그 수정 | 1일 | 루프 동작 정상화 |
+| Step 2: 벡터 타입 | 3일 | 5개 벡터 타입 지원 |
+| Step 3: VectorLib | 4일 | 20개+ 벡터 함수 |
+| Step 4: HybridIndex | 3일 | 코사인 유사도 Z-Lang 구현 |
+| Step 5: 벤치마크 | 2일 | 성능 수치 측정 |
+| Step 6: 테스트 | 2일 | 30개+ 테스트 |
+| **총** | **15일** | **완전한 벡터 라이브러리** |
+
+---
+
+## 검증 방법
+
+1. **버그 수정 검증**: `./test_loop` 정상 실행 확인 (기존 실패했던 테스트)
+2. **벡터 타입 검증**: `vec4f` 타입으로 간단한 덧셈 컴파일
+3. **성능 검증**: Python NumPy 대비 실제 속도 측정 (목표 10배)
+4. **통합 검증**: hybrid_index.z 전체 컴파일 + 실행
+
+---
+
+## 특이사항
+
+- ARM64 (Termux 환경) 기준으로 NEON SIMD 최적화 적용
+- LLVM의 auto-vectorization 활성화 (`-O2` 또는 `-O3`)
+- 향후 Z-Lang + FreeLang 통합 시 이 라이브러리를 공유 컴포넌트로 활용 가능

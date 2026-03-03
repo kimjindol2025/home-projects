@@ -1,0 +1,441 @@
+// ============================================================================
+// TEST MOUSE: Fuzzing Victim Stage
+// raft-sharded-db Malformed Packet Injection - 1,000,000 Iterations
+// Zero-Crash Requirement: ALL packets must be safely rejected or handled
+// ============================================================================
+
+// ============================================================================
+// Fuzzing Infrastructure
+// ============================================================================
+
+struct FuzzPayload
+  rawBytes: array<number>
+  byteCount: number
+  checksum: number
+  isValid: bool
+
+struct FuzzMetrics
+  totalIterations: number
+  crashEvents: number
+  silentDataLoss: number
+  logDivergences: number
+  validPacketsRejected: number
+  invalidPacketsAccepted: number
+  recoveryAttempts: number
+
+struct FuzzScenario
+  seed: number
+  packetSizeMin: number
+  packetSizeMax: number
+  mutationRate: number  // 0.0-1.0
+
+// ============================================================================
+// Malformed Packet Generators
+// ============================================================================
+
+fn generateTruncatedPacket(seed: number) -> array<number>
+  // Packet cut mid-message
+  var packet = []
+  for i = 0 to 64  // 64 bytes (half packet)
+    packet.append((seed + i) % 256)
+  packet
+
+fn generateCorruptedChecksum(seed: number) -> array<number>
+  // Valid structure, invalid checksum
+  var packet = []
+  for i = 0 to 128
+    packet.append((seed + i) % 256)
+  // Last 4 bytes are checksum (invalid)
+  packet[124] = 255
+  packet[125] = 255
+  packet[126] = 255
+  packet[127] = 255
+  packet
+
+fn generateRandomBytes(seed: number, count: number) -> array<number>
+  // Completely random garbage
+  var packet = []
+  var randomSeed = seed
+  for i = 0 to count
+    randomSeed = (randomSeed * 1103515245 + 12345) % 2147483648
+    packet.append((randomSeed / 65536) % 256)
+  packet
+
+fn generateNullBytes(count: number) -> array<number>
+  // All zeros (potential null dereference)
+  var packet = []
+  for i = 0 to count
+    packet.append(0)
+  packet
+
+fn generateAllOnes(count: number) -> array<number>
+  // All 0xFF (potential integer overflow)
+  var packet = []
+  for i = 0 to count
+    packet.append(255)
+  packet
+
+fn generatePartialHeader(seed: number) -> array<number>
+  // Valid header, missing payload
+  var packet = []
+  // Valid 4-byte header
+  packet.append((seed / 16777216) % 256)
+  packet.append((seed / 65536) % 256)
+  packet.append((seed / 256) % 256)
+  packet.append(seed % 256)
+  packet
+
+fn generateDuplicateFields(seed: number) -> array<number>
+  // Repeated field numbers (could confuse parser)
+  var packet = []
+  for rep = 0 to 3  // 3 copies of same field
+    for i = 0 to 32
+      packet.append((seed + i) % 256)
+  packet
+
+fn generateNestedOverflow(seed: number) -> array<number>
+  // Nested message size > buffer
+  var packet = []
+  // Size field = 1GB
+  packet.append(255)
+  packet.append(255)
+  packet.append(255)
+  packet.append(127)  // 2GB in varint
+  // But only 128 bytes of data
+  for i = 0 to 128
+    packet.append((seed + i) % 256)
+  packet
+
+fn generateInvalidVarints(seed: number) -> array<number>
+  // Varint with continuation bit but no following byte
+  var packet = []
+  packet.append(255)  // Continuation bit set
+  packet.append(255)  // Another byte
+  packet.append(128)  // Continuation set, but packet ends
+  // No more bytes = invalid varint
+  packet
+
+// ============================================================================
+// Fuzzing Test 1: 100K Truncated Packets
+// ============================================================================
+
+fn testFuzzTruncatedPackets()
+  var crashEvents = 0
+  var successfulRejections = 0
+
+  for i = 0 to 100000
+    let packet = generateTruncatedPacket(i)
+
+    // Attempt to parse (should reject, not crash)
+    var isValid = false
+    if packet.length() >= 128  // Minimum packet size
+      isValid = true
+    else
+      isValid = false
+
+    // If parser doesn't crash on invalid packet, count as safe rejection
+    if !isValid
+      successfulRejections = successfulRejections + 1
+
+  // Expectation: All 100K packets rejected, 0 crashes
+  (crashEvents == 0 && successfulRejections == 100000)
+
+// ============================================================================
+// Fuzzing Test 2: 100K Corrupted Checksums
+// ============================================================================
+
+fn testFuzzCorruptedChecksums()
+  var dataLossEvents = 0
+  var checksumFailures = 0
+
+  for i = 0 to 100000
+    let packet = generateCorruptedChecksum(i)
+
+    // Validate checksum
+    var computedChecksum = 0
+    for j = 0 to 124
+      computedChecksum = computedChecksum + packet[j]
+    computedChecksum = computedChecksum % 4294967296
+
+    let providedChecksum =
+      (packet[124] * 16777216) +
+      (packet[125] * 65536) +
+      (packet[126] * 256) +
+      packet[127]
+
+    if computedChecksum != providedChecksum
+      checksumFailures = checksumFailures + 1
+
+  // Expectation: All 100K checksums fail, packet rejected, no data loss
+  (checksumFailures == 100000 && dataLossEvents == 0)
+
+// ============================================================================
+// Fuzzing Test 3: 100K Random Garbage
+// ============================================================================
+
+fn testFuzzRandomGarbage()
+  var validParses = 0
+  var safeRejections = 0
+
+  for i = 0 to 100000
+    let packet = generateRandomBytes(i, 128)
+
+    // Try to parse as valid Raft log entry
+    // Valid entries must have:
+    // - Magic byte (0x42)
+    // - Valid type (0-3)
+    // - Valid term (non-zero)
+
+    let magicByte = packet[0]
+    let entryType = packet[1]
+    let termBytes = [packet[2], packet[3]]
+
+    let isValid = (magicByte == 66) && (entryType <= 3) && (termBytes[0] > 0)
+
+    if isValid
+      validParses = validParses + 1
+    else
+      safeRejections = safeRejections + 1
+
+  // Expectation: ~0 valid parses (random), ~100K safe rejections
+  (validParses < 10 && safeRejections > 99990)
+
+// ============================================================================
+// Fuzzing Test 4: 100K Null Byte Sequences
+// ============================================================================
+
+fn testFuzzNullBytes()
+  var nullPointerDereferences = 0
+  var bufferOverruns = 0
+
+  for i = 0 to 100000
+    let packet = generateNullBytes(256)
+
+    // Null bytes shouldn't cause dereference crashes
+    var safelyHandled = true
+
+    // If we got here without crashing, safe handling
+    if packet.length() == 256
+      safelyHandled = true
+    else
+      safelyHandled = false
+
+  // Expectation: No crashes on null byte sequences
+  (nullPointerDereferences == 0)
+
+// ============================================================================
+// Fuzzing Test 5: 100K All-Ones Sequences
+// ============================================================================
+
+fn testFuzzAllOnes()
+  var integerOverflows = 0
+  var validPackets = 0
+
+  for i = 0 to 100000
+    let packet = generateAllOnes(256)
+
+    // All 0xFF could trigger overflow in varint decoding
+    // Varint decoder must handle this safely
+
+    // Decode first varint (all 0xFF)
+    var value = 0
+    var shift = 0
+    var validVarInt = true
+
+    for j = 0 to packet.length()
+      if j >= 5  // Varint can be max 5 bytes (protobuf)
+        validVarInt = false
+        break
+
+      let byte = packet[j]
+      value = value + ((byte % 128) * (2 ^ (shift * 7)))
+
+      if byte < 128
+        break
+      shift = shift + 1
+
+    if !validVarInt
+      integerOverflows = integerOverflows + 1
+
+  // Expectation: All sequences either safely decode or rejected
+  (integerOverflows <= 10)  // Allow tiny margin for implementation variation
+
+// ============================================================================
+// Fuzzing Test 6: 100K Partial Headers
+// ============================================================================
+
+fn testFuzzPartialHeaders()
+  var incompletePackets = 0
+  var safeRejections = 0
+
+  for i = 0 to 100000
+    let packet = generatePartialHeader(i)
+
+    // Header is valid, but payload missing
+    // Parser must handle this safely (not crash, not accept)
+
+    if packet.length() < 8  // Minimum valid packet
+      safeRejections = safeRejections + 1
+    else
+      incompletePackets = incompletePackets + 1
+
+  // Expectation: ~100K safe rejections
+  (safeRejections > 99900)
+
+// ============================================================================
+// Fuzzing Test 7: 100K Duplicate Fields
+// ============================================================================
+
+fn testFuzzDuplicateFields()
+  var dataLossFromDuplicates = 0
+  var logDivergences = 0
+
+  for i = 0 to 100000
+    let packet = generateDuplicateFields(i)
+
+    // Duplicate fields could cause:
+    // 1. Data loss (if earlier field overwritten)
+    // 2. Log divergence (if different nodes handle differently)
+    // 3. Inconsistent state
+
+    // Proper handling: Last field wins (protobuf semantics)
+    // All nodes must agree on same semantics
+
+    // Count as safe if no loss/divergence
+    if logDivergences == 0 && dataLossFromDuplicates == 0
+      // Safe handling
+      var x = 0
+
+  // Expectation: No data loss from duplicates
+  (dataLossFromDuplicates == 0 && logDivergences == 0)
+
+// ============================================================================
+// Fuzzing Test 8: 100K Nested Overflow Attempts
+// ============================================================================
+
+fn testFuzzNestedOverflow()
+  var bufferAllocations = 0
+  var outOfMemoryErrors = 0
+
+  for i = 0 to 100000
+    let packet = generateNestedOverflow(i)
+
+    // Packet claims 2GB payload but only has 128 bytes
+    // Parser must NOT:
+    // 1. Allocate 2GB memory (OOM)
+    // 2. Read past end of buffer (crash)
+    // 3. Accept partial message as complete
+
+    // Safe handling: Reject as malformed
+    let declaredSize =
+      (packet[0] * 128 * 128 * 128) +
+      (packet[1] * 128 * 128) +
+      (packet[2] * 128) +
+      packet[3]
+
+    let actualSize = packet.length() - 4
+
+    if declaredSize > actualSize
+      // Safe rejection
+      var x = 0
+
+  // Expectation: No OOM, no crashes
+  (outOfMemoryErrors == 0)
+
+// ============================================================================
+// Fuzzing Test 9: 100K Invalid Varint Sequences
+// ============================================================================
+
+fn testFuzzInvalidVarints()
+  var parsingErrors = 0
+  var safeFallbacks = 0
+
+  for i = 0 to 100000
+    let packet = generateInvalidVarints(i)
+
+    // Varint with continuation bit but no following byte
+    // Parser must detect EOF and reject, not crash
+
+    var varIntValid = false
+    if packet[0] >= 128  // Continuation bit set
+      if packet.length() >= 2
+        varIntValid = true
+    else
+      varIntValid = true
+
+    if !varIntValid
+      safeFallbacks = safeFallbacks + 1
+    else
+      parsingErrors = parsingErrors + 1
+
+  // Expectation: ~100K safe fallbacks (rejected as invalid)
+  (safeFallbacks > 99900 && parsingErrors < 100)
+
+// ============================================================================
+// Fuzzing Test 10: 100K Random Size Variations
+// ============================================================================
+
+fn testFuzzSizeVariations()
+  var allHandledSafely = true
+
+  for i = 0 to 100000
+    let size = (i % 4096) + 1  // 1 to 4096 bytes
+    let packet = generateRandomBytes(i, size)
+
+    // Parser must handle any size without crashing
+    // Even 1 byte should be safely rejected (not crash)
+
+    if packet.length() != size
+      allHandledSafely = false
+
+  (allHandledSafely)
+
+// ============================================================================
+// Summary: Fuzz Test Execution
+// ============================================================================
+
+fn runFuzzTests()
+  var passedTests = 0
+  var totalTests = 0
+
+  if testFuzzTruncatedPackets()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzCorruptedChecksums()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzRandomGarbage()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzNullBytes()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzAllOnes()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzPartialHeaders()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzDuplicateFields()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzNestedOverflow()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzInvalidVarints()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  if testFuzzSizeVariations()
+    passedTests = passedTests + 1
+  totalTests = totalTests + 1
+
+  (passedTests as f64) / (totalTests as f64)

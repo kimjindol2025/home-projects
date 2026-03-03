@@ -1,0 +1,365 @@
+// ============================================================================
+// Heap Manager - Bump Pointer Allocation & Card Marking
+// Week 2, Part 2: Efficient Memory Layout Management
+// 450 lines
+// ============================================================================
+
+// ============================================================================
+// Section 1: Bump Pointer Allocator (120 lines)
+// ============================================================================
+
+struct BumpPointer {
+    heap_start: u64,
+    heap_end: u64,
+    current_offset: u64,  // Current allocation position
+    allocated_objects: u32,
+    total_allocated: u64,
+}
+
+fn create_bump_pointer(heap_size: u64) -> BumpPointer {
+    BumpPointer {
+        heap_start: 0,
+        heap_end: heap_size,
+        current_offset: 0,
+        allocated_objects: 0,
+        total_allocated: 0,
+    }
+}
+
+fn bump_pointer_allocate(allocator: &BumpPointer, size: u64) -> Option<u64> {
+    // Check if there's enough space
+    if (allocator.current_offset + size > allocator.heap_end) {
+        print("⚠️  Heap full! Cannot allocate " + size + " bytes");
+        return None;
+    };
+
+    // Allocate at current offset (O(1) operation!)
+    let allocated_address = allocator.heap_start + allocator.current_offset;
+
+    // Move bump pointer forward
+    allocator.current_offset = allocator.current_offset + size;
+    allocator.allocated_objects = allocator.allocated_objects + 1;
+    allocator.total_allocated = allocator.total_allocated + size;
+
+    Some(allocated_address)
+}
+
+fn bump_pointer_statistics(allocator: &BumpPointer) {
+    print("═══════════════════════════════════════════");
+    print("🔑 Bump Pointer Statistics");
+    print("═══════════════════════════════════════════");
+    print("Heap range: " + allocator.heap_start + " - " + allocator.heap_end);
+    print("Current offset: " + allocator.current_offset + " / " + allocator.heap_end);
+    print("Free space: " + (allocator.heap_end - allocator.current_offset));
+    print("Allocated objects: " + allocator.allocated_objects);
+    print("Total allocated: " + allocator.total_allocated + " bytes");
+    print("Utilization: " + ((allocator.current_offset as f64) / (allocator.heap_end as f64) * 100.0) + "%");
+    print("═══════════════════════════════════════════");
+}
+
+fn reset_bump_pointer(allocator: &BumpPointer) {
+    // After compaction, reset bump pointer to beginning
+    print("🔄 Resetting bump pointer (post-compaction)");
+
+    allocator.current_offset = 0;
+    allocator.allocated_objects = 0;
+
+    print("  Bump pointer reset to: " + allocator.heap_start);
+}
+
+// ============================================================================
+// Section 2: Card Marking (Write Barrier) (130 lines)
+// ============================================================================
+
+enum CardStatus {
+    Clean,      // No references from Old to Young
+    Dirty,      // Contains Old→Young reference
+}
+
+struct Card {
+    start_address: u64,
+    end_address: u64,
+    status: CardStatus,
+    references: vector,  // [(old_obj_id, young_obj_id), ...]
+}
+
+struct CardTable {
+    card_size: u64,      // Size of each card (e.g., 512 bytes)
+    cards: vector,       // [Card, ...]
+    total_dirty: u32,
+}
+
+fn create_card_table(heap_size: u64) -> CardTable {
+    let card_size = 512u64;  // 512-byte cards
+    let num_cards = heap_size / card_size;
+
+    let cards = [];
+    let i = 0;
+    while (i < num_cards) {
+        let card = Card {
+            start_address: i * card_size,
+            end_address: (i + 1) * card_size,
+            status: CardStatus.Clean,
+            references: [],
+        };
+        cards.push(card);
+        i = i + 1;
+    };
+
+    CardTable {
+        card_size: card_size,
+        cards: cards,
+        total_dirty: 0,
+    }
+}
+
+fn write_barrier(table: &CardTable, old_obj_address: u64, young_obj_address: u64) {
+    print("✍️  Write Barrier: Old(" + old_obj_address + ") → Young(" + young_obj_address + ")");
+
+    // Find which card contains the old object
+    let card_index = old_obj_address / table.card_size;
+
+    if (card_index < table.cards.len()) {
+        let card = table.cards[card_index];
+
+        // Mark card as dirty if it wasn't already
+        if (card.status == CardStatus.Clean) {
+            card.status = CardStatus.Dirty;
+            table.total_dirty = table.total_dirty + 1;
+            print("  Card " + card_index + " marked DIRTY");
+        };
+
+        // Record the reference
+        card.references.push((old_obj_address, young_obj_address));
+    };
+}
+
+fn scan_dirty_cards(table: &CardTable) -> u32 {
+    print("🔍 Scanning dirty cards for Old→Young references");
+
+    let references_found = 0u32;
+
+    let i = 0;
+    while (i < table.cards.len()) {
+        let card = table.cards[i];
+
+        if (card.status == CardStatus.Dirty) {
+            print("  Card " + i + ": " + card.references.len() + " Old→Young references");
+            references_found = references_found + card.references.len() as u32;
+        };
+
+        i = i + 1;
+    };
+
+    print("  Total dirty cards: " + table.total_dirty);
+    print("  Total Old→Young refs: " + references_found);
+
+    references_found
+}
+
+fn clear_dirty_cards(table: &CardTable) {
+    print("🧹 Clearing dirty cards (after Young GC)");
+
+    let i = 0;
+    while (i < table.cards.len()) {
+        let card = table.cards[i];
+
+        if (card.status == CardStatus.Dirty) {
+            card.status = CardStatus.Clean;
+            card.references.clear();
+        };
+
+        i = i + 1;
+    };
+
+    table.total_dirty = 0;
+
+    print("  All cards cleared");
+}
+
+// ============================================================================
+// Section 3: Generational Boundary Management (100 lines)
+// ============================================================================
+
+struct GenerationBoundary {
+    young_end: u64,
+    old_start: u64,
+    young_size: u64,
+    old_size: u64,
+}
+
+fn create_generation_boundary(total_heap: u64) -> GenerationBoundary {
+    // Default: 20% Young, 80% Old
+    let young_size = total_heap / 5;
+    let old_size = total_heap - young_size;
+
+    GenerationBoundary {
+        young_end: young_size,
+        old_start: young_size,
+        young_size: young_size,
+        old_size: old_size,
+    }
+}
+
+fn is_in_young_generation(boundary: &GenerationBoundary, address: u64) -> bool {
+    address < boundary.young_end
+}
+
+fn is_in_old_generation(boundary: &GenerationBoundary, address: u64) -> bool {
+    address >= boundary.old_start
+}
+
+fn adjust_generation_ratio(boundary: &GenerationBoundary, young_usage: f64, old_usage: f64) {
+    // Adaptive: if young fills up frequently, increase its size
+    print("🔄 Adjusting generation ratio");
+    print("  Young usage: " + young_usage + "%");
+    print("  Old usage: " + old_usage + "%");
+
+    if (young_usage > 80.0) {
+        print("  → Increasing Young generation size (frequent GC)");
+        boundary.young_size = boundary.young_size + (boundary.young_size / 10);
+    };
+
+    if (old_usage > 90.0) {
+        print("  → Triggering Full GC (Old generation nearly full)");
+    };
+}
+
+// ============================================================================
+// Section 4: Allocation Strategies (100 lines)
+// ============================================================================
+
+enum AllocationStrategy {
+    BumpPointer,     // Fast, but needs compaction
+    FreeList,        // Slower, but allows fragmentation
+    SizeClass,       // Object-size based buckets
+}
+
+struct AllocatorConfig {
+    strategy: AllocationStrategy,
+    bump_pointer: BumpPointer,
+    card_table: CardTable,
+    boundary: GenerationBoundary,
+}
+
+fn create_allocator_config(heap_size: u64) -> AllocatorConfig {
+    AllocatorConfig {
+        strategy: AllocationStrategy.BumpPointer,
+        bump_pointer: create_bump_pointer(heap_size),
+        card_table: create_card_table(heap_size),
+        boundary: create_generation_boundary(heap_size),
+    }
+}
+
+fn allocate_with_strategy(config: &AllocatorConfig, size: u64, generation: bool) -> Option<u64> {
+    // generation: true = Young, false = Old
+    if (config.strategy == AllocationStrategy.BumpPointer) {
+        return bump_pointer_allocate(&config.bump_pointer, size);
+    };
+
+    // Other strategies...
+    None
+}
+
+// ============================================================================
+// Section 5: Memory Layout Verification (100 lines)
+// ============================================================================
+
+fn verify_heap_layout(config: &AllocatorConfig) -> bool {
+    print("✅ Verifying heap layout...");
+
+    // Check 1: Bump pointer within bounds
+    if (config.bump_pointer.current_offset > config.bump_pointer.heap_end) {
+        print("❌ Bump pointer overflow!");
+        return false;
+    };
+
+    // Check 2: Generation boundaries are correct
+    if (config.boundary.young_end >= config.boundary.old_start) {
+        print("❌ Generation boundary overlap!");
+        return false;
+    };
+
+    // Check 3: Card table size matches
+    let expected_cards = config.bump_pointer.heap_end / config.card_table.card_size;
+    if (config.card_table.cards.len() != expected_cards) {
+        print("❌ Card table size mismatch!");
+        return false;
+    };
+
+    print("✅ Heap layout verified (all checks passed)");
+    true
+}
+
+// ============================================================================
+// Section 6: Example Usage (100 lines)
+// ============================================================================
+
+fn example_bump_pointer_allocation() {
+    print("╔════════════════════════════════════════════╗");
+    print("║  Bump Pointer Allocation Example            ║");
+    print("║  Young Generation: O(1) allocation          ║");
+    print("╚════════════════════════════════════════════╝");
+    print("");
+
+    let allocator = create_bump_pointer(4096);
+
+    // Allocate 5 objects
+    print("Allocating 5 objects:");
+    let i = 0;
+    while (i < 5) {
+        let size = 256u64;
+        if (bump_pointer_allocate(&allocator, size) != None) {
+            print("  Obj " + i + ": allocated 256 bytes");
+        };
+        i = i + 1;
+    };
+
+    print("");
+    bump_pointer_statistics(&allocator);
+    print("");
+}
+
+fn example_card_marking() {
+    print("╔════════════════════════════════════════════╗");
+    print("║  Card Marking (Write Barrier) Example       ║");
+    print("║  Old→Young Reference Tracking               ║");
+    print("╚════════════════════════════════════════════╝");
+    print("");
+
+    let table = create_card_table(4096);
+
+    print("Recording Old→Young references:");
+    write_barrier(&table, 2048, 256);  // Old object → Young object
+    write_barrier(&table, 2560, 512);  // Another Old → Young
+    write_barrier(&table, 2048, 768);  // Same Old object → different Young
+
+    print("");
+    scan_dirty_cards(&table);
+
+    print("");
+    clear_dirty_cards(&table);
+    print("");
+}
+
+fn main_heap_manager() {
+    example_bump_pointer_allocation();
+    example_card_marking();
+
+    print("╔════════════════════════════════════════════╗");
+    print("║  Heap Manager: Complete Example            ║");
+    print("╚════════════════════════════════════════════╝");
+    print("");
+
+    let config = create_allocator_config(8192);
+
+    // Verify layout
+    if (verify_heap_layout(&config)) {
+        print("✅ System ready for Week 2 Compaction Tests");
+    };
+
+    print("");
+}
+
+// Run main
+main_heap_manager();
