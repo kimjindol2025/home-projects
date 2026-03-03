@@ -458,6 +458,7 @@ async function runAllTests(): Promise<void> {
   monitor.printReport();
 
   // 메모리 프로파일 리포트
+  const memoryReport = profiler.analyzeTrend();
   profiler.printReport();
 
   // 결과 요약
@@ -471,6 +472,9 @@ ${colors.red}❌ Failed: ${testsFailed}${colors.reset}
 Pass Rate: ${((testsPassed / (testsPassed + testsFailed)) * 100).toFixed(1)}%
 
 ${testsFailed === 0 ? `${colors.green}🎉 ALL TESTS PASSED!${colors.reset}` : `${colors.red}⚠️  SOME TESTS FAILED${colors.reset}`}
+
+💾 Memory Report:
+   Leak Status: ${memoryReport.isLeaking ? '⚠️  LEAKING' : '✅ OK'}
   `);
 }
 

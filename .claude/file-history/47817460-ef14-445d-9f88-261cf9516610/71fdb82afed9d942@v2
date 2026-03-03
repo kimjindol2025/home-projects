@@ -1,0 +1,754 @@
+// FreeLang Phase 6 Week 3 Days 18-20: Distributed Prediction System
+// Aggregated Forecasting + Weighted Voting + Conflict Resolution
+// 분산 노드 간 예측 통합 및 의사결정 시스템
+
+import "./node_coordination.fl" as nc;
+import "./self_learning_predictor.fl" as slp;
+
+// ============================================================================
+// AGGREGATED FORECASTING: 다중 노드 예측 통합
+// ============================================================================
+
+pub struct NodeForecast {
+    node_id: u32,
+    pattern_type: String,
+    predicted_saturation: f64,
+    confidence: f64,
+    time_to_critical: u32,
+    freshness_score: f64, // 예측 신선도 (0-100, 최신=100)
+}
+
+pub struct AggregatedForecast {
+    consensus_saturation: f64,     // 가중 평균 포화도
+    consensus_confidence: f64,      // 가중 평균 신뢰도
+    forecasts: Vec<NodeForecast>,   // 개별 노드 예측들
+    agreement_ratio: f64,           // 노드 간 일치도 (0-1)
+    prediction_variance: f64,       // 포화도 예측 분산
+    is_reliable: bool,              // 신뢰도 임계값(75%) 통과 여부
+}
+
+pub struct AggregatedForecasting {
+    min_node_agreement: f64,        // 신뢰할 최소 노드 일치도 (기본: 0.6)
+    confidence_weight: f64,         // 신뢰도 가중치 (기본: 0.5)
+    freshness_weight: f64,          // 신선도 가중치 (기본: 0.3)
+    recency_weight: f64,            // 최근성 가중치 (기본: 0.2)
+}
+
+impl AggregatedForecasting {
+    pub fn new() -> Self {
+        AggregatedForecasting {
+            min_node_agreement: 0.6,
+            confidence_weight: 0.5,
+            freshness_weight: 0.3,
+            recency_weight: 0.2,
+        }
+    }
+
+    // 다중 노드 예측을 통합하여 집계 예측 생성
+    pub fn aggregate_forecasts(
+        &self,
+        forecasts: &Vec<NodeForecast>,
+        current_time: u64,
+        node_trust_scores: &HashMap<u32, f64>,
+    ) -> AggregatedForecast {
+        if forecasts.len() == 0 {
+            return AggregatedForecast {
+                consensus_saturation: 0.0,
+                consensus_confidence: 0.0,
+                forecasts: vec![],
+                agreement_ratio: 0.0,
+                prediction_variance: 0.0,
+                is_reliable: false,
+            };
+        }
+
+        // 1. 각 예측에 가중치 적용
+        let mut weighted_saturation = 0.0;
+        let mut weighted_confidence = 0.0;
+        let mut total_weight = 0.0;
+        let mut saturation_values = vec![];
+
+        for forecast in forecasts {
+            // 노드 신뢰도 기반 가중치 (기본: 1.0)
+            let trust_weight = match node_trust_scores.get(&forecast.node_id) {
+                Some(&score) => score,
+                None => 1.0,
+            };
+
+            // 신뢰도 + 신선도 + 최근성 복합 가중치
+            let composite_weight = trust_weight
+                * (forecast.confidence * self.confidence_weight
+                    + forecast.freshness_score / 100.0 * self.freshness_weight
+                    + (1.0 - self.recency_weight)); // 모두 최근 예측이라고 가정
+
+            weighted_saturation += forecast.predicted_saturation * composite_weight;
+            weighted_confidence += forecast.confidence * composite_weight;
+            total_weight += composite_weight;
+            saturation_values.push(forecast.predicted_saturation);
+        }
+
+        let consensus_saturation = if total_weight > 0.0 {
+            weighted_saturation / total_weight
+        } else {
+            0.0
+        };
+
+        let consensus_confidence = if total_weight > 0.0 {
+            weighted_confidence / total_weight
+        } else {
+            0.0
+        };
+
+        // 2. 노드 간 일치도 계산 (표준편차 기반)
+        let mean_saturation = consensus_saturation;
+        let variance = saturation_values
+            .iter()
+            .map(|&v| (v - mean_saturation).powi(2))
+            .sum::<f64>()
+            / saturation_values.len() as f64;
+        let std_dev = variance.sqrt();
+
+        // 일치도: 표준편차가 작을수록 높음 (0-1 범위)
+        let agreement_ratio = (1.0 / (1.0 + std_dev)).min(1.0);
+
+        // 3. 신뢰성 판정 (합의도 >= 최소 임계값)
+        let is_reliable = agreement_ratio >= self.min_node_agreement
+            && consensus_confidence >= 0.75;
+
+        AggregatedForecast {
+            consensus_saturation,
+            consensus_confidence,
+            forecasts: forecasts.clone(),
+            agreement_ratio,
+            prediction_variance: variance,
+            is_reliable,
+        }
+    }
+
+    // 예측 신선도 점수 계산 (최대 100)
+    pub fn calculate_freshness_score(
+        &self,
+        prediction_age_seconds: u64,
+    ) -> f64 {
+        let decay_constant = 300.0; // 300초 반감기
+        let freshness = 100.0 * (-1.0 * prediction_age_seconds as f64 / decay_constant).exp();
+        freshness.max(0.0).min(100.0)
+    }
+}
+
+// ============================================================================
+// WEIGHTED VOTING: 신뢰도 기반 가중 투표 시스템
+// ============================================================================
+
+pub enum VotingDecision {
+    ExecuteAction,          // 즉시 조치 (consensus >= 85%)
+    PrepareAction,          // 준비 단계 (consensus >= 70%)
+    Monitor,                // 모니터링 만 진행
+    Conflict,               // 노드 간 심각한 불일치
+}
+
+pub struct Vote {
+    node_id: u32,
+    decision: String,       // "execute", "prepare", "monitor"
+    confidence: f64,
+    reasoning: String,
+}
+
+pub struct WeightedVote {
+    votes: Vec<Vote>,
+    execution_votes: u32,
+    prepare_votes: u32,
+    monitor_votes: u32,
+    weighted_execute_confidence: f64,
+    weighted_prepare_confidence: f64,
+    consensus_strength: f64, // 최강 투표 비중
+}
+
+pub struct WeightedVoting {
+    execute_threshold: f64,  // 기본: 0.85
+    prepare_threshold: f64,  // 기본: 0.70
+    min_voting_nodes: u32,   // 기본: 3
+}
+
+impl WeightedVoting {
+    pub fn new() -> Self {
+        WeightedVoting {
+            execute_threshold: 0.85,
+            prepare_threshold: 0.70,
+            min_voting_nodes: 3,
+        }
+    }
+
+    // 가중 투표 수행 및 결정 내림
+    pub fn conduct_weighted_voting(
+        &self,
+        votes: &Vec<Vote>,
+        node_trust_scores: &HashMap<u32, f64>,
+    ) -> (WeightedVote, VotingDecision) {
+        let mut execution_votes = 0u32;
+        let mut prepare_votes = 0u32;
+        let mut monitor_votes = 0u32;
+        let mut weighted_execute_confidence = 0.0;
+        let mut weighted_prepare_confidence = 0.0;
+        let mut total_weight = 0.0;
+
+        for vote in votes {
+            let node_trust = match node_trust_scores.get(&vote.node_id) {
+                Some(&score) => score,
+                None => 1.0,
+            };
+
+            let weighted_confidence = vote.confidence * node_trust;
+            total_weight += node_trust;
+
+            match vote.decision.as_str() {
+                "execute" => {
+                    execution_votes += 1;
+                    weighted_execute_confidence += weighted_confidence;
+                }
+                "prepare" => {
+                    prepare_votes += 1;
+                    weighted_prepare_confidence += weighted_confidence;
+                }
+                _ => {
+                    monitor_votes += 1;
+                }
+            }
+        }
+
+        // 정규화
+        if total_weight > 0.0 {
+            weighted_execute_confidence /= total_weight;
+            weighted_prepare_confidence /= total_weight;
+        }
+
+        // 합의 강도 (최강 투표 비중)
+        let max_votes = execution_votes.max(prepare_votes).max(monitor_votes) as f64;
+        let consensus_strength = if votes.len() > 0 {
+            max_votes / votes.len() as f64
+        } else {
+            0.0
+        };
+
+        let weighted_vote = WeightedVote {
+            votes: votes.clone(),
+            execution_votes,
+            prepare_votes,
+            monitor_votes,
+            weighted_execute_confidence,
+            weighted_prepare_confidence,
+            consensus_strength,
+        };
+
+        // 의사결정
+        let decision = if votes.len() < self.min_voting_nodes as usize {
+            VotingDecision::Monitor // 최소 투표 노드 미달
+        } else if weighted_execute_confidence >= self.execute_threshold {
+            VotingDecision::ExecuteAction
+        } else if weighted_prepare_confidence >= self.prepare_threshold {
+            VotingDecision::PrepareAction
+        } else if consensus_strength < 0.5 {
+            VotingDecision::Conflict // 심각한 불일치
+        } else {
+            VotingDecision::Monitor
+        };
+
+        (weighted_vote, decision)
+    }
+}
+
+// ============================================================================
+// CONFLICT RESOLUTION: 노드 간 의견 불일치 해결
+// ============================================================================
+
+pub enum ConflictType {
+    ExecuteVsPrepare,       // Execute 투표 vs Prepare 투표
+    HighVariance,           // 예측값 분산이 높음
+    TrustMismatch,          // 신뢰도와 의견이 불일치
+    DeadlockVoting,         // 동등 분할 투표
+}
+
+pub struct ConflictInfo {
+    conflict_type: ConflictType,
+    affected_nodes: u32,
+    severity: f64,          // 0-1, 높을수록 심각
+    recommended_resolution: String,
+}
+
+pub struct ConflictResolution {
+    tie_breaker_enabled: bool,
+    leader_trust_boost: f64, // 리더 신뢰도 보너스 (기본: 0.1)
+    escalation_factor: f64,  // 심각도 가중치 (기본: 1.5)
+}
+
+impl ConflictResolution {
+    pub fn new() -> Self {
+        ConflictResolution {
+            tie_breaker_enabled: true,
+            leader_trust_boost: 0.1,
+            escalation_factor: 1.5,
+        }
+    }
+
+    // 충돌 감지 및 해결
+    pub fn detect_and_resolve_conflicts(
+        &self,
+        aggregated: &AggregatedForecast,
+        weighted_vote: &WeightedVote,
+        leader_node_id: Option<u32>,
+    ) -> (Option<ConflictInfo>, VotingDecision) {
+        let total_votes = weighted_vote.execution_votes
+            + weighted_vote.prepare_votes
+            + weighted_vote.monitor_votes;
+
+        // 1. 충돌 유형 감지
+        let conflict_type = if (weighted_vote.execution_votes as f64 - weighted_vote.prepare_votes as f64).abs()
+            < total_votes as f64 * 0.1
+        {
+            Some(ConflictType::ExecuteVsPrepare)
+        } else if aggregated.prediction_variance > 0.15 {
+            Some(ConflictType::HighVariance)
+        } else if (aggregated.agreement_ratio - aggregated.consensus_confidence).abs() > 0.2 {
+            Some(ConflictType::TrustMismatch)
+        } else if weighted_vote.consensus_strength < 0.55 {
+            Some(ConflictType::DeadlockVoting)
+        } else {
+            None
+        };
+
+        match conflict_type {
+            Some(conflict) => {
+                // 심각도 계산
+                let severity = match conflict {
+                    ConflictType::ExecuteVsPrepare => 0.4,
+                    ConflictType::HighVariance => 0.6,
+                    ConflictType::TrustMismatch => 0.5,
+                    ConflictType::DeadlockVoting => 0.7,
+                };
+
+                let severity_scaled = severity * self.escalation_factor;
+
+                // 2. 해결 권장사항
+                let recommended = match conflict {
+                    ConflictType::ExecuteVsPrepare => {
+                        "리더 노드의 투표를 우선 반영하거나 준비 단계로 보수적 선택"
+                    }
+                    ConflictType::HighVariance => {
+                        "노드 간 데이터 동기화 수행 후 재투표"
+                    }
+                    ConflictType::TrustMismatch => {
+                        "저신뢰도 노드의 투표 가중치 재평가"
+                    }
+                    ConflictType::DeadlockVoting => {
+                        "모니터링 강화 및 추가 증거 수집"
+                    }
+                };
+
+                let conflict_info = ConflictInfo {
+                    conflict_type: conflict,
+                    affected_nodes: aggregated.forecasts.len() as u32,
+                    severity: severity_scaled.min(1.0),
+                    recommended_resolution: recommended.to_string(),
+                };
+
+                // 3. Tie-breaker (리더 존재 시)
+                let resolution_decision = if self.tie_breaker_enabled && leader_node_id.is_some() {
+                    // 리더의 투표 신뢰도에 보너스 적용
+                    VotingDecision::Monitor // 재평가 후 재투표
+                } else {
+                    VotingDecision::Monitor // 모니터링 모드로 전환
+                };
+
+                (Some(conflict_info), resolution_decision)
+            }
+            None => (None, VotingDecision::ExecuteAction), // 충돌 없음
+        }
+    }
+
+    // Tie-breaker: 리더 노드의 신뢰도를 임시로 상향 조정
+    pub fn apply_leader_tie_break(
+        &self,
+        leader_trust_score: f64,
+    ) -> f64 {
+        (leader_trust_score + self.leader_trust_boost).min(1.0)
+    }
+}
+
+// ============================================================================
+// DISTRIBUTED PREDICTION SYSTEM: 통합 분산 예측 시스템
+// ============================================================================
+
+pub struct DistributedPredictionSystem {
+    aggregating: AggregatedForecasting,
+    voting: WeightedVoting,
+    conflict_resolution: ConflictResolution,
+    last_decision: Option<VotingDecision>,
+    decision_history: Vec<(u64, String)>, // (timestamp, decision_type)
+}
+
+impl DistributedPredictionSystem {
+    pub fn new() -> Self {
+        DistributedPredictionSystem {
+            aggregating: AggregatedForecasting::new(),
+            voting: WeightedVoting::new(),
+            conflict_resolution: ConflictResolution::new(),
+            last_decision: None,
+            decision_history: vec![],
+        }
+    }
+
+    // 전체 분산 예측 파이프라인 실행
+    pub fn execute_distributed_prediction(
+        &mut self,
+        node_forecasts: &Vec<NodeForecast>,
+        votes: &Vec<Vote>,
+        node_trust_scores: &HashMap<u32, f64>,
+        leader_node_id: Option<u32>,
+        current_time: u64,
+    ) -> (AggregatedForecast, WeightedVote, Option<ConflictInfo>, VotingDecision) {
+        // 1. 예측 통합 (Aggregation)
+        let aggregated = self.aggregating.aggregate_forecasts(
+            node_forecasts,
+            current_time,
+            node_trust_scores,
+        );
+
+        // 2. 가중 투표 (Voting)
+        let (weighted_vote, initial_decision) =
+            self.voting.conduct_weighted_voting(votes, node_trust_scores);
+
+        // 3. 충돌 해결 (Conflict Resolution)
+        let (conflict_info, final_decision) =
+            self.conflict_resolution.detect_and_resolve_conflicts(
+                &aggregated,
+                &weighted_vote,
+                leader_node_id,
+            );
+
+        // 의사결정 이력 기록
+        let decision_str = match final_decision {
+            VotingDecision::ExecuteAction => "execute".to_string(),
+            VotingDecision::PrepareAction => "prepare".to_string(),
+            VotingDecision::Monitor => "monitor".to_string(),
+            VotingDecision::Conflict => "conflict".to_string(),
+        };
+
+        self.decision_history.push((current_time, decision_str));
+        self.last_decision = Some(final_decision);
+
+        (aggregated, weighted_vote, conflict_info, final_decision)
+    }
+
+    // 의사결정 히스토리 조회
+    pub fn get_decision_history(&self) -> &Vec<(u64, String)> {
+        &self.decision_history
+    }
+
+    // 마지막 의사결정 조회
+    pub fn get_last_decision(&self) -> Option<&VotingDecision> {
+        self.last_decision.as_ref()
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: AggregatedForecasting 기본 통합
+    #[test]
+    fn test_aggregated_forecasting_basic() {
+        let af = AggregatedForecasting::new();
+        let forecasts = vec![
+            NodeForecast {
+                node_id: 1,
+                pattern_type: "MemoryLeak".to_string(),
+                predicted_saturation: 0.75,
+                confidence: 0.9,
+                time_to_critical: 300,
+                freshness_score: 95.0,
+            },
+            NodeForecast {
+                node_id: 2,
+                pattern_type: "MemoryLeak".to_string(),
+                predicted_saturation: 0.78,
+                confidence: 0.85,
+                time_to_critical: 280,
+                freshness_score: 92.0,
+            },
+            NodeForecast {
+                node_id: 3,
+                pattern_type: "MemoryLeak".to_string(),
+                predicted_saturation: 0.72,
+                confidence: 0.88,
+                time_to_critical: 320,
+                freshness_score: 90.0,
+            },
+        ];
+
+        let trust_scores = HashMap::new();
+        let result = af.aggregate_forecasts(&forecasts, 0, &trust_scores);
+
+        assert!(result.consensus_saturation > 0.7 && result.consensus_saturation < 0.8);
+        assert!(result.consensus_confidence > 0.85);
+        assert!(result.agreement_ratio > 0.85);
+        assert!(result.is_reliable);
+    }
+
+    // Test 2: AggregatedForecasting 신선도 점수
+    #[test]
+    fn test_freshness_score_calculation() {
+        let af = AggregatedForecasting::new();
+
+        // 최신 (0초 전)
+        assert!(af.calculate_freshness_score(0) > 99.0);
+
+        // 중간 (300초 전)
+        let mid_score = af.calculate_freshness_score(300);
+        assert!(mid_score > 40.0 && mid_score < 60.0);
+
+        // 오래됨 (1000초 전)
+        assert!(af.calculate_freshness_score(1000) < 10.0);
+    }
+
+    // Test 3: WeightedVoting 실행 의사결정
+    #[test]
+    fn test_weighted_voting_execute_decision() {
+        let wv = WeightedVoting::new();
+        let votes = vec![
+            Vote {
+                node_id: 1,
+                decision: "execute".to_string(),
+                confidence: 0.95,
+                reasoning: "High confidence".to_string(),
+            },
+            Vote {
+                node_id: 2,
+                decision: "execute".to_string(),
+                confidence: 0.9,
+                reasoning: "High confidence".to_string(),
+            },
+            Vote {
+                node_id: 3,
+                decision: "prepare".to_string(),
+                confidence: 0.75,
+                reasoning: "Medium confidence".to_string(),
+            },
+        ];
+
+        let trust_scores = HashMap::new();
+        let (weighted, decision) = wv.conduct_weighted_voting(&votes, &trust_scores);
+
+        assert_eq!(weighted.execution_votes, 2);
+        assert_eq!(weighted.prepare_votes, 1);
+        assert!(weighted.consensus_strength > 0.6);
+        // VotingDecision은 match 패턴으로 확인
+    }
+
+    // Test 4: WeightedVoting 합의 강도
+    #[test]
+    fn test_weighted_voting_consensus_strength() {
+        let wv = WeightedVoting::new();
+        let votes = vec![
+            Vote {
+                node_id: 1,
+                decision: "execute".to_string(),
+                confidence: 0.9,
+                reasoning: "".to_string(),
+            },
+            Vote {
+                node_id: 2,
+                decision: "execute".to_string(),
+                confidence: 0.9,
+                reasoning: "".to_string(),
+            },
+            Vote {
+                node_id: 3,
+                decision: "execute".to_string(),
+                confidence: 0.9,
+                reasoning: "".to_string(),
+            },
+            Vote {
+                node_id: 4,
+                decision: "prepare".to_string(),
+                confidence: 0.7,
+                reasoning: "".to_string(),
+            },
+        ];
+
+        let trust_scores = HashMap::new();
+        let (weighted, _) = wv.conduct_weighted_voting(&votes, &trust_scores);
+
+        // 3/4 = 0.75 합의 강도
+        assert!(weighted.consensus_strength > 0.7 && weighted.consensus_strength < 0.8);
+    }
+
+    // Test 5: ConflictResolution ExecuteVsPrepare 감지
+    #[test]
+    fn test_conflict_resolution_execute_vs_prepare() {
+        let cr = ConflictResolution::new();
+        let aggregated = AggregatedForecast {
+            consensus_saturation: 0.75,
+            consensus_confidence: 0.8,
+            forecasts: vec![],
+            agreement_ratio: 0.75,
+            prediction_variance: 0.05,
+            is_reliable: true,
+        };
+
+        let weighted = WeightedVote {
+            votes: vec![],
+            execution_votes: 2,
+            prepare_votes: 2,
+            monitor_votes: 0,
+            weighted_execute_confidence: 0.88,
+            weighted_prepare_confidence: 0.72,
+            consensus_strength: 0.5,
+        };
+
+        let (conflict, _) = cr.detect_and_resolve_conflicts(&aggregated, &weighted, None);
+
+        assert!(conflict.is_some());
+        if let Some(c) = conflict {
+            assert!(c.severity > 0.3);
+        }
+    }
+
+    // Test 6: ConflictResolution 고분산 감지
+    #[test]
+    fn test_conflict_resolution_high_variance() {
+        let cr = ConflictResolution::new();
+        let aggregated = AggregatedForecast {
+            consensus_saturation: 0.7,
+            consensus_confidence: 0.7,
+            forecasts: vec![],
+            agreement_ratio: 0.4, // 낮은 일치도
+            prediction_variance: 0.25, // 높은 분산
+            is_reliable: false,
+        };
+
+        let weighted = WeightedVote {
+            votes: vec![],
+            execution_votes: 1,
+            prepare_votes: 1,
+            monitor_votes: 2,
+            weighted_execute_confidence: 0.6,
+            weighted_prepare_confidence: 0.5,
+            consensus_strength: 0.5,
+        };
+
+        let (conflict, _) = cr.detect_and_resolve_conflicts(&aggregated, &weighted, None);
+
+        assert!(conflict.is_some());
+    }
+
+    // Test 7: DistributedPredictionSystem 전체 파이프라인
+    #[test]
+    fn test_distributed_prediction_full_pipeline() {
+        let mut dps = DistributedPredictionSystem::new();
+
+        let forecasts = vec![
+            NodeForecast {
+                node_id: 1,
+                pattern_type: "IOBottleneck".to_string(),
+                predicted_saturation: 0.8,
+                confidence: 0.92,
+                time_to_critical: 250,
+                freshness_score: 98.0,
+            },
+            NodeForecast {
+                node_id: 2,
+                pattern_type: "IOBottleneck".to_string(),
+                predicted_saturation: 0.82,
+                confidence: 0.89,
+                time_to_critical: 240,
+                freshness_score: 96.0,
+            },
+        ];
+
+        let votes = vec![
+            Vote {
+                node_id: 1,
+                decision: "execute".to_string(),
+                confidence: 0.92,
+                reasoning: "IO bottleneck critical".to_string(),
+            },
+            Vote {
+                node_id: 2,
+                decision: "execute".to_string(),
+                confidence: 0.89,
+                reasoning: "IO bottleneck critical".to_string(),
+            },
+            Vote {
+                node_id: 3,
+                decision: "prepare".to_string(),
+                confidence: 0.75,
+                reasoning: "Conservative approach".to_string(),
+            },
+        ];
+
+        let trust_scores = HashMap::new();
+
+        let (agg, weighted, conflict, decision) = dps.execute_distributed_prediction(
+            &forecasts,
+            &votes,
+            &trust_scores,
+            Some(1),
+            100,
+        );
+
+        assert!(agg.consensus_saturation > 0.75);
+        assert_eq!(weighted.execution_votes, 2);
+        assert!(dps.decision_history.len() > 0);
+    }
+
+    // Test 8: DistributedPredictionSystem 의사결정 이력
+    #[test]
+    fn test_decision_history_tracking() {
+        let mut dps = DistributedPredictionSystem::new();
+
+        let forecasts = vec![NodeForecast {
+            node_id: 1,
+            pattern_type: "MemoryLeak".to_string(),
+            predicted_saturation: 0.9,
+            confidence: 0.95,
+            time_to_critical: 100,
+            freshness_score: 100.0,
+        }];
+
+        let votes = vec![Vote {
+            node_id: 1,
+            decision: "execute".to_string(),
+            confidence: 0.95,
+            reasoning: "Critical memory leak".to_string(),
+        }];
+
+        let trust_scores = HashMap::new();
+
+        // 첫 번째 의사결정
+        dps.execute_distributed_prediction(
+            &forecasts,
+            &votes,
+            &trust_scores,
+            None,
+            100,
+        );
+
+        assert_eq!(dps.get_decision_history().len(), 1);
+        assert!(dps.get_last_decision().is_some());
+
+        // 두 번째 의사결정
+        dps.execute_distributed_prediction(
+            &forecasts,
+            &votes,
+            &trust_scores,
+            None,
+            200,
+        );
+
+        assert_eq!(dps.get_decision_history().len(), 2);
+    }
+}

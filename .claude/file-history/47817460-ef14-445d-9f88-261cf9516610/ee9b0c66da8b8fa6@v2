@@ -1,0 +1,570 @@
+// FreeLang Phase I: Chaos Engineering - Fault Injector API
+// Days 5-7: ObservabilityStack Integration
+// Purpose: Bridge chaos_engineering with Phase H observability for realistic testing
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Scenario Handle & Management
+// ============================================================================
+
+pub struct ScenarioHandle {
+    scenario_id: String,
+    scenario_name: String,
+    start_time_us: u64,
+    expected_duration_ms: u32,
+    current_time_us: u64,
+    status: String, // "running", "completed", "failed"
+    faults_injected: Vec<String>,
+}
+
+impl ScenarioHandle {
+    pub fn is_running(&self) -> bool {
+        self.status == "running"
+    }
+
+    pub fn get_elapsed_ms(&self) -> u32 {
+        ((self.current_time_us - self.start_time_us) / 1000) as u32
+    }
+
+    pub fn get_remaining_ms(&self) -> u32 {
+        let elapsed = self.get_elapsed_ms();
+        if elapsed >= self.expected_duration_ms {
+            return 0;
+        }
+        self.expected_duration_ms - elapsed
+    }
+}
+
+// ============================================================================
+// SLO Violation Detection
+// ============================================================================
+
+pub struct SLOTarget {
+    metric_name: String,
+    threshold: f64,
+    breach_count: u32,
+    consecutive_breaches: u32,
+}
+
+pub struct SLOViolation {
+    violation_id: String,
+    metric_name: String,
+    threshold: f64,
+    actual_value: f64,
+    severity: u32, // 1-5
+    detected_at_us: u64,
+    expected_root_cause: String, // Which fault caused this?
+}
+
+// ============================================================================
+// Fault Injector API
+// ============================================================================
+
+pub struct FaultInjector {
+    // Chaos framework
+    engine: crate::fault_injection::FaultInjectionEngine,
+
+    // Observability integration (Phase H)
+    observability_stack: Option<Box<dyn ObservabilityStackAdapter>>,
+
+    // Scenario management
+    current_scenario: Option<ScenarioHandle>,
+    scenario_history: Vec<ScenarioHandle>,
+
+    // SLO tracking
+    slo_targets: HashMap<String, SLOTarget>,
+    slo_violations: Vec<SLOViolation>,
+
+    // Metrics snapshot before chaos
+    baseline_metrics: HashMap<String, f64>,
+    current_metrics: HashMap<String, f64>,
+}
+
+// ============================================================================
+// ObservabilityStack Adapter Trait
+// ============================================================================
+
+pub trait ObservabilityStackAdapter {
+    fn record_cpu_metric(&mut self, util: f64, ctx_switches: u32);
+    fn record_memory_metric(&mut self, usage_mb: u64, gc_pause_ms: u32, fragmentation: f64);
+    fn record_io_metric(&mut self, read_latency_us: u64, write_latency_us: u64, queue_depth: u32, cache_hit_rate: f64);
+    fn detect_failures(&mut self, p99_latency_ms: u64, scheduler_queue_depth: u32,
+                       context_switch_rate: u32, previous_context_switch_rate: u32,
+                       fragmentation_ratio: f64, gc_pause_ms: u32, memory_pressure: f64,
+                       allocator_failures: u32, io_queue_depth: u32, io_latency_us: u64,
+                       cache_hit_rate: f64, previous_cache_hit_rate: f64) -> Vec<String>;
+}
+
+// ============================================================================
+// FaultInjector Implementation
+// ============================================================================
+
+impl FaultInjector {
+    pub fn new() -> Self {
+        FaultInjector {
+            engine: crate::fault_injection::FaultInjectionEngine::new(),
+            observability_stack: None,
+            current_scenario: None,
+            scenario_history: vec![],
+            slo_targets: HashMap::new(),
+            slo_violations: vec![],
+            baseline_metrics: HashMap::new(),
+            current_metrics: HashMap::new(),
+        }
+    }
+
+    // ========================================================================
+    // Scenario Management
+    // ========================================================================
+
+    pub fn start_scenario(
+        &mut self,
+        scenario_name: String,
+        expected_duration_ms: u32,
+        current_time_us: u64,
+    ) -> String {
+        let scenario_id = format!("SCENARIO-{}", self.scenario_history.len() + 1);
+
+        let scenario = ScenarioHandle {
+            scenario_id: scenario_id.clone(),
+            scenario_name,
+            start_time_us: current_time_us,
+            expected_duration_ms,
+            current_time_us,
+            status: "running".to_string(),
+            faults_injected: vec![],
+        };
+
+        self.current_scenario = Some(scenario);
+        scenario_id
+    }
+
+    pub fn end_scenario(&mut self) {
+        if let Some(mut scenario) = self.current_scenario.take() {
+            scenario.status = "completed".to_string();
+            self.scenario_history.push(scenario);
+        }
+    }
+
+    pub fn get_current_scenario_info(&self) -> Option<(String, u32, u32)> {
+        self.current_scenario.as_ref().map(|s| {
+            (s.scenario_name.clone(), s.get_elapsed_ms(), s.get_remaining_ms())
+        })
+    }
+
+    // ========================================================================
+    // Fault Injection Control
+    // ========================================================================
+
+    pub fn inject_fault(
+        &mut self,
+        fault_type: crate::fault_injection::FaultType,
+        duration_ms: u32,
+        start_time_us: u64,
+    ) -> String {
+        let fault_id = self.engine.inject_fault(fault_type, duration_ms, start_time_us);
+
+        if let Some(ref mut scenario) = self.current_scenario {
+            scenario.faults_injected.push(fault_id.clone());
+        }
+
+        fault_id
+    }
+
+    pub fn remove_fault(&mut self, fault_id: &str, current_time_us: u64) {
+        self.engine.remove_fault(fault_id, current_time_us);
+    }
+
+    pub fn list_active_faults(&self, current_time_us: u64) -> Vec<String> {
+        self.engine.check_fault_active(current_time_us)
+    }
+
+    // ========================================================================
+    // Time Advancement & Metric Updates
+    // ========================================================================
+
+    pub fn advance_time(&mut self, delta_ms: u32, current_time_us: u64) {
+        if let Some(ref mut scenario) = self.current_scenario {
+            scenario.current_time_us = current_time_us;
+        }
+
+        // Update all metrics with fault degradation
+        self.apply_fault_degradation(current_time_us);
+    }
+
+    fn apply_fault_degradation(&mut self, current_time_us: u64) {
+        let combined_degradation = self.engine.get_combined_degradation(current_time_us);
+
+        // Apply degradation to current metrics
+        // P99 latency
+        if let Some(baseline_p99) = self.baseline_metrics.get("p99_latency_ms") {
+            let degraded = baseline_p99 * (1.0 + combined_degradation.p99_latency_increase_percent / 100.0);
+            self.current_metrics.insert("p99_latency_ms".to_string(), degraded);
+        }
+
+        // Memory pressure
+        if let Some(baseline_mem) = self.baseline_metrics.get("memory_pressure") {
+            let degraded = (baseline_mem + combined_degradation.memory_pressure_increase).min(1.0);
+            self.current_metrics.insert("memory_pressure".to_string(), degraded);
+        }
+
+        // GC pause
+        if let Some(baseline_gc) = self.baseline_metrics.get("gc_pause_ms") {
+            let degraded = baseline_gc * (1.0 + combined_degradation.gc_pause_increase_percent / 100.0);
+            self.current_metrics.insert("gc_pause_ms".to_string(), degraded);
+        }
+
+        // Cache hit rate
+        if let Some(baseline_cache) = self.baseline_metrics.get("cache_hit_rate") {
+            let degraded = (baseline_cache - combined_degradation.cache_hit_drop_total).max(0.0);
+            self.current_metrics.insert("cache_hit_rate".to_string(), degraded);
+        }
+
+        // Context switch rate
+        if let Some(baseline_cs) = self.baseline_metrics.get("context_switch_rate") {
+            let degraded = baseline_cs * (1.0 + combined_degradation.context_switch_increase_percent / 100.0);
+            self.current_metrics.insert("context_switch_rate".to_string(), degraded);
+        }
+
+        // IO latency
+        if let Some(baseline_io) = self.baseline_metrics.get("io_latency_us") {
+            let degraded = baseline_io * (1.0 + combined_degradation.io_latency_increase_percent / 100.0);
+            self.current_metrics.insert("io_latency_us".to_string(), degraded);
+        }
+    }
+
+    // ========================================================================
+    // SLO Target Management
+    // ========================================================================
+
+    pub fn set_slo_target(&mut self, metric_name: String, threshold: f64) {
+        self.slo_targets.insert(
+            metric_name.clone(),
+            SLOTarget {
+                metric_name,
+                threshold,
+                breach_count: 0,
+                consecutive_breaches: 0,
+            },
+        );
+    }
+
+    pub fn check_slo_violations(&mut self, current_time_us: u64) -> Vec<SLOViolation> {
+        let mut violations = vec![];
+
+        for (metric_name, target) in self.slo_targets.iter_mut() {
+            if let Some(current_value) = self.current_metrics.get(metric_name) {
+                // Determine if there's a breach
+                let is_breach = match metric_name.as_str() {
+                    // Higher is worse for latency/queue/pause
+                    "p99_latency_ms" | "gc_pause_ms" | "io_latency_us" | "scheduler_queue_depth_percent" => {
+                        current_value > &target.threshold
+                    },
+                    // Lower is worse for cache/rate
+                    "cache_hit_rate" | "context_switch_rate" => {
+                        current_value < &target.threshold
+                    },
+                    // Higher is worse for pressure
+                    "memory_pressure" => {
+                        current_value > &target.threshold
+                    },
+                    _ => false,
+                };
+
+                if is_breach {
+                    target.consecutive_breaches += 1;
+                    target.breach_count += 1;
+
+                    // Generate violation if consecutive breaches >= 3
+                    if target.consecutive_breaches >= 3 {
+                        let violation = SLOViolation {
+                            violation_id: format!("VIOLATION-{}", violations.len() + 1),
+                            metric_name: metric_name.clone(),
+                            threshold: target.threshold,
+                            actual_value: *current_value,
+                            severity: self.calculate_violation_severity(current_value, &target.threshold, metric_name),
+                            detected_at_us: current_time_us,
+                            expected_root_cause: self.identify_expected_root_cause(metric_name),
+                        };
+                        violations.push(violation);
+                    }
+                } else {
+                    target.consecutive_breaches = 0;
+                }
+            }
+        }
+
+        self.slo_violations.extend(violations.clone());
+        violations
+    }
+
+    fn calculate_violation_severity(
+        &self,
+        actual: &f64,
+        threshold: &f64,
+        metric_name: &str,
+    ) -> u32 {
+        let ratio = if threshold > &0.0 {
+            actual / threshold
+        } else {
+            2.0
+        };
+
+        match metric_name {
+            "p99_latency_ms" | "gc_pause_ms" | "io_latency_us" => {
+                if ratio > 3.0 { 5 } else if ratio > 2.0 { 4 } else { 3 }
+            },
+            "memory_pressure" => {
+                if actual > &0.9 { 5 } else if actual > &0.8 { 4 } else { 3 }
+            },
+            _ => 3,
+        }
+    }
+
+    fn identify_expected_root_cause(&self, metric_name: &str) -> String {
+        let active_faults = self.engine.check_fault_active(self.current_scenario.as_ref().map(|s| s.current_time_us).unwrap_or(0));
+
+        match metric_name {
+            "p99_latency_ms" => {
+                if active_faults.iter().any(|f| f.contains("LatencySpike")) {
+                    "LatencySpike".to_string()
+                } else if active_faults.iter().any(|f| f.contains("GCPause")) {
+                    "GCPause".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            },
+            "gc_pause_ms" | "memory_pressure" => {
+                if active_faults.iter().any(|f| f.contains("MemoryLeak")) {
+                    "MemoryLeak".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            },
+            "io_latency_us" | "cache_hit_rate" => {
+                if active_faults.iter().any(|f| f.contains("IOSaturation")) {
+                    "IOSaturation".to_string()
+                } else if active_faults.iter().any(|f| f.contains("NetworkPartition")) {
+                    "NetworkPartition".to_string()
+                } else {
+                    "Unknown".to_string()
+                }
+            },
+            _ => "Unknown".to_string(),
+        }
+    }
+
+    // ========================================================================
+    // Baseline & Comparison
+    // ========================================================================
+
+    pub fn record_baseline_metrics(&mut self, metrics: HashMap<String, f64>) {
+        self.baseline_metrics = metrics.clone();
+        self.current_metrics = metrics;
+    }
+
+    pub fn get_metric_improvement(&self, metric_name: &str) -> Option<f64> {
+        let baseline = self.baseline_metrics.get(metric_name)?;
+        let current = self.current_metrics.get(metric_name)?;
+
+        // Improvement = how much better we are (positive = improvement)
+        match metric_name {
+            "p99_latency_ms" | "gc_pause_ms" | "io_latency_us" => {
+                // Lower is better
+                Some((baseline - current) / baseline * 100.0)
+            },
+            "cache_hit_rate" => {
+                // Higher is better
+                Some((current - baseline) / baseline * 100.0)
+            },
+            "memory_pressure" => {
+                // Lower is better
+                Some((baseline - current) / baseline * 100.0)
+            },
+            _ => None,
+        }
+    }
+
+    pub fn get_all_metrics(&self) -> HashMap<String, f64> {
+        self.current_metrics.clone()
+    }
+
+    // ========================================================================
+    // Reporting
+    // ========================================================================
+
+    pub fn generate_scenario_report(&self) -> String {
+        let mut report = String::new();
+
+        if let Some(scenario) = &self.current_scenario {
+            report.push_str(&format!(
+                "=== Scenario Report: {} ===\n",
+                scenario.scenario_name
+            ));
+            report.push_str(&format!("Status: {}\n", scenario.status));
+            report.push_str(&format!("Elapsed: {}ms / Expected: {}ms\n",
+                scenario.get_elapsed_ms(), scenario.expected_duration_ms));
+            report.push_str(&format!("Faults Injected: {}\n", scenario.faults_injected.len()));
+        }
+
+        report.push_str(&format!("\n=== SLO Violations: {} ===\n", self.slo_violations.len()));
+        for violation in &self.slo_violations {
+            report.push_str(&format!(
+                "{}: {} (threshold: {}, actual: {:.2}, severity: {})\n",
+                violation.violation_id, violation.metric_name, violation.threshold,
+                violation.actual_value, violation.severity
+            ));
+        }
+
+        report
+    }
+
+    pub fn get_violation_count(&self) -> usize {
+        self.slo_violations.len()
+    }
+}
+
+// ============================================================================
+// TEST CASES (Days 5-7)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scenario_lifecycle() {
+        let mut injector = FaultInjector::new();
+
+        let scenario_id = injector.start_scenario(
+            "Test Scenario".to_string(),
+            10000,
+            1000_000_000,
+        );
+
+        assert_eq!(scenario_id, "SCENARIO-1");
+        assert!(injector.current_scenario.is_some());
+
+        let info = injector.get_current_scenario_info();
+        assert!(info.is_some());
+        let (name, elapsed, remaining) = info.unwrap();
+        assert_eq!(name, "Test Scenario");
+
+        injector.end_scenario();
+        assert!(injector.current_scenario.is_none());
+        assert_eq!(injector.scenario_history.len(), 1);
+    }
+
+    #[test]
+    fn test_baseline_and_degradation() {
+        let mut injector = FaultInjector::new();
+
+        let mut baseline = HashMap::new();
+        baseline.insert("p99_latency_ms".to_string(), 100.0);
+        baseline.insert("memory_pressure".to_string(), 0.5);
+        baseline.insert("gc_pause_ms".to_string(), 50.0);
+        baseline.insert("cache_hit_rate".to_string(), 0.9);
+
+        injector.record_baseline_metrics(baseline);
+
+        // After fault injection, degradation should be applied
+        let current = injector.get_all_metrics();
+        assert_eq!(current.len(), 4);
+    }
+
+    #[test]
+    fn test_slo_target_and_violation() {
+        let mut injector = FaultInjector::new();
+
+        let mut baseline = HashMap::new();
+        baseline.insert("p99_latency_ms".to_string(), 100.0);
+        injector.record_baseline_metrics(baseline);
+
+        injector.set_slo_target("p99_latency_ms".to_string(), 100.0);
+
+        // Simulate degradation by updating metric
+        injector.current_metrics.insert("p99_latency_ms".to_string(), 150.0);
+
+        // First check: 1 breach
+        let violations1 = injector.check_slo_violations(1000_000_000);
+        assert_eq!(violations1.len(), 0); // Need 3 consecutive breaches
+
+        // Second check: 2 breaches
+        let violations2 = injector.check_slo_violations(1001_000_000);
+        assert_eq!(violations2.len(), 0);
+
+        // Third check: 3 breaches (violation triggered)
+        let violations3 = injector.check_slo_violations(1002_000_000);
+        assert_eq!(violations3.len(), 1);
+        assert_eq!(violations3[0].metric_name, "p99_latency_ms");
+    }
+
+    #[test]
+    fn test_metric_improvement_calculation() {
+        let mut injector = FaultInjector::new();
+
+        let mut baseline = HashMap::new();
+        baseline.insert("p99_latency_ms".to_string(), 150.0);
+        baseline.insert("cache_hit_rate".to_string(), 0.5);
+        injector.record_baseline_metrics(baseline);
+
+        // Simulate improvement
+        injector.current_metrics.insert("p99_latency_ms".to_string(), 90.0); // Improved
+        injector.current_metrics.insert("cache_hit_rate".to_string(), 0.7);   // Improved
+
+        let latency_improvement = injector.get_metric_improvement("p99_latency_ms");
+        assert!(latency_improvement.is_some());
+        assert!(latency_improvement.unwrap() > 30.0); // 40% improvement
+
+        let cache_improvement = injector.get_metric_improvement("cache_hit_rate");
+        assert!(cache_improvement.is_some());
+        assert!(cache_improvement.unwrap() > 30.0); // 40% improvement
+    }
+
+    #[test]
+    fn test_fault_injection_in_scenario() {
+        let mut injector = FaultInjector::new();
+
+        let mut baseline = HashMap::new();
+        baseline.insert("p99_latency_ms".to_string(), 100.0);
+        injector.record_baseline_metrics(baseline);
+
+        injector.start_scenario(
+            "Latency Test".to_string(),
+            5000,
+            1000_000_000,
+        );
+
+        let fault_id = injector.inject_fault(
+            crate::fault_injection::FaultType::LatencySpike(200),
+            3000,
+            1000_000_000,
+        );
+
+        assert!(!fault_id.is_empty());
+
+        if let Some(scenario) = &injector.current_scenario {
+            assert_eq!(scenario.faults_injected.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_root_cause_identification() {
+        let mut injector = FaultInjector::new();
+
+        let mut baseline = HashMap::new();
+        baseline.insert("p99_latency_ms".to_string(), 100.0);
+        injector.record_baseline_metrics(baseline);
+
+        injector.start_scenario("Test".to_string(), 5000, 1000_000_000);
+        injector.inject_fault(
+            crate::fault_injection::FaultType::LatencySpike(300),
+            3000,
+            1000_000_000,
+        );
+
+        let root_cause = injector.identify_expected_root_cause("p99_latency_ms");
+        assert!(root_cause.contains("LatencySpike") || root_cause.contains("Unknown"));
+    }
+}

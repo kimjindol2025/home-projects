@@ -1,0 +1,514 @@
+// FreeLang Phase H Week 2: Causality Graph Engine
+// Trace → Root Cause 자동 추론 (Design by Failure의 핵심)
+
+use std::collections::{HashMap, VecDeque};
+
+// ============================================================================
+// Event for Causality Analysis
+// ============================================================================
+
+pub struct CausalityEvent {
+    timestamp_us: u64,
+    event_type: String,               // "gc_pause", "scheduler_queue", "io_latency", "p99_spike"
+    value: f64,
+    impact_level: u32,                // 1-5 (얼마나 P99에 영향을 미쳤나)
+}
+
+// ============================================================================
+// Causality Link: 인과 관계
+// ============================================================================
+
+pub struct CausalityLink {
+    cause_event: String,              // Event type
+    effect_event: String,
+    temporal_gap_us: u64,             // Time between cause and effect
+    correlation_strength: f64,        // 0.0-1.0 (얼마나 강한 인과관계인가)
+    impact_proportion: f64,           // Effect의 몇 %가 이 원인 때문인가
+}
+
+// ============================================================================
+// Causality Graph: 완전한 원인 분석
+// ============================================================================
+
+pub struct CausalityGraph {
+    events: VecDeque<CausalityEvent>,
+    links: Vec<CausalityLink>,
+    window_size_us: u64,              // 60초 default
+    root_causes: Vec<(String, f64)>,  // (cause, confidence)
+}
+
+impl CausalityGraph {
+    pub fn new(window_size_us: u64) -> Self {
+        CausalityGraph {
+            events: VecDeque::new(),
+            links: vec![],
+            window_size_us,
+            root_causes: vec![],
+        }
+    }
+
+    // ========================================================================
+    // Phase 1: Event Collection (60초 윈도우)
+    // ========================================================================
+
+    pub fn add_event(&mut self, event_type: String, value: f64, impact_level: u32, current_time_us: u64) {
+        // 자동으로 impact_level 정확화 (정규화)
+        let normalized_impact = (impact_level as f64 / 5.0).min(1.0);
+
+        self.events.push_back(CausalityEvent {
+            timestamp_us: current_time_us,
+            event_type,
+            value,
+            impact_level: (normalized_impact * 5.0) as u32,
+        });
+
+        // 윈도우를 벗어난 이벤트 제거
+        let cutoff_time = current_time_us.saturating_sub(self.window_size_us);
+        while let Some(first_event) = self.events.front() {
+            if first_event.timestamp_us < cutoff_time {
+                self.events.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // ========================================================================
+    // Phase 2: Event Clustering (시간적으로 가까운 이벤트 그룹화)
+    // ========================================================================
+
+    fn cluster_events(&self) -> Vec<Vec<&CausalityEvent>> {
+        let mut clusters = vec![];
+        let mut current_cluster = vec![];
+        let clustering_window_us = 100_000; // 100ms 이내를 같은 클러스터로
+
+        let events_vec: Vec<&CausalityEvent> = self.events.iter().collect();
+
+        for event in events_vec {
+            if current_cluster.is_empty() {
+                current_cluster.push(event);
+            } else {
+                let last_event = current_cluster.last().unwrap();
+                if event.timestamp_us - last_event.timestamp_us < clustering_window_us {
+                    current_cluster.push(event);
+                } else {
+                    clusters.push(current_cluster.clone());
+                    current_cluster = vec![event];
+                }
+            }
+        }
+
+        if !current_cluster.is_empty() {
+            clusters.push(current_cluster);
+        }
+
+        clusters
+    }
+
+    // ========================================================================
+    // Phase 3: Causality Inference (원인 추론)
+    // ========================================================================
+
+    pub fn infer_causality(&mut self) {
+        self.links.clear();
+
+        let events_vec: Vec<&CausalityEvent> = self.events.iter().collect();
+
+        // 모든 가능한 이벤트 쌍 검사
+        for i in 0..events_vec.len() {
+            for j in (i + 1)..events_vec.len() {
+                let cause = events_vec[i];
+                let effect = events_vec[j];
+
+                // Temporal constraint: cause가 effect보다 먼저
+                if cause.timestamp_us >= effect.timestamp_us {
+                    continue;
+                }
+
+                let temporal_gap = effect.timestamp_us - cause.timestamp_us;
+
+                // Temporal plausibility: 너무 오래 떨어져 있으면 관계 없음
+                // (GC pause → P99는 보통 1초 이내)
+                if temporal_gap > 5_000_000 {
+                    continue; // 5초 이상 차이 = 관계 없음
+                }
+
+                // Correlation strength 계산
+                let correlation = self.calculate_correlation(cause, effect, temporal_gap);
+
+                if correlation > 0.4 {
+                    // 유의미한 인과관계 발견
+                    self.links.push(CausalityLink {
+                        cause_event: cause.event_type.clone(),
+                        effect_event: effect.event_type.clone(),
+                        temporal_gap_us: temporal_gap,
+                        correlation_strength: correlation,
+                        impact_proportion: self.calculate_impact_proportion(cause, effect),
+                    });
+                }
+            }
+        }
+
+        // Temporal gap 기준으로 정렬 (가장 가까운 것이 가장 강한 인과관계)
+        self.links.sort_by(|a, b| {
+            a.temporal_gap_us.cmp(&b.temporal_gap_us)
+        });
+    }
+
+    // ========================================================================
+    // Phase 3a: Correlation 계산
+    // ========================================================================
+
+    fn calculate_correlation(
+        &self,
+        cause: &CausalityEvent,
+        effect: &CausalityEvent,
+        temporal_gap_us: u64,
+    ) -> f64 {
+        // Cause와 effect의 "흐름이 자연스러운가?"를 판단
+
+        // Impact level이 높은 cause → effect가 높은 = 강한 관계
+        let impact_factor = (cause.impact_level as f64 / 5.0) * 0.4;
+
+        // Temporal proximity: 시간이 가까울수록 강함
+        let temporal_proximity = if temporal_gap_us < 100_000 {
+            1.0 - (temporal_gap_us as f64 / 100_000.0)
+        } else {
+            0.0
+        };
+        let temporal_factor = temporal_proximity * 0.4;
+
+        // Domain knowledge: 특정 이벤트 쌍은 더 강한 관계
+        let domain_factor = self.get_domain_correlation(&cause.event_type, &effect.event_type) * 0.2;
+
+        (impact_factor + temporal_factor + domain_factor).min(1.0)
+    }
+
+    // ========================================================================
+    // Phase 3b: Domain Knowledge (특정 이벤트 쌍의 자연스러운 관계)
+    // ========================================================================
+
+    fn get_domain_correlation(&self, cause_type: &str, effect_type: &str) -> f64 {
+        match (cause_type, effect_type) {
+            // GC → Scheduler → P99 chain
+            ("gc_pause", "scheduler_queue") => 0.9,
+            ("scheduler_queue", "p99_spike") => 0.85,
+            ("gc_pause", "p99_spike") => 0.7,
+
+            // Memory → GC → P99
+            ("memory_pressure", "gc_pause") => 0.8,
+            ("memory_pressure", "p99_spike") => 0.6,
+
+            // I/O → Queue → Latency
+            ("io_latency", "io_queue") => 0.85,
+            ("io_queue", "p99_spike") => 0.7,
+
+            // Default: weak correlation
+            _ => 0.3,
+        }
+    }
+
+    // ========================================================================
+    // Phase 3c: Impact Proportion (Effect의 몇 %가 이 Cause 때문인가?)
+    // ========================================================================
+
+    fn calculate_impact_proportion(&self, cause: &CausalityEvent, effect: &CausalityEvent) -> f64 {
+        // Effect의 심각도 중 얼마나 많은 부분이 이 cause 때문인가?
+
+        // Simple heuristic: cause의 impact level이 높을수록 영향도 큼
+        let cause_weight = (cause.impact_level as f64) / 5.0;
+
+        // effect의 값이 크면 더 많은 비중 가능
+        let effect_weight = (effect.value.max(0.0) / 100.0).min(1.0); // normalize to 0-1
+
+        (cause_weight * 0.6 + effect_weight * 0.4).min(1.0)
+    }
+
+    // ========================================================================
+    // Phase 4: Root Cause Identification (근본 원인 식별)
+    // ========================================================================
+
+    pub fn identify_root_causes(&mut self) {
+        self.root_causes.clear();
+
+        // Root cause = 인입 차수가 0인 이벤트 (아무것도 그것을 야기하지 않음)
+        let mut in_degree: HashMap<String, u32> = HashMap::new();
+
+        // 모든 이벤트 타입을 먼저 등록
+        for event in &self.events {
+            in_degree.entry(event.event_type.clone()).or_insert(0);
+        }
+
+        // in_degree 계산
+        for link in &self.links {
+            *in_degree.entry(link.effect_event.clone()).or_insert(0) += 1;
+        }
+
+        // Root cause 식별 (in_degree = 0)
+        for (event_type, degree) in in_degree.iter() {
+            if *degree == 0 {
+                // 이 이벤트 타입의 강도 계산
+                let events_of_type: Vec<&CausalityEvent> = self.events
+                    .iter()
+                    .filter(|e| &e.event_type == event_type)
+                    .collect();
+
+                if !events_of_type.is_empty() {
+                    // Impact와 Frequency로 confidence 계산
+                    let avg_impact = events_of_type.iter()
+                        .map(|e| e.impact_level as f64)
+                        .sum::<f64>() / events_of_type.len() as f64;
+
+                    let frequency_weight = (events_of_type.len() as f64 / 10.0).min(1.0);
+
+                    let confidence = (avg_impact / 5.0) * 0.6 + frequency_weight * 0.4;
+
+                    self.root_causes.push((event_type.clone(), confidence));
+                }
+            }
+        }
+
+        // Confidence 기준 정렬 (내림차순)
+        self.root_causes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    }
+
+    // ========================================================================
+    // Output: Root Causes with Explanation
+    // ========================================================================
+
+    pub fn get_root_cause_report(&self) -> String {
+        let mut report = String::new();
+
+        report.push_str("╔════════════════════════════════════════════╗\n");
+        report.push_str("║        Root Cause Analysis Report          ║\n");
+        report.push_str("╚════════════════════════════════════════════╝\n\n");
+
+        if self.root_causes.is_empty() {
+            report.push_str("No root causes identified\n");
+            return report;
+        }
+
+        // Primary cause
+        if let Some((primary_cause, confidence)) = self.root_causes.first() {
+            report.push_str(&format!("Primary Cause: {} (confidence: {:.2})\n", primary_cause, confidence));
+
+            // Causal chain 추적
+            if let Some(chain) = self.trace_causal_chain(primary_cause) {
+                report.push_str("  Causal Chain:\n");
+                for (i, link) in chain.iter().enumerate() {
+                    let indent = "    ".repeat(i + 1);
+                    report.push_str(&format!(
+                        "{}→ {} (gap: {}ms, strength: {:.2})\n",
+                        indent,
+                        link.effect_event,
+                        link.temporal_gap_us / 1000,
+                        link.correlation_strength
+                    ));
+                }
+            }
+        }
+
+        // Secondary causes
+        if self.root_causes.len() > 1 {
+            report.push_str("\nSecondary Causes:\n");
+            for (cause, confidence) in self.root_causes.iter().skip(1) {
+                report.push_str(&format!("  - {} (confidence: {:.2})\n", cause, confidence));
+            }
+        }
+
+        report
+    }
+
+    // ========================================================================
+    // Causal Chain Tracing (원인 → 결과 체인 추적)
+    // ========================================================================
+
+    fn trace_causal_chain(&self, start_event: &str) -> Option<Vec<CausalityLink>> {
+        let mut chain = vec![];
+        let mut current = start_event.to_string();
+
+        for _ in 0..10 { // Max depth 10 (무한 루프 방지)
+            let next_links: Vec<&CausalityLink> = self.links
+                .iter()
+                .filter(|link| link.cause_event == current)
+                .collect();
+
+            if next_links.is_empty() {
+                break;
+            }
+
+            // Strongest correlation 선택
+            if let Some(strongest) = next_links.iter().max_by(|a, b| {
+                a.correlation_strength.partial_cmp(&b.correlation_strength).unwrap()
+            }) {
+                chain.push((*strongest).clone());
+                current = strongest.effect_event.clone();
+            } else {
+                break;
+            }
+        }
+
+        if chain.is_empty() {
+            None
+        } else {
+            Some(chain)
+        }
+    }
+
+    // ========================================================================
+    // Statistics
+    // ========================================================================
+
+    pub fn get_event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn get_link_count(&self) -> usize {
+        self.links.len()
+    }
+
+    pub fn get_root_cause_count(&self) -> usize {
+        self.root_causes.len()
+    }
+}
+
+// Impl Clone for CausalityLink (test에서 필요)
+impl Clone for CausalityLink {
+    fn clone(&self) -> Self {
+        CausalityLink {
+            cause_event: self.cause_event.clone(),
+            effect_event: self.effect_event.clone(),
+            temporal_gap_us: self.temporal_gap_us,
+            correlation_strength: self.correlation_strength,
+            impact_proportion: self.impact_proportion,
+        }
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_collection() {
+        let mut graph = CausalityGraph::new(60_000_000); // 60초
+
+        graph.add_event("gc_pause".to_string(), 120.0, 5, 0);
+        graph.add_event("scheduler_queue".to_string(), 50.0, 4, 100_000);
+        graph.add_event("p99_spike".to_string(), 340.0, 5, 200_000);
+
+        assert_eq!(graph.get_event_count(), 3);
+    }
+
+    #[test]
+    fn test_causality_inference() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        // Natural causal chain: GC → Scheduler → P99
+        graph.add_event("gc_pause".to_string(), 120.0, 5, 0);
+        graph.add_event("scheduler_queue".to_string(), 50.0, 4, 10_000); // 10ms later
+        graph.add_event("p99_spike".to_string(), 340.0, 5, 100_000); // 100ms later
+
+        graph.infer_causality();
+
+        // Should find links
+        assert!(graph.get_link_count() >= 2);
+    }
+
+    #[test]
+    fn test_root_cause_identification() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        graph.add_event("gc_pause".to_string(), 120.0, 5, 0);
+        graph.add_event("scheduler_queue".to_string(), 50.0, 4, 10_000);
+        graph.add_event("p99_spike".to_string(), 340.0, 5, 100_000);
+
+        graph.infer_causality();
+        graph.identify_root_causes();
+
+        // GC pause should be root cause (nothing causes it)
+        assert!(graph.get_root_cause_count() >= 1);
+        assert_eq!(graph.root_causes[0].0, "gc_pause");
+    }
+
+    #[test]
+    fn test_confidence_scoring() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        // Add high-impact events
+        graph.add_event("gc_pause".to_string(), 120.0, 5, 0);
+        graph.add_event("p99_spike".to_string(), 340.0, 5, 10_000);
+
+        graph.infer_causality();
+        graph.identify_root_causes();
+
+        if let Some((_, confidence)) = graph.root_causes.first() {
+            assert!(*confidence > 0.5);
+        }
+    }
+
+    #[test]
+    fn test_causal_chain_tracing() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        graph.add_event("gc_pause".to_string(), 120.0, 5, 0);
+        graph.add_event("scheduler_queue".to_string(), 50.0, 4, 10_000);
+        graph.add_event("p99_spike".to_string(), 340.0, 5, 100_000);
+
+        graph.infer_causality();
+
+        let chain = graph.trace_causal_chain("gc_pause");
+        assert!(chain.is_some());
+
+        let c = chain.unwrap();
+        assert_eq!(c.len(), 2); // GC → Scheduler, Scheduler → P99
+    }
+
+    #[test]
+    fn test_temporal_constraint() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        // Events too far apart
+        graph.add_event("event_a".to_string(), 100.0, 5, 0);
+        graph.add_event("event_b".to_string(), 100.0, 5, 10_000_000); // 10초 차이
+
+        graph.infer_causality();
+
+        // Should not find link (too far apart)
+        assert_eq!(graph.get_link_count(), 0);
+    }
+
+    #[test]
+    fn test_no_reverse_causality() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        // Later event cannot cause earlier event
+        graph.add_event("event_a".to_string(), 100.0, 5, 100_000);
+        graph.add_event("event_b".to_string(), 100.0, 5, 0); // This is earlier
+
+        graph.infer_causality();
+
+        // Should not find link
+        assert_eq!(graph.get_link_count(), 0);
+    }
+
+    #[test]
+    fn test_report_generation() {
+        let mut graph = CausalityGraph::new(60_000_000);
+
+        graph.add_event("gc_pause".to_string(), 120.0, 5, 0);
+        graph.add_event("p99_spike".to_string(), 340.0, 5, 100_000);
+
+        graph.infer_causality();
+        graph.identify_root_causes();
+
+        let report = graph.get_root_cause_report();
+
+        assert!(report.contains("Root Cause Analysis"));
+        assert!(report.contains("gc_pause"));
+    }
+}

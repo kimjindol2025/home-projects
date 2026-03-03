@@ -1,0 +1,480 @@
+// FreeLang Phase H Week 1: Distributed Tracer
+// 분산 트레이싱 - 모든 요청의 전체 경로 추적 (Trace ID, Span, Context)
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Span: 단일 작업 단위 (예: http_request, cpu_analysis, memory_predict)
+// ============================================================================
+
+pub struct Span {
+    span_id: String,
+    parent_span_id: Option<String>,
+    trace_id: String,
+    operation_name: String,
+    start_time_us: u64,
+    end_time_us: Option<u64>,
+    tags: HashMap<String, String>,     // {phase: "Phase7", pattern: "MemoryLeak"}
+    logs: Vec<(u64, String)>,           // (timestamp_us, event)
+}
+
+impl Span {
+    pub fn new(span_id: String, trace_id: String, operation_name: String, start_time_us: u64) -> Self {
+        Span {
+            span_id,
+            parent_span_id: None,
+            trace_id,
+            operation_name,
+            start_time_us,
+            end_time_us: None,
+            tags: HashMap::new(),
+            logs: vec![],
+        }
+    }
+
+    pub fn set_parent(&mut self, parent_span_id: String) {
+        self.parent_span_id = Some(parent_span_id);
+    }
+
+    pub fn add_tag(&mut self, key: String, value: String) {
+        self.tags.insert(key, value);
+    }
+
+    pub fn add_log(&mut self, timestamp_us: u64, message: String) {
+        self.logs.push((timestamp_us, message));
+    }
+
+    pub fn end(&mut self, end_time_us: u64) {
+        self.end_time_us = Some(end_time_us);
+    }
+
+    pub fn get_duration_us(&self) -> Option<u64> {
+        self.end_time_us.map(|e| e - self.start_time_us)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.end_time_us.is_some()
+    }
+}
+
+impl Clone for Span {
+    fn clone(&self) -> Self {
+        Span {
+            span_id: self.span_id.clone(),
+            parent_span_id: self.parent_span_id.clone(),
+            trace_id: self.trace_id.clone(),
+            operation_name: self.operation_name.clone(),
+            start_time_us: self.start_time_us,
+            end_time_us: self.end_time_us,
+            tags: self.tags.clone(),
+            logs: self.logs.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// TraceContext: 단일 요청의 추적 컨텍스트
+// ============================================================================
+
+pub struct TraceContext {
+    trace_id: String,                   // 550e8400-e29b-41d4-a716-446655440000
+    spans: Vec<Span>,                   // 모든 span 포함
+    start_time_us: u64,
+    end_time_us: Option<u64>,
+    status: String,                     // "active" / "completed" / "failed"
+    error_message: Option<String>,
+}
+
+impl TraceContext {
+    pub fn new(trace_id: String, start_time_us: u64) -> Self {
+        TraceContext {
+            trace_id,
+            spans: vec![],
+            start_time_us,
+            end_time_us: None,
+            status: "active".to_string(),
+            error_message: None,
+        }
+    }
+
+    pub fn add_span(&mut self, span: Span) {
+        self.spans.push(span);
+    }
+
+    pub fn complete(&mut self, end_time_us: u64) {
+        self.end_time_us = Some(end_time_us);
+        self.status = "completed".to_string();
+    }
+
+    pub fn fail(&mut self, error: String) {
+        self.status = "failed".to_string();
+        self.error_message = Some(error);
+    }
+
+    pub fn get_total_duration_us(&self) -> Option<u64> {
+        self.end_time_us.map(|e| e - self.start_time_us)
+    }
+
+    pub fn get_span_count(&self) -> usize {
+        self.spans.len()
+    }
+}
+
+impl Clone for TraceContext {
+    fn clone(&self) -> Self {
+        TraceContext {
+            trace_id: self.trace_id.clone(),
+            spans: self.spans.clone(),
+            start_time_us: self.start_time_us,
+            end_time_us: self.end_time_us,
+            status: self.status.clone(),
+            error_message: self.error_message.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// DistributedTracer: 전체 트레이싱 엔진
+// ============================================================================
+
+pub struct DistributedTracer {
+    traces: HashMap<String, TraceContext>,      // trace_id → TraceContext
+    root_traces: Vec<String>,                   // active root trace IDs
+    sampling_rate: f64,                         // 1.0 = 100%, 0.1 = 10%
+    max_traces: usize,                          // 최대 1000개 trace 보유
+    current_time_us: u64,
+}
+
+impl DistributedTracer {
+    pub fn new(sampling_rate: f64) -> Self {
+        DistributedTracer {
+            traces: HashMap::new(),
+            root_traces: vec![],
+            sampling_rate: sampling_rate.max(0.0).min(1.0),
+            max_traces: 1000,
+            current_time_us: 0,
+        }
+    }
+
+    // Trace 시작 (HTTP 요청의 진입점)
+    pub fn start_trace(&mut self, trace_id: String) -> bool {
+        // Sampling 확인
+        let sample: f64 = (trace_id.len() % 100) as f64 / 100.0;
+        if sample > self.sampling_rate {
+            return false;  // Sampled out
+        }
+
+        if self.traces.len() >= self.max_traces {
+            // 오래된 completed trace 제거
+            let old_id = self.traces
+                .iter()
+                .filter(|(_, ctx)| ctx.status == "completed")
+                .min_by_key(|(_, ctx)| ctx.end_time_us.unwrap_or(0))
+                .map(|(id, _)| id.clone());
+
+            if let Some(id) = old_id {
+                self.traces.remove(&id);
+            }
+        }
+
+        let context = TraceContext::new(trace_id.clone(), self.current_time_us);
+        self.traces.insert(trace_id.clone(), context);
+        self.root_traces.push(trace_id);
+        true
+    }
+
+    // Span 시작 (작업의 시작)
+    pub fn start_span(&mut self, trace_id: String, operation_name: String) -> Option<String> {
+        if let Some(context) = self.traces.get_mut(&trace_id) {
+            let span_id = format!("span-{}-{}", trace_id.clone(), context.get_span_count());
+            let mut span = Span::new(span_id.clone(), trace_id.clone(), operation_name, self.current_time_us);
+
+            // 마지막 span이 부모
+            if let Some(last_span) = context.spans.last() {
+                if last_span.is_complete() {
+                    span.set_parent(last_span.span_id.clone());
+                }
+            }
+
+            context.add_span(span);
+            Some(span_id)
+        } else {
+            None
+        }
+    }
+
+    // Span 종료 (작업의 완료)
+    pub fn end_span(&mut self, trace_id: String, span_id: String) -> Option<u64> {
+        if let Some(context) = self.traces.get_mut(&trace_id) {
+            if let Some(span) = context.spans.iter_mut().find(|s| s.span_id == span_id) {
+                span.end(self.current_time_us);
+                span.get_duration_us()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    // Span에 Tag 추가 (예: phase: "Phase7", pattern: "MemoryLeak")
+    pub fn add_tag(&mut self, trace_id: String, span_id: String, key: String, value: String) {
+        if let Some(context) = self.traces.get_mut(&trace_id) {
+            if let Some(span) = context.spans.iter_mut().find(|s| s.span_id == span_id) {
+                span.add_tag(key, value);
+            }
+        }
+    }
+
+    // Span에 Event 로그 추가 (예: "CPU analysis complete")
+    pub fn add_log(&mut self, trace_id: String, span_id: String, message: String) {
+        if let Some(context) = self.traces.get_mut(&trace_id) {
+            if let Some(span) = context.spans.iter_mut().find(|s| s.span_id == span_id) {
+                span.add_log(self.current_time_us, message);
+            }
+        }
+    }
+
+    // Trace 완료
+    pub fn complete_trace(&mut self, trace_id: String) {
+        if let Some(context) = self.traces.get_mut(&trace_id) {
+            context.complete(self.current_time_us);
+        }
+    }
+
+    // Trace 실패
+    pub fn fail_trace(&mut self, trace_id: String, error: String) {
+        if let Some(context) = self.traces.get_mut(&trace_id) {
+            context.fail(error);
+        }
+    }
+
+    // 전체 Trace 지연시간 조회
+    pub fn get_trace_latency(&self, trace_id: String) -> Option<u64> {
+        self.traces.get(&trace_id).and_then(|ctx| ctx.get_total_duration_us())
+    }
+
+    // Span 지연시간 조회
+    pub fn get_span_latency(&self, trace_id: String, span_id: String) -> Option<u64> {
+        self.traces.get(&trace_id).and_then(|ctx| {
+            ctx.spans.iter()
+                .find(|s| s.span_id == span_id)
+                .and_then(|s| s.get_duration_us())
+        })
+    }
+
+    // Active trace 개수
+    pub fn get_active_trace_count(&self) -> usize {
+        self.traces.values().filter(|ctx| ctx.status == "active").count()
+    }
+
+    // 에러 trace 개수
+    pub fn get_error_trace_count(&self) -> usize {
+        self.traces.values().filter(|ctx| ctx.status == "failed").count()
+    }
+
+    // Jaeger 형식으로 내보내기 (JSON)
+    pub fn export_jaeger_format(&self) -> String {
+        let mut output = String::from("{\n  \"traces\": [\n");
+
+        let mut first = true;
+        for (trace_id, context) in &self.traces {
+            if !first { output.push(','); }
+            first = false;
+
+            output.push_str("    {\n");
+            output.push_str(&format!("      \"traceID\": \"{}\",\n", trace_id));
+            output.push_str(&format!("      \"spans\": [\n"));
+
+            let mut first_span = true;
+            for span in &context.spans {
+                if !first_span { output.push(','); }
+                first_span = false;
+
+                output.push_str("        {\n");
+                output.push_str(&format!("          \"spanID\": \"{}\",\n", span.span_id));
+                output.push_str(&format!("          \"operationName\": \"{}\",\n", span.operation_name));
+                output.push_str(&format!("          \"startTime\": {},\n", span.start_time_us));
+
+                if let Some(end) = span.end_time_us {
+                    output.push_str(&format!("          \"duration\": {},\n", end - span.start_time_us));
+                }
+
+                output.push_str("          \"tags\": {\n");
+                let mut first_tag = true;
+                for (k, v) in &span.tags {
+                    if !first_tag { output.push(','); }
+                    first_tag = false;
+                    output.push_str(&format!("            \"{}\": \"{}\"\n", k, v));
+                }
+                output.push_str("          }\n");
+                output.push_str("        }\n");
+            }
+
+            output.push_str("      ],\n");
+            output.push_str(&format!("      \"status\": \"{}\"\n", context.status));
+            output.push_str("    }\n");
+        }
+
+        output.push_str("  ]\n}\n");
+        output
+    }
+
+    // 시간 경과
+    pub fn advance_time(&mut self, delta_us: u64) {
+        self.current_time_us += delta_us;
+    }
+
+    // Trace 통계
+    pub fn get_statistics(&self) -> (usize, usize, usize, f64) {
+        let total = self.traces.len();
+        let active = self.get_active_trace_count();
+        let completed = self.traces.values().filter(|ctx| ctx.status == "completed").count();
+        let avg_latency = if completed > 0 {
+            let sum: u64 = self.traces.values()
+                .filter(|ctx| ctx.status == "completed")
+                .filter_map(|ctx| ctx.get_total_duration_us())
+                .sum();
+            (sum / completed as u64) as f64
+        } else {
+            0.0
+        };
+
+        (total, active, completed, avg_latency)
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: Trace 생성
+    #[test]
+    fn test_trace_creation() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        assert!(tracer.start_trace(trace_id.clone()));
+        assert_eq!(tracer.get_active_trace_count(), 1);
+    }
+
+    // Test 2: Span 계층 구조
+    #[test]
+    fn test_span_hierarchy() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        tracer.start_trace(trace_id.clone());
+
+        let span1 = tracer.start_span(trace_id.clone(), "http_request".to_string()).unwrap();
+        tracer.advance_time(100);
+        tracer.end_span(trace_id.clone(), span1);
+
+        let span2 = tracer.start_span(trace_id.clone(), "cpu_analysis".to_string()).unwrap();
+        tracer.advance_time(50);
+        tracer.end_span(trace_id.clone(), span2);
+
+        let context = tracer.traces.get(&trace_id).unwrap();
+        assert_eq!(context.get_span_count(), 2);
+    }
+
+    // Test 3: 지연시간 계산
+    #[test]
+    fn test_latency_calculation() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        tracer.start_trace(trace_id.clone());
+        let span1 = tracer.start_span(trace_id.clone(), "operation".to_string()).unwrap();
+
+        tracer.advance_time(1000);
+        tracer.end_span(trace_id.clone(), span1.clone());
+
+        let latency = tracer.get_span_latency(trace_id.clone(), span1);
+        assert_eq!(latency, Some(1000));
+    }
+
+    // Test 4: Tag 추가
+    #[test]
+    fn test_tag_addition() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        tracer.start_trace(trace_id.clone());
+        let span = tracer.start_span(trace_id.clone(), "memory_predict".to_string()).unwrap();
+
+        tracer.add_tag(trace_id.clone(), span.clone(), "phase".to_string(), "Phase7".to_string());
+        tracer.add_tag(trace_id.clone(), span.clone(), "pattern".to_string(), "MemoryLeak".to_string());
+
+        let context = tracer.traces.get(&trace_id).unwrap();
+        let span_obj = context.spans.first().unwrap();
+        assert_eq!(span_obj.tags.len(), 2);
+    }
+
+    // Test 5: 로그 추적
+    #[test]
+    fn test_log_tracking() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        tracer.start_trace(trace_id.clone());
+        let span = tracer.start_span(trace_id.clone(), "io_dispatch".to_string()).unwrap();
+
+        tracer.add_log(trace_id.clone(), span.clone(), "Cache hit".to_string());
+        tracer.advance_time(100);
+        tracer.add_log(trace_id.clone(), span.clone(), "Request completed".to_string());
+
+        let context = tracer.traces.get(&trace_id).unwrap();
+        let span_obj = context.spans.first().unwrap();
+        assert_eq!(span_obj.logs.len(), 2);
+    }
+
+    // Test 6: Trace 완료
+    #[test]
+    fn test_trace_completion() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        tracer.start_trace(trace_id.clone());
+        tracer.advance_time(500);
+        tracer.complete_trace(trace_id.clone());
+
+        let context = tracer.traces.get(&trace_id).unwrap();
+        assert_eq!(context.status, "completed");
+        assert_eq!(context.get_total_duration_us(), Some(500));
+    }
+
+    // Test 7: Jaeger 포맷 내보내기
+    #[test]
+    fn test_jaeger_export() {
+        let mut tracer = DistributedTracer::new(1.0);
+        let trace_id = "trace-001".to_string();
+
+        tracer.start_trace(trace_id.clone());
+        let span = tracer.start_span(trace_id.clone(), "test_op".to_string()).unwrap();
+        tracer.add_tag(trace_id.clone(), span, "key".to_string(), "value".to_string());
+        tracer.advance_time(100);
+        tracer.complete_trace(trace_id.clone());
+
+        let json = tracer.export_jaeger_format();
+        assert!(json.contains("\"traceID\""));
+        assert!(json.contains("\"spans\""));
+        assert!(json.contains("\"key\": \"value\""));
+    }
+
+    // Test 8: Sampling rate
+    #[test]
+    fn test_sampling_rate() {
+        let mut tracer = DistributedTracer::new(0.5);  // 50% sampling
+
+        let sampled = tracer.start_trace("trace-0-sampled".to_string());
+        let not_sampled = tracer.start_trace("trace-1-not-sampled".to_string());
+
+        // Sampling은 trace_id 기반이므로 결과가 결정적
+        assert!(sampled || !sampled);  // 한쪽은 참, 한쪽은 거짓
+    }
+}

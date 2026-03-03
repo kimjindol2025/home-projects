@@ -1,0 +1,380 @@
+// FreeLang Phase 7 Week 1 Days 1-2: CPU Resource Analyzer
+// CPU 메트릭 추적 및 병목 감지, 성능 분석
+
+use std::collections::HashMap;
+
+// ============================================================================
+// CPU Metrics: CPU 상태 추적
+// ============================================================================
+
+pub struct CPUMetrics {
+    node_id: u32,
+    timestamp: u64,
+    utilization: f64,              // 0.0-1.0 (사용률)
+    context_switches: u64,          // 초당 컨텍스트 스위치 수
+    runqueue_length: u32,           // 준비 큐의 스레드 개수
+    cache_misses: u64,              // L3 캐시 미스
+    l3_cache_hit_rate: f64,         // 0.0-1.0
+    thermal_level: f64,             // 0.0-1.0 (온도, 0=cold, 1=overheat)
+    frequency_mhz: u32,             // 현재 CPU 주파수
+}
+
+impl CPUMetrics {
+    pub fn new(node_id: u32, timestamp: u64) -> Self {
+        CPUMetrics {
+            node_id,
+            timestamp,
+            utilization: 0.0,
+            context_switches: 0,
+            runqueue_length: 0,
+            cache_misses: 0,
+            l3_cache_hit_rate: 0.9,
+            thermal_level: 0.3,
+            frequency_mhz: 3500,
+        }
+    }
+
+    pub fn with_values(
+        node_id: u32,
+        timestamp: u64,
+        util: f64,
+        ctx_sw: u64,
+        rq_len: u32,
+        cache_miss: u64,
+        thermal: f64,
+    ) -> Self {
+        let mut metrics = CPUMetrics::new(node_id, timestamp);
+        metrics.utilization = util.max(0.0).min(1.0);
+        metrics.context_switches = ctx_sw;
+        metrics.runqueue_length = rq_len;
+        metrics.cache_misses = cache_miss;
+        metrics.thermal_level = thermal.max(0.0).min(1.0);
+        metrics.l3_cache_hit_rate = 1.0 - (cache_miss as f64 / (cache_miss as f64 + 100.0));
+        metrics
+    }
+
+    pub fn is_saturated(&self) -> bool {
+        self.utilization >= 0.9 || self.thermal_level >= 0.85
+    }
+
+    pub fn cache_efficiency(&self) -> f64 {
+        self.l3_cache_hit_rate
+    }
+}
+
+// ============================================================================
+// CPU Resource Analyzer: CPU 리소스 분석
+// ============================================================================
+
+pub struct CPUResourceAnalyzer {
+    current_metrics: CPUMetrics,
+    history: Vec<(u64, CPUMetrics)>,
+    max_history: usize,                    // 최대 100개 보유
+    detected_bottleneck: Option<f64>,      // 마지막 병목 신뢰도
+    last_bottleneck_time: u64,
+}
+
+impl CPUResourceAnalyzer {
+    pub fn new() -> Self {
+        CPUResourceAnalyzer {
+            current_metrics: CPUMetrics::new(0, 0),
+            history: vec![],
+            max_history: 100,
+            detected_bottleneck: None,
+            last_bottleneck_time: 0,
+        }
+    }
+
+    // 현재 CPU 메트릭 업데이트
+    pub fn update_metrics(&mut self, metrics: CPUMetrics) {
+        self.current_metrics = metrics;
+
+        // 이력에 추가
+        self.history.push((self.current_metrics.timestamp, self.current_metrics.clone()));
+
+        // 최대 크기 유지
+        if self.history.len() > self.max_history {
+            self.history.remove(0);
+        }
+    }
+
+    // CPU 병목 감지 (신뢰도 0.0-1.0)
+    pub fn detect_cpu_bottleneck(&mut self) -> Option<f64> {
+        let mut confidence = 0.0;
+
+        // 1. 높은 CPU 사용률 (50%)
+        if self.current_metrics.utilization > 0.85 {
+            confidence += 0.35;
+        } else if self.current_metrics.utilization > 0.7 {
+            confidence += 0.2;
+        }
+
+        // 2. 높은 컨텍스트 스위칭 (오버헤드, 20%)
+        if self.current_metrics.context_switches > 100000 {
+            confidence += 0.15;
+        } else if self.current_metrics.context_switches > 50000 {
+            confidence += 0.08;
+        }
+
+        // 3. 긴 준비 큐 (10%)
+        if self.current_metrics.runqueue_length > 16 {
+            confidence += 0.08;
+        } else if self.current_metrics.runqueue_length > 8 {
+            confidence += 0.04;
+        }
+
+        // 4. 높은 온도 (10%)
+        if self.current_metrics.thermal_level > 0.85 {
+            confidence += 0.08;
+        } else if self.current_metrics.thermal_level > 0.75 {
+            confidence += 0.04;
+        }
+
+        // 5. 낮은 캐시 효율 (10%)
+        if self.current_metrics.l3_cache_hit_rate < 0.5 {
+            confidence += 0.08;
+        } else if self.current_metrics.l3_cache_hit_rate < 0.7 {
+            confidence += 0.04;
+        }
+
+        let final_confidence = confidence.min(1.0);
+
+        if final_confidence >= 0.5 {
+            self.detected_bottleneck = Some(final_confidence);
+            self.last_bottleneck_time = self.current_metrics.timestamp;
+            Some(final_confidence)
+        } else {
+            self.detected_bottleneck = None;
+            None
+        }
+    }
+
+    // 예측된 포화도 추이 (상승/안정/하강)
+    pub fn predict_saturation_trend(&self) -> String {
+        if self.history.len() < 2 {
+            return "Insufficient Data".to_string();
+        }
+
+        let recent = &self.history[self.history.len() - 1];
+        let previous = &self.history[self.history.len() - 2];
+
+        let current_sat = recent.1.utilization;
+        let prev_sat = previous.1.utilization;
+
+        let delta = current_sat - prev_sat;
+        let threshold = 0.05; // 5% 변화
+
+        if delta > threshold {
+            "Rising".to_string()
+        } else if delta < -threshold {
+            "Falling".to_string()
+        } else {
+            "Stable".to_string()
+        }
+    }
+
+    // 캐시 효율도 계산 (0.0-1.0)
+    pub fn get_cache_efficiency(&self) -> f64 {
+        self.current_metrics.l3_cache_hit_rate
+    }
+
+    // 필요한 CPU 코어 수 추정
+    pub fn estimate_needed_cores(&self, pattern_name: &str, base_cores: u32) -> u32 {
+        let mut needed = base_cores as f64;
+
+        // 패턴별 추가 코어 필요
+        match pattern_name {
+            "MemoryLeak" => needed *= 1.2,           // 20% 추가 (GC 부담)
+            "IOBottleneck" => needed *= 1.1,         // 10% 추가 (I/O 스레드)
+            "ThreadContention" => needed *= 1.5,     // 50% 추가 (동기화 오버헤드)
+            "CacheThreshing" => needed *= 1.3,       // 30% 추가 (캐시 복구)
+            "CombinedPressure" => needed *= 1.8,     // 80% 추가 (복합 부하)
+            _ => {}
+        }
+
+        // CPU 사용률에 따른 동적 조정
+        if self.current_metrics.utilization > 0.9 {
+            needed *= 1.2;  // 20% 추가
+        } else if self.current_metrics.utilization < 0.5 {
+            needed *= 0.8;  // 20% 감소
+        }
+
+        (needed as u32).max(1)
+    }
+
+    // 컨텍스트 스위칭 오버헤드 계산 (ns)
+    pub fn estimate_context_switch_overhead(&self) -> u32 {
+        // 기본값: 1 마이크로초 = 1000ns
+        let mut overhead = 1000u32;
+
+        // 높은 컨텍스트 스위칭 시 오버헤드 증가
+        if self.current_metrics.context_switches > 100000 {
+            overhead = 3000;  // 3 마이크로초
+        } else if self.current_metrics.context_switches > 50000 {
+            overhead = 2000;  // 2 마이크로초
+        }
+
+        overhead
+    }
+
+    // 히스토리 조회 (최근 N개)
+    pub fn get_recent_metrics(&self, count: usize) -> Vec<CPUMetrics> {
+        self.history
+            .iter()
+            .rev()
+            .take(count)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    // 평균 CPU 사용률 (최근 윈도우)
+    pub fn get_average_utilization(&self, window_size: usize) -> f64 {
+        if self.history.is_empty() {
+            return 0.0;
+        }
+
+        let recent = self.get_recent_metrics(window_size);
+        let sum: f64 = recent.iter().map(|m| m.utilization).sum();
+        sum / recent.len() as f64
+    }
+
+    // 최대 CPU 사용률
+    pub fn get_peak_utilization(&self) -> f64 {
+        self.history
+            .iter()
+            .map(|(_, m)| m.utilization)
+            .fold(0.0, f64::max)
+    }
+
+    // 병목 현황
+    pub fn get_bottleneck_status(&self) -> (bool, f64) {
+        let is_bottleneck = self.detected_bottleneck.is_some();
+        let confidence = self.detected_bottleneck.unwrap_or(0.0);
+        (is_bottleneck, confidence)
+    }
+}
+
+// ============================================================================
+// Clone trait for CPUMetrics
+// ============================================================================
+
+impl Clone for CPUMetrics {
+    fn clone(&self) -> Self {
+        CPUMetrics {
+            node_id: self.node_id,
+            timestamp: self.timestamp,
+            utilization: self.utilization,
+            context_switches: self.context_switches,
+            runqueue_length: self.runqueue_length,
+            cache_misses: self.cache_misses,
+            l3_cache_hit_rate: self.l3_cache_hit_rate,
+            thermal_level: self.thermal_level,
+            frequency_mhz: self.frequency_mhz,
+        }
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: CPU 메트릭 기본 생성 및 초기화
+    #[test]
+    fn test_cpu_metrics_creation() {
+        let metrics = CPUMetrics::new(0, 1000);
+        assert_eq!(metrics.node_id, 0);
+        assert_eq!(metrics.timestamp, 1000);
+        assert_eq!(metrics.utilization, 0.0);
+        assert_eq!(metrics.thermal_level, 0.3);
+    }
+
+    // Test 2: CPU 메트릭 포화도 판정
+    #[test]
+    fn test_cpu_saturation_detection() {
+        let saturated = CPUMetrics::with_values(0, 1000, 0.95, 0, 0, 0, 0.3);
+        assert!(saturated.is_saturated());
+
+        let normal = CPUMetrics::with_values(0, 1000, 0.7, 0, 0, 0, 0.3);
+        assert!(!normal.is_saturated());
+
+        let thermal = CPUMetrics::with_values(0, 1000, 0.5, 0, 0, 0, 0.9);
+        assert!(thermal.is_saturated());
+    }
+
+    // Test 3: CPU 병목 감지 (높은 사용률)
+    #[test]
+    fn test_bottleneck_detection_high_util() {
+        let mut analyzer = CPUResourceAnalyzer::new();
+        let metrics = CPUMetrics::with_values(0, 1000, 0.95, 10000, 4, 1000, 0.3);
+        analyzer.update_metrics(metrics);
+
+        let bottleneck = analyzer.detect_cpu_bottleneck();
+        assert!(bottleneck.is_some());
+        assert!(bottleneck.unwrap() > 0.3);
+    }
+
+    // Test 4: CPU 병목 감지 (높은 컨텍스트 스위칭)
+    #[test]
+    fn test_bottleneck_detection_high_context_switch() {
+        let mut analyzer = CPUResourceAnalyzer::new();
+        let metrics = CPUMetrics::with_values(0, 1000, 0.6, 150000, 20, 2000, 0.3);
+        analyzer.update_metrics(metrics);
+
+        let bottleneck = analyzer.detect_cpu_bottleneck();
+        assert!(bottleneck.is_some());
+        assert!(bottleneck.unwrap() > 0.25);
+    }
+
+    // Test 5: CPU 병목 감지 (정상 상태)
+    #[test]
+    fn test_bottleneck_no_detection_normal() {
+        let mut analyzer = CPUResourceAnalyzer::new();
+        let metrics = CPUMetrics::with_values(0, 1000, 0.5, 10000, 2, 500, 0.3);
+        analyzer.update_metrics(metrics);
+
+        let bottleneck = analyzer.detect_cpu_bottleneck();
+        assert!(bottleneck.is_none());
+    }
+
+    // Test 6: 포화도 추이 분석 (상승)
+    #[test]
+    fn test_saturation_trend_rising() {
+        let mut analyzer = CPUResourceAnalyzer::new();
+        analyzer.update_metrics(CPUMetrics::with_values(0, 1000, 0.5, 10000, 2, 500, 0.3));
+        analyzer.update_metrics(CPUMetrics::with_values(0, 2000, 0.65, 15000, 4, 800, 0.4));
+
+        let trend = analyzer.predict_saturation_trend();
+        assert_eq!(trend, "Rising");
+    }
+
+    // Test 7: 필요한 코어 수 추정
+    #[test]
+    fn test_estimate_needed_cores() {
+        let mut analyzer = CPUResourceAnalyzer::new();
+        let metrics = CPUMetrics::with_values(0, 1000, 0.7, 50000, 8, 1000, 0.3);
+        analyzer.update_metrics(metrics);
+
+        // 기본: 4코어
+        let cores_memory = analyzer.estimate_needed_cores("MemoryLeak", 4);
+        assert!(cores_memory > 4);  // 20% 증가
+
+        let cores_contention = analyzer.estimate_needed_cores("ThreadContention", 4);
+        assert!(cores_contention > cores_memory);  // 50% 증가
+    }
+
+    // Test 8: 캐시 효율도 계산
+    #[test]
+    fn test_cache_efficiency() {
+        let metrics = CPUMetrics::with_values(0, 1000, 0.5, 10000, 2, 500, 0.3);
+        let efficiency = metrics.cache_efficiency();
+        assert!(efficiency > 0.8 && efficiency <= 1.0);
+
+        let metrics_poor = CPUMetrics::with_values(0, 1000, 0.5, 10000, 2, 10000, 0.3);
+        let efficiency_poor = metrics_poor.cache_efficiency();
+        assert!(efficiency_poor < efficiency);
+    }
+}

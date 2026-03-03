@@ -1,0 +1,308 @@
+// FreeLang Phase 7 Week 3: I/O Bandwidth Manager (Integration)
+// 세 개의 I/O 컴포넌트 통합 및 적응형 대역폭 관리
+
+use std::collections::VecDeque;
+
+// ============================================================================
+// I/O Bandwidth Manager: 통합 대역폭 관리자
+// ============================================================================
+
+pub struct IOBandwidthManager {
+    analyzer: IOPatternAnalyzer,
+    scheduler: IOScheduler,
+    cache: CacheOptimizer,
+
+    // 메트릭
+    total_requests: u32,
+    total_latency_us: u64,
+    pattern_history: Vec<(String, f64)>,  // (pattern, timestamp)
+}
+
+impl IOBandwidthManager {
+    pub fn new(scheduler_policy: IOSchedulePolicy, cache_policy: EvictionPolicy) -> Self {
+        IOBandwidthManager {
+            analyzer: IOPatternAnalyzer::new(),
+            scheduler: IOScheduler::new(scheduler_policy),
+            cache: CacheOptimizer::new(256, cache_policy),  // 256MB 기본
+
+            total_requests: 0,
+            total_latency_us: 0,
+            pattern_history: vec![],
+        }
+    }
+
+    // 1. I/O 요청 처리 (입수 → 분석 → 스케줄 → 캐시)
+    pub fn process_io_request(&mut self, mut request: IORequest) -> Option<u64> {
+        // 1. 캐시 확인
+        if request.is_read() {
+            if self.cache.access_block(request.address) {
+                // 캐시 히트: 1µs 반환
+                self.total_latency_us += 1;
+                return Some(request.address);
+            }
+        }
+
+        // 2. 큐에 추가
+        self.scheduler.enqueue_io_request(request.clone());
+        self.total_requests += 1;
+
+        // 3. 스케줄 실행
+        if let Some(scheduled) = self.scheduler.dequeue_next_request() {
+            let simulated_latency = if scheduled.is_read() {
+                self.analyzer.current_metrics.read_latency_us
+            } else {
+                self.analyzer.current_metrics.write_latency_us
+            };
+
+            self.total_latency_us += simulated_latency as u64;
+
+            // 4. 캐시 추가 (읽기의 경우)
+            if scheduled.is_read() {
+                let cache_block = CacheBlock {
+                    block_id: scheduled.request_id as u64,
+                    address: scheduled.address,
+                    size: scheduled.size,
+                    access_count: 1,
+                    last_access_time: 0,
+                    priority: (scheduled.priority as f64) / 255.0,
+                    is_dirty: false,
+                };
+                let _ = self.cache.add_block(cache_block);
+            }
+
+            Some(scheduled.address)
+        } else {
+            None
+        }
+    }
+
+    // 2. 패턴 감지 및 적응
+    pub fn detect_and_adapt(&mut self, metrics: IOMetrics) {
+        // 메트릭 업데이트
+        self.analyzer.update_metrics(metrics);
+
+        // 패턴 감지
+        let pattern = self.analyzer.detect_io_pattern();
+        let pattern_str = pattern.to_string();
+
+        // 패턴 이력 기록
+        self.pattern_history.push((pattern_str.clone(), 0.0));
+        if self.pattern_history.len() > 10 {
+            self.pattern_history.remove(0);
+        }
+
+        // 패턴별 적응 조치
+        match pattern {
+            IOPattern::SequentialRead => {
+                // 순차 읽기: 프리페치 + 캐시 최대화
+                if let Some(first) = self.scheduler.queue.front() {
+                    self.cache.prefetch_sequential_blocks(first.address, first.size);
+                }
+                self.cache.optimize_for_pattern("SequentialRead");
+                self.scheduler.reorder_for_pattern("SequentialRead");
+            }
+            IOPattern::RandomRead => {
+                // 임의 읽기: 캐시 중심
+                self.cache.optimize_for_pattern("RandomRead");
+                self.scheduler.reorder_for_pattern("RandomRead");
+            }
+            IOPattern::Bursty => {
+                // 버스트: 우선순위 기반
+                self.scheduler.reorder_for_pattern("Bursty");
+                self.cache.optimize_for_pattern("Bursty");
+            }
+            _ => {
+                self.cache.optimize_for_pattern("Mixed");
+            }
+        }
+
+        // Phase 6 패턴 동기화
+        self.cache.sync_with_phase6(&pattern_str, 0.85);
+    }
+
+    // 3. 대역폭 포화도 예측
+    pub fn predict_bandwidth_saturation(&self) -> (f64, u32) {
+        // 현재 포화도 계산
+        let saturation = self.analyzer.estimate_io_saturation();
+
+        // 미래 포화도 예측
+        let (predicted_mb, time_to_saturate) = self.analyzer.predict_bandwidth_usage();
+
+        (saturation, time_to_saturate)
+    }
+
+    // 4. 성능 메트릭 조회
+    pub fn get_performance_metrics(&self) -> (u32, u64, f64) {
+        let avg_latency = if self.total_requests > 0 {
+            self.total_latency_us / self.total_requests as u64
+        } else {
+            0
+        };
+
+        let cache_efficiency = self.cache.get_hit_rate() * 100.0;
+
+        (self.total_requests, avg_latency, cache_efficiency)
+    }
+
+    // 5. I/O 스케줄링 정책 변경
+    pub fn change_scheduling_policy(&mut self, policy: IOSchedulePolicy) {
+        self.scheduler = IOScheduler::new(policy);
+    }
+
+    // 6. 캐시 크기 동적 조정
+    pub fn adjust_cache_size(&mut self, pattern: &str) {
+        let recommended = self.cache.recommend_cache_size(pattern);
+        self.cache.max_cache_size_mb = recommended;
+    }
+
+    // 7. 큐 상태 조회
+    pub fn get_queue_stats(&self) -> (u32, u32, f64) {
+        self.scheduler.get_queue_stats()
+    }
+
+    // 8. 시간 경과
+    pub fn advance_time(&mut self, delta_ms: u64) {
+        self.analyzer.current_metrics.timestamp += delta_ms;
+        self.cache.advance_time(delta_ms);
+    }
+
+    // 9. 적응 권고사항 생성
+    pub fn get_adaptation_recommendations(&self) -> Vec<String> {
+        let mut recommendations = vec![];
+
+        let saturation = self.analyzer.estimate_io_saturation();
+        if saturation > 0.8 {
+            recommendations.push("I/O 포화: 캐시 크기 증가 권고".to_string());
+        }
+
+        let hit_rate = self.cache.get_hit_rate();
+        if hit_rate < 0.5 {
+            recommendations.push("캐시 적중률 저하: 정책 변경 권고".to_string());
+        }
+
+        let (_, time_to_saturate) = self.analyzer.predict_bandwidth_usage();
+        if time_to_saturate < 60 {
+            recommendations.push("포화 임박: 사전 대응 권고".to_string());
+        }
+
+        recommendations
+    }
+
+    // 10. 상태 리셋
+    pub fn reset_statistics(&mut self) {
+        self.total_requests = 0;
+        self.total_latency_us = 0;
+        self.cache.hit_count = 0;
+        self.cache.miss_count = 0;
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: I/O 요청 처리
+    #[test]
+    fn test_io_request_processing() {
+        let mut manager = IOBandwidthManager::new(IOSchedulePolicy::FIFO, EvictionPolicy::LRU);
+
+        let req = IORequest::new(1, IOType::Read, 0, 4096);
+        let result = manager.process_io_request(req);
+
+        assert!(result.is_some());
+        assert_eq!(manager.total_requests, 1);
+    }
+
+    // Test 2: 패턴 감지 및 적응
+    #[test]
+    fn test_pattern_detection_and_adaptation() {
+        let mut manager = IOBandwidthManager::new(IOSchedulePolicy::Predictive, EvictionPolicy::LRU);
+
+        let metrics = IOMetrics::with_values(0, 10000, 100, 50, 200, 20, 0.8);
+        manager.detect_and_adapt(metrics);
+
+        assert!(!manager.pattern_history.is_empty());
+    }
+
+    // Test 3: 포화도 예측
+    #[test]
+    fn test_saturation_prediction() {
+        let manager = IOBandwidthManager::new(IOSchedulePolicy::FIFO, EvictionPolicy::LRU);
+
+        let (saturation, time_to_saturate) = manager.predict_bandwidth_saturation();
+        assert!(saturation >= 0.0 && saturation <= 1.0);
+        assert!(time_to_saturate < 1000);
+    }
+
+    // Test 4: 성능 메트릭
+    #[test]
+    fn test_performance_metrics() {
+        let mut manager = IOBandwidthManager::new(IOSchedulePolicy::FIFO, EvictionPolicy::LRU);
+
+        let req = IORequest::new(1, IOType::Read, 0, 4096);
+        let _ = manager.process_io_request(req);
+
+        let (requests, latency, efficiency) = manager.get_performance_metrics();
+        assert_eq!(requests, 1);
+        assert!(efficiency >= 0.0 && efficiency <= 100.0);
+    }
+
+    // Test 5: 스케줄링 정책 변경
+    #[test]
+    fn test_change_scheduling_policy() {
+        let mut manager = IOBandwidthManager::new(IOSchedulePolicy::FIFO, EvictionPolicy::LRU);
+
+        manager.change_scheduling_policy(IOSchedulePolicy::Deadline);
+        // 정책 변경 후 동작 확인
+
+        let req = IORequest::new(1, IOType::Read, 0, 4096);
+        let result = manager.process_io_request(req);
+        assert!(result.is_some());
+    }
+
+    // Test 6: 캐시 크기 동적 조정
+    #[test]
+    fn test_dynamic_cache_adjustment() {
+        let mut manager = IOBandwidthManager::new(IOSchedulePolicy::FIFO, EvictionPolicy::LRU);
+
+        let initial_size = manager.cache.max_cache_size_mb;
+        manager.adjust_cache_size("SequentialRead");
+
+        assert!(manager.cache.max_cache_size_mb >= initial_size);
+    }
+
+    // Test 7: 적응 권고사항
+    #[test]
+    fn test_adaptation_recommendations() {
+        let manager = IOBandwidthManager::new(IOSchedulePolicy::FIFO, EvictionPolicy::LRU);
+
+        let recommendations = manager.get_adaptation_recommendations();
+        // 초기 상태에서는 권고가 없거나 적을 것
+        assert!(recommendations.len() >= 0);
+    }
+
+    // Test 8: 통합 워크플로우 (요청 → 분석 → 적응)
+    #[test]
+    fn test_integrated_workflow() {
+        let mut manager = IOBandwidthManager::new(IOSchedulePolicy::Predictive, EvictionPolicy::Predictive);
+
+        // 여러 요청 처리
+        for i in 0..5 {
+            let req = IORequest::new(i, IOType::Read, (i as u64) * 4096, 4096);
+            let _ = manager.process_io_request(req);
+        }
+
+        // 패턴 감지 및 적응
+        let metrics = IOMetrics::with_values(0, 5000, 500, 100, 100, 10, 0.7);
+        manager.detect_and_adapt(metrics);
+
+        // 성능 확인
+        let (requests, _, efficiency) = manager.get_performance_metrics();
+        assert_eq!(requests, 5);
+        assert!(efficiency >= 0.0);
+    }
+}

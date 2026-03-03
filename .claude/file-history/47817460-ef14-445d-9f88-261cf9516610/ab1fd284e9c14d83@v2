@@ -1,0 +1,410 @@
+// FreeLang Phase 7 Week 2 Days 8-9: Memory Predictor
+// 메모리 사용 패턴 예측 및 누수 감지
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Memory Prediction: 메모리 사용 예측
+// ============================================================================
+
+pub struct MemoryPrediction {
+    current_usage_mb: u64,
+    predicted_peak_mb: u64,        // 앞으로 N초 내 최고 사용량
+    growth_rate_mb_per_sec: f64,
+    time_to_limit_sec: u32,        // 메모리 한계 도달 시간
+    confidence: f64,               // Phase 6 신뢰도 (0.0-1.0)
+    prediction_method: String,     // "Linear" / "Exponential" / "Pattern"
+}
+
+impl MemoryPrediction {
+    pub fn new(current_usage: u64, confidence: f64) -> Self {
+        MemoryPrediction {
+            current_usage_mb: current_usage,
+            predicted_peak_mb: current_usage,
+            growth_rate_mb_per_sec: 0.0,
+            time_to_limit_sec: 300,  // 기본 5분
+            confidence,
+            prediction_method: "Linear".to_string(),
+        }
+    }
+
+    pub fn is_critical(&self) -> bool {
+        // 메모리 부족 임계값: 1024MB 이내로 남음
+        self.predicted_peak_mb > self.current_usage_mb &&
+        (16384 - self.predicted_peak_mb) < 1024  // 16GB 시스템 가정
+    }
+
+    pub fn urgency_score(&self) -> f64 {
+        // 0.0: 안전, 1.0: 긴급
+        if self.time_to_limit_sec == 0 {
+            return 1.0;
+        }
+
+        let time_factor = 1.0 / (1.0 + (self.time_to_limit_sec as f64) / 60.0);
+        let confidence_factor = self.confidence;
+
+        (time_factor * confidence_factor).min(1.0)
+    }
+}
+
+impl Clone for MemoryPrediction {
+    fn clone(&self) -> Self {
+        MemoryPrediction {
+            current_usage_mb: self.current_usage_mb,
+            predicted_peak_mb: self.predicted_peak_mb,
+            growth_rate_mb_per_sec: self.growth_rate_mb_per_sec,
+            time_to_limit_sec: self.time_to_limit_sec,
+            confidence: self.confidence,
+            prediction_method: self.prediction_method.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Memory Metrics History: 메모리 사용 이력
+// ============================================================================
+
+pub struct MemoryMetric {
+    timestamp: u64,
+    usage_mb: u64,
+    fragmentation: f64,            // 0.0-1.0
+    page_faults: u64,
+    swap_usage_mb: u64,
+}
+
+impl Clone for MemoryMetric {
+    fn clone(&self) -> Self {
+        MemoryMetric {
+            timestamp: self.timestamp,
+            usage_mb: self.usage_mb,
+            fragmentation: self.fragmentation,
+            page_faults: self.page_faults,
+            swap_usage_mb: self.swap_usage_mb,
+        }
+    }
+}
+
+// ============================================================================
+// Memory Predictor: 메모리 예측 엔진
+// ============================================================================
+
+pub struct MemoryPredictor {
+    history: Vec<MemoryMetric>,
+    max_history: usize,            // 최대 100개 보유
+    phase6_predictions: Vec<(String, f64)>,  // (pattern, confidence)
+    detected_leak_rate: Option<f64>, // MB/sec
+}
+
+impl MemoryPredictor {
+    pub fn new() -> Self {
+        MemoryPredictor {
+            history: vec![],
+            max_history: 100,
+            phase6_predictions: vec![],
+            detected_leak_rate: None,
+        }
+    }
+
+    // 메모리 메트릭 업데이트
+    pub fn update_metric(&mut self, timestamp: u64, usage_mb: u64, fragmentation: f64) {
+        let metric = MemoryMetric {
+            timestamp,
+            usage_mb,
+            fragmentation,
+            page_faults: 0,
+            swap_usage_mb: 0,
+        };
+
+        self.history.push(metric);
+
+        if self.history.len() > self.max_history {
+            self.history.remove(0);
+        }
+
+        // 누수 감지 업데이트
+        self.update_leak_detection();
+    }
+
+    // 메모리 사용 예측
+    pub fn predict_memory_usage(&self, pattern: &str) -> MemoryPrediction {
+        if self.history.is_empty() {
+            return MemoryPrediction::new(0, 0.0);
+        }
+
+        let current = self.history.last().unwrap();
+        let mut prediction = MemoryPrediction::new(current.usage_mb, 0.75);
+
+        // 패턴별 예측
+        match pattern {
+            "MemoryLeak" => {
+                // 지속적 상승
+                if let Some(leak_rate) = self.detected_leak_rate {
+                    prediction.growth_rate_mb_per_sec = leak_rate;
+                    prediction.predicted_peak_mb = current.usage_mb + (leak_rate as u64 * 60); // 1분 후
+                    prediction.time_to_limit_sec = self.estimate_time_to_limit(leak_rate);
+                    prediction.confidence = 0.95;
+                    prediction.prediction_method = "Pattern".to_string();
+                }
+            }
+            "CacheThreshing" => {
+                // 급격한 등락
+                let growth = self.estimate_growth_rate();
+                prediction.growth_rate_mb_per_sec = growth * 2.0;  // 2배 가속
+                prediction.predicted_peak_mb = current.usage_mb + (growth as u64 * 30);
+                prediction.time_to_limit_sec = 300;
+                prediction.confidence = 0.80;
+                prediction.prediction_method = "Exponential".to_string();
+            }
+            _ => {
+                // 기본: 선형 예측
+                let growth = self.estimate_growth_rate();
+                prediction.growth_rate_mb_per_sec = growth;
+                prediction.predicted_peak_mb = current.usage_mb + (growth as u64 * 120);  // 2분 후
+                prediction.time_to_limit_sec = 600;
+                prediction.confidence = 0.70;
+                prediction.prediction_method = "Linear".to_string();
+            }
+        }
+
+        prediction
+    }
+
+    // 사전 할당 크기 추정
+    pub fn estimate_preallocation_size(&self, pattern: &str, safety_margin: f64) -> u64 {
+        let prediction = self.predict_memory_usage(pattern);
+        let needed = prediction.predicted_peak_mb;
+
+        // 안전 마진 적용 (기본: 10%)
+        let margin = (needed as f64 * safety_margin) as u64;
+        (needed + margin).min(16384)  // 16GB 최대
+    }
+
+    // 메모리 누수 패턴 감지
+    pub fn detect_memory_leak_pattern(&self) -> Option<(u64, f64)> {
+        if self.history.len() < 5 {
+            return None;
+        }
+
+        // 선형 회귀로 증가 추세 감지
+        let recent = &self.history[self.history.len().saturating_sub(5)..];
+        let mut prev_usage = recent[0].usage_mb as f64;
+        let mut total_growth = 0.0;
+
+        for metric in &recent[1..] {
+            let growth = metric.usage_mb as f64 - prev_usage;
+            total_growth += growth.max(0.0);  // 양수만 계산
+            prev_usage = metric.usage_mb as f64;
+        }
+
+        let avg_growth_per_sec = total_growth / (recent.len() as f64);
+
+        // 지속적 증가 (≥1MB/sec) = 누수
+        if avg_growth_per_sec >= 1.0 {
+            Some((avg_growth_per_sec as u64, avg_growth_per_sec / 100.0))  // confidence
+        } else {
+            None
+        }
+    }
+
+    // GC 긴급도 계산 (0.0-1.0)
+    pub fn calculate_gc_urgency(&self, pattern: &str) -> f64 {
+        let prediction = self.predict_memory_usage(pattern);
+
+        // 긴급도 = 1. 시간 압박 (30%) + 2. 성장률 (40%) + 3. 신뢰도 (30%)
+        let time_factor = (1.0 - (prediction.time_to_limit_sec as f64 / 600.0)).max(0.0) * 0.3;
+        let growth_factor = (prediction.growth_rate_mb_per_sec / 10.0).min(1.0) * 0.4;
+        let confidence_factor = prediction.confidence * 0.3;
+
+        (time_factor + growth_factor + confidence_factor).min(1.0)
+    }
+
+    // 메모리 조각화 추이
+    pub fn analyze_fragmentation_trend(&self) -> String {
+        if self.history.len() < 2 {
+            return "Insufficient Data".to_string();
+        }
+
+        let recent = self.history.last().unwrap().fragmentation;
+        let prev = self.history[self.history.len() - 2].fragmentation;
+
+        if recent > prev + 0.05 {
+            "Increasing".to_string()
+        } else if recent < prev - 0.05 {
+            "Decreasing".to_string()
+        } else {
+            "Stable".to_string()
+        }
+    }
+
+    // Phase 6 예측과 동기화
+    pub fn sync_with_phase6_prediction(&mut self, pattern: &str, confidence: f64) {
+        self.phase6_predictions.push((pattern.to_string(), confidence));
+
+        // 최대 10개만 보유
+        if self.phase6_predictions.len() > 10 {
+            self.phase6_predictions.remove(0);
+        }
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn estimate_growth_rate(&self) -> f64 {
+        if self.history.len() < 2 {
+            return 0.0;
+        }
+
+        let recent = self.history.last().unwrap();
+        let prev = &self.history[self.history.len() - 2];
+
+        let time_delta = (recent.timestamp - prev.timestamp).max(1) as f64;
+        let memory_delta = (recent.usage_mb as i64 - prev.usage_mb as i64) as f64;
+
+        memory_delta / time_delta  // MB/sec
+    }
+
+    fn update_leak_detection(&self) {
+        if let Some((rate, _)) = self.detect_memory_leak_pattern() {
+            // 누수 감지됨
+        }
+    }
+
+    fn estimate_time_to_limit(&self, leak_rate: f64) -> u32 {
+        let remaining_mb = (16384.0 - self.history.last().unwrap().usage_mb as f64).max(100.0);
+        let seconds = (remaining_mb / leak_rate.max(0.1)) as u32;
+
+        seconds.min(3600)  // 1시간 최대
+    }
+
+    // 최근 메트릭 조회
+    pub fn get_recent_metrics(&self, count: usize) -> Vec<MemoryMetric> {
+        self.history
+            .iter()
+            .rev()
+            .take(count)
+            .map(|m| m.clone())
+            .collect()
+    }
+
+    // 평균 메모리 사용량
+    pub fn get_average_usage(&self, window_size: usize) -> u64 {
+        if self.history.is_empty() {
+            return 0;
+        }
+
+        let recent = self.get_recent_metrics(window_size);
+        let sum: u64 = recent.iter().map(|m| m.usage_mb).sum();
+        sum / recent.len() as u64
+    }
+
+    // 최대 메모리 사용량
+    pub fn get_peak_usage(&self) -> u64 {
+        self.history
+            .iter()
+            .map(|m| m.usage_mb)
+            .fold(0, u64::max)
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: 메모리 예측 정확도
+    #[test]
+    fn test_memory_prediction_accuracy() {
+        let mut predictor = MemoryPredictor::new();
+
+        // 선형 증가 시뮬레이션
+        for i in 0..10 {
+            predictor.update_metric(i as u64 * 1000, 1000 + i as u64 * 100, 0.2);
+        }
+
+        let prediction = predictor.predict_memory_usage("MemoryLeak");
+        assert!(prediction.predicted_peak_mb > 1900);  // 1GB 이상
+        assert!(prediction.confidence > 0.5);
+    }
+
+    // Test 2: 사전 할당 크기 계산
+    #[test]
+    fn test_preallocation_sizing() {
+        let mut predictor = MemoryPredictor::new();
+        predictor.update_metric(0, 2000, 0.1);
+
+        let size = predictor.estimate_preallocation_size("MemoryLeak", 0.2);
+        assert!(size > 2000);  // 현재 사용량보다 큼
+    }
+
+    // Test 3: 메모리 누수 감지
+    #[test]
+    fn test_leak_detection_confidence() {
+        let mut predictor = MemoryPredictor::new();
+
+        // 급격한 증가
+        for i in 0..5 {
+            predictor.update_metric(i as u64 * 1000, 1000 + i as u64 * 50, 0.1);
+        }
+
+        let leak = predictor.detect_memory_leak_pattern();
+        assert!(leak.is_some());
+    }
+
+    // Test 4: 성장률 계산
+    #[test]
+    fn test_growth_rate_calculation() {
+        let mut predictor = MemoryPredictor::new();
+        predictor.update_metric(0, 1000, 0.0);
+        predictor.update_metric(1000, 1100, 0.05);  // 100MB/1sec = 100MB/sec
+
+        let prediction = predictor.predict_memory_usage("CacheThreshing");
+        assert!(prediction.growth_rate_mb_per_sec > 0.0);
+    }
+
+    // Test 5: GC 긴급도 점수
+    #[test]
+    fn test_gc_urgency_scoring() {
+        let mut predictor = MemoryPredictor::new();
+        predictor.update_metric(0, 15000, 0.5);  // 거의 꽉 찬 상태
+
+        let urgency = predictor.calculate_gc_urgency("MemoryLeak");
+        assert!(urgency > 0.3);  // 긴급한 상태
+    }
+
+    // Test 6: Phase 6 동기화
+    #[test]
+    fn test_prediction_with_phase6_input() {
+        let mut predictor = MemoryPredictor::new();
+        predictor.update_metric(0, 2000, 0.1);
+        predictor.sync_with_phase6_prediction("MemoryLeak", 0.95);
+
+        assert_eq!(predictor.phase6_predictions.len(), 1);
+    }
+
+    // Test 7: 메모리 조각화 예측
+    #[test]
+    fn test_memory_fragmentation_prediction() {
+        let mut predictor = MemoryPredictor::new();
+        predictor.update_metric(0, 2000, 0.2);
+        predictor.update_metric(1000, 2100, 0.35);  // 증가
+
+        let trend = predictor.analyze_fragmentation_trend();
+        assert_eq!(trend, "Increasing");
+    }
+
+    // Test 8: Peak 사용량 포캐스팅
+    #[test]
+    fn test_peak_usage_forecasting() {
+        let mut predictor = MemoryPredictor::new();
+        for i in 0..10 {
+            predictor.update_metric(i as u64 * 100, 1000 + i as u64 * 50, 0.1);
+        }
+
+        let peak = predictor.get_peak_usage();
+        assert_eq!(peak, 1450);  // 마지막 값
+    }
+}

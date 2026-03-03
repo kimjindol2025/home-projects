@@ -1,0 +1,410 @@
+// FreeLang Phase 7 Week 1 Days 3-4: Thread Affinity Manager
+// 스레드를 최적의 CPU 코어에 할당 (NUMA 인식, 캐시 친화성)
+
+use std::collections::HashMap;
+
+// ============================================================================
+// CPU Topology: CPU 구조 정보
+// ============================================================================
+
+pub struct CPUTopology {
+    total_cores: u32,
+    cores_per_socket: u32,          // NUMA socket당 코어 수
+    num_sockets: u32,
+    cache_levels: Vec<u32>,         // L1, L2, L3 (KB)
+    has_smt: bool,                  // Simultaneous Multi-Threading
+    threads_per_core: u32,          // SMT일 때 2, 아니면 1
+}
+
+impl CPUTopology {
+    pub fn new_x86_64_dual_socket() -> Self {
+        CPUTopology {
+            total_cores: 32,        // 16 + 16 (dual socket)
+            cores_per_socket: 16,
+            num_sockets: 2,
+            cache_levels: vec![32, 256, 8192],  // L1: 32KB, L2: 256KB, L3: 8MB
+            has_smt: true,
+            threads_per_core: 2,
+        }
+    }
+
+    pub fn get_socket_for_core(&self, core_id: u32) -> u32 {
+        core_id / self.cores_per_socket
+    }
+
+    pub fn get_cores_in_socket(&self, socket_id: u32) -> (u32, u32) {
+        let start = socket_id * self.cores_per_socket;
+        let end = start + self.cores_per_socket;
+        (start, end)
+    }
+}
+
+// ============================================================================
+// Thread Affinity: 스레드 친화성 정보
+// ============================================================================
+
+pub struct ThreadAffinity {
+    thread_id: u32,
+    preferred_cores: Vec<u32>,     // 선호하는 코어 목록 (우선순위 순)
+    current_core: Option<u32>,     // 현재 할당된 코어
+    cache_level: u8,               // L1(1), L2(2), L3(3)
+    migration_cost: u32,           // 마이그레이션 비용 (ns)
+    access_count: u32,             // 현재 코어에서의 접근 횟수
+    last_migration_time: u64,      // 마지막 마이그레이션 시간
+}
+
+impl ThreadAffinity {
+    pub fn new(thread_id: u32) -> Self {
+        ThreadAffinity {
+            thread_id,
+            preferred_cores: vec![],
+            current_core: None,
+            cache_level: 3,         // L3 기본
+            migration_cost: 1000,   // 1 마이크로초 기본
+            access_count: 0,
+            last_migration_time: 0,
+        }
+    }
+
+    pub fn is_cache_resident(&self, other_thread_id: u32, topology: &CPUTopology) -> bool {
+        // 같은 캐시 레벨에 있는지 확인
+        if let (Some(my_core), Some(other_core)) = (self.current_core, None) {
+            match self.cache_level {
+                1 => my_core == other_core,                         // L1: 같은 코어
+                2 => my_core / 2 == other_core / 2,                 // L2: 2개 코어 공유
+                3 => {
+                    // L3: 같은 socket
+                    topology.get_socket_for_core(my_core)
+                        == topology.get_socket_for_core(other_core)
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+}
+
+impl Clone for ThreadAffinity {
+    fn clone(&self) -> Self {
+        ThreadAffinity {
+            thread_id: self.thread_id,
+            preferred_cores: self.preferred_cores.clone(),
+            current_core: self.current_core,
+            cache_level: self.cache_level,
+            migration_cost: self.migration_cost,
+            access_count: self.access_count,
+            last_migration_time: self.last_migration_time,
+        }
+    }
+}
+
+// ============================================================================
+// Thread Affinity Manager: 스레드 친화성 관리
+// ============================================================================
+
+pub struct ThreadAffinityManager {
+    affinities: HashMap<u32, ThreadAffinity>,
+    topology: CPUTopology,
+    rebalance_threshold: f64,       // 재배치 임계값 (0.0-1.0)
+    core_utilization: Vec<f64>,     // 각 코어의 사용률
+}
+
+impl ThreadAffinityManager {
+    pub fn new(topology: CPUTopology) -> Self {
+        let num_cores = topology.total_cores as usize;
+        ThreadAffinityManager {
+            affinities: HashMap::new(),
+            topology,
+            rebalance_threshold: 0.75,
+            core_utilization: vec![0.0; num_cores],
+        }
+    }
+
+    // 스레드 친화성 최적화 (패턴 기반)
+    pub fn optimize_affinity(&mut self, thread_id: u32, pattern: &str) -> bool {
+        let mut affinity = ThreadAffinity::new(thread_id);
+
+        match pattern {
+            "MemoryLeak" => {
+                // GC 스레드: 적극적 캐시 활용
+                affinity.cache_level = 3;      // L3 공유
+                affinity.preferred_cores = self.select_low_util_cores(4);
+            }
+            "IOBottleneck" => {
+                // I/O 스레드: 캐시보다 응답성
+                affinity.cache_level = 2;      // L2
+                affinity.preferred_cores = self.select_responsive_cores(2);
+            }
+            "ThreadContention" => {
+                // 동기화 부담 많음: 분산
+                affinity.cache_level = 1;      // L1 격리
+                affinity.preferred_cores = self.spread_across_sockets(8);
+            }
+            _ => {
+                // 기본: L3 캐시 친화
+                affinity.cache_level = 3;
+                affinity.preferred_cores = self.select_low_util_cores(2);
+            }
+        }
+
+        // 최적 코어 할당
+        if let Some(best_core) = affinity.preferred_cores.first() {
+            affinity.current_core = Some(*best_core);
+            self.affinities.insert(thread_id, affinity);
+            true
+        } else {
+            false
+        }
+    }
+
+    // 캐시 마이그레이션 문제 감지 (스레드 쌍)
+    pub fn detect_cache_migration_problem(&self) -> Option<(u32, u32)> {
+        let affinities: Vec<_> = self.affinities.values().collect();
+
+        for i in 0..affinities.len() {
+            for j in (i + 1)..affinities.len() {
+                let thread1 = affinities[i];
+                let thread2 = affinities[j];
+
+                // 같은 캐시 레벨인데 자주 마이그레이션하는지 확인
+                if let (Some(core1), Some(core2)) = (thread1.current_core, thread2.current_core) {
+                    let distance = (core1 as i32 - core2 as i32).abs() as u32;
+
+                    // 물리적으로 멀리 떨어져 있음 (마이그레이션 비용 높음)
+                    if distance > 8 && thread1.access_count > 1000 && thread2.access_count > 1000 {
+                        return Some((thread1.thread_id, thread2.thread_id));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    // 최적의 코어 할당 (스레드용)
+    pub fn get_optimal_core_assignment(&self, thread_id: u32) -> u32 {
+        if let Some(affinity) = self.affinities.get(&thread_id) {
+            // 선호하는 코어 중 가장 사용률이 낮은 것
+            affinity
+                .preferred_cores
+                .iter()
+                .min_by_key(|&&core| {
+                    (self.core_utilization[core as usize] * 1000.0) as u32
+                })
+                .copied()
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    // 마이그레이션 비용 계산 (ns)
+    pub fn measure_migration_cost(&self, from_core: u32, to_core: u32) -> u32 {
+        let socket_from = self.topology.get_socket_for_core(from_core);
+        let socket_to = self.topology.get_socket_for_core(to_core);
+
+        if socket_from == socket_to {
+            // 같은 socket: 1 마이크로초
+            1000u32
+        } else {
+            // 다른 socket: 10 마이크로초 (QPI/UPI)
+            10000u32
+        }
+    }
+
+    // 핫스팟 감지 (특정 코어에 스레드 몰림)
+    pub fn detect_hotspot(&self) -> Option<u32> {
+        let threshold = 0.5;
+        self.core_utilization
+            .iter()
+            .position(|&util| util > threshold)
+            .map(|idx| idx as u32)
+    }
+
+    // SMT 스레드 쌍 짓기
+    pub fn pair_smt_threads(&mut self, main_thread: u32, smt_thread: u32) -> bool {
+        if !self.topology.has_smt {
+            return false;
+        }
+
+        if let Some(main_affinity) = self.affinities.get(&main_thread) {
+            if let Some(main_core) = main_affinity.current_core {
+                // SMT 스레드를 같은 물리 코어에 할당
+                if let Some(smt_affinity) = self.affinities.get_mut(&smt_thread) {
+                    smt_affinity.current_core = Some(main_core);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    // Cross-socket 마이그레이션 최소화
+    pub fn minimize_cross_socket_migration(&mut self) {
+        for affinity in self.affinities.values_mut() {
+            if let Some(current_core) = affinity.current_core {
+                let current_socket = self.topology.get_socket_for_core(current_core);
+
+                // 선호 코어를 현재 socket 내에서 재선택
+                affinity.preferred_cores = affinity
+                    .preferred_cores
+                    .iter()
+                    .filter(|&&core| self.topology.get_socket_for_core(core) == current_socket)
+                    .copied()
+                    .collect();
+
+                // 같은 socket 내의 저사용률 코어로 변경
+                if let Some(best_core) = affinity.preferred_cores.first() {
+                    affinity.current_core = Some(*best_core);
+                }
+            }
+        }
+    }
+
+    // 코어 사용률 업데이트
+    pub fn update_core_utilization(&mut self, core_id: u32, utilization: f64) {
+        if (core_id as usize) < self.core_utilization.len() {
+            self.core_utilization[core_id as usize] = utilization.max(0.0).min(1.0);
+        }
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn select_low_util_cores(&self, count: u32) -> Vec<u32> {
+        let mut cores: Vec<_> = (0..self.topology.total_cores).collect();
+        cores.sort_by(|&a, &b| {
+            self.core_utilization[a as usize]
+                .partial_cmp(&self.core_utilization[b as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        cores.into_iter().take(count as usize).collect()
+    }
+
+    fn select_responsive_cores(&self, count: u32) -> Vec<u32> {
+        // 짧은 준비 큐를 가진 코어 선택
+        let mut cores: Vec<_> = (0..self.topology.total_cores).collect();
+        cores.sort_by(|&a, &b| {
+            self.core_utilization[a as usize]
+                .partial_cmp(&self.core_utilization[b as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        cores.into_iter().take(count as usize).collect()
+    }
+
+    fn spread_across_sockets(&self, count: u32) -> Vec<u32> {
+        // socket 간에 분산
+        let mut cores = vec![];
+        let per_socket = count / self.topology.num_sockets;
+
+        for socket_id in 0..self.topology.num_sockets {
+            let (start, end) = self.topology.get_cores_in_socket(socket_id);
+            for core in start..end.min(start + per_socket) {
+                cores.push(core);
+            }
+        }
+
+        cores
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: CPU Topology 생성
+    #[test]
+    fn test_cpu_topology_creation() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        assert_eq!(topo.total_cores, 32);
+        assert_eq!(topo.num_sockets, 2);
+        assert!(topo.has_smt);
+    }
+
+    // Test 2: Socket ID 계산
+    #[test]
+    fn test_get_socket_for_core() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        assert_eq!(topo.get_socket_for_core(0), 0);
+        assert_eq!(topo.get_socket_for_core(15), 0);
+        assert_eq!(topo.get_socket_for_core(16), 1);
+        assert_eq!(topo.get_socket_for_core(31), 1);
+    }
+
+    // Test 3: Thread Affinity 생성
+    #[test]
+    fn test_thread_affinity_creation() {
+        let affinity = ThreadAffinity::new(42);
+        assert_eq!(affinity.thread_id, 42);
+        assert_eq!(affinity.cache_level, 3);
+        assert!(affinity.current_core.is_none());
+    }
+
+    // Test 4: Thread Affinity Manager 생성
+    #[test]
+    fn test_affinity_manager_creation() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        let manager = ThreadAffinityManager::new(topo);
+        assert_eq!(manager.core_utilization.len(), 32);
+    }
+
+    // Test 5: Memory Leak 패턴 최적화
+    #[test]
+    fn test_optimize_affinity_memory_leak() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        let mut manager = ThreadAffinityManager::new(topo);
+
+        let success = manager.optimize_affinity(1, "MemoryLeak");
+        assert!(success);
+
+        let affinity = manager.affinities.get(&1).unwrap();
+        assert_eq!(affinity.cache_level, 3);  // L3
+        assert!(!affinity.preferred_cores.is_empty());
+    }
+
+    // Test 6: Thread Contention 패턴 최적화 (분산)
+    #[test]
+    fn test_optimize_affinity_thread_contention() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        let mut manager = ThreadAffinityManager::new(topo);
+
+        manager.optimize_affinity(1, "ThreadContention");
+        manager.optimize_affinity(2, "ThreadContention");
+
+        let aff1 = manager.affinities.get(&1).unwrap();
+        let aff2 = manager.affinities.get(&2).unwrap();
+
+        // 서로 다른 코어에 할당될 가능성 높음
+        assert!(aff1.preferred_cores.len() >= 1);
+        assert!(aff2.preferred_cores.len() >= 1);
+    }
+
+    // Test 7: 마이그레이션 비용 계산
+    #[test]
+    fn test_migration_cost_same_socket() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        let manager = ThreadAffinityManager::new(topo);
+
+        let cost = manager.measure_migration_cost(0, 8);  // 같은 socket
+        assert_eq!(cost, 1000);  // 1 마이크로초
+    }
+
+    // Test 8: Cross-socket 마이그레이션 비용
+    #[test]
+    fn test_migration_cost_cross_socket() {
+        let topo = CPUTopology::new_x86_64_dual_socket();
+        let manager = ThreadAffinityManager::new(topo);
+
+        let cost = manager.measure_migration_cost(0, 20);  // 다른 socket
+        assert_eq!(cost, 10000);  // 10 마이크로초
+    }
+}

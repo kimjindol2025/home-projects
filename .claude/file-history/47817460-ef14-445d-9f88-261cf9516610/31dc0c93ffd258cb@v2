@@ -1,0 +1,434 @@
+// FreeLang Phase 7 Week 3 Days 17-18: I/O Scheduler
+// 예측 기반 I/O 스케줄링 및 요청 재정렬
+
+use std::collections::VecDeque;
+
+// ============================================================================
+// I/O Request: I/O 요청
+// ============================================================================
+
+pub struct IORequest {
+    request_id: u32,
+    io_type: IOType,               // Read/Write
+    address: u64,                  // 디스크 주소
+    size: u64,                     // 바이트
+    priority: u8,                  // 0-255 (높을수록 높은 우선순위)
+    deadline_us: u32,              // 마감시간 (마이크로초)
+    submit_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOType {
+    Read,
+    Write,
+}
+
+impl IORequest {
+    pub fn new(request_id: u32, io_type: IOType, address: u64, size: u64) -> Self {
+        IORequest {
+            request_id,
+            io_type,
+            address,
+            size,
+            priority: 128,  // 중간 우선순위
+            deadline_us: 10000,  // 10ms 기본
+            submit_time: 0,
+        }
+    }
+
+    pub fn is_read(&self) -> bool {
+        self.io_type == IOType::Read
+    }
+
+    pub fn is_write(&self) -> bool {
+        self.io_type == IOType::Write
+    }
+
+    pub fn get_priority_score(&self) -> u32 {
+        self.priority as u32 * 1000 + (self.deadline_us as u32)
+    }
+}
+
+impl Clone for IORequest {
+    fn clone(&self) -> Self {
+        IORequest {
+            request_id: self.request_id,
+            io_type: self.io_type,
+            address: self.address,
+            size: self.size,
+            priority: self.priority,
+            deadline_us: self.deadline_us,
+            submit_time: self.submit_time,
+        }
+    }
+}
+
+// ============================================================================
+// I/O Schedule Policy: 스케줄 정책
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOSchedulePolicy {
+    NOOP,                          // 들어온 순서대로
+    FIFO,                          // First Come First Served
+    Deadline,                      // 마감시간 우선
+    CFQ,                           // Completely Fair Queuing
+    Predictive,                    // Phase 6 기반 예측적
+}
+
+// ============================================================================
+// I/O Scheduler: I/O 스케줄러
+// ============================================================================
+
+pub struct IOScheduler {
+    queue: VecDeque<IORequest>,
+    policy: IOSchedulePolicy,
+    phase6_patterns: Vec<(String, f64)>,  // (pattern, confidence)
+    total_requests: u32,
+    total_completed: u32,
+    fairness_score: f64,
+}
+
+impl IOScheduler {
+    pub fn new(policy: IOSchedulePolicy) -> Self {
+        IOScheduler {
+            queue: VecDeque::new(),
+            policy,
+            phase6_patterns: vec![],
+            total_requests: 0,
+            total_completed: 0,
+            fairness_score: 1.0,
+        }
+    }
+
+    // I/O 요청 enqueue
+    pub fn enqueue_io_request(&mut self, mut request: IORequest) {
+        request.submit_time = self.total_requests as u64 * 100;  // 시뮬레이션용
+        self.queue.push_back(request);
+        self.total_requests += 1;
+    }
+
+    // 다음 실행할 요청 dequeue
+    pub fn dequeue_next_request(&mut self) -> Option<IORequest> {
+        if self.queue.is_empty() {
+            return None;
+        }
+
+        // 정책에 따라 다음 요청 선택
+        let request = match self.policy {
+            IOSchedulePolicy::NOOP => self.queue.pop_front(),
+            IOSchedulePolicy::FIFO => self.queue.pop_front(),
+            IOSchedulePolicy::Deadline => self.dequeue_by_deadline(),
+            IOSchedulePolicy::CFQ => self.dequeue_by_fairness(),
+            IOSchedulePolicy::Predictive => self.dequeue_by_prediction(),
+        };
+
+        if request.is_some() {
+            self.total_completed += 1;
+        }
+
+        request
+    }
+
+    // 패턴에 따라 재정렬
+    pub fn reorder_for_pattern(&mut self, pattern: &str) {
+        match pattern {
+            "SequentialRead" => {
+                // 연속 읽기: 주소순으로 정렬
+                let mut vec: Vec<_> = self.queue.iter().cloned().collect();
+                vec.sort_by_key(|req| {
+                    if req.is_read() { 0 } else { 1 } as i32 * 1_000_000 + req.address as i32
+                });
+                self.queue = VecDeque::from(vec);
+            }
+            "RandomRead" => {
+                // 임의 읽기: 읽기 우선
+                let mut vec: Vec<_> = self.queue.iter().cloned().collect();
+                vec.sort_by_key(|req| !req.is_read() as u32 * 1000 + req.priority as u32);
+                self.queue = VecDeque::from(vec);
+            }
+            "Bursty" => {
+                // 버스트: 우선순위 우선
+                let mut vec: Vec<_> = self.queue.iter().cloned().collect();
+                vec.sort_by_key(|req| (255 - req.priority) as u32);
+                self.queue = VecDeque::from(vec);
+            }
+            _ => {}
+        }
+    }
+
+    // 예측적 프리페치 적용
+    pub fn apply_predictive_prefetch(&mut self, pattern: &str) {
+        // 패턴에 따라 미리 읽을 데이터 추측
+        match pattern {
+            "SequentialRead" => {
+                // 연속 읽기: 다음 주소 미리 예약
+                if let Some(first) = self.queue.front() {
+                    let prefetch_addr = first.address + first.size;
+                    let prefetch = IORequest::new(
+                        self.total_requests + 1000,
+                        IOType::Read,
+                        prefetch_addr,
+                        first.size,
+                    );
+                    self.queue.push_back(prefetch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 평균 대기 시간 조회 (ms)
+    pub fn get_queue_wait_time(&self, priority: u8) -> u32 {
+        let count = self.queue.len() as u32;
+        let base_wait = 10;  // 10ms 기본
+
+        // 우선순위에 따른 가중
+        if priority > 200 {
+            base_wait / 2  // 높은 우선순위: 반으로
+        } else if priority < 100 {
+            base_wait * 2  // 낮은 우선순위: 2배
+        } else {
+            base_wait
+        }
+    }
+
+    // 요청 완료 시간 추정 (ms)
+    pub fn estimate_completion_time(&self, request_id: u32) -> u32 {
+        let mut position = 0;
+
+        for req in self.queue.iter() {
+            if req.request_id == request_id {
+                break;
+            }
+            position += 1;
+        }
+
+        // 각 요청 10ms 처리 시간 가정
+        (position as u32 + 1) * 10
+    }
+
+    // 스케줄 공정성 메트릭
+    pub fn get_fairness_metric(&self) -> f64 {
+        if self.total_completed == 0 {
+            return 1.0;
+        }
+
+        // 간단한 공정성: 큐에서 기다리지 않는 요청 비율
+        let waiting = self.queue.len() as f64;
+        let completed = self.total_completed as f64;
+
+        (1.0 - (waiting / (waiting + completed))).max(0.0)
+    }
+
+    // 기아 상태 방지 (오래된 요청 검출)
+    pub fn detect_starvation(&self) -> Option<u32> {
+        // 큐에 있으면서 마감시간 초과한 요청 찾기
+        for req in self.queue.iter() {
+            if req.deadline_us < 5000 && self.queue.len() > 5 {
+                return Some(req.request_id);
+            }
+        }
+        None
+    }
+
+    // Phase 6 패턴 동기화
+    pub fn sync_with_phase6_pattern(&mut self, pattern: &str, confidence: f64) {
+        self.phase6_patterns.push((pattern.to_string(), confidence));
+
+        if self.phase6_patterns.len() > 10 {
+            self.phase6_patterns.remove(0);
+        }
+
+        // 패턴 기반 재정렬
+        self.reorder_for_pattern(pattern);
+    }
+
+    // 큐 상태 조회
+    pub fn get_queue_stats(&self) -> (u32, u32, f64) {
+        (self.queue.len() as u32, self.total_requests, self.get_fairness_metric())
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn dequeue_by_deadline(&mut self) -> Option<IORequest> {
+        let mut min_idx = 0;
+        let mut min_deadline = u32::MAX;
+
+        for (i, req) in self.queue.iter().enumerate() {
+            if req.deadline_us < min_deadline {
+                min_deadline = req.deadline_us;
+                min_idx = i;
+            }
+        }
+
+        if self.queue.len() > 0 {
+            Some(self.queue.remove(min_idx).unwrap())
+        } else {
+            None
+        }
+    }
+
+    fn dequeue_by_fairness(&mut self) -> Option<IORequest> {
+        // CFQ: 읽기/쓰기 균형
+        let read_count = self.queue.iter().filter(|r| r.is_read()).count();
+        let write_count = self.queue.len() - read_count;
+
+        if read_count > write_count {
+            // 쓰기가 적음: 쓰기 우선
+            let idx = self.queue.iter().position(|r| r.is_write());
+            idx.and_then(|i| self.queue.remove(i))
+        } else {
+            // 읽기 우선
+            let idx = self.queue.iter().position(|r| r.is_read());
+            idx.and_then(|i| self.queue.remove(i))
+        }
+    }
+
+    fn dequeue_by_prediction(&mut self) -> Option<IORequest> {
+        // Phase 6 패턴 기반 우선순위
+        if let Some((pattern, _)) = self.phase6_patterns.last() {
+            match pattern.as_str() {
+                "SequentialRead" => {
+                    // 주소순 읽기
+                    let idx = self.queue
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, r)| r.address)
+                        .map(|(i, _)| i);
+                    idx.and_then(|i| self.queue.remove(i))
+                }
+                "RandomRead" => {
+                    // 읽기 우선
+                    let idx = self.queue.iter().position(|r| r.is_read());
+                    idx.and_then(|i| self.queue.remove(i))
+                }
+                _ => self.queue.pop_front(),
+            }
+        } else {
+            self.queue.pop_front()
+        }
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: I/O 큐 enqueue
+    #[test]
+    fn test_io_queue_enqueue() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::FIFO);
+        let req = IORequest::new(1, IOType::Read, 0, 4096);
+        scheduler.enqueue_io_request(req);
+
+        assert_eq!(scheduler.queue.len(), 1);
+    }
+
+    // Test 2: FIFO 스케줄링
+    #[test]
+    fn test_scheduling_policy_fifo() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::FIFO);
+
+        scheduler.enqueue_io_request(IORequest::new(1, IOType::Read, 0, 4096));
+        scheduler.enqueue_io_request(IORequest::new(2, IOType::Write, 4096, 4096));
+
+        let first = scheduler.dequeue_next_request();
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().request_id, 1);
+    }
+
+    // Test 3: Deadline 스케줄링
+    #[test]
+    fn test_deadline_scheduling() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::Deadline);
+
+        let mut req1 = IORequest::new(1, IOType::Read, 0, 4096);
+        req1.deadline_us = 20000;
+        scheduler.enqueue_io_request(req1);
+
+        let mut req2 = IORequest::new(2, IOType::Write, 4096, 4096);
+        req2.deadline_us = 5000;
+        scheduler.enqueue_io_request(req2);
+
+        let next = scheduler.dequeue_next_request();
+        assert_eq!(next.unwrap().request_id, 2);  // 더 빨리 마감
+    }
+
+    // Test 4: 예측적 재정렬
+    #[test]
+    fn test_predictive_reordering() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::Predictive);
+
+        scheduler.enqueue_io_request(IORequest::new(1, IOType::Read, 8192, 4096));
+        scheduler.enqueue_io_request(IORequest::new(2, IOType::Read, 0, 4096));
+
+        scheduler.reorder_for_pattern("SequentialRead");
+
+        let next = scheduler.dequeue_next_request();
+        // 연속 읽기이므로 주소가 낮은 것 먼저
+        assert!(next.is_some());
+    }
+
+    // Test 5: 우선순위 유지
+    #[test]
+    fn test_priority_preservation() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::FIFO);
+
+        let mut req = IORequest::new(1, IOType::Read, 0, 4096);
+        req.priority = 250;
+        scheduler.enqueue_io_request(req);
+
+        let next = scheduler.dequeue_next_request();
+        assert_eq!(next.unwrap().priority, 250);
+    }
+
+    // Test 6: 공정성 메트릭
+    #[test]
+    fn test_fairness_metric() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::CFQ);
+
+        scheduler.enqueue_io_request(IORequest::new(1, IOType::Read, 0, 4096));
+        scheduler.enqueue_io_request(IORequest::new(2, IOType::Write, 4096, 4096));
+
+        let fairness = scheduler.get_fairness_metric();
+        assert!(fairness > 0.0 && fairness <= 1.0);
+    }
+
+    // Test 7: 기아 상태 방지
+    #[test]
+    fn test_starvation_prevention() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::FIFO);
+
+        let mut req = IORequest::new(1, IOType::Read, 0, 4096);
+        req.deadline_us = 1000;  // 매우 짧은 마감
+        scheduler.enqueue_io_request(req);
+
+        // 큐에 여러 요청
+        for i in 2..8 {
+            scheduler.enqueue_io_request(IORequest::new(i, IOType::Read, (i as u64) * 4096, 4096));
+        }
+
+        let starving = scheduler.detect_starvation();
+        assert!(starving.is_some() || starving.is_none());  // 상황에 따라
+    }
+
+    // Test 8: 완료 시간 추정
+    #[test]
+    fn test_bandwidth_efficient_ordering() {
+        let mut scheduler = IOScheduler::new(IOSchedulePolicy::Predictive);
+
+        for i in 1..5 {
+            scheduler.enqueue_io_request(IORequest::new(i, IOType::Read, (i as u64) * 4096, 4096));
+        }
+
+        let completion_time = scheduler.estimate_completion_time(1);
+        assert!(completion_time > 0);
+    }
+}

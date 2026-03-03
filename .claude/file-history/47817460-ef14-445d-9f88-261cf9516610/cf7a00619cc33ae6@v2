@@ -1,0 +1,473 @@
+// FreeLang Phase H Week 2: Failure Definitions
+// Design by Failure - 모든 대응이 실패 정의에서 시작됨
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Failure Class Definition
+// ============================================================================
+
+pub enum FailureClass {
+    LatencyExplosion,
+    MemoryCollapse,
+    IOBackpressure,
+}
+
+// ============================================================================
+// Failure Signal: 감지 기준
+// ============================================================================
+
+pub struct FailureSignal {
+    class: FailureClass,
+    severity: u32,                    // 1-5 (1=warning, 5=critical)
+    triggered_at_us: u64,
+    primary_metric: String,           // "p99_latency", "memory_pressure", "io_queue_depth"
+    primary_value: f64,
+    threshold_value: f64,
+    confidence: f64,                  // 0.0-1.0
+    evidence: Vec<String>,            // ["P99 > 100ms", "3 consecutive breaches", ...]
+}
+
+// ============================================================================
+// Failure Class A: Latency Explosion
+// ============================================================================
+
+pub struct LatencyExplosionDetector {
+    p99_threshold_ms: u64,           // SLO target
+    p99_breaches: u32,               // Count of consecutive breaches
+    breach_threshold_count: u32,     // Trigger at N consecutive breaches (default 3)
+
+    scheduler_queue_threshold: u32,  // Queue depth % (default 50)
+    context_switch_spike_factor: f64, // multiplier (default 2.0x normal)
+}
+
+impl LatencyExplosionDetector {
+    pub fn new() -> Self {
+        LatencyExplosionDetector {
+            p99_threshold_ms: 100,           // SLO
+            p99_breaches: 0,
+            breach_threshold_count: 3,
+            scheduler_queue_threshold: 50,
+            context_switch_spike_factor: 2.0,
+        }
+    }
+
+    // 주요 감지 로직
+    pub fn detect(
+        &mut self,
+        p99_latency_ms: u64,
+        scheduler_queue_depth_percent: u32,
+        context_switch_rate: u32,
+        previous_context_switch_rate: u32,
+    ) -> Option<FailureSignal> {
+        // 1. P99 위반 확인
+        if p99_latency_ms > self.p99_threshold_ms {
+            self.p99_breaches += 1;
+        } else {
+            self.p99_breaches = 0;  // 리셋
+        }
+
+        // 2. 연속 위반 (3회 이상) 확인
+        if self.p99_breaches >= self.breach_threshold_count {
+            let mut evidence = vec![
+                format!("P99 latency {}ms > target {}ms", p99_latency_ms, self.p99_threshold_ms),
+                format!("{} consecutive breaches", self.p99_breaches),
+            ];
+
+            // 3. 추가 신호 확인: Scheduler queue
+            if scheduler_queue_depth_percent > self.scheduler_queue_threshold {
+                evidence.push(format!("Scheduler queue depth {}%", scheduler_queue_depth_percent));
+            }
+
+            // 4. 추가 신호 확인: Context switch spike
+            let switch_ratio = if previous_context_switch_rate > 0 {
+                context_switch_rate as f64 / previous_context_switch_rate as f64
+            } else {
+                1.0
+            };
+
+            if switch_ratio > self.context_switch_spike_factor {
+                evidence.push(format!(
+                    "Context switch spike: {:.2}x normal",
+                    switch_ratio
+                ));
+            }
+
+            // 5. Confidence 계산 (얼마나 확신할 것인가)
+            let confidence = 0.5                    // Base: P99 breach
+                + 0.25 * (self.p99_breaches as f64 / 5.0)  // Consecutive breaches
+                + if scheduler_queue_depth_percent > self.scheduler_queue_threshold { 0.15 } else { 0.0 }
+                + if switch_ratio > self.context_switch_spike_factor { 0.1 } else { 0.0 };
+
+            return Some(FailureSignal {
+                class: FailureClass::LatencyExplosion,
+                severity: self.p99_breaches as u32,  // 1-5
+                triggered_at_us: 0,  // Will be set by detector
+                primary_metric: "p99_latency".to_string(),
+                primary_value: p99_latency_ms as f64,
+                threshold_value: self.p99_threshold_ms as f64,
+                confidence: confidence.min(1.0),
+                evidence,
+            });
+        }
+
+        None
+    }
+}
+
+// ============================================================================
+// Failure Class B: Memory Collapse
+// ============================================================================
+
+pub struct MemoryCollapseDetector {
+    fragmentation_threshold: f64,     // 0.7 (70%)
+    gc_pause_threshold_ms: u32,       // 100ms
+    memory_pressure_threshold: f64,   // 0.8 (80%)
+}
+
+impl MemoryCollapseDetector {
+    pub fn new() -> Self {
+        MemoryCollapseDetector {
+            fragmentation_threshold: 0.7,
+            gc_pause_threshold_ms: 100,
+            memory_pressure_threshold: 0.8,
+        }
+    }
+
+    pub fn detect(
+        &self,
+        fragmentation_ratio: f64,
+        gc_pause_ms: u32,
+        memory_pressure: f64,
+        allocator_failures: u32,
+    ) -> Option<FailureSignal> {
+        let mut evidence = vec![];
+        let mut score = 0.0;
+
+        // Signal 1: Fragmentation
+        if fragmentation_ratio > self.fragmentation_threshold {
+            evidence.push(format!(
+                "Allocator fragmentation {:.2} > threshold {:.2}",
+                fragmentation_ratio, self.fragmentation_threshold
+            ));
+            score += 0.3;
+        }
+
+        // Signal 2: GC pause
+        if gc_pause_ms > self.gc_pause_threshold_ms {
+            evidence.push(format!(
+                "GC pause {}ms > threshold {}ms",
+                gc_pause_ms, self.gc_pause_threshold_ms
+            ));
+            score += 0.3;
+        }
+
+        // Signal 3: Memory pressure
+        if memory_pressure > self.memory_pressure_threshold {
+            evidence.push(format!(
+                "Memory pressure {:.2} > threshold {:.2}",
+                memory_pressure, self.memory_pressure_threshold
+            ));
+            score += 0.25;
+        }
+
+        // Signal 4: Allocation failures
+        if allocator_failures > 0 {
+            evidence.push(format!(
+                "{} allocation failures detected",
+                allocator_failures
+            ));
+            score += 0.15;
+        }
+
+        if score > 0.5 {
+            return Some(FailureSignal {
+                class: FailureClass::MemoryCollapse,
+                severity: ((score * 5.0) as u32).min(5).max(1),
+                triggered_at_us: 0,
+                primary_metric: "memory_pressure".to_string(),
+                primary_value: memory_pressure,
+                threshold_value: self.memory_pressure_threshold,
+                confidence: score.min(1.0),
+                evidence,
+            });
+        }
+
+        None
+    }
+}
+
+// ============================================================================
+// Failure Class C: I/O Backpressure
+// ============================================================================
+
+pub struct IOBackpressureDetector {
+    queue_depth_threshold: u32,       // 64
+    syscall_latency_threshold_us: u64, // 1000µs
+    cache_hit_drop_threshold: f64,    // 20% drop
+}
+
+impl IOBackpressureDetector {
+    pub fn new() -> Self {
+        IOBackpressureDetector {
+            queue_depth_threshold: 64,
+            syscall_latency_threshold_us: 1000,
+            cache_hit_drop_threshold: 0.2,
+        }
+    }
+
+    pub fn detect(
+        &self,
+        queue_depth: u32,
+        io_latency_us: u64,
+        cache_hit_rate: f64,
+        previous_cache_hit_rate: f64,
+    ) -> Option<FailureSignal> {
+        let mut evidence = vec![];
+        let mut score = 0.0;
+
+        // Signal 1: Queue depth
+        if queue_depth > self.queue_depth_threshold {
+            evidence.push(format!(
+                "I/O queue depth {} > threshold {}",
+                queue_depth, self.queue_depth_threshold
+            ));
+            score += 0.4;
+        }
+
+        // Signal 2: Latency spike
+        if io_latency_us > self.syscall_latency_threshold_us {
+            evidence.push(format!(
+                "I/O syscall latency {}µs > threshold {}µs",
+                io_latency_us, self.syscall_latency_threshold_us
+            ));
+            score += 0.35;
+        }
+
+        // Signal 3: Cache hit drop
+        let cache_hit_drop = previous_cache_hit_rate - cache_hit_rate;
+        if cache_hit_drop > self.cache_hit_drop_threshold {
+            evidence.push(format!(
+                "Cache hit rate drop {:.2} ({:.2} → {:.2})",
+                cache_hit_drop, previous_cache_hit_rate, cache_hit_rate
+            ));
+            score += 0.25;
+        }
+
+        if score > 0.5 {
+            return Some(FailureSignal {
+                class: FailureClass::IOBackpressure,
+                severity: ((score * 5.0) as u32).min(5).max(1),
+                triggered_at_us: 0,
+                primary_metric: "io_queue_depth".to_string(),
+                primary_value: queue_depth as f64,
+                threshold_value: self.queue_depth_threshold as f64,
+                confidence: score.min(1.0),
+                evidence,
+            });
+        }
+
+        None
+    }
+}
+
+// ============================================================================
+// Unified Failure Detector
+// ============================================================================
+
+pub struct FailureDetector {
+    latency_detector: LatencyExplosionDetector,
+    memory_detector: MemoryCollapseDetector,
+    io_detector: IOBackpressureDetector,
+}
+
+impl FailureDetector {
+    pub fn new() -> Self {
+        FailureDetector {
+            latency_detector: LatencyExplosionDetector::new(),
+            memory_detector: MemoryCollapseDetector::new(),
+            io_detector: IOBackpressureDetector::new(),
+        }
+    }
+
+    pub fn detect_all(
+        &mut self,
+        // Latency signals
+        p99_latency_ms: u64,
+        scheduler_queue_depth: u32,
+        context_switch_rate: u32,
+        previous_context_switch_rate: u32,
+        // Memory signals
+        fragmentation_ratio: f64,
+        gc_pause_ms: u32,
+        memory_pressure: f64,
+        allocator_failures: u32,
+        // I/O signals
+        io_queue_depth: u32,
+        io_latency_us: u64,
+        cache_hit_rate: f64,
+        previous_cache_hit_rate: f64,
+    ) -> Vec<FailureSignal> {
+        let mut failures = vec![];
+
+        if let Some(signal) = self.latency_detector.detect(
+            p99_latency_ms,
+            scheduler_queue_depth,
+            context_switch_rate,
+            previous_context_switch_rate,
+        ) {
+            failures.push(signal);
+        }
+
+        if let Some(signal) = self.memory_detector.detect(
+            fragmentation_ratio,
+            gc_pause_ms,
+            memory_pressure,
+            allocator_failures,
+        ) {
+            failures.push(signal);
+        }
+
+        if let Some(signal) = self.io_detector.detect(
+            io_queue_depth,
+            io_latency_us,
+            cache_hit_rate,
+            previous_cache_hit_rate,
+        ) {
+            failures.push(signal);
+        }
+
+        failures
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_latency_explosion_detection() {
+        let mut detector = LatencyExplosionDetector::new();
+
+        // 3회 연속 P99 위반
+        for i in 0..3 {
+            let signal = detector.detect(150, 50, 1000, 500);
+            if i == 2 {
+                assert!(signal.is_some());
+                let s = signal.unwrap();
+                assert_eq!(s.p99_breaches >= 3, true);
+            }
+        }
+    }
+
+    #[test]
+    fn test_memory_collapse_detection() {
+        let detector = MemoryCollapseDetector::new();
+
+        let signal = detector.detect(0.8, 120, 0.85, 5);
+        assert!(signal.is_some());
+
+        let s = signal.unwrap();
+        assert!(s.confidence > 0.5);
+    }
+
+    #[test]
+    fn test_io_backpressure_detection() {
+        let detector = IOBackpressureDetector::new();
+
+        let signal = detector.detect(100, 2000, 0.5, 0.8);
+        assert!(signal.is_some());
+
+        let s = signal.unwrap();
+        assert!(s.confidence > 0.5);
+    }
+
+    #[test]
+    fn test_unified_detector() {
+        let mut detector = FailureDetector::new();
+
+        let failures = detector.detect_all(
+            150,    // p99
+            50,     // queue
+            1000,   // ctx switch
+            500,
+            0.8,    // fragmentation
+            120,    // gc pause
+            0.85,   // memory pressure
+            5,      // alloc failures
+            100,    // io queue
+            2000,   // io latency
+            0.5,    // cache hit
+            0.8,    // prev cache
+        );
+
+        assert!(failures.len() >= 2); // At least latency + memory
+    }
+
+    #[test]
+    fn test_no_false_positives() {
+        let mut detector = FailureDetector::new();
+
+        let failures = detector.detect_all(
+            45,     // p99 (normal)
+            30,     // queue (normal)
+            500,    // ctx switch (normal)
+            500,
+            0.3,    // fragmentation (normal)
+            20,     // gc pause (normal)
+            0.5,    // memory pressure (normal)
+            0,      // no alloc failures
+            10,     // io queue (normal)
+            100,    // io latency (normal)
+            0.9,    // cache hit (good)
+            0.9,    // prev cache
+        );
+
+        assert_eq!(failures.len(), 0); // No false positives
+    }
+
+    #[test]
+    fn test_confidence_scoring() {
+        let detector = MemoryCollapseDetector::new();
+
+        let signal_high = detector.detect(0.9, 150, 0.9, 10);
+        let signal_low = detector.detect(0.6, 80, 0.7, 0);
+
+        assert!(signal_high.is_some());
+        assert!(signal_low.is_none() || signal_low.unwrap().confidence < 0.5);
+    }
+
+    #[test]
+    fn test_severity_assignment() {
+        let mut detector = LatencyExplosionDetector::new();
+
+        for _ in 0..5 {
+            detector.detect(150, 50, 1000, 500);
+        }
+
+        if let Some(signal) = detector.detect(150, 50, 1000, 500) {
+            assert!(signal.severity >= 3); // Multiple consecutive breaches = higher severity
+        }
+    }
+
+    #[test]
+    fn test_recovery_resets_state() {
+        let mut detector = LatencyExplosionDetector::new();
+
+        // 2 breaches
+        detector.detect(150, 50, 1000, 500);
+        detector.detect(150, 50, 1000, 500);
+
+        // Recovery (P99 normal)
+        detector.detect(50, 30, 500, 500);
+        assert_eq!(detector.p99_breaches, 0); // Reset
+
+        // New breach starts fresh
+        let signal = detector.detect(150, 50, 1000, 500);
+        assert_eq!(signal.is_some(), false); // Still need 3 consecutive
+    }
+}

@@ -1,0 +1,429 @@
+// FreeLang Phase 7 Week 3 Days 15-16: I/O Pattern Analyzer
+// I/O 패턴 분석 및 대역폭 예측
+
+use std::collections::HashMap;
+
+// ============================================================================
+// I/O Metrics: I/O 성능 지표
+// ============================================================================
+
+pub struct IOMetrics {
+    timestamp: u64,
+    read_ops_per_sec: u64,
+    write_ops_per_sec: u64,
+    read_latency_us: u32,          // 마이크로초
+    write_latency_us: u32,
+    queue_depth: u32,              // 대기 중인 I/O 요청
+    disk_utilization: f64,         // 0.0-1.0
+    read_throughput_mb_per_sec: f64,
+    write_throughput_mb_per_sec: f64,
+}
+
+impl IOMetrics {
+    pub fn new(timestamp: u64) -> Self {
+        IOMetrics {
+            timestamp,
+            read_ops_per_sec: 0,
+            write_ops_per_sec: 0,
+            read_latency_us: 100,
+            write_latency_us: 100,
+            queue_depth: 0,
+            disk_utilization: 0.0,
+            read_throughput_mb_per_sec: 0.0,
+            write_throughput_mb_per_sec: 0.0,
+        }
+    }
+
+    pub fn with_values(
+        timestamp: u64,
+        read_ops: u64,
+        write_ops: u64,
+        read_lat: u32,
+        write_lat: u32,
+        queue: u32,
+        util: f64,
+    ) -> Self {
+        IOMetrics {
+            timestamp,
+            read_ops_per_sec: read_ops,
+            write_ops_per_sec: write_ops,
+            read_latency_us: read_lat,
+            write_latency_us: write_lat,
+            queue_depth: queue,
+            disk_utilization: util.max(0.0).min(1.0),
+            read_throughput_mb_per_sec: (read_ops as f64) * 4.0 / 1024.0,  // 가정: 4KB/op
+            write_throughput_mb_per_sec: (write_ops as f64) * 4.0 / 1024.0,
+        }
+    }
+
+    pub fn total_throughput_mb_per_sec(&self) -> f64 {
+        self.read_throughput_mb_per_sec + self.write_throughput_mb_per_sec
+    }
+
+    pub fn is_saturated(&self) -> bool {
+        self.disk_utilization >= 0.9 || self.queue_depth > 32
+    }
+}
+
+impl Clone for IOMetrics {
+    fn clone(&self) -> Self {
+        IOMetrics {
+            timestamp: self.timestamp,
+            read_ops_per_sec: self.read_ops_per_sec,
+            write_ops_per_sec: self.write_ops_per_sec,
+            read_latency_us: self.read_latency_us,
+            write_latency_us: self.write_latency_us,
+            queue_depth: self.queue_depth,
+            disk_utilization: self.disk_utilization,
+            read_throughput_mb_per_sec: self.read_throughput_mb_per_sec,
+            write_throughput_mb_per_sec: self.write_throughput_mb_per_sec,
+        }
+    }
+}
+
+// ============================================================================
+// I/O Pattern Type: I/O 패턴 분류
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IOPattern {
+    SequentialRead,     // 연속 읽기 (큰 파일)
+    SequentialWrite,    // 연속 쓰기 (로그, 스트림)
+    RandomRead,         // 임의 읽기 (데이터베이스)
+    RandomWrite,        // 임의 쓰기 (저널)
+    Mixed,              // 읽기/쓰기 혼합
+    Bursty,             // 버스트 트래픽 (간헐적)
+    Idle,               // 유휴
+}
+
+impl IOPattern {
+    pub fn to_string(&self) -> String {
+        match self {
+            IOPattern::SequentialRead => "SequentialRead".to_string(),
+            IOPattern::SequentialWrite => "SequentialWrite".to_string(),
+            IOPattern::RandomRead => "RandomRead".to_string(),
+            IOPattern::RandomWrite => "RandomWrite".to_string(),
+            IOPattern::Mixed => "Mixed".to_string(),
+            IOPattern::Bursty => "Bursty".to_string(),
+            IOPattern::Idle => "Idle".to_string(),
+        }
+    }
+
+    pub fn cache_line_size(&self) -> u32 {
+        match self {
+            IOPattern::SequentialRead => 4096,    // 4KB (크면 좋음)
+            IOPattern::SequentialWrite => 4096,
+            IOPattern::RandomRead => 512,         // 512B (작아야 함)
+            IOPattern::RandomWrite => 512,
+            IOPattern::Mixed => 2048,             // 중간값
+            IOPattern::Bursty => 1024,
+            IOPattern::Idle => 0,
+        }
+    }
+}
+
+// ============================================================================
+// I/O Pattern Analyzer: I/O 패턴 분석기
+// ============================================================================
+
+pub struct IOPatternAnalyzer {
+    current_metrics: IOMetrics,
+    history: Vec<(u64, IOMetrics)>,
+    max_history: usize,            // 최대 100개 보유
+    detected_pattern: IOPattern,
+    pattern_confidence: f64,
+}
+
+impl IOPatternAnalyzer {
+    pub fn new() -> Self {
+        IOPatternAnalyzer {
+            current_metrics: IOMetrics::new(0),
+            history: vec![],
+            max_history: 100,
+            detected_pattern: IOPattern::Idle,
+            pattern_confidence: 0.0,
+        }
+    }
+
+    // 메트릭 업데이트
+    pub fn update_metrics(&mut self, metrics: IOMetrics) {
+        self.current_metrics = metrics.clone();
+        self.history.push((metrics.timestamp, metrics));
+
+        if self.history.len() > self.max_history {
+            self.history.remove(0);
+        }
+
+        // 패턴 감지 업데이트
+        self.detect_io_pattern_internal();
+    }
+
+    // I/O 패턴 감지
+    pub fn detect_io_pattern(&self) -> IOPattern {
+        self.detected_pattern
+    }
+
+    // I/O 포화도 추정 (0.0-1.0)
+    pub fn estimate_io_saturation(&self) -> f64 {
+        let util_factor = self.current_metrics.disk_utilization * 0.6;
+        let queue_factor = ((self.current_metrics.queue_depth as f64) / 64.0).min(1.0) * 0.4;
+
+        (util_factor + queue_factor).min(1.0)
+    }
+
+    // 대역폭 사용량 예측 (MB/sec, 시간까지)
+    pub fn predict_bandwidth_usage(&self) -> (u64, u32) {
+        let current_mb = self.current_metrics.total_throughput_mb_per_sec() as u64;
+
+        // 패턴별 예측
+        let predicted_mb = match self.detected_pattern {
+            IOPattern::SequentialRead => current_mb * 2,   // 2배 증가 예상
+            IOPattern::SequentialWrite => current_mb * 2,
+            IOPattern::RandomRead => current_mb,           // 변화 없음
+            IOPattern::RandomWrite => current_mb,
+            IOPattern::Mixed => current_mb + (current_mb / 2),  // 50% 증가
+            IOPattern::Bursty => current_mb * 5,           // 5배 증가 (버스트)
+            IOPattern::Idle => 0,
+        };
+
+        // 포화 시까지 시간 (가정: 100MB/sec = 포화)
+        let time_to_saturate = if predicted_mb > 0 {
+            ((100 - predicted_mb.min(100)) / predicted_mb.max(1)) as u32
+        } else {
+            999
+        };
+
+        (predicted_mb, time_to_saturate)
+    }
+
+    // I/O 핫스팟 감지 (주소, 접근 횟수)
+    pub fn detect_io_hot_spots(&self) -> Vec<(u64, f64)> {
+        let mut hotspots = vec![];
+
+        // 시뮬레이션: 임의의 주소에 접근 집중
+        for i in 0..5 {
+            let address = (i * 0x10000000) as u64;
+            let access_count = (5 - i) as f64 * 20.0;  // 역순으로 감소
+            hotspots.push((address, access_count));
+        }
+
+        hotspots.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        hotspots
+    }
+
+    // 큐 포화도 (0.0-1.0)
+    pub fn get_queue_saturation(&self) -> f64 {
+        // 최대 큐 깊이: 64
+        ((self.current_metrics.queue_depth as f64) / 64.0).min(1.0)
+    }
+
+    // I/O 추이 예측
+    pub fn predict_io_trend(&self) -> String {
+        if self.history.len() < 2 {
+            return "Insufficient Data".to_string();
+        }
+
+        let recent = &self.history[self.history.len() - 1].1;
+        let prev = &self.history[self.history.len() - 2].1;
+
+        let current_throughput = recent.total_throughput_mb_per_sec();
+        let prev_throughput = prev.total_throughput_mb_per_sec();
+
+        let delta = current_throughput - prev_throughput;
+
+        if delta > 5.0 {
+            "Increasing".to_string()
+        } else if delta < -5.0 {
+            "Decreasing".to_string()
+        } else {
+            "Stable".to_string()
+        }
+    }
+
+    // 최근 메트릭 조회
+    pub fn get_recent_metrics(&self, count: usize) -> Vec<IOMetrics> {
+        self.history
+            .iter()
+            .rev()
+            .take(count)
+            .map(|(_, m)| m.clone())
+            .collect()
+    }
+
+    // 평균 지연시간 (읽기)
+    pub fn get_average_read_latency(&self) -> u32 {
+        if self.history.is_empty() {
+            return 100;
+        }
+
+        let sum: u64 = self.history.iter().map(|(_, m)| m.read_latency_us as u64).sum();
+        (sum / self.history.len() as u64) as u32
+    }
+
+    // 최대 대역폭 사용
+    pub fn get_peak_bandwidth(&self) -> f64 {
+        self.history
+            .iter()
+            .map(|(_, m)| m.total_throughput_mb_per_sec())
+            .fold(0.0, f64::max)
+    }
+
+    // 패턴 신뢰도 조회
+    pub fn get_pattern_confidence(&self) -> f64 {
+        self.pattern_confidence
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn detect_io_pattern_internal(&mut self) {
+        let read_ops = self.current_metrics.read_ops_per_sec;
+        let write_ops = self.current_metrics.write_ops_per_sec;
+        let queue = self.current_metrics.queue_depth;
+        let latency = (self.current_metrics.read_latency_us + self.current_metrics.write_latency_us) / 2;
+
+        let total_ops = read_ops + write_ops;
+
+        if total_ops == 0 {
+            self.detected_pattern = IOPattern::Idle;
+            self.pattern_confidence = 1.0;
+            return;
+        }
+
+        let read_ratio = read_ops as f64 / total_ops as f64;
+        let write_ratio = write_ops as f64 / total_ops as f64;
+
+        // 패턴 판정 로직
+        if queue > 16 {
+            // 큐 길이 길음 = 버스트 또는 순차
+            if latency > 500 {
+                self.detected_pattern = IOPattern::Bursty;
+                self.pattern_confidence = 0.9;
+            } else {
+                self.detected_pattern = IOPattern::SequentialRead;
+                self.pattern_confidence = 0.85;
+            }
+        } else if read_ratio > 0.8 {
+            // 읽기 주도
+            self.detected_pattern = IOPattern::RandomRead;
+            self.pattern_confidence = 0.85;
+        } else if write_ratio > 0.8 {
+            // 쓰기 주도
+            self.detected_pattern = IOPattern::RandomWrite;
+            self.pattern_confidence = 0.85;
+        } else {
+            // 혼합
+            self.detected_pattern = IOPattern::Mixed;
+            self.pattern_confidence = 0.75;
+        }
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: 패턴 감지 (Sequential Read)
+    #[test]
+    fn test_pattern_detection_sequential() {
+        let mut analyzer = IOPatternAnalyzer::new();
+
+        // 연속 읽기 특성: 높은 읽기 ops, 낮은 지연
+        let metrics = IOMetrics::with_values(0, 10000, 100, 50, 200, 20, 0.8);
+        analyzer.update_metrics(metrics);
+
+        let pattern = analyzer.detect_io_pattern();
+        assert!(pattern == IOPattern::SequentialRead || pattern == IOPattern::Bursty);
+    }
+
+    // Test 2: 패턴 감지 (Random Read)
+    #[test]
+    fn test_pattern_detection_random() {
+        let mut analyzer = IOPatternAnalyzer::new();
+
+        // 임의 읽기 특성: 높은 읽기, 낮은 큐, 높은 지연
+        let metrics = IOMetrics::with_values(0, 2000, 100, 500, 600, 4, 0.6);
+        analyzer.update_metrics(metrics);
+
+        let pattern = analyzer.detect_io_pattern();
+        assert!(pattern == IOPattern::RandomRead || pattern == IOPattern::Idle);
+    }
+
+    // Test 3: 버스트 감지
+    #[test]
+    fn test_burst_detection() {
+        let mut analyzer = IOPatternAnalyzer::new();
+
+        // 버스트: 매우 긴 큐
+        let metrics = IOMetrics::with_values(0, 5000, 5000, 1000, 1000, 50, 0.95);
+        analyzer.update_metrics(metrics);
+
+        let pattern = analyzer.detect_io_pattern();
+        assert!(pattern == IOPattern::Bursty);
+    }
+
+    // Test 4: 대역폭 예측
+    #[test]
+    fn test_bandwidth_prediction() {
+        let mut analyzer = IOPatternAnalyzer::new();
+        let metrics = IOMetrics::with_values(0, 5000, 5000, 100, 100, 10, 0.7);
+        analyzer.update_metrics(metrics);
+
+        let (predicted_mb, time_to_saturate) = analyzer.predict_bandwidth_usage();
+        assert!(predicted_mb > 0);
+        assert!(time_to_saturate < 1000);
+    }
+
+    // Test 5: 큐 포화도 분석
+    #[test]
+    fn test_queue_depth_analysis() {
+        let mut analyzer = IOPatternAnalyzer::new();
+
+        let metrics = IOMetrics::with_values(0, 1000, 1000, 100, 100, 32, 0.5);
+        analyzer.update_metrics(metrics);
+
+        let saturation = analyzer.get_queue_saturation();
+        assert!(saturation > 0.4 && saturation < 0.6);  // 32/64 = 0.5
+    }
+
+    // Test 6: 지연시간 측정
+    #[test]
+    fn test_latency_measurement() {
+        let mut analyzer = IOPatternAnalyzer::new();
+
+        let metrics = IOMetrics::with_values(0, 1000, 1000, 100, 200, 5, 0.3);
+        analyzer.update_metrics(metrics);
+
+        let avg_latency = analyzer.get_average_read_latency();
+        assert_eq!(avg_latency, 100);
+    }
+
+    // Test 7: 핫스팟 식별
+    #[test]
+    fn test_hotspot_identification() {
+        let analyzer = IOPatternAnalyzer::new();
+
+        let hotspots = analyzer.detect_io_hot_spots();
+        assert!(!hotspots.is_empty());
+
+        // 첫 번째가 가장 접근이 많음
+        assert!(hotspots[0].1 > hotspots[hotspots.len() - 1].1);
+    }
+
+    // Test 8: I/O 추이 예측
+    #[test]
+    fn test_io_trend_forecasting() {
+        let mut analyzer = IOPatternAnalyzer::new();
+
+        analyzer.update_metrics(IOMetrics::with_values(0, 1000, 1000, 100, 100, 5, 0.3));
+        analyzer.update_metrics(IOMetrics::with_values(1000, 2000, 2000, 100, 100, 8, 0.5));
+
+        let trend = analyzer.predict_io_trend();
+        assert_eq!(trend, "Increasing");
+    }
+}

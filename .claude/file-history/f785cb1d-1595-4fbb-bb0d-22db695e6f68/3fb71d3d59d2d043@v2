@@ -1,0 +1,544 @@
+# FreeLang VM 아키텍처 설계 (Rust)
+
+**버전**: 1.0
+**상태**: 설계 중
+**목표**: Stack-based Bytecode VM 구현
+
+---
+
+## 🏗️ 전체 아키텍처
+
+```
+┌─────────────────────────────────────┐
+│     Bytecode File (*.bc)            │
+│ (Header + Code + Data + Symbols)    │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│        Bytecode Loader              │
+│  - 파일 검증                        │
+│  - 메모리에 로드                    │
+│  - 심볼 테이블 파싱                │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│    Stack-based Virtual Machine      │
+│  ┌─────────────────────────────────┐│
+│  │  Memory (64KB)                  ││
+│  │  - Stack (20KB)                 ││
+│  │  - Heap (44KB)                  ││
+│  │  - Globals (1 word)             ││
+│  └─────────────────────────────────┘│
+│  ┌─────────────────────────────────┐│
+│  │  Execution Engine               ││
+│  │  - PC (Program Counter)         ││
+│  │  - SP (Stack Pointer)           ││
+│  │  - BP (Base Pointer)            ││
+│  │  - Instruction Decoder          ││
+│  └─────────────────────────────────┘│
+│  ┌─────────────────────────────────┐│
+│  │  Standard Library               ││
+│  │  - println, to_string           ││
+│  │  - Array operations             ││
+│  │  - String operations            ││
+│  └─────────────────────────────────┘│
+│  ┌─────────────────────────────────┐│
+│  │  Garbage Collector              ││
+│  │  - Mark-and-sweep               ││
+│  │  - Reference counting           ││
+│  └─────────────────────────────────┘│
+└──────────────┬──────────────────────┘
+               │
+               ▼
+         Execution Result
+```
+
+---
+
+## 📦 Rust 구조 (Cargo 프로젝트)
+
+```
+freelang-vm/
+├── Cargo.toml                    # 프로젝트 설정
+├── Cargo.lock                    # 의존성 잠금
+│
+├── src/
+│   ├── main.rs                   # CLI 진입점 (100줄)
+│   ├── lib.rs                    # 모듈 정의 (50줄)
+│   │
+│   ├── vm.rs                     # VM 핵심 (600줄)
+│   │   ├── struct VM
+│   │   ├── impl VM
+│   │   └── execution loop
+│   │
+│   ├── bytecode.rs               # 바이트코드 로더 (200줄)
+│   │   ├── BytecodeLoader
+│   │   ├── Instruction enum
+│   │   └── Header parsing
+│   │
+│   ├── memory.rs                 # 메모리 관리 (300줄)
+│   │   ├── struct Memory
+│   │   ├── Stack operations
+│   │   └── Heap management
+│   │
+│   ├── gc.rs                     # GC (400줄)
+│   │   ├── GarbageCollector
+│   │   ├── Mark phase
+│   │   └── Sweep phase
+│   │
+│   └── stdlib.rs                 # 표준 라이브러리 (300줄)
+│       ├── println, to_string
+│       ├── Array functions
+│       └── String functions
+│
+├── tests/
+│   ├── unit_tests.rs             # 단위 테스트 (800줄)
+│   │   ├── test_push
+│   │   ├── test_arithmetic
+│   │   └── test_control_flow
+│   │
+│   └── integration_tests.rs       # 통합 테스트 (600줄)
+│       ├── test_factorial
+│       ├── test_hello_world
+│       └── test_self_hosting
+│
+├── examples/
+│   ├── hello_world.bc            # 바이트코드 예제
+│   ├── factorial.bc
+│   └── array_sum.bc
+│
+└── docs/
+    ├── PHASE_A_BYTECODE_ISA.md   # ISA 설계
+    ├── BYTECODE_FORMAT.md         # 파일 포맷
+    └── VM_ARCHITECTURE.md         # 이 문서
+```
+
+---
+
+## 💾 Rust 코드 구조
+
+### 1. main.rs (진입점)
+
+```rust
+use freelang_vm::VM;
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        eprintln!("Usage: freelang-vm <bytecode.bc>");
+        std::process::exit(1);
+    }
+
+    let bytecode = std::fs::read(&args[1])
+        .expect("Failed to read bytecode file");
+
+    let mut vm = VM::new(&bytecode)
+        .expect("Failed to initialize VM");
+
+    match vm.run() {
+        Ok(exit_code) => std::process::exit(exit_code as i32),
+        Err(e) => {
+            eprintln!("Runtime error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+```
+
+### 2. vm.rs (핵심 VM)
+
+```rust
+pub struct VM {
+    memory: [u64; 16384],           // 64KB (8-byte words)
+    pc: usize,                      // Program Counter
+    sp: usize,                      // Stack Pointer
+    bp: usize,                      // Base Pointer
+    code: Vec<u8>,                  // Bytecode
+    call_stack: Vec<CallFrame>,     // 함수 호출 스택
+    gc: GarbageCollector,
+}
+
+#[derive(Clone)]
+struct CallFrame {
+    return_pc: usize,
+    saved_bp: usize,
+}
+
+impl VM {
+    pub fn new(bytecode: &[u8]) -> Result<Self> {
+        let mut vm = VM {
+            memory: [0u64; 16384],
+            pc: 0,
+            sp: 0,
+            bp: 0,
+            code: Vec::new(),
+            call_stack: Vec::new(),
+            gc: GarbageCollector::new(),
+        };
+
+        // 바이트코드 로드
+        let loader = BytecodeLoader::new(bytecode)?;
+        vm.code = loader.code();
+        // 데이터, 심볼 로드...
+
+        Ok(vm)
+    }
+
+    pub fn run(&mut self) -> Result<u64> {
+        loop {
+            // 프로그램 끝
+            if self.pc >= self.code.len() {
+                break;
+            }
+
+            // 다음 명령어 실행
+            self.step()?;
+        }
+
+        Ok(0)  // 기본 exit code
+    }
+
+    pub fn step(&mut self) -> Result<()> {
+        let opcode = self.code[self.pc];
+        self.pc += 1;
+
+        match opcode {
+            0x01 => self.exec_push()?,      // PUSH
+            0x02 => self.exec_pop()?,       // POP
+            0x03 => self.exec_load()?,      // LOAD
+            0x04 => self.exec_store()?,     // STORE
+            // ... 더 많은 명령어
+            0x60 => self.exec_print()?,     // PRINT
+            0x61 => self.exec_halt()?,      // HALT
+            _ => return Err(format!("Unknown opcode: 0x{:02x}", opcode)),
+        }
+
+        Ok(())
+    }
+
+    fn exec_push(&mut self) -> Result<()> {
+        let value = self.read_u64()?;
+        self.push(value);
+        Ok(())
+    }
+
+    fn exec_add(&mut self) -> Result<()> {
+        let b = self.pop();
+        let a = self.pop();
+        self.push(a.wrapping_add(b));
+        Ok(())
+    }
+
+    fn push(&mut self, value: u64) {
+        self.memory[self.sp] = value;
+        self.sp += 1;
+    }
+
+    fn pop(&mut self) -> u64 {
+        self.sp -= 1;
+        self.memory[self.sp]
+    }
+
+    fn read_u64(&mut self) -> Result<u64> {
+        if self.pc + 8 > self.code.len() {
+            return Err("Unexpected end of bytecode".to_string());
+        }
+
+        let bytes = &self.code[self.pc..self.pc+8];
+        self.pc += 8;
+
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn exec_print(&mut self) -> Result<()> {
+        let value = self.pop();
+        println!("{}", value);
+        Ok(())
+    }
+
+    fn exec_halt(&mut self) -> Result<()> {
+        let exit_code = self.pop();
+        std::process::exit(exit_code as i32);
+    }
+}
+```
+
+### 3. memory.rs (메모리 관리)
+
+```rust
+pub struct Memory {
+    data: [u64; 16384],
+}
+
+impl Memory {
+    pub fn new() -> Self {
+        Memory {
+            data: [0u64; 16384],
+        }
+    }
+
+    pub fn read(&self, addr: usize) -> u64 {
+        self.data[addr]
+    }
+
+    pub fn write(&mut self, addr: usize, value: u64) {
+        self.data[addr] = value;
+    }
+
+    pub fn stack_push(&mut self, sp: &mut usize, value: u64) {
+        self.data[*sp] = value;
+        *sp += 1;
+    }
+
+    pub fn stack_pop(&mut self, sp: &mut usize) -> u64 {
+        *sp -= 1;
+        self.data[*sp]
+    }
+
+    pub fn heap_allocate(&mut self, size: usize) -> usize {
+        // 단순 할당 (나중에 GC 연동)
+        0x5000  // 힙 시작 주소
+    }
+}
+```
+
+### 4. gc.rs (가비지 컬렉터)
+
+```rust
+pub struct GarbageCollector {
+    marked: Vec<bool>,
+    reachable: Vec<usize>,
+}
+
+impl GarbageCollector {
+    pub fn new() -> Self {
+        GarbageCollector {
+            marked: vec![false; 16384],
+            reachable: Vec::new(),
+        }
+    }
+
+    pub fn collect(&mut self, memory: &mut Memory, roots: &[usize]) {
+        // Mark phase
+        for root in roots {
+            self.mark(*root, memory);
+        }
+
+        // Sweep phase
+        for i in 0..16384 {
+            if !self.marked[i] {
+                memory.write(i, 0);
+            }
+        }
+
+        // Reset
+        self.marked.fill(false);
+    }
+
+    fn mark(&mut self, addr: usize, memory: &Memory) {
+        if self.marked[addr] {
+            return;
+        }
+
+        self.marked[addr] = true;
+
+        // 참조 추적...
+        // 배열/문자열의 요소들 마킹
+    }
+}
+```
+
+### 5. stdlib.rs (표준 라이브러리)
+
+```rust
+pub fn println_value(value: u64) {
+    println!("{}", value);
+}
+
+pub fn to_string(value: u64) -> String {
+    format!("{}", value)
+}
+
+pub fn array_new(size: usize) -> Vec<u64> {
+    vec![0u64; size]
+}
+
+pub fn array_get(arr: &[u64], index: usize) -> Result<u64> {
+    arr.get(index)
+        .copied()
+        .ok_or_else(|| "Index out of bounds".to_string())
+}
+
+pub fn array_set(arr: &mut [u64], index: usize, value: u64) -> Result<()> {
+    if index < arr.len() {
+        arr[index] = value;
+        Ok(())
+    } else {
+        Err("Index out of bounds".to_string())
+    }
+}
+```
+
+---
+
+## 🧪 테스트 구조
+
+### tests/unit_tests.rs
+
+```rust
+#[cfg(test)]
+mod tests {
+    use freelang_vm::VM;
+
+    #[test]
+    fn test_push_pop() {
+        let bytecode = vec![
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A,  // PUSH 42
+            0x02,  // POP
+            0x61, 0x00,  // HALT 0
+        ];
+
+        let mut vm = VM::new(&bytecode).unwrap();
+        let result = vm.run().unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn test_arithmetic() {
+        let bytecode = vec![
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,  // PUSH 3
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05,  // PUSH 5
+            0x10,  // ADD
+            0x60,  // PRINT
+            0x61, 0x00,  // HALT 0
+        ];
+
+        let mut vm = VM::new(&bytecode).unwrap();
+        vm.run().unwrap();  // 8 출력
+    }
+}
+```
+
+---
+
+## 🔄 실행 사이클
+
+```
+1. 초기화
+   ├─ 바이트코드 로드
+   ├─ 메모리 초기화
+   └─ PC=0, SP=0, BP=0
+
+2. 실행 루프
+   ├─ PC에서 opcode 읽기
+   ├─ opcode 디코드
+   ├─ 명령어 실행
+   ├─ PC 증가
+   └─ PC < code.len()이면 계속
+
+3. 종료
+   ├─ HALT 명령어 실행
+   ├─ exit code 반환
+   └─ 프로세스 종료
+```
+
+---
+
+## 📊 성능 목표
+
+| 항목 | 목표 | 설명 |
+|------|-----|------|
+| 명령어 처리 | <100ns | 단순 명령어 |
+| 함수 호출 | <1µs | 스택 프레임 설정 |
+| 배열 접근 | <100ns | O(1) |
+| GC pause | <10ms | 64KB 메모리 |
+| 메모리 | <1MB | VM + 코드 |
+| 시작 시간 | <100ms | 바이트코드 로드 |
+
+---
+
+## 🚀 개발 로드맵
+
+### Week 1: 설계 (✓ 진행 중)
+- [x] Bytecode ISA
+- [x] 파일 포맷
+- [x] 아키텍처 설계
+- [ ] Cargo 프로젝트 설정
+
+### Week 2: Core VM
+- [ ] Memory 구현
+- [ ] Bytecode Loader
+- [ ] Basic instructions (PUSH, POP, LOAD, STORE)
+- [ ] 10개 단위 테스트
+
+### Week 3: Arithmetic & Logic
+- [ ] 산술 명령어 (ADD, SUB, MUL, DIV)
+- [ ] 논리 명령어 (AND, OR, NOT, EQ, LT)
+- [ ] 15개 단위 테스트
+
+### Week 4: Control Flow
+- [ ] JMP, JZ, JNZ
+- [ ] CALL, RET
+- [ ] 함수 호출 스택 관리
+- [ ] 10개 통합 테스트
+
+### Week 5: 고급 기능
+- [ ] 배열 (NEWARR, ALOAD, ASTORE, ALEN)
+- [ ] 문자열 (NEWSTR, SLOAD, SSTORE, SLEN)
+- [ ] 10개 테스트
+
+### Week 6: GC 통합
+- [ ] 가비지 컬렉터 구현
+- [ ] Mark-and-sweep
+- [ ] 메모리 할당 통합
+- [ ] 5개 GC 테스트
+
+### Week 7: 최적화 & 버그 수정
+- [ ] 성능 프로파일링
+- [ ] 최적화
+- [ ] 버그 수정
+- [ ] 총 50개 테스트 통과
+
+### Week 8: 문서 & 배포
+- [ ] 완전한 명세서
+- [ ] 튜토리얼
+- [ ] GOGS 저장소
+- [ ] Docker 이미지
+
+---
+
+## ✅ 체크리스트
+
+### 구현
+- [ ] VM 핵심 구조
+- [ ] 40개 명령어
+- [ ] 메모리 관리
+- [ ] GC
+- [ ] 표준 라이브러리
+
+### 테스트
+- [ ] 50개 단위 테스트
+- [ ] 30개 통합 테스트
+- [ ] 자기 호스팅 검증
+
+### 문서
+- [ ] API 문서
+- [ ] 튜토리얼
+- [ ] 운영 가이드
+
+### 배포
+- [ ] Cargo release build
+- [ ] GitHub Actions CI
+- [ ] Docker 컨테이너
+
+---
+
+**상태**: 🚀 **설계 완료, 구현 준비**
+**다음**: Week 1 마스터 계획 수립
+

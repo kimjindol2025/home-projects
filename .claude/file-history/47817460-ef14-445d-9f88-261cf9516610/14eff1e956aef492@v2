@@ -1,0 +1,599 @@
+// FreeLang Phase I: Chaos Engineering - Fault Injection Core
+// Days 1-2: Fault Types & Injection Engine
+// Design: Realistic fault injection for Phase H validation
+
+use std::collections::{HashMap, VecDeque};
+
+// ============================================================================
+// Fault Type Definitions
+// ============================================================================
+
+pub enum FaultType {
+    LatencySpike(u64),           // milliseconds (5ms ~ 500ms)
+    MemoryLeak(u64),             // bytes (1MB ~ 100MB)
+    GCPause(u32),                // milliseconds (50ms ~ 200ms)
+    IOSaturation(u32),           // pending operations (10 ~ 100)
+    NetworkPartition,            // complete network disconnect
+    CPUThrottling(f64),          // percentage (50% ~ 100%)
+    ContextSwitchSpike(u32),     // multiplier from normal (2x ~ 5x)
+}
+
+impl FaultType {
+    pub fn name(&self) -> String {
+        match self {
+            FaultType::LatencySpike(ms) => format!("LatencySpike(+{}ms)", ms),
+            FaultType::MemoryLeak(bytes) => format!("MemoryLeak(+{}MB)", bytes / 1_000_000),
+            FaultType::GCPause(ms) => format!("GCPause({}ms)", ms),
+            FaultType::IOSaturation(count) => format!("IOSaturation({} ops)", count),
+            FaultType::NetworkPartition => "NetworkPartition".to_string(),
+            FaultType::CPUThrottling(pct) => format!("CPUThrottling({:.0}%)", pct),
+            FaultType::ContextSwitchSpike(mult) => format!("ContextSwitchSpike({}x)", mult),
+        }
+    }
+
+    pub fn severity(&self) -> u32 {
+        // 1-5 scale for impact assessment
+        match self {
+            FaultType::LatencySpike(ms) => {
+                if *ms > 300 { 5 } else if *ms > 200 { 4 } else { 3 }
+            },
+            FaultType::MemoryLeak(bytes) => {
+                let mb = *bytes / 1_000_000;
+                if mb > 50 { 5 } else if mb > 20 { 4 } else { 3 }
+            },
+            FaultType::GCPause(ms) => {
+                if *ms > 150 { 5 } else if *ms > 100 { 4 } else { 3 }
+            },
+            FaultType::IOSaturation(count) => {
+                if *count > 75 { 5 } else if *count > 50 { 4 } else { 3 }
+            },
+            FaultType::NetworkPartition => 5,
+            FaultType::CPUThrottling(pct) => {
+                if *pct < 30.0 { 5 } else if *pct < 50.0 { 4 } else { 3 }
+            },
+            FaultType::ContextSwitchSpike(mult) => {
+                if *mult > 4 { 5 } else if *mult > 3 { 4 } else { 3 }
+            },
+        }
+    }
+}
+
+// ============================================================================
+// Fault Instance & Timeline
+// ============================================================================
+
+pub struct FaultInstance {
+    fault_id: String,
+    fault_type: FaultType,
+    start_time_us: u64,
+    duration_ms: u32,
+    end_time_us: Option<u64>,
+    status: String, // "active", "completed", "failed"
+}
+
+impl FaultInstance {
+    pub fn is_active(&self, current_time_us: u64) -> bool {
+        if current_time_us < self.start_time_us {
+            return false;
+        }
+
+        let end_time = self.start_time_us + (self.duration_ms as u64 * 1000);
+        current_time_us < end_time
+    }
+
+    pub fn get_elapsed_ms(&self, current_time_us: u64) -> u32 {
+        if current_time_us < self.start_time_us {
+            return 0;
+        }
+        ((current_time_us - self.start_time_us) / 1000) as u32
+    }
+
+    pub fn get_remaining_ms(&self, current_time_us: u64) -> u32 {
+        let elapsed = self.get_elapsed_ms(current_time_us);
+        if elapsed >= self.duration_ms {
+            return 0;
+        }
+        self.duration_ms - elapsed
+    }
+}
+
+// ============================================================================
+// Metric Degradation Models
+// ============================================================================
+
+pub struct MetricDegradation {
+    // Latency spike effects
+    pub p99_latency_increase_percent: f64,
+    pub avg_latency_increase_percent: f64,
+    pub scheduler_queue_increase_percent: f64,
+
+    // Memory leak effects
+    pub memory_usage_increase_percent: f64,
+    pub gc_pause_increase_percent: f64,
+    pub memory_pressure_increase: f64,
+
+    // GC pause effects
+    pub allocation_stall_percent: f64,
+    pub fragmentation_increase: f64,
+
+    // I/O saturation effects
+    pub io_latency_increase_percent: f64,
+    pub io_queue_depth_increase: u32,
+    pub cache_hit_drop_percent: f64,
+
+    // Network partition effects
+    pub cache_hit_drop_total: f64,
+
+    // CPU throttling effects
+    pub throughput_reduction_percent: f64,
+
+    // Context switch spike effects
+    pub context_switch_increase_percent: f64,
+}
+
+impl MetricDegradation {
+    pub fn from_fault_type(fault_type: &FaultType) -> Self {
+        match fault_type {
+            FaultType::LatencySpike(ms) => {
+                let severity_mult = (*ms as f64) / 500.0; // Normalized to max
+                MetricDegradation {
+                    p99_latency_increase_percent: 100.0 + (50.0 * severity_mult),
+                    avg_latency_increase_percent: 30.0 + (30.0 * severity_mult),
+                    scheduler_queue_increase_percent: 40.0 + (30.0 * severity_mult),
+                    memory_usage_increase_percent: 0.0,
+                    gc_pause_increase_percent: 0.0,
+                    memory_pressure_increase: 0.0,
+                    allocation_stall_percent: 0.0,
+                    fragmentation_increase: 0.0,
+                    io_latency_increase_percent: 20.0,
+                    io_queue_depth_increase: 5,
+                    cache_hit_drop_percent: 5.0,
+                    cache_hit_drop_total: 0.05,
+                    throughput_reduction_percent: 20.0,
+                    context_switch_increase_percent: 100.0 + (150.0 * severity_mult),
+                }
+            },
+            FaultType::MemoryLeak(bytes) => {
+                let mb = *bytes as f64 / 1_000_000.0;
+                let severity_mult = (mb / 100.0).min(1.0); // Normalized to 100MB max
+                MetricDegradation {
+                    p99_latency_increase_percent: 0.0,
+                    avg_latency_increase_percent: 0.0,
+                    scheduler_queue_increase_percent: 0.0,
+                    memory_usage_increase_percent: 5.0 + (95.0 * severity_mult),
+                    gc_pause_increase_percent: 50.0 + (150.0 * severity_mult),
+                    memory_pressure_increase: 0.3 + (0.5 * severity_mult),
+                    allocation_stall_percent: 10.0 + (80.0 * severity_mult),
+                    fragmentation_increase: 0.2 + (0.3 * severity_mult),
+                    io_latency_increase_percent: 0.0,
+                    io_queue_depth_increase: 0,
+                    cache_hit_drop_percent: 0.0,
+                    cache_hit_drop_total: 0.0,
+                    throughput_reduction_percent: 5.0 + (45.0 * severity_mult),
+                    context_switch_increase_percent: 50.0 + (100.0 * severity_mult),
+                }
+            },
+            FaultType::GCPause(ms) => {
+                let severity_mult = (*ms as f64) / 200.0; // Normalized to 200ms max
+                MetricDegradation {
+                    p99_latency_increase_percent: 60.0 + (80.0 * severity_mult),
+                    avg_latency_increase_percent: 20.0 + (40.0 * severity_mult),
+                    scheduler_queue_increase_percent: 30.0 + (50.0 * severity_mult),
+                    memory_usage_increase_percent: 0.0,
+                    gc_pause_increase_percent: 100.0 + (200.0 * severity_mult),
+                    memory_pressure_increase: 0.0,
+                    allocation_stall_percent: 40.0 + (50.0 * severity_mult),
+                    fragmentation_increase: 0.0,
+                    io_latency_increase_percent: 10.0,
+                    io_queue_depth_increase: 3,
+                    cache_hit_drop_percent: 3.0,
+                    cache_hit_drop_total: 0.03,
+                    throughput_reduction_percent: 20.0 + (50.0 * severity_mult),
+                    context_switch_increase_percent: 100.0 + (150.0 * severity_mult),
+                }
+            },
+            FaultType::IOSaturation(count) => {
+                let severity_mult = (*count as f64) / 100.0; // Normalized to 100 ops max
+                MetricDegradation {
+                    p99_latency_increase_percent: 40.0 + (80.0 * severity_mult),
+                    avg_latency_increase_percent: 20.0 + (60.0 * severity_mult),
+                    scheduler_queue_increase_percent: 20.0 + (50.0 * severity_mult),
+                    memory_usage_increase_percent: 0.0,
+                    gc_pause_increase_percent: 0.0,
+                    memory_pressure_increase: 0.0,
+                    allocation_stall_percent: 0.0,
+                    fragmentation_increase: 0.0,
+                    io_latency_increase_percent: 150.0 + (300.0 * severity_mult),
+                    io_queue_depth_increase: (*count) + 20,
+                    cache_hit_drop_percent: 30.0 + (50.0 * severity_mult),
+                    cache_hit_drop_total: 0.3 + (0.5 * severity_mult),
+                    throughput_reduction_percent: 60.0 + (40.0 * severity_mult),
+                    context_switch_increase_percent: 50.0 + (100.0 * severity_mult),
+                }
+            },
+            FaultType::NetworkPartition => {
+                MetricDegradation {
+                    p99_latency_increase_percent: 100.0,
+                    avg_latency_increase_percent: 80.0,
+                    scheduler_queue_increase_percent: 30.0,
+                    memory_usage_increase_percent: 0.0,
+                    gc_pause_increase_percent: 0.0,
+                    memory_pressure_increase: 0.0,
+                    allocation_stall_percent: 0.0,
+                    fragmentation_increase: 0.0,
+                    io_latency_increase_percent: 200.0,
+                    io_queue_depth_increase: 50,
+                    cache_hit_drop_percent: 70.0,
+                    cache_hit_drop_total: 0.7, // Catastrophic cache hit drop
+                    throughput_reduction_percent: 100.0, // Network operations stall
+                    context_switch_increase_percent: 200.0,
+                }
+            },
+            FaultType::CPUThrottling(pct) => {
+                let throttle_ratio = (100.0 - pct) / 100.0; // Lower pct = more throttle
+                MetricDegradation {
+                    p99_latency_increase_percent: 50.0 + (200.0 * throttle_ratio),
+                    avg_latency_increase_percent: 30.0 + (150.0 * throttle_ratio),
+                    scheduler_queue_increase_percent: 60.0 + (200.0 * throttle_ratio),
+                    memory_usage_increase_percent: 0.0,
+                    gc_pause_increase_percent: 20.0 + (100.0 * throttle_ratio),
+                    memory_pressure_increase: 0.0,
+                    allocation_stall_percent: 0.0,
+                    fragmentation_increase: 0.0,
+                    io_latency_increase_percent: 0.0,
+                    io_queue_depth_increase: 0,
+                    cache_hit_drop_percent: 0.0,
+                    cache_hit_drop_total: 0.0,
+                    throughput_reduction_percent: 100.0 * throttle_ratio,
+                    context_switch_increase_percent: 150.0 + (250.0 * throttle_ratio),
+                }
+            },
+            FaultType::ContextSwitchSpike(mult) => {
+                let severity_mult = (*mult as f64) / 5.0; // Normalized to 5x max
+                MetricDegradation {
+                    p99_latency_increase_percent: 50.0 + (100.0 * severity_mult),
+                    avg_latency_increase_percent: 20.0 + (50.0 * severity_mult),
+                    scheduler_queue_increase_percent: 40.0 + (80.0 * severity_mult),
+                    memory_usage_increase_percent: 0.0,
+                    gc_pause_increase_percent: 0.0,
+                    memory_pressure_increase: 0.0,
+                    allocation_stall_percent: 0.0,
+                    fragmentation_increase: 0.0,
+                    io_latency_increase_percent: 10.0,
+                    io_queue_depth_increase: 0,
+                    cache_hit_drop_percent: 20.0 + (30.0 * severity_mult),
+                    cache_hit_drop_total: 0.2 + (0.3 * severity_mult),
+                    throughput_reduction_percent: 30.0 + (60.0 * severity_mult),
+                    context_switch_increase_percent: (*mult as f64 - 1.0) * 100.0,
+                }
+            },
+        }
+    }
+}
+
+// ============================================================================
+// Fault Injection Engine
+// ============================================================================
+
+pub struct FaultInjectionEngine {
+    active_faults: Vec<FaultInstance>,
+    fault_timeline: VecDeque<(u64, String, String)>, // (time_us, fault_name, event)
+    max_timeline_size: usize,
+    degradation_cache: HashMap<String, MetricDegradation>,
+}
+
+impl FaultInjectionEngine {
+    pub fn new() -> Self {
+        FaultInjectionEngine {
+            active_faults: vec![],
+            fault_timeline: VecDeque::new(),
+            max_timeline_size: 1000,
+            degradation_cache: HashMap::new(),
+        }
+    }
+
+    pub fn inject_fault(
+        &mut self,
+        fault_type: FaultType,
+        duration_ms: u32,
+        start_time_us: u64,
+    ) -> String {
+        let fault_id = format!("FAULT-{}", self.active_faults.len() + 1);
+        let fault_name = fault_type.name();
+
+        let degradation = MetricDegradation::from_fault_type(&fault_type);
+        self.degradation_cache.insert(fault_id.clone(), degradation);
+
+        let instance = FaultInstance {
+            fault_id: fault_id.clone(),
+            fault_type,
+            start_time_us,
+            duration_ms,
+            end_time_us: None,
+            status: "active".to_string(),
+        };
+
+        self.active_faults.push(instance);
+
+        // 타임라인에 기록
+        self.add_timeline_event(start_time_us, &fault_name, "INJECTED");
+
+        fault_id
+    }
+
+    pub fn check_fault_active(&self, current_time_us: u64) -> Vec<String> {
+        self.active_faults
+            .iter()
+            .filter(|f| f.is_active(current_time_us))
+            .map(|f| f.fault_id.clone())
+            .collect()
+    }
+
+    pub fn get_metric_degradation(
+        &self,
+        fault_id: &str,
+    ) -> Option<&MetricDegradation> {
+        self.degradation_cache.get(fault_id)
+    }
+
+    pub fn get_combined_degradation(
+        &self,
+        current_time_us: u64,
+    ) -> MetricDegradation {
+        // 여러 fault가 동시에 active일 때, 영향도를 조합
+        let active_fault_ids = self.check_fault_active(current_time_us);
+
+        let mut combined = MetricDegradation {
+            p99_latency_increase_percent: 0.0,
+            avg_latency_increase_percent: 0.0,
+            scheduler_queue_increase_percent: 0.0,
+            memory_usage_increase_percent: 0.0,
+            gc_pause_increase_percent: 0.0,
+            memory_pressure_increase: 0.0,
+            allocation_stall_percent: 0.0,
+            fragmentation_increase: 0.0,
+            io_latency_increase_percent: 0.0,
+            io_queue_depth_increase: 0,
+            cache_hit_drop_percent: 0.0,
+            cache_hit_drop_total: 0.0,
+            throughput_reduction_percent: 0.0,
+            context_switch_increase_percent: 0.0,
+        };
+
+        for fault_id in active_fault_ids {
+            if let Some(degradation) = self.get_metric_degradation(&fault_id) {
+                // Additive combination for most metrics
+                combined.p99_latency_increase_percent += degradation.p99_latency_increase_percent;
+                combined.avg_latency_increase_percent += degradation.avg_latency_increase_percent;
+                combined.scheduler_queue_increase_percent += degradation.scheduler_queue_increase_percent;
+                combined.memory_usage_increase_percent += degradation.memory_usage_increase_percent;
+                combined.gc_pause_increase_percent += degradation.gc_pause_increase_percent;
+                combined.memory_pressure_increase += degradation.memory_pressure_increase;
+                combined.allocation_stall_percent += degradation.allocation_stall_percent;
+                combined.fragmentation_increase += degradation.fragmentation_increase;
+                combined.io_latency_increase_percent += degradation.io_latency_increase_percent;
+                combined.io_queue_depth_increase += degradation.io_queue_depth_increase;
+                combined.cache_hit_drop_percent += degradation.cache_hit_drop_percent;
+                combined.cache_hit_drop_total += degradation.cache_hit_drop_total;
+                combined.throughput_reduction_percent += degradation.throughput_reduction_percent;
+                combined.context_switch_increase_percent += degradation.context_switch_increase_percent;
+            }
+        }
+
+        // Cap percentages at reasonable values
+        combined.p99_latency_increase_percent = combined.p99_latency_increase_percent.min(500.0);
+        combined.memory_pressure_increase = combined.memory_pressure_increase.min(1.0);
+        combined.cache_hit_drop_total = combined.cache_hit_drop_total.min(1.0);
+
+        combined
+    }
+
+    pub fn remove_fault(&mut self, fault_id: &str, current_time_us: u64) {
+        if let Some(fault) = self.active_faults.iter_mut().find(|f| f.fault_id == fault_id) {
+            fault.status = "completed".to_string();
+            fault.end_time_us = Some(current_time_us);
+            self.add_timeline_event(current_time_us, &fault.fault_type.name(), "REMOVED");
+        }
+    }
+
+    fn add_timeline_event(&mut self, time_us: u64, fault_name: &str, event_type: &str) {
+        self.fault_timeline.push_back((time_us, fault_name.to_string(), event_type.to_string()));
+
+        // Maintain size limit
+        while self.fault_timeline.len() > self.max_timeline_size {
+            self.fault_timeline.pop_front();
+        }
+    }
+
+    pub fn get_timeline(&self) -> String {
+        let mut timeline = String::new();
+        for (time_us, fault_name, event_type) in &self.fault_timeline {
+            timeline.push_str(&format!(
+                "{}us: {} - {}\n",
+                time_us, fault_name, event_type
+            ));
+        }
+        timeline
+    }
+
+    pub fn get_summary(&self) -> String {
+        format!(
+            "Fault Injection Engine: {} active faults, {} timeline events",
+            self.active_faults.len(),
+            self.fault_timeline.len()
+        )
+    }
+}
+
+// ============================================================================
+// TEST CASES (Days 1-2)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fault_type_severity() {
+        let latency_spike = FaultType::LatencySpike(250);
+        assert_eq!(latency_spike.severity(), 4);
+
+        let memory_leak = FaultType::MemoryLeak(50_000_000);
+        assert_eq!(memory_leak.severity(), 4);
+
+        let network_partition = FaultType::NetworkPartition;
+        assert_eq!(network_partition.severity(), 5);
+    }
+
+    #[test]
+    fn test_fault_instance_active() {
+        let fault = FaultInstance {
+            fault_id: "FAULT-1".to_string(),
+            fault_type: FaultType::LatencySpike(100),
+            start_time_us: 1000_000_000,
+            duration_ms: 5000,
+            end_time_us: None,
+            status: "active".to_string(),
+        };
+
+        // Before start time
+        assert!(!fault.is_active(999_000_000));
+
+        // During fault
+        assert!(fault.is_active(1000_000_000));
+        assert!(fault.is_active(1002_500_000));
+
+        // After fault
+        assert!(!fault.is_active(1006_000_000));
+    }
+
+    #[test]
+    fn test_fault_elapsed_and_remaining() {
+        let fault = FaultInstance {
+            fault_id: "FAULT-1".to_string(),
+            fault_type: FaultType::LatencySpike(100),
+            start_time_us: 1000_000_000,
+            duration_ms: 5000,
+            end_time_us: None,
+            status: "active".to_string(),
+        };
+
+        assert_eq!(fault.get_elapsed_ms(1001_000_000), 1000);
+        assert_eq!(fault.get_remaining_ms(1001_000_000), 4000);
+
+        assert_eq!(fault.get_elapsed_ms(1005_500_000), 5500);
+        assert_eq!(fault.get_remaining_ms(1005_500_000), 0);
+    }
+
+    #[test]
+    fn test_metric_degradation_latency_spike() {
+        let degradation = MetricDegradation::from_fault_type(&FaultType::LatencySpike(300));
+
+        assert!(degradation.p99_latency_increase_percent > 100.0);
+        assert!(degradation.scheduler_queue_increase_percent > 40.0);
+        assert!(degradation.context_switch_increase_percent > 100.0);
+        assert_eq!(degradation.memory_usage_increase_percent, 0.0);
+    }
+
+    #[test]
+    fn test_metric_degradation_memory_leak() {
+        let degradation = MetricDegradation::from_fault_type(&FaultType::MemoryLeak(50_000_000));
+
+        assert!(degradation.memory_usage_increase_percent > 50.0);
+        assert!(degradation.gc_pause_increase_percent > 50.0);
+        assert!(degradation.allocation_stall_percent > 10.0);
+        assert_eq!(degradation.p99_latency_increase_percent, 0.0);
+    }
+
+    #[test]
+    fn test_metric_degradation_network_partition() {
+        let degradation = MetricDegradation::from_fault_type(&FaultType::NetworkPartition);
+
+        assert_eq!(degradation.cache_hit_drop_total, 0.7); // Catastrophic
+        assert_eq!(degradation.throughput_reduction_percent, 100.0);
+    }
+
+    #[test]
+    fn test_fault_injection_engine() {
+        let mut engine = FaultInjectionEngine::new();
+
+        let fault_id = engine.inject_fault(
+            FaultType::LatencySpike(150),
+            5000,
+            1000_000_000,
+        );
+
+        assert_eq!(fault_id, "FAULT-1");
+
+        let active = engine.check_fault_active(1000_000_000);
+        assert_eq!(active.len(), 1);
+
+        let active_after = engine.check_fault_active(1006_000_000);
+        assert_eq!(active_after.len(), 0);
+    }
+
+    #[test]
+    fn test_combined_degradation_multiple_faults() {
+        let mut engine = FaultInjectionEngine::new();
+
+        let fault1 = engine.inject_fault(
+            FaultType::LatencySpike(100),
+            5000,
+            1000_000_000,
+        );
+        let fault2 = engine.inject_fault(
+            FaultType::GCPause(100),
+            3000,
+            1000_000_000,
+        );
+
+        let combined = engine.get_combined_degradation(1000_000_000);
+
+        // Both faults active, so combined effect > single fault
+        let single_latency = MetricDegradation::from_fault_type(&FaultType::LatencySpike(100));
+        assert!(combined.p99_latency_increase_percent > single_latency.p99_latency_increase_percent);
+    }
+
+    #[test]
+    fn test_fault_timeline_logging() {
+        let mut engine = FaultInjectionEngine::new();
+
+        engine.inject_fault(FaultType::LatencySpike(100), 5000, 1000_000_000);
+        engine.inject_fault(FaultType::MemoryLeak(10_000_000), 3000, 1000_000_500);
+        engine.remove_fault("FAULT-1", 1005_000_000);
+
+        let timeline = engine.get_timeline();
+        assert!(timeline.contains("LatencySpike"));
+        assert!(timeline.contains("MemoryLeak"));
+        assert!(timeline.contains("REMOVED"));
+    }
+
+    #[test]
+    fn test_fault_severity_consistency() {
+        let mild_latency = FaultType::LatencySpike(50);
+        let severe_latency = FaultType::LatencySpike(400);
+
+        assert!(mild_latency.severity() < severe_latency.severity());
+    }
+
+    #[test]
+    fn test_degradation_capping() {
+        let mut engine = FaultInjectionEngine::new();
+
+        // Inject multiple high-severity faults
+        for i in 0..5 {
+            engine.inject_fault(
+                FaultType::LatencySpike(400),
+                5000,
+                1000_000_000,
+            );
+        }
+
+        let combined = engine.get_combined_degradation(1000_000_000);
+
+        // Verify capping at reasonable values
+        assert!(combined.p99_latency_increase_percent <= 500.0);
+        assert!(combined.memory_pressure_increase <= 1.0);
+        assert!(combined.cache_hit_drop_total <= 1.0);
+    }
+}

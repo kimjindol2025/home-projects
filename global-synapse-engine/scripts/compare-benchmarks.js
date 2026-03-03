@@ -27,6 +27,8 @@ if (allMetrics.length < 2) {
 const latest = allMetrics[allMetrics.length - 1];
 const previous = allMetrics[allMetrics.length - 2];
 
+let hasRegression = false;
+
 console.log('\n📊 Benchmark Comparison\n');
 console.log('═'.repeat(60));
 
@@ -37,6 +39,16 @@ console.log(`Current:  ${latest.tests.passed}/${latest.tests.total} (${latest.te
 
 if (latest.tests.passed < previous.tests.passed) {
   console.log('❌ REGRESSION: Tests failing');
+  hasRegression = true;
+}
+
+// Memory leak detection
+console.log('\n💾 Memory Status\n');
+if (latest.memory && latest.memory.isLeaking) {
+  console.log('⚠️  REGRESSION: Memory leak detected');
+  hasRegression = true;
+} else {
+  console.log('✅ No memory leaks detected');
 }
 
 // Performance comparison
@@ -52,6 +64,38 @@ console.log(`Change:   ${timeDiff > 0 ? '+' : ''}${timeDiff}ms (${timeDiff > 0 ?
 
 if (timeDiff > prevTime * 0.1) { // More than 10% slower
   console.log('⚠️  WARNING: Performance degradation >10%');
+  hasRegression = true;
+}
+
+// P99 latency comparison for individual operations
+console.log('\n⚡ P99 Latency by Operation\n');
+const prevOps = previous.performance.operations || {};
+const currOps = latest.performance.operations || {};
+
+let hasLatencyRegression = false;
+const operationKeys = new Set([...Object.keys(prevOps), ...Object.keys(currOps)]);
+
+for (const opName of operationKeys) {
+  const prevOp = prevOps[opName];
+  const currOp = currOps[opName];
+
+  if (!prevOp || !currOp) continue;
+
+  const prevP99 = prevOp.p99Us;
+  const currP99 = currOp.p99Us;
+  const p99Diff = currP99 - prevP99;
+  const p99Percent = ((p99Diff / prevP99) * 100).toFixed(1);
+
+  console.log(`${opName}:`);
+  console.log(`  Previous p99: ${prevP99.toFixed(2)}μs`);
+  console.log(`  Current p99:  ${currP99.toFixed(2)}μs`);
+  console.log(`  Change:       ${p99Diff > 0 ? '+' : ''}${p99Diff.toFixed(2)}μs (${p99Diff > 0 ? '+' : ''}${p99Percent}%)`);
+
+  // Alert if p99 latency increased more than 20%
+  if (p99Diff > prevP99 * 0.2) {
+    console.log(`  ⚠️  WARNING: p99 latency regression >20%`);
+    hasLatencyRegression = true;
+  }
 }
 
 // Trend analysis
@@ -74,10 +118,14 @@ console.log(`Min:      ${minTime}ms`);
 console.log(`Max:      ${maxTime}ms`);
 console.log(`Variance: ${(maxTime - minTime)}ms`);
 
+if (hasLatencyRegression) {
+  hasRegression = true;
+}
+
 console.log('\n═'.repeat(60));
 
 // Exit code based on regression
-if (latest.tests.passRate < previous.tests.passRate || timeDiff > prevTime * 0.1) {
+if (hasRegression) {
   console.log('\n⚠️  Performance regression detected');
   process.exit(1);
 }

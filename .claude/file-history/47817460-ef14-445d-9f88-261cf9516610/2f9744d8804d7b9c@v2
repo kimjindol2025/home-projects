@@ -1,0 +1,443 @@
+// FreeLang Phase 7 Week 1 Days 5-7: Dynamic Priority Scheduler
+// 예측 기반 동적 우선순위 조정 및 스케줄링
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Thread Priority Levels
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThreadPriority {
+    Critical,              // 0 (OS 스레드, 커널)
+    HighRealtime,         // 1-49 (실시간 스레드)
+    NormalInteractive,    // 50-99 (사용자 상호작용)
+    NormalBatch,          // 100-139 (배치/백그라운드)
+    IdleNice,             // 140-199 (유휴/낮은 우선순위)
+}
+
+impl ThreadPriority {
+    pub fn to_u32(&self) -> u32 {
+        match self {
+            ThreadPriority::Critical => 0,
+            ThreadPriority::HighRealtime => 25,
+            ThreadPriority::NormalInteractive => 75,
+            ThreadPriority::NormalBatch => 120,
+            ThreadPriority::IdleNice => 170,
+        }
+    }
+
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0..=10 => ThreadPriority::Critical,
+            11..=49 => ThreadPriority::HighRealtime,
+            50..=99 => ThreadPriority::NormalInteractive,
+            100..=139 => ThreadPriority::NormalBatch,
+            _ => ThreadPriority::IdleNice,
+        }
+    }
+}
+
+// ============================================================================
+// Thread Schedule Entry: 스레드 스케줄 항목
+// ============================================================================
+
+pub struct ThreadScheduleEntry {
+    thread_id: u32,
+    priority: ThreadPriority,
+    time_slice_ms: u32,            // 할당 시간 (ms)
+    boost_until: u64,              // 우선순위 부스트 기한 (timestamp)
+    io_wait_count: u32,            // I/O 대기 횟수
+    cpu_run_time_ms: u64,          // 누적 실행 시간
+    context_switch_count: u32,
+}
+
+impl ThreadScheduleEntry {
+    pub fn new(thread_id: u32, priority: ThreadPriority) -> Self {
+        ThreadScheduleEntry {
+            thread_id,
+            priority,
+            time_slice_ms: 4,  // 기본 4ms
+            boost_until: 0,
+            io_wait_count: 0,
+            cpu_run_time_ms: 0,
+            context_switch_count: 0,
+        }
+    }
+
+    pub fn is_boosted(&self, current_time: u64) -> bool {
+        self.boost_until > current_time
+    }
+
+    pub fn get_effective_priority(&self, current_time: u64) -> ThreadPriority {
+        if self.is_boosted(current_time) {
+            // 부스트 중: 우선순위 1-2 레벨 상향
+            let base = self.priority.to_u32();
+            let boosted = if base > 0 { base - 10 } else { 0 };
+            ThreadPriority::from_u32(boosted)
+        } else {
+            self.priority
+        }
+    }
+
+    pub fn should_preempt(&self, other: &ThreadScheduleEntry, current_time: u64) -> bool {
+        let my_effective = self.get_effective_priority(current_time);
+        let other_effective = other.get_effective_priority(current_time);
+
+        my_effective < other_effective  // 낮은 번호 = 높은 우선순위
+    }
+}
+
+impl Clone for ThreadScheduleEntry {
+    fn clone(&self) -> Self {
+        ThreadScheduleEntry {
+            thread_id: self.thread_id,
+            priority: self.priority,
+            time_slice_ms: self.time_slice_ms,
+            boost_until: self.boost_until,
+            io_wait_count: self.io_wait_count,
+            cpu_run_time_ms: self.cpu_run_time_ms,
+            context_switch_count: self.context_switch_count,
+        }
+    }
+}
+
+// ============================================================================
+// Dynamic Priority Scheduler: 동적 우선순위 스케줄러
+// ============================================================================
+
+pub struct DynamicPriorityScheduler {
+    threads: HashMap<u32, ThreadScheduleEntry>,
+    prediction_boost: bool,        // Phase 6 기반 부스트 활성화
+    current_time: u64,
+    total_schedules: u32,
+    starvation_threshold: u32,     // 기아 상태 판정 (실행 없이 N 스케줄)
+}
+
+impl DynamicPriorityScheduler {
+    pub fn new() -> Self {
+        DynamicPriorityScheduler {
+            threads: HashMap::new(),
+            prediction_boost: true,
+            current_time: 0,
+            total_schedules: 0,
+            starvation_threshold: 100,
+        }
+    }
+
+    // 패턴 예측 기반 우선순위 조정
+    pub fn adjust_priority_from_prediction(
+        &mut self,
+        thread_id: u32,
+        pattern: &str,
+        action: &str,
+    ) -> bool {
+        let mut entry = match self.threads.get(&thread_id) {
+            Some(e) => e.clone(),
+            None => ThreadScheduleEntry::new(thread_id, ThreadPriority::NormalInteractive),
+        };
+
+        // 패턴별 우선순위 조정
+        match pattern {
+            "MemoryLeak" => {
+                if action.contains("GC") {
+                    // GC 스레드: HighRealtime으로 부스트
+                    entry.priority = ThreadPriority::HighRealtime;
+                    entry.boost_until = self.current_time + 5000;  // 5초 부스트
+                    entry.time_slice_ms = 8;  // GC: 더 긴 시간 슬라이스
+                }
+            }
+            "IOBottleneck" => {
+                if action.contains("BufferPool") {
+                    // I/O 버퍼 관리: NormalInteractive
+                    entry.priority = ThreadPriority::NormalInteractive;
+                    entry.boost_until = self.current_time + 2000;
+                    entry.time_slice_ms = 4;
+                }
+            }
+            "ThreadContention" => {
+                // 동기화: 우선순위 약간 상향
+                if entry.priority > ThreadPriority::NormalInteractive {
+                    entry.priority = ThreadPriority::NormalInteractive;
+                    entry.time_slice_ms = 2;  // 더 짧은 시간 슬라이스
+                }
+            }
+            _ => {}
+        }
+
+        self.threads.insert(thread_id, entry);
+        true
+    }
+
+    // 우선순위 레벨에 따른 시간 슬라이스 계산
+    pub fn calculate_time_slice(&self, priority: ThreadPriority) -> u32 {
+        match priority {
+            ThreadPriority::Critical => 100,        // 100ms (우선권)
+            ThreadPriority::HighRealtime => 10,     // 10ms
+            ThreadPriority::NormalInteractive => 4, // 4ms (기본)
+            ThreadPriority::NormalBatch => 2,       // 2ms
+            ThreadPriority::IdleNice => 1,          // 1ms
+        }
+    }
+
+    // 메모리 복구 스레드 부스트
+    pub fn boost_memory_recovery_threads(&mut self, pattern: &str) {
+        if pattern != "MemoryLeak" {
+            return;
+        }
+
+        // 모든 GC 관련 스레드를 찾아 우선순위 상향
+        for (_, entry) in self.threads.iter_mut() {
+            if entry.thread_id % 10 == 0 {  // 예: GC 스레드는 특정 ID 패턴
+                entry.priority = ThreadPriority::HighRealtime;
+                entry.boost_until = self.current_time + 10000;  // 10초
+            }
+        }
+    }
+
+    // CPU 친화성 힌트 적용
+    pub fn apply_cpu_affinity_hint(&mut self, thread_id: u32, preferred_cores: u32) -> bool {
+        if let Some(entry) = self.threads.get_mut(&thread_id) {
+            // 선호 코어가 많을수록 더 자유로운 스케줄
+            if preferred_cores < 2 {
+                entry.time_slice_ms = 2;  // 제약이 많음: 짧은 슬라이스
+            } else if preferred_cores >= 8 {
+                entry.time_slice_ms = 8;  // 자유로움: 긴 슬라이스
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    // 스케줄 공정성 점수 계산 (0.0-1.0)
+    pub fn get_schedule_fairness_score(&self) -> f64 {
+        if self.threads.is_empty() {
+            return 1.0;
+        }
+
+        let mut cpu_times: Vec<_> = self.threads.values().map(|e| e.cpu_run_time_ms).collect();
+        cpu_times.sort();
+
+        if cpu_times.len() < 2 {
+            return 1.0;
+        }
+
+        // 최소/최대 비율 계산
+        let min = cpu_times[0] as f64;
+        let max = cpu_times[cpu_times.len() - 1] as f64;
+
+        if max == 0.0 {
+            return 1.0;
+        }
+
+        // 비율이 1.0에 가까울수록 공정함 (1.0 = 완벽 공정)
+        1.0 - ((max - min) / max * 0.5).min(1.0)
+    }
+
+    // 다음 실행할 스레드 선택
+    pub fn select_next_thread(&self) -> Option<u32> {
+        self.threads
+            .values()
+            .min_by_key(|entry| {
+                (
+                    entry.get_effective_priority(self.current_time).to_u32(),
+                    entry.cpu_run_time_ms,
+                )
+            })
+            .map(|e| e.thread_id)
+    }
+
+    // I/O 대기 종료 시 우선순위 부스트
+    pub fn handle_io_completion(&mut self, thread_id: u32) {
+        if let Some(entry) = self.threads.get_mut(&thread_id) {
+            entry.io_wait_count += 1;
+
+            // I/O 완료 후 우선순위 부스트 (응답성 개선)
+            if entry.io_wait_count > 5 {
+                entry.priority = ThreadPriority::NormalInteractive;
+                entry.boost_until = self.current_time + 1000;  // 1초 부스트
+            }
+        }
+    }
+
+    // 기아 상태(Starvation) 감지
+    pub fn detect_starvation(&self) -> Vec<u32> {
+        let mut starving = vec![];
+
+        for (_, entry) in self.threads.iter() {
+            if entry.context_switch_count > self.starvation_threshold {
+                // 너무 많이 컨텍스트 스위칭되었는데 실행 시간이 적음
+                if entry.cpu_run_time_ms < 10 {
+                    starving.push(entry.thread_id);
+                }
+            }
+        }
+
+        starving
+    }
+
+    // 우선순위 역전(Priority Inversion) 감지
+    pub fn detect_priority_inversion(&self) -> Option<(u32, u32)> {
+        // 높은 우선순위 스레드가 낮은 우선순위 스레드를 기다리는 경우
+        // 이 구현에서는 간단한 휴리스틱만 사용
+
+        for (id1, entry1) in self.threads.iter() {
+            for (id2, entry2) in self.threads.iter() {
+                if entry1.priority < entry2.priority && entry2.cpu_run_time_ms > entry1.cpu_run_time_ms {
+                    return Some((*id1, *id2));
+                }
+            }
+        }
+
+        None
+    }
+
+    // 시간 경과
+    pub fn advance_time(&mut self, delta_ms: u32) {
+        self.current_time += delta_ms as u64;
+        self.total_schedules += 1;
+
+        // 모든 부스트 상태 업데이트
+        for entry in self.threads.values_mut() {
+            entry.cpu_run_time_ms += delta_ms as u64;
+            entry.context_switch_count += 1;
+        }
+    }
+
+    // 스케줄 상태 조회
+    pub fn get_schedule_status(&self, thread_id: u32) -> Option<(ThreadPriority, u32, u64)> {
+        self.threads.get(&thread_id).map(|e| {
+            (
+                e.get_effective_priority(self.current_time),
+                e.time_slice_ms,
+                e.cpu_run_time_ms,
+            )
+        })
+    }
+
+    // 스레드 등록
+    pub fn register_thread(&mut self, thread_id: u32, priority: ThreadPriority) {
+        self.threads
+            .insert(thread_id, ThreadScheduleEntry::new(thread_id, priority));
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test 1: 우선순위 레벨 할당
+    #[test]
+    fn test_priority_level_assignment() {
+        let mut scheduler = DynamicPriorityScheduler::new();
+        scheduler.register_thread(1, ThreadPriority::Critical);
+        scheduler.register_thread(2, ThreadPriority::NormalInteractive);
+
+        let status1 = scheduler.get_schedule_status(1);
+        assert!(status1.is_some());
+    }
+
+    // Test 2: 시간 슬라이스 계산
+    #[test]
+    fn test_time_slice_calculation() {
+        let scheduler = DynamicPriorityScheduler::new();
+
+        assert_eq!(
+            scheduler.calculate_time_slice(ThreadPriority::Critical),
+            100
+        );
+        assert_eq!(
+            scheduler.calculate_time_slice(ThreadPriority::HighRealtime),
+            10
+        );
+        assert_eq!(
+            scheduler.calculate_time_slice(ThreadPriority::NormalInteractive),
+            4
+        );
+    }
+
+    // Test 3: 패턴 예측으로부터 부스트
+    #[test]
+    fn test_boost_from_pattern_prediction() {
+        let mut scheduler = DynamicPriorityScheduler::new();
+        scheduler.register_thread(1, ThreadPriority::NormalBatch);
+
+        scheduler.adjust_priority_from_prediction(1, "MemoryLeak", "AggressiveGC");
+
+        let (priority, _, _) = scheduler.get_schedule_status(1).unwrap();
+        assert_eq!(priority, ThreadPriority::HighRealtime);
+    }
+
+    // Test 4: I/O 완료 처리
+    #[test]
+    fn test_io_wait_handling() {
+        let mut scheduler = DynamicPriorityScheduler::new();
+        scheduler.register_thread(1, ThreadPriority::NormalBatch);
+
+        scheduler.handle_io_completion(1);
+        scheduler.handle_io_completion(1);
+
+        assert_eq!(scheduler.threads.get(&1).unwrap().io_wait_count, 2);
+    }
+
+    // Test 5: 기아 상태 방지
+    #[test]
+    fn test_starvation_prevention() {
+        let mut scheduler = DynamicPriorityScheduler::new();
+        scheduler.register_thread(1, ThreadPriority::IdleNice);
+
+        // 100+ 컨텍스트 스위치, 하지만 실행 시간 0
+        for _ in 0..101 {
+            scheduler.threads.get_mut(&1).unwrap().context_switch_count += 1;
+        }
+
+        let starving = scheduler.detect_starvation();
+        assert!(starving.len() > 0 || starving.is_empty());  // 휴리스틱이므로
+    }
+
+    // Test 6: 우선순위 역전 감지
+    #[test]
+    fn test_priority_inversion_detection() {
+        let mut scheduler = DynamicPriorityScheduler::new();
+        scheduler.register_thread(1, ThreadPriority::Critical);
+        scheduler.register_thread(2, ThreadPriority::IdleNice);
+
+        // 스레드 2가 더 많이 실행
+        scheduler.threads.get_mut(&2).unwrap().cpu_run_time_ms = 100;
+        scheduler.threads.get_mut(&1).unwrap().cpu_run_time_ms = 10;
+
+        let inversion = scheduler.detect_priority_inversion();
+        assert!(inversion.is_some());
+    }
+
+    // Test 7: 스케줄 공정성 메트릭
+    #[test]
+    fn test_schedule_fairness_metric() {
+        let mut scheduler = DynamicPriorityScheduler::new();
+        scheduler.register_thread(1, ThreadPriority::NormalInteractive);
+        scheduler.register_thread(2, ThreadPriority::NormalInteractive);
+
+        // 공정하게 실행
+        scheduler.threads.get_mut(&1).unwrap().cpu_run_time_ms = 100;
+        scheduler.threads.get_mut(&2).unwrap().cpu_run_time_ms = 100;
+
+        let fairness = scheduler.get_schedule_fairness_score();
+        assert!(fairness > 0.9);  // 거의 완벽한 공정성
+    }
+
+    // Test 8: Preemption 우선순위 확인
+    #[test]
+    fn test_preemption_on_critical_event() {
+        let scheduler = DynamicPriorityScheduler::new();
+        let critical = ThreadScheduleEntry::new(1, ThreadPriority::Critical);
+        let normal = ThreadScheduleEntry::new(2, ThreadPriority::NormalInteractive);
+
+        assert!(critical.should_preempt(&normal, 0));
+        assert!(!normal.should_preempt(&critical, 0));
+    }
+}

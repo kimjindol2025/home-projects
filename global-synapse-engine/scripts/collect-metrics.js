@@ -77,6 +77,46 @@ function parseMetrics(output) {
   const passRateMatch = output.match(/Pass Rate:\s+([\d.]+)%/);
   const passRate = passRateMatch ? parseFloat(passRateMatch[1]) : null;
 
+  // Extract individual operation latencies (p99)
+  const perfMatch = output.match(/\[PERF\]\s+(.+?):\s+([\d.]+)μs/g) || [];
+  const operations = {};
+  perfMatch.forEach(line => {
+    const match = line.match(/\[PERF\]\s+(.+?):\s+([\d.]+)μs/);
+    if (match) {
+      const opName = match[1].trim();
+      const latencyUs = parseFloat(match[2]);
+      if (!operations[opName]) {
+        operations[opName] = [];
+      }
+      operations[opName].push(latencyUs);
+    }
+  });
+
+  // Calculate p95/p99 for each operation
+  const operationStats = {};
+  Object.entries(operations).forEach(([opName, latencies]) => {
+    latencies.sort((a, b) => a - b);
+    const p50Index = Math.floor(latencies.length * 0.5);
+    const p95Index = Math.floor(latencies.length * 0.95);
+    const p99Index = Math.floor(latencies.length * 0.99);
+
+    operationStats[opName] = {
+      count: latencies.length,
+      minUs: Math.min(...latencies),
+      maxUs: Math.max(...latencies),
+      p50Us: latencies[p50Index],
+      p95Us: latencies[p95Index],
+      p99Us: latencies[p99Index]
+    };
+  });
+
+  // Extract memory stats
+  const memoryMatch = output.match(/Start RSS:\s+([\d.]+) MB[\s\S]*?Leak Status:\s+(✅|⚠️)/);
+  let memoryLeaking = false;
+  if (memoryMatch && memoryMatch[2] === '⚠️') {
+    memoryLeaking = true;
+  }
+
   return {
     tests: {
       passed: passedTests,
@@ -85,7 +125,11 @@ function parseMetrics(output) {
       passRate: passRate
     },
     performance: {
-      executionTimeMs: executionTimeMs
+      executionTimeMs: executionTimeMs,
+      operations: operationStats
+    },
+    memory: {
+      isLeaking: memoryLeaking
     }
   };
 }

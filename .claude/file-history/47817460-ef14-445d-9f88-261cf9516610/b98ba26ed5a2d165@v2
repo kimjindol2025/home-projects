@@ -1,0 +1,816 @@
+// FreeLang Phase H Week 2: Root Cause Engine
+// Automatic root cause analysis + PostMortem report generation
+// Design by Failure: 장애 → 원인 분석 → 자동 리포트
+
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// Root Cause Analysis Types
+// ============================================================================
+
+pub struct RootCauseHypothesis {
+    event_id: String,              // causality_graph에서 나온 root cause 후보
+    event_type: String,            // "GC", "Scheduler", "IOSystem" 등
+    confidence: f64,               // 0.0-1.0 (얼마나 확신하는가)
+    supporting_evidence: Vec<String>, // ["P99 spike 3 consecutive", "GC pause 150ms", ...]
+    impact_score: f64,             // 0.0-1.0 (영향도: 얼마나 심각한가)
+    prior_probability: f64,        // 도메인 지식 (GC가 P99 유발할 확률: 0.85)
+}
+
+pub struct RootCauseAnalysis {
+    failure_id: String,            // SLO violation ID
+    failure_class: String,         // "LatencyExplosion", "MemoryCollapse", "IOBackpressure"
+    failure_time_us: u64,
+    hypothesis_list: Vec<RootCauseHypothesis>, // 우선순위 내림차순
+    primary_root_cause: Option<RootCauseHypothesis>, // 가장 높은 confidence 원인
+    secondary_causes: Vec<RootCauseHypothesis>,      // 2-5순위 원인들
+    confidence_in_analysis: f64,   // 전체 분석 신뢰도
+    recommendation: String,        // 제안된 조치
+}
+
+pub struct AutoReport {
+    report_id: String,
+    timestamp_us: u64,
+    failure_summary: String,       // "Latency explosion at 2026-03-03 11:45:32Z"
+    root_cause_section: String,    // "Primary Cause: GC pause (0.92 confidence)"
+    timeline_section: String,      // "11:45:20Z: GC pause starts\n11:45:25Z: Scheduler queue filled"
+    applied_policies_section: String, // "Applied: GCMode(aggressive), ThreadAffinity(numa)"
+    expected_outcome_section: String,  // "Expected: P99 drop to <50ms within 60s"
+    metrics_impact_section: String, // "Predicted improvement: 60-70%"
+    next_steps: String,            // "Monitor for 10 minutes, then rollback if no improvement"
+    report_markdown: String,       // 최종 Markdown 형식 리포트
+}
+
+// ============================================================================
+// Root Cause Analyzer
+// ============================================================================
+
+pub struct RootCauseAnalyzer {
+    // 도메인 지식: 어떤 이벤트가 어떤 결과를 유발하는가
+    causal_relationships: HashMap<String, HashMap<String, f64>>, // cause_type → effect_type → prior_prob
+
+    // 실시간 데이터
+    recent_failures: Vec<(String, String, u64)>, // (failure_id, failure_class, time_us)
+    max_history: usize,
+}
+
+impl RootCauseAnalyzer {
+    pub fn new() -> Self {
+        let mut causal_relationships = HashMap::new();
+
+        // Latency Explosion causes
+        let mut latency_causes = HashMap::new();
+        latency_causes.insert("GC".to_string(), 0.85);
+        latency_causes.insert("Scheduler".to_string(), 0.75);
+        latency_causes.insert("IOSystem".to_string(), 0.65);
+        latency_causes.insert("ContextSwitch".to_string(), 0.70);
+        latency_causes.insert("CacheContention".to_string(), 0.60);
+        causal_relationships.insert("LatencyExplosion".to_string(), latency_causes);
+
+        // Memory Collapse causes
+        let mut memory_causes = HashMap::new();
+        memory_causes.insert("GC".to_string(), 0.80);
+        memory_causes.insert("Allocator".to_string(), 0.75);
+        memory_causes.insert("Fragmentation".to_string(), 0.70);
+        memory_causes.insert("MemLeak".to_string(), 0.85);
+        causal_relationships.insert("MemoryCollapse".to_string(), memory_causes);
+
+        // I/O Backpressure causes
+        let mut io_causes = HashMap::new();
+        io_causes.insert("IOSystem".to_string(), 0.90);
+        io_causes.insert("DiskQueue".to_string(), 0.75);
+        io_causes.insert("CacheEviction".to_string(), 0.65);
+        io_causes.insert("Scheduler".to_string(), 0.55);
+        causal_relationships.insert("IOBackpressure".to_string(), io_causes);
+
+        RootCauseAnalyzer {
+            causal_relationships,
+            recent_failures: vec![],
+            max_history: 100,
+        }
+    }
+
+    // ========================================================================
+    // 핵심 분석 메서드
+    // ========================================================================
+
+    pub fn analyze(
+        &mut self,
+        failure_id: String,
+        failure_class: String,
+        failure_time_us: u64,
+        root_cause_candidates: Vec<(String, String, f64)>, // (event_id, event_type, from_causality_graph)
+        supporting_metrics: HashMap<String, f64>, // "P99": 150.0, "GC_pause": 120.0, etc
+    ) -> RootCauseAnalysis {
+        // 1. Hypothesis 생성: 각 후보에 대해 confidence 계산
+        let mut hypotheses = vec![];
+
+        if let Some(cause_probs) = self.causal_relationships.get(&failure_class) {
+            for (event_id, event_type, graph_confidence) in root_cause_candidates {
+                let prior_prob = cause_probs.get(&event_type).copied().unwrap_or(0.5);
+
+                // Confidence = Causality Graph confidence × Prior probability
+                let confidence = (graph_confidence * 0.6 + prior_prob * 0.4).min(1.0);
+
+                // Supporting evidence 수집
+                let supporting_evidence = self.collect_evidence(&event_type, &supporting_metrics);
+
+                // Impact score: 메트릭 기반 (클수록 심각함)
+                let impact_score = self.calculate_impact(&event_type, &supporting_metrics);
+
+                hypotheses.push(RootCauseHypothesis {
+                    event_id: event_id.clone(),
+                    event_type,
+                    confidence,
+                    supporting_evidence,
+                    impact_score,
+                    prior_probability: prior_prob,
+                });
+            }
+        }
+
+        // 2. Confidence로 정렬 (내림차순)
+        hypotheses.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+
+        // 3. Primary + Secondary 분리
+        let primary_root_cause = hypotheses.first().cloned();
+        let secondary_causes = if hypotheses.len() > 1 {
+            hypotheses[1..].to_vec()
+        } else {
+            vec![]
+        };
+
+        // 4. 전체 분석 신뢰도 계산
+        let confidence_in_analysis = if let Some(ref primary) = primary_root_cause {
+            // Primary가 높을수록, Secondary와의 gap이 클수록 신뢰도 높음
+            let primary_conf = primary.confidence;
+            let secondary_conf = secondary_causes.first().map(|h| h.confidence).unwrap_or(0.0);
+            let gap = primary_conf - secondary_conf;
+            (primary_conf * 0.7 + gap * 0.3).min(1.0)
+        } else {
+            0.0
+        };
+
+        // 5. 제안된 조치 생성
+        let recommendation = self.generate_recommendation(
+            &primary_root_cause,
+            &failure_class,
+            &supporting_metrics,
+        );
+
+        // 6. 히스토리에 추가
+        self.recent_failures.push((failure_id.clone(), failure_class.clone(), failure_time_us));
+        if self.recent_failures.len() > self.max_history {
+            self.recent_failures.remove(0);
+        }
+
+        RootCauseAnalysis {
+            failure_id,
+            failure_class,
+            failure_time_us,
+            hypothesis_list: hypotheses,
+            primary_root_cause,
+            secondary_causes,
+            confidence_in_analysis,
+            recommendation,
+        }
+    }
+
+    // ========================================================================
+    // Helper Methods
+    // ========================================================================
+
+    fn collect_evidence(
+        &self,
+        event_type: &str,
+        supporting_metrics: &HashMap<String, f64>,
+    ) -> Vec<String> {
+        let mut evidence = vec![];
+
+        match event_type {
+            "GC" => {
+                if let Some(gc_pause) = supporting_metrics.get("GC_pause_ms") {
+                    if *gc_pause > 100.0 {
+                        evidence.push(format!("GC pause {:.0}ms (threshold: 100ms)", gc_pause));
+                    }
+                }
+                if let Some(fragmentation) = supporting_metrics.get("fragmentation_ratio") {
+                    if *fragmentation > 0.7 {
+                        evidence.push(format!("Allocator fragmentation {:.2} (threshold: 0.7)", fragmentation));
+                    }
+                }
+            },
+            "Scheduler" => {
+                if let Some(queue_depth) = supporting_metrics.get("scheduler_queue_depth_percent") {
+                    if *queue_depth > 50.0 {
+                        evidence.push(format!("Scheduler queue depth {:.0}% (threshold: 50%)", queue_depth));
+                    }
+                }
+                if let Some(context_switches) = supporting_metrics.get("context_switches_per_sec") {
+                    if *context_switches > 10000.0 {
+                        evidence.push(format!("High context switches: {:.0}/sec", context_switches));
+                    }
+                }
+            },
+            "IOSystem" => {
+                if let Some(io_latency) = supporting_metrics.get("io_syscall_latency_us") {
+                    if *io_latency > 1000.0 {
+                        evidence.push(format!("I/O latency {:.0}µs (threshold: 1000µs)", io_latency));
+                    }
+                }
+                if let Some(queue_depth) = supporting_metrics.get("io_queue_depth") {
+                    if *queue_depth > 64.0 {
+                        evidence.push(format!("I/O queue depth {:.0} (threshold: 64)", queue_depth));
+                    }
+                }
+            },
+            "ContextSwitch" => {
+                if let Some(spike) = supporting_metrics.get("context_switch_spike_factor") {
+                    if *spike > 2.0 {
+                        evidence.push(format!("Context switch spike: {:.2}x normal", spike));
+                    }
+                }
+            },
+            "CacheContention" => {
+                if let Some(cache_hit) = supporting_metrics.get("cache_hit_rate") {
+                    if *cache_hit < 0.5 {
+                        evidence.push(format!("Low cache hit rate: {:.2} (expected: >0.8)", cache_hit));
+                    }
+                }
+            },
+            _ => {},
+        }
+
+        evidence
+    }
+
+    fn calculate_impact(
+        &self,
+        event_type: &str,
+        supporting_metrics: &HashMap<String, f64>,
+    ) -> f64 {
+        let mut impact = 0.5; // 기본값
+
+        match event_type {
+            "GC" => {
+                if let Some(gc_pause) = supporting_metrics.get("GC_pause_ms") {
+                    impact = (*gc_pause / 200.0).min(1.0); // 200ms = 1.0
+                }
+            },
+            "Scheduler" => {
+                if let Some(queue) = supporting_metrics.get("scheduler_queue_depth_percent") {
+                    impact = (*queue / 100.0).min(1.0);
+                }
+            },
+            "IOSystem" => {
+                if let Some(latency) = supporting_metrics.get("io_syscall_latency_us") {
+                    impact = (*latency / 5000.0).min(1.0); // 5000µs = 1.0
+                }
+            },
+            _ => {
+                impact = 0.5;
+            }
+        }
+
+        impact
+    }
+
+    fn generate_recommendation(
+        &self,
+        primary_cause: &Option<RootCauseHypothesis>,
+        failure_class: &str,
+        supporting_metrics: &HashMap<String, f64>,
+    ) -> String {
+        if let Some(cause) = primary_cause {
+            let confidence_pct = (cause.confidence * 100.0) as i32;
+
+            match cause.event_type.as_str() {
+                "GC" => {
+                    format!(
+                        "Switch to aggressive GC mode (confidence: {}%). Expected: 35-40% improvement. \
+                         Monitor P99 latency over next 60 seconds; if no improvement, consider increasing heap size.",
+                        confidence_pct
+                    )
+                },
+                "Scheduler" => {
+                    format!(
+                        "Rebalance thread affinity to NUMA-aware (confidence: {}%). Expected: 20-25% improvement. \
+                         Verify CPU utilization remains balanced across sockets.",
+                        confidence_pct
+                    )
+                },
+                "IOSystem" => {
+                    format!(
+                        "Switch to deadline I/O scheduler (confidence: {}%). Expected: 30-35% improvement. \
+                         Monitor disk queue depth; prepare rollback if cache hit rate drops further.",
+                        confidence_pct
+                    )
+                },
+                _ => {
+                    format!(
+                        "Primary cause: {} (confidence: {}%). Recommended action: apply corresponding policy rule. \
+                         Monitor SLO metrics for improvement.",
+                        cause.event_type, confidence_pct
+                    )
+                }
+            }
+        } else {
+            "Unable to identify primary root cause. Manual investigation required.".to_string()
+        }
+    }
+}
+
+// ============================================================================
+// PostMortem Report Generator
+// ============================================================================
+
+pub struct PostMortemReportGenerator {
+    organization: String,  // 조직명
+    severity_levels: HashMap<String, String>, // "LatencyExplosion" → "CRITICAL", etc
+}
+
+impl PostMortemReportGenerator {
+    pub fn new(organization: String) -> Self {
+        let mut severity_levels = HashMap::new();
+        severity_levels.insert("LatencyExplosion".to_string(), "CRITICAL".to_string());
+        severity_levels.insert("MemoryCollapse".to_string(), "CRITICAL".to_string());
+        severity_levels.insert("IOBackpressure".to_string(), "HIGH".to_string());
+
+        PostMortemReportGenerator {
+            organization,
+            severity_levels,
+        }
+    }
+
+    pub fn generate_report(
+        &self,
+        analysis: &RootCauseAnalysis,
+        applied_policies: Vec<String>,
+        expected_improvements: HashMap<String, f64>, // "P99_latency_drop_percent": 35.0
+    ) -> AutoReport {
+        let report_id = format!("PM-{}", uuid::Uuid::new_v4());
+        let timestamp_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+
+        // 1. Failure summary
+        let severity = self.severity_levels
+            .get(&analysis.failure_class)
+            .cloned()
+            .unwrap_or_else(|| "MEDIUM".to_string());
+        let failure_summary = format!(
+            "[{}] {} at {} UTC",
+            severity,
+            analysis.failure_class,
+            format_timestamp(analysis.failure_time_us),
+        );
+
+        // 2. Root cause section
+        let root_cause_section = if let Some(ref primary) = analysis.primary_root_cause {
+            format!(
+                "**Primary Cause:** {} (confidence: {:.0}%)\n\
+                 **Impact Score:** {:.0}%\n\
+                 **Evidence:** {}",
+                primary.event_type,
+                primary.confidence * 100.0,
+                primary.impact_score * 100.0,
+                primary.supporting_evidence.join(" + "),
+            )
+        } else {
+            "**Root Cause:** Unable to identify with confidence".to_string()
+        };
+
+        // 3. Timeline section (causality graph 기반)
+        let timeline_section = self.generate_timeline(analysis);
+
+        // 4. Applied policies section
+        let applied_policies_section = if !applied_policies.is_empty() {
+            format!("**Policies Applied:**\n{}", applied_policies.join("\n"))
+        } else {
+            "**Policies Applied:** None".to_string()
+        };
+
+        // 5. Expected outcome section
+        let expected_outcome_section = self.generate_expected_outcome(
+            analysis,
+            &expected_improvements,
+        );
+
+        // 6. Metrics impact section
+        let metrics_impact_section = self.generate_metrics_impact(&expected_improvements);
+
+        // 7. Next steps
+        let next_steps = if analysis.confidence_in_analysis > 0.8 {
+            "Monitor system for 10 minutes to verify improvement. If metrics improve by >30%, \
+             leave policies active and schedule follow-up review in 24 hours. \
+             If no improvement, prepare immediate rollback.".to_string()
+        } else if analysis.confidence_in_analysis > 0.6 {
+            "Monitor system for 15 minutes. Multiple potential causes identified; \
+             if improvement <20%, consider applying secondary cause policy (high risk of oscillation).".to_string()
+        } else {
+            "Root cause unclear. Escalate to on-call SRE for manual investigation. \
+             Apply conservative policies only (GC mode change, no aggressive scheduling changes).".to_string()
+        };
+
+        // 8. 최종 Markdown 리포트
+        let report_markdown = format!(
+            "# PostMortem Report: {}\n\n\
+             **Report ID:** {}\n\
+             **Generated:** {}\n\
+             **Confidence:** {:.0}%\n\n\
+             ## Summary\n\
+             {}\n\n\
+             ## Root Cause Analysis\n\
+             {}\n\n\
+             ## Event Timeline\n\
+             {}\n\n\
+             ## Remediation Actions\n\
+             {}\n\n\
+             ## Expected Impact\n\
+             {}\n\n\
+             ## Metrics Projection\n\
+             {}\n\n\
+             ## Recommended Next Steps\n\
+             {}\n\n\
+             ---\n\
+             *Generated by FreeLang Phase H Root Cause Engine*",
+            analysis.failure_class,
+            report_id,
+            format_timestamp(timestamp_us),
+            analysis.confidence_in_analysis * 100.0,
+            failure_summary,
+            root_cause_section,
+            timeline_section,
+            applied_policies_section,
+            expected_outcome_section,
+            metrics_impact_section,
+            next_steps,
+        );
+
+        AutoReport {
+            report_id,
+            timestamp_us,
+            failure_summary,
+            root_cause_section,
+            timeline_section,
+            applied_policies_section,
+            expected_outcome_section,
+            metrics_impact_section,
+            next_steps,
+            report_markdown,
+        }
+    }
+
+    fn generate_timeline(&self, analysis: &RootCauseAnalysis) -> String {
+        // Causality graph에서 causal chain을 이용해 timeline 재구성
+        // 실제로는 causality_graph의 trace_causal_chain 결과를 입력받아야 함
+        match analysis.failure_class.as_str() {
+            "LatencyExplosion" => {
+                format!(
+                    "- T-2.0s: GC pause begins (full mark phase)\n\
+                     - T-1.5s: Scheduler queue depth increases (tasks blocked by GC)\n\
+                     - T-0.5s: Context switches spike 2.5x normal\n\
+                     - T-0.0s: P99 latency spike detected ({} UTC)\n\
+                     - T+1.0s: SLO violation triggered, policy engine activated",
+                    format_timestamp(analysis.failure_time_us),
+                )
+            },
+            "MemoryCollapse" => {
+                format!(
+                    "- T-30s: Allocator fragmentation reaches 0.72\n\
+                     - T-15s: GC pause extends beyond 100ms\n\
+                     - T-5s: Memory pressure reaches 0.82\n\
+                     - T-0s: Allocation failures begin (memory collapse)\n\
+                     - T+2s: SLO violation triggered, policy engine activated",
+                )
+            },
+            "IOBackpressure" => {
+                format!(
+                    "- T-20s: Disk I/O latency spikes to 1200µs\n\
+                     - T-10s: I/O queue depth reaches 80 (threshold 64)\n\
+                     - T-5s: Cache hit rate drops from 0.92 to 0.65\n\
+                     - T-0s: SLO latency violation detected (I/O backpressure)\n\
+                     - T+1s: Policy engine activated",
+                )
+            },
+            _ => format!("Timeline for {}: Unable to reconstruct", analysis.failure_class),
+        }
+    }
+
+    fn generate_expected_outcome(
+        &self,
+        analysis: &RootCauseAnalysis,
+        expected_improvements: &HashMap<String, f64>,
+    ) -> String {
+        if let Some(ref primary) = analysis.primary_root_cause {
+            let improvement = expected_improvements
+                .get("improvement_percent")
+                .copied()
+                .unwrap_or(40.0);
+
+            format!(
+                "**Primary Action:** Apply {} policy\n\
+                 **Expected Improvement:** {:.0}% reduction in {}\n\
+                 **Confidence:** {:.0}%\n\
+                 **Timeline:** Results should be observable within 30-60 seconds\n\
+                 **Rollback Condition:** If improvement <20% after 90s, execute rollback",
+                primary.event_type,
+                improvement,
+                analysis.failure_class,
+                primary.confidence * 100.0,
+            )
+        } else {
+            "Unable to project outcome without identified root cause".to_string()
+        }
+    }
+
+    fn generate_metrics_impact(&self, expected_improvements: &HashMap<String, f64>) -> String {
+        let mut metrics = String::new();
+
+        if let Some(p99_drop) = expected_improvements.get("P99_latency_drop_percent") {
+            metrics.push_str(&format!("- P99 Latency: -{:.0}%\n", p99_drop));
+        }
+        if let Some(gc_improvement) = expected_improvements.get("GC_pause_reduction_percent") {
+            metrics.push_str(&format!("- GC Pause Time: -{:.0}%\n", gc_improvement));
+        }
+        if let Some(mem_improvement) = expected_improvements.get("memory_pressure_reduction_percent") {
+            metrics.push_str(&format!("- Memory Pressure: -{:.0}%\n", mem_improvement));
+        }
+        if let Some(io_improvement) = expected_improvements.get("io_latency_reduction_percent") {
+            metrics.push_str(&format!("- I/O Latency: -{:.0}%\n", io_improvement));
+        }
+
+        if metrics.is_empty() {
+            metrics = "Projected improvements pending policy execution".to_string();
+        }
+
+        metrics
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn format_timestamp(us: u64) -> String {
+    let secs = us / 1_000_000;
+    let micros = us % 1_000_000;
+    format!("{}.{:06}Z", secs, micros)
+}
+
+// ============================================================================
+// Integration Module
+// ============================================================================
+
+pub struct RootCauseEngineStack {
+    analyzer: RootCauseAnalyzer,
+    report_generator: PostMortemReportGenerator,
+}
+
+impl RootCauseEngineStack {
+    pub fn new(organization: String) -> Self {
+        RootCauseEngineStack {
+            analyzer: RootCauseAnalyzer::new(),
+            report_generator: PostMortemReportGenerator::new(organization),
+        }
+    }
+
+    pub fn analyze_and_report(
+        &mut self,
+        failure_id: String,
+        failure_class: String,
+        failure_time_us: u64,
+        root_cause_candidates: Vec<(String, String, f64)>,
+        supporting_metrics: HashMap<String, f64>,
+        applied_policies: Vec<String>,
+        expected_improvements: HashMap<String, f64>,
+    ) -> (RootCauseAnalysis, AutoReport) {
+        let analysis = self.analyzer.analyze(
+            failure_id,
+            failure_class,
+            failure_time_us,
+            root_cause_candidates,
+            supporting_metrics,
+        );
+
+        let report = self.report_generator.generate_report(
+            &analysis,
+            applied_policies,
+            expected_improvements,
+        );
+
+        (analysis, report)
+    }
+}
+
+// ============================================================================
+// TEST CASES (Phase 2 Week 2)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_root_cause_hypothesis_generation() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let mut metrics = HashMap::new();
+        metrics.insert("GC_pause_ms".to_string(), 150.0);
+        metrics.insert("scheduler_queue_depth_percent".to_string(), 75.0);
+
+        let analysis = analyzer.analyze(
+            "FAIL-001".to_string(),
+            "LatencyExplosion".to_string(),
+            1000_000_000,
+            vec![
+                ("EVT-1".to_string(), "GC".to_string(), 0.9),
+                ("EVT-2".to_string(), "Scheduler".to_string(), 0.7),
+            ],
+            metrics,
+        );
+
+        assert!(analysis.hypothesis_list.len() >= 2);
+        assert!(analysis.primary_root_cause.is_some());
+        let primary = analysis.primary_root_cause.unwrap();
+        assert!(primary.confidence > 0.7);
+        assert!(!primary.supporting_evidence.is_empty());
+    }
+
+    #[test]
+    fn test_confidence_scoring() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let mut metrics = HashMap::new();
+
+        // High-confidence scenario: strong GC evidence
+        metrics.insert("GC_pause_ms".to_string(), 200.0);
+        metrics.insert("fragmentation_ratio".to_string(), 0.75);
+
+        let analysis = analyzer.analyze(
+            "FAIL-002".to_string(),
+            "MemoryCollapse".to_string(),
+            1000_000_000,
+            vec![("EVT-3".to_string(), "GC".to_string(), 0.95)],
+            metrics,
+        );
+
+        if let Some(primary) = analysis.primary_root_cause {
+            assert!(primary.confidence > 0.8);
+        }
+    }
+
+    #[test]
+    fn test_secondary_causes() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let metrics = HashMap::new();
+
+        let analysis = analyzer.analyze(
+            "FAIL-003".to_string(),
+            "LatencyExplosion".to_string(),
+            1000_000_000,
+            vec![
+                ("EVT-4".to_string(), "GC".to_string(), 0.9),
+                ("EVT-5".to_string(), "Scheduler".to_string(), 0.75),
+                ("EVT-6".to_string(), "IOSystem".to_string(), 0.6),
+            ],
+            metrics,
+        );
+
+        assert_eq!(analysis.secondary_causes.len(), 2);
+        assert!(analysis.secondary_causes[0].confidence >= analysis.secondary_causes[1].confidence);
+    }
+
+    #[test]
+    fn test_postmortem_report_generation() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let generator = PostMortemReportGenerator::new("FreeLang".to_string());
+
+        let mut metrics = HashMap::new();
+        metrics.insert("GC_pause_ms".to_string(), 120.0);
+
+        let analysis = analyzer.analyze(
+            "FAIL-004".to_string(),
+            "MemoryCollapse".to_string(),
+            1000_000_000,
+            vec![("EVT-7".to_string(), "GC".to_string(), 0.88)],
+            metrics,
+        );
+
+        let mut improvements = HashMap::new();
+        improvements.insert("GC_pause_reduction_percent".to_string(), 45.0);
+
+        let report = generator.generate_report(
+            &analysis,
+            vec!["GCMode(aggressive)".to_string()],
+            improvements,
+        );
+
+        assert!(!report.report_id.is_empty());
+        assert!(report.report_markdown.contains("PostMortem"));
+        assert!(report.report_markdown.contains("confidence"));
+    }
+
+    #[test]
+    fn test_report_markdown_format() {
+        let generator = PostMortemReportGenerator::new("Test Org".to_string());
+        let mut analyzer = RootCauseAnalyzer::new();
+        let metrics = HashMap::new();
+
+        let analysis = analyzer.analyze(
+            "FAIL-005".to_string(),
+            "LatencyExplosion".to_string(),
+            1000_000_000,
+            vec![("EVT-8".to_string(), "GC".to_string(), 0.85)],
+            metrics,
+        );
+
+        let improvements = HashMap::new();
+        let report = generator.generate_report(&analysis, vec![], improvements);
+
+        assert!(report.report_markdown.contains("# PostMortem Report"));
+        assert!(report.report_markdown.contains("Root Cause Analysis"));
+        assert!(report.report_markdown.contains("Event Timeline"));
+    }
+
+    #[test]
+    fn test_confidence_in_analysis_high_gap() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let metrics = HashMap::new();
+
+        // GC가 명확히 더 높은 confidence
+        let analysis = analyzer.analyze(
+            "FAIL-006".to_string(),
+            "LatencyExplosion".to_string(),
+            1000_000_000,
+            vec![
+                ("EVT-9".to_string(), "GC".to_string(), 0.95),
+                ("EVT-10".to_string(), "Scheduler".to_string(), 0.55),
+            ],
+            metrics,
+        );
+
+        assert!(analysis.confidence_in_analysis > 0.8);
+    }
+
+    #[test]
+    fn test_confidence_in_analysis_low_gap() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let metrics = HashMap::new();
+
+        // Primary와 secondary의 confidence가 비슷 (불확실)
+        let analysis = analyzer.analyze(
+            "FAIL-007".to_string(),
+            "LatencyExplosion".to_string(),
+            1000_000_000,
+            vec![
+                ("EVT-11".to_string(), "GC".to_string(), 0.70),
+                ("EVT-12".to_string(), "Scheduler".to_string(), 0.68),
+            ],
+            metrics,
+        );
+
+        assert!(analysis.confidence_in_analysis < 0.7);
+    }
+
+    #[test]
+    fn test_root_cause_engine_stack_integration() {
+        let mut stack = RootCauseEngineStack::new("TestOrg".to_string());
+
+        let mut metrics = HashMap::new();
+        metrics.insert("GC_pause_ms".to_string(), 150.0);
+
+        let mut improvements = HashMap::new();
+        improvements.insert("P99_latency_drop_percent".to_string(), 40.0);
+
+        let (analysis, report) = stack.analyze_and_report(
+            "FAIL-008".to_string(),
+            "LatencyExplosion".to_string(),
+            1000_000_000,
+            vec![("EVT-13".to_string(), "GC".to_string(), 0.9)],
+            metrics,
+            vec!["GCMode(aggressive)".to_string()],
+            improvements,
+        );
+
+        assert!(!report.report_markdown.is_empty());
+        assert!(analysis.confidence_in_analysis > 0.0);
+    }
+
+    #[test]
+    fn test_no_root_cause_identified() {
+        let mut analyzer = RootCauseAnalyzer::new();
+        let metrics = HashMap::new();
+
+        let analysis = analyzer.analyze(
+            "FAIL-009".to_string(),
+            "UnknownClass".to_string(),
+            1000_000_000,
+            vec![],
+            metrics,
+        );
+
+        assert!(analysis.primary_root_cause.is_none());
+        assert_eq!(analysis.confidence_in_analysis, 0.0);
+    }
+}

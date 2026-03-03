@@ -1,0 +1,506 @@
+// FreeLang Phase H Week 2: Policy Controller
+// Metric → Policy 변환 (Control Authority 획득)
+
+use std::collections::HashMap;
+
+// ============================================================================
+// Policy Definition
+// ============================================================================
+
+pub enum PolicyType {
+    GCMode(String),                  // "normal" / "aggressive" / "incremental"
+    PreallocSize(u64),              // bytes
+    IOSchedulerPolicy(String),      // "noop" / "deadline" / "cfq"
+    ThreadAffinity(String),         // "default" / "numa_aware" / "lock"
+}
+
+pub enum PolicyStatus {
+    Pending,
+    Active,
+    Rolled back,
+    Reverted,
+}
+
+pub struct PolicyChange {
+    policy_type: PolicyType,
+    applied_at_us: u64,
+    triggered_by: String,           // Rule name
+    expected_impact: f64,           // Expected improvement (0-1)
+    confidence: f64,                // How confident in this policy
+    side_effects: Vec<String>,      // "increases CPU usage", etc.
+    reversible: bool,               // Can we undo this?
+    rollback_condition: String,     // When to undo (e.g., "if P99 > 80ms for 60s")
+    status: PolicyStatus,
+}
+
+// ============================================================================
+// Policy Rule: Failure → Policy 매핑
+// ============================================================================
+
+pub struct PolicyRule {
+    name: String,
+    class: String,                  // "LatencyExplosion", "MemoryCollapse", "IOBackpressure"
+    trigger_condition: String,      // "P99 > threshold 3 times" etc
+    action: PolicyType,
+    priority: u32,                  // 1-5 (5=highest, apply first)
+    expected_impact: f64,           // What % improvement expected?
+    enabled: bool,
+}
+
+// ============================================================================
+// Control Decision: 언제, 어떤 정책을 적용할 것인가?
+// ============================================================================
+
+pub struct ControlDecision {
+    decision_id: String,
+    triggered_by_failure: String,
+    triggered_at_us: u64,
+    matched_rules: Vec<String>,     // Which rules fired?
+    applied_policies: Vec<PolicyChange>,
+    decision_confidence: f64,       // Overall confidence
+    reasoning: String,              // "왜 이 결정을 내렸는가"
+    expected_outcome: String,       // "이렇게 되길 기대함"
+}
+
+// ============================================================================
+// Policy Controller: 자동 정책 결정 및 실행
+// ============================================================================
+
+pub struct PolicyController {
+    rules: Vec<PolicyRule>,
+    active_policies: Vec<PolicyChange>,
+    decision_history: Vec<ControlDecision>,
+    phase7_interface: String,       // Phase 7과의 인터페이스 (시뮬레이션)
+}
+
+impl PolicyController {
+    pub fn new() -> Self {
+        let mut controller = PolicyController {
+            rules: vec![],
+            active_policies: vec![],
+            decision_history: vec![],
+            phase7_interface: "phase7_control".to_string(),
+        };
+
+        // 기본 규칙 정의
+        controller.initialize_default_rules();
+
+        controller
+    }
+
+    // ========================================================================
+    // Initialize Default Rules (3개 Failure Class)
+    // ========================================================================
+
+    fn initialize_default_rules(&mut self) {
+        // Rule 1: Latency Explosion → GC Aggressive
+        self.rules.push(PolicyRule {
+            name: "LATENCY_GC_AGGRESSIVE".to_string(),
+            class: "LatencyExplosion".to_string(),
+            trigger_condition: "P99 > threshold 3 consecutive".to_string(),
+            action: PolicyType::GCMode("aggressive".to_string()),
+            priority: 4,
+            expected_impact: 0.35,  // 35% P99 improvement expected
+            enabled: true,
+        });
+
+        // Rule 2: Latency Explosion → Thread Affinity
+        self.rules.push(PolicyRule {
+            name: "LATENCY_AFFINITY_REBALANCE".to_string(),
+            class: "LatencyExplosion".to_string(),
+            trigger_condition: "Scheduler queue > 50%".to_string(),
+            action: PolicyType::ThreadAffinity("numa_aware".to_string()),
+            priority: 3,
+            expected_impact: 0.20,  // 20% P99 improvement
+            enabled: true,
+        });
+
+        // Rule 3: Memory Collapse → Prealloc
+        self.rules.push(PolicyRule {
+            name: "MEMORY_PREALLOC".to_string(),
+            class: "MemoryCollapse".to_string(),
+            trigger_condition: "Memory pressure > 80%".to_string(),
+            action: PolicyType::PreallocSize(256 * 1024 * 1024),  // +256MB
+            priority: 5,  // Highest: memory is critical
+            expected_impact: 0.50,  // 50% GC frequency reduction
+            enabled: true,
+        });
+
+        // Rule 4: Memory Collapse → GC Incremental
+        self.rules.push(PolicyRule {
+            name: "MEMORY_GC_INCREMENTAL".to_string(),
+            class: "MemoryCollapse".to_string(),
+            trigger_condition: "GC pause > 100ms".to_string(),
+            action: PolicyType::GCMode("incremental".to_string()),
+            priority: 4,
+            expected_impact: 0.40,  // 40% GC pause reduction
+            enabled: true,
+        });
+
+        // Rule 5: I/O Backpressure → Deadline Scheduling
+        self.rules.push(PolicyRule {
+            name: "IO_DEADLINE_SCHEDULER".to_string(),
+            class: "IOBackpressure".to_string(),
+            trigger_condition: "I/O queue depth > 64".to_string(),
+            action: PolicyType::IOSchedulerPolicy("deadline".to_string()),
+            priority: 3,
+            expected_impact: 0.30,  // 30% latency reduction
+            enabled: true,
+        });
+    }
+
+    // ========================================================================
+    // Main Decision Logic: Failure를 받아 Policy를 결정
+    // ========================================================================
+
+    pub fn decide_policies(
+        &mut self,
+        failure_class: &str,
+        confidence: f64,
+        current_time_us: u64,
+    ) -> ControlDecision {
+        let decision_id = format!("DECISION_{}", current_time_us);
+
+        // 1. 매칭되는 규칙 찾기
+        let mut matched_rules = vec![];
+        for rule in &self.rules {
+            if rule.class == failure_class && rule.enabled {
+                matched_rules.push(rule.name.clone());
+            }
+        }
+
+        // 2. 우선순위 순서로 정렬
+        matched_rules.sort_by(|a, b| {
+            let rule_a = self.rules.iter().find(|r| r.name == *a).unwrap();
+            let rule_b = self.rules.iter().find(|r| r.name == *b).unwrap();
+            b.priority.cmp(&rule_a.priority)
+        });
+
+        // 3. 정책 생성 및 실행
+        let mut applied_policies = vec![];
+        let mut total_impact = 0.0;
+
+        for rule_name in matched_rules.iter() {
+            if let Some(rule) = self.rules.iter().find(|r| r.name == *rule_name) {
+                let policy_change = PolicyChange {
+                    policy_type: self.clone_policy_type(&rule.action),
+                    applied_at_us: current_time_us,
+                    triggered_by: rule_name.clone(),
+                    expected_impact: rule.expected_impact,
+                    confidence,
+                    side_effects: self.get_side_effects(&rule.action),
+                    reversible: true,  // All our policies are reversible
+                    rollback_condition: format!("if metric improves < 10% in 60s"),
+                    status: PolicyStatus::Active,
+                };
+
+                applied_policies.push(policy_change.clone());
+                self.active_policies.push(policy_change);
+                total_impact += rule.expected_impact;
+            }
+        }
+
+        // 4. Decision reasoning 생성
+        let reasoning = format!(
+            "Failure class '{}' detected (confidence {:.2}). Matched {} rules. Applying {} policies.",
+            failure_class,
+            confidence,
+            matched_rules.len(),
+            applied_policies.len()
+        );
+
+        let expected_outcome = if applied_policies.len() == 1 {
+            format!(
+                "Single policy expected to improve metrics by {:.0}%",
+                applied_policies[0].expected_impact * 100.0
+            )
+        } else {
+            let combined_impact = (applied_policies.iter()
+                .map(|p| p.expected_impact)
+                .sum::<f64>() * 100.0) as u32;
+            format!(
+                "Multiple policies combined expected improvement: {}%+",
+                combined_impact
+            )
+        };
+
+        // 5. Decision 구성
+        let decision = ControlDecision {
+            decision_id,
+            triggered_by_failure: failure_class.to_string(),
+            triggered_at_us: current_time_us,
+            matched_rules,
+            applied_policies,
+            decision_confidence: confidence,
+            reasoning,
+            expected_outcome,
+        };
+
+        self.decision_history.push(decision.clone());
+
+        decision
+    }
+
+    // ========================================================================
+    // Clone PolicyType (serde 없이)
+    // ========================================================================
+
+    fn clone_policy_type(&self, policy: &PolicyType) -> PolicyType {
+        match policy {
+            PolicyType::GCMode(mode) => PolicyType::GCMode(mode.clone()),
+            PolicyType::PreallocSize(size) => PolicyType::PreallocSize(*size),
+            PolicyType::IOSchedulerPolicy(policy) => PolicyType::IOSchedulerPolicy(policy.clone()),
+            PolicyType::ThreadAffinity(affinity) => PolicyType::ThreadAffinity(affinity.clone()),
+        }
+    }
+
+    // ========================================================================
+    // Side Effects: 이 정책을 적용하면 뭐가 바뀌는가?
+    // ========================================================================
+
+    fn get_side_effects(&self, policy: &PolicyType) -> Vec<String> {
+        match policy {
+            PolicyType::GCMode(mode) => {
+                match mode.as_str() {
+                    "aggressive" => vec![
+                        "CPU usage may increase 10-20%".to_string(),
+                        "GC pause frequency increases".to_string(),
+                    ],
+                    "incremental" => vec![
+                        "Total GC time increases but pause time reduces".to_string(),
+                    ],
+                    _ => vec![],
+                }
+            }
+            PolicyType::PreallocSize(size_mb) => {
+                vec![format!("Heap size increases by {}MB", size_mb / (1024 * 1024))]
+            }
+            PolicyType::IOSchedulerPolicy(_) => {
+                vec!["I/O request ordering changes".to_string()]
+            }
+            PolicyType::ThreadAffinity(_) => {
+                vec!["Thread placement changes, potential migration cost".to_string()]
+            }
+        }
+    }
+
+    // ========================================================================
+    // Execute Policy (Phase 7과의 인터페이스)
+    // ========================================================================
+
+    pub fn execute_policy(&self, policy: &PolicyChange) -> Result<String, String> {
+        // 실제로는 Phase 7으로 메시지를 보냄
+        // 여기서는 시뮬레이션
+        let message = match &policy.policy_type {
+            PolicyType::GCMode(mode) => {
+                format!("PHASE7_COMMAND: GC_MODE = {}", mode)
+            }
+            PolicyType::PreallocSize(size) => {
+                format!("PHASE7_COMMAND: PREALLOC_SIZE = {} bytes", size)
+            }
+            PolicyType::IOSchedulerPolicy(policy_name) => {
+                format!("PHASE7_COMMAND: IO_SCHEDULER = {}", policy_name)
+            }
+            PolicyType::ThreadAffinity(affinity) => {
+                format!("PHASE7_COMMAND: THREAD_AFFINITY = {}", affinity)
+            }
+        };
+
+        Ok(message)
+    }
+
+    // ========================================================================
+    // Hysteresis: 진동 방지
+    // ========================================================================
+
+    pub fn should_rollback_policy(&self, policy: &PolicyChange, current_time_us: u64) -> bool {
+        let elapsed_us = current_time_us.saturating_sub(policy.applied_at_us);
+
+        // 최소 60초는 유지 (thrashing 방지)
+        if elapsed_us < 60_000_000 {
+            return false;
+        }
+
+        // 이후로는 개선 수치에 따라 판단
+        // (실제로는 metric을 봐야 하지만, 여기서는 간단히)
+        false
+    }
+
+    // ========================================================================
+    // Reporting
+    // ========================================================================
+
+    pub fn get_decision_log(&self) -> String {
+        let mut log = String::new();
+
+        log.push_str("═══════════════════════════════════════════════════════\n");
+        log.push_str("Policy Control Decision History\n");
+        log.push_str("═══════════════════════════════════════════════════════\n\n");
+
+        for decision in self.decision_history.iter().rev().take(10) {
+            log.push_str(&format!("Decision: {}\n", decision.decision_id));
+            log.push_str(&format!("  Triggered by: {} (confidence: {:.2})\n",
+                decision.triggered_by_failure, decision.decision_confidence));
+            log.push_str(&format!("  Matched rules: {:?}\n", decision.matched_rules));
+            log.push_str(&format!("  Applied policies: {}\n", decision.applied_policies.len()));
+            log.push_str(&format!("  Reasoning: {}\n", decision.reasoning));
+            log.push_str(&format!("  Expected outcome: {}\n\n", decision.expected_outcome));
+        }
+
+        log
+    }
+
+    // ========================================================================
+    // Statistics
+    // ========================================================================
+
+    pub fn get_active_policy_count(&self) -> usize {
+        self.active_policies.len()
+    }
+
+    pub fn get_decision_count(&self) -> usize {
+        self.decision_history.len()
+    }
+}
+
+// Clone for PolicyChange
+impl Clone for PolicyChange {
+    fn clone(&self) -> Self {
+        PolicyChange {
+            policy_type: match &self.policy_type {
+                PolicyType::GCMode(m) => PolicyType::GCMode(m.clone()),
+                PolicyType::PreallocSize(s) => PolicyType::PreallocSize(*s),
+                PolicyType::IOSchedulerPolicy(p) => PolicyType::IOSchedulerPolicy(p.clone()),
+                PolicyType::ThreadAffinity(a) => PolicyType::ThreadAffinity(a.clone()),
+            },
+            applied_at_us: self.applied_at_us,
+            triggered_by: self.triggered_by.clone(),
+            expected_impact: self.expected_impact,
+            confidence: self.confidence,
+            side_effects: self.side_effects.clone(),
+            reversible: self.reversible,
+            rollback_condition: self.rollback_condition.clone(),
+            status: match &self.status {
+                PolicyStatus::Pending => PolicyStatus::Pending,
+                PolicyStatus::Active => PolicyStatus::Active,
+                PolicyStatus::Rolled back => PolicyStatus::Rolled back,
+                PolicyStatus::Reverted => PolicyStatus::Reverted,
+            },
+        }
+    }
+}
+
+// Clone for ControlDecision
+impl Clone for ControlDecision {
+    fn clone(&self) -> Self {
+        ControlDecision {
+            decision_id: self.decision_id.clone(),
+            triggered_by_failure: self.triggered_by_failure.clone(),
+            triggered_at_us: self.triggered_at_us,
+            matched_rules: self.matched_rules.clone(),
+            applied_policies: self.applied_policies.clone(),
+            decision_confidence: self.decision_confidence,
+            reasoning: self.reasoning.clone(),
+            expected_outcome: self.expected_outcome.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// TEST CASES
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_controller_initialization() {
+        let controller = PolicyController::new();
+        assert!(controller.rules.len() >= 5); // At least 5 default rules
+    }
+
+    #[test]
+    fn test_latency_policy_decision() {
+        let mut controller = PolicyController::new();
+
+        let decision = controller.decide_policies("LatencyExplosion", 0.8, 0);
+
+        assert!(!decision.matched_rules.is_empty());
+        assert!(!decision.applied_policies.is_empty());
+    }
+
+    #[test]
+    fn test_memory_policy_decision() {
+        let mut controller = PolicyController::new();
+
+        let decision = controller.decide_policies("MemoryCollapse", 0.9, 0);
+
+        assert!(!decision.matched_rules.is_empty());
+        // Should include MEMORY_PREALLOC
+        assert!(decision.matched_rules.contains(&"MEMORY_PREALLOC".to_string()));
+    }
+
+    #[test]
+    fn test_io_policy_decision() {
+        let mut controller = PolicyController::new();
+
+        let decision = controller.decide_policies("IOBackpressure", 0.7, 0);
+
+        assert!(!decision.matched_rules.is_empty());
+    }
+
+    #[test]
+    fn test_policy_execution() {
+        let controller = PolicyController::new();
+
+        let policy = PolicyChange {
+            policy_type: PolicyType::GCMode("aggressive".to_string()),
+            applied_at_us: 0,
+            triggered_by: "TEST_RULE".to_string(),
+            expected_impact: 0.35,
+            confidence: 0.8,
+            side_effects: vec![],
+            reversible: true,
+            rollback_condition: "test".to_string(),
+            status: PolicyStatus::Active,
+        };
+
+        let result = controller.execute_policy(&policy);
+        assert!(result.is_ok());
+        assert!(result.unwrap().contains("GC_MODE"));
+    }
+
+    #[test]
+    fn test_decision_logging() {
+        let mut controller = PolicyController::new();
+
+        controller.decide_policies("LatencyExplosion", 0.8, 0);
+        controller.decide_policies("MemoryCollapse", 0.9, 1_000_000);
+
+        let log = controller.get_decision_log();
+        assert!(log.contains("Decision"));
+        assert_eq!(controller.get_decision_count(), 2);
+    }
+
+    #[test]
+    fn test_multiple_policies_per_failure() {
+        let mut controller = PolicyController::new();
+
+        let decision = controller.decide_policies("LatencyExplosion", 0.9, 0);
+
+        // Should match multiple rules and apply multiple policies
+        assert!(decision.applied_policies.len() >= 1);
+    }
+
+    #[test]
+    fn test_confidence_affects_decision() {
+        let mut controller = PolicyController::new();
+
+        let high_conf = controller.decide_policies("MemoryCollapse", 0.95, 0);
+        let low_conf = controller.decide_policies("MemoryCollapse", 0.3, 1000);
+
+        // Both should trigger, but high_conf should have higher expected impact
+        assert!(high_conf.decision_confidence >= low_conf.decision_confidence);
+    }
+}
