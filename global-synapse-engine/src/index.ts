@@ -9,13 +9,12 @@ export * from './types';
 export {
   CircuitBreaker,
   CircuitBreakerState,
-  CircuitBreakerConfig,
-  CircuitBreakerMetrics,
   RetryStrategy,
-  RetryPolicy,
   TimeoutManager,
-  TimeoutPolicy,
   AutoRecoveryOrchestrator,
+  getGlobalTimeoutManager,
+  getGlobalRetryStrategy,
+  getGlobalAutoRecoveryOrchestrator,
 } from './auto_recovery';
 
 export { ChaosMonkey, ChaosEvent, ChaosStats } from './chaos-monkey';

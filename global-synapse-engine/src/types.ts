@@ -208,3 +208,63 @@ export class NodeState {
     return currentTime - this.lastHeartbeat > timeoutNs;
   }
 }
+
+/**
+ * Circuit Breaker 상태 정의 (Week 4)
+ */
+export enum CircuitBreakerState {
+  CLOSED = 'CLOSED',          // 정상 (모든 요청 통과)
+  OPEN = 'OPEN',              // 장애 감지 (모든 요청 차단)
+  HALF_OPEN = 'HALF_OPEN'     // 복구 시도 (제한된 요청만 통과)
+}
+
+/**
+ * Circuit Breaker: 장애 격리 및 자동 복구
+ */
+export interface CircuitBreakerStatus {
+  nodeId: bigint;
+  state: CircuitBreakerState;
+  failureCount: number;           // 연속 실패 횟수
+  successCount: number;           // HALF_OPEN에서 성공 횟수
+  lastFailureTime: bigint;        // 마지막 실패 시각
+  lastTransitionTime: bigint;     // 마지막 상태 전환 시각
+  totalFailures: number;          // 누적 실패
+  totalSuccesses: number;         // 누적 성공
+}
+
+/**
+ * 재시도 전략 설정
+ */
+export interface RetryConfig {
+  maxAttempts: number;            // 최대 재시도 횟수
+  baseDelayMs: number;            // 기본 지연 (ms)
+  maxDelayMs: number;             // 최대 지연 (ms)
+  jitterFactor: number;           // 지터 비율 (0-1)
+  backoffMultiplier: number;      // 지수 백오프 배수 (기본 2)
+  retryableErrors: string[];      // 재시도 가능한 에러 유형
+}
+
+/**
+ * 타임아웃 관리 설정
+ */
+export interface TimeoutConfig {
+  rdmaReadMs: number;             // RDMA read 타임아웃
+  rdmaWriteMs: number;            // RDMA write 타임아웃
+  semanticSyncMs: number;         // Semantic Sync 타임아웃
+  heartbeatMs: number;            // 하트비트 타임아웃
+  globalMs: number;               // 전역 작업 타임아웃
+}
+
+/**
+ * 자동 복구 통계
+ */
+export interface AutoRecoveryStats {
+  totalAttempts: number;          // 총 복구 시도
+  successfulRecoveries: number;   // 성공한 복구
+  failedRecoveries: number;       // 실패한 복구
+  recoveryRate: number;           // 복구율 (%)
+  averageRecoveryTimeMs: number;  // 평균 복구 시간
+  maxRecoveryTimeMs: number;      // 최대 복구 시간
+  totalRetries: number;           // 총 재시도 횟수
+  circuitBreakerTrips: number;    // Circuit Breaker 트립 횟수
+}
