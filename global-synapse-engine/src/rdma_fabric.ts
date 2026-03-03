@@ -346,26 +346,27 @@ export class RDMAFabric {
   /**
    * 무결성 로그 검증
    */
-  public verifyIntegrity(): boolean {
-    const verification = this.integrityLog.verify();
+  public async verifyIntegrity(): Promise<boolean> {
+    const verification = await this.integrityLog.verify();
     return verification.isValid;
   }
 
   /**
    * Layer 1 통계
    */
-  public getStats(): {
+  public async getStats(): Promise<{
     nodeId: bigint;
     operationsCompleted: number;
     integrityValid: boolean;
     remoteNodesCount: number;
     memoryUsedBytes: number;
-  } {
+  }> {
     const queueStats = this.rdmaQueue.getStats();
+    const integrityValid = await this.verifyIntegrity();
     return {
       nodeId: this.nodeId,
       operationsCompleted: queueStats.completedOps,
-      integrityValid: this.verifyIntegrity(),
+      integrityValid,
       remoteNodesCount: this.remoteNodes.size,
       memoryUsedBytes: this.localMemory.length,
     };

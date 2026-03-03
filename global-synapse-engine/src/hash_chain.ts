@@ -1,7 +1,7 @@
 // 🔗 Test Mouse Audit Log - Hash Chain Verification
 // Layer: Shared across all layers (Immutability guarantee)
 
-import { HashChainLink, sha256 } from './types';
+import { HashChainLink, sha256, measurePerformance } from './types';
 
 /**
  * HashChain: Test Mouse의 감사 로그
@@ -59,56 +59,60 @@ export class HashChain {
    * 체인 무결성 검증
    * @returns { isValid: boolean, totalLinks: number, verifiedLinks: number, brokenAt: number }
    */
-  public verify(): {
+  public async verify(): Promise<{
     isValid: boolean;
     totalLinks: number;
     verifiedLinks: number;
     brokenAt?: number;
-  } {
-    if (this.links.length === 0) {
-      return { isValid: true, totalLinks: 0, verifiedLinks: 0 };
-    }
-
-    let verifiedLinks = 0;
-    let previousHash = '0'.repeat(64);
-
-    for (let i = 0; i < this.links.length; i++) {
-      const link = this.links[i];
-
-      // 이전 해시 검증
-      if (link.previousHash !== previousHash) {
-        return {
-          isValid: false,
-          totalLinks: this.links.length,
-          verifiedLinks,
-          brokenAt: i,
-        };
+  }> {
+    const { result } = await measurePerformance(`HashChain.verify ${this.links.length} links`, async () => {
+      if (this.links.length === 0) {
+        return { isValid: true, totalLinks: 0, verifiedLinks: 0 };
       }
 
-      // 현재 해시 재계산 및 검증
-      const content = JSON.stringify(link.content, (key, value) =>
-        typeof value === 'bigint' ? value.toString() : value
-      );
-      const expectedHash = sha256(previousHash + content);
+      let verifiedLinks = 0;
+      let previousHash = '0'.repeat(64);
 
-      if (expectedHash !== link.hash) {
-        return {
-          isValid: false,
-          totalLinks: this.links.length,
-          verifiedLinks,
-          brokenAt: i,
-        };
+      for (let i = 0; i < this.links.length; i++) {
+        const link = this.links[i];
+
+        // 이전 해시 검증
+        if (link.previousHash !== previousHash) {
+          return {
+            isValid: false,
+            totalLinks: this.links.length,
+            verifiedLinks,
+            brokenAt: i,
+          };
+        }
+
+        // 현재 해시 재계산 및 검증
+        const content = JSON.stringify(link.content, (key, value) =>
+          typeof value === 'bigint' ? value.toString() : value
+        );
+        const expectedHash = sha256(previousHash + content);
+
+        if (expectedHash !== link.hash) {
+          return {
+            isValid: false,
+            totalLinks: this.links.length,
+            verifiedLinks,
+            brokenAt: i,
+          };
+        }
+
+        verifiedLinks++;
+        previousHash = link.hash;
       }
 
-      verifiedLinks++;
-      previousHash = link.hash;
-    }
+      return {
+        isValid: true,
+        totalLinks: this.links.length,
+        verifiedLinks,
+      };
+    });
 
-    return {
-      isValid: true,
-      totalLinks: this.links.length,
-      verifiedLinks,
-    };
+    return result;
   }
 
   /**
@@ -237,8 +241,8 @@ export class HashChainVerifier {
   /**
    * 체인에서 변조된 부분 찾기 (이진 검색)
    */
-  public static findTampering(chain: HashChain): number | null {
-    const verification = chain.verify();
+  public static async findTampering(chain: HashChain): Promise<number | null> {
+    const verification = await chain.verify();
 
     if (verification.isValid) {
       return null;

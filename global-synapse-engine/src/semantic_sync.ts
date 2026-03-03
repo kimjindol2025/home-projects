@@ -143,17 +143,21 @@ export class SemanticSyncProtocol {
     code: string,
     input: Map<string, string>
   ): Promise<ExecutionState> {
-    const state = new ExecutionState(this.executionId++, this.nodeId);
+    const { result: state } = await measurePerformance(`SemanticSync.startExecution on node ${this.nodeId}`, async () => {
+      const newState = new ExecutionState(this.executionId++, this.nodeId);
 
-    // 입력 변수 초기화
-    for (const [key, value] of input.entries()) {
-      state.setVariable(key, value);
-    }
+      // 입력 변수 초기화
+      for (const [key, value] of input.entries()) {
+        newState.setVariable(key, value);
+      }
 
-    // 코드 실행 (모의 구현)
-    await this.executeCode(state, code);
+      // 코드 실행 (모의 구현)
+      await this.executeCode(newState, code);
 
-    this.currentState = state;
+      this.currentState = newState;
+      return newState;
+    });
+
     return state;
   }
 
@@ -188,17 +192,21 @@ export class SemanticSyncProtocol {
   /**
    * 현재 상태 스냅샷 생성
    */
-  public createSnapshot(): StateSnapshot {
-    if (!this.currentState) {
-      throw new Error('No execution in progress');
-    }
+  public async createSnapshot(): Promise<StateSnapshot> {
+    const { result: snapshot } = await measurePerformance(`SemanticSync.createSnapshot on node ${this.nodeId}`, async () => {
+      if (!this.currentState) {
+        throw new Error('No execution in progress');
+      }
 
-    const snapshot = this.currentState.snapshot();
+      const snap = this.currentState.snapshot();
 
-    // 동기화 로그에 기록
-    this.syncLog.addLink(snapshot.executionId, 'state_snapshot', snapshot.memoryChecksum);
+      // 동기화 로그에 기록
+      this.syncLog.addLink(snap.executionId, 'state_snapshot', snap.memoryChecksum);
 
-    this.stateSnapshots.push(snapshot);
+      this.stateSnapshots.push(snap);
+
+      return snap;
+    });
 
     return snapshot;
   }
@@ -209,44 +217,48 @@ export class SemanticSyncProtocol {
    * @param otherSnapshot 비교 대상 스냅샷
    * @returns 동등성 증명
    */
-  public verifyEquivalence(
+  public async verifyEquivalence(
     otherNodeId: bigint,
     otherSnapshot: StateSnapshot
-  ): SemanticEquivalenceProof {
-    if (!this.currentState) {
-      throw new Error('No execution in progress');
-    }
+  ): Promise<SemanticEquivalenceProof> {
+    const { result: proof } = await measurePerformance(`SemanticSync.verifyEquivalence node ${this.nodeId} vs ${otherNodeId}`, async () => {
+      if (!this.currentState) {
+        throw new Error('No execution in progress');
+      }
 
-    const proof: SemanticEquivalenceProof = {
-      node1Id: this.nodeId,
-      node2Id: otherNodeId,
-      inputHash: 'todo', // 실제로는 입력 데이터 해시
-      outputHash: 'todo',
-      snapshot1: this.currentState.snapshot(),
-      snapshot2: otherSnapshot,
-      isEquivalent: false,
-      proofTime: BigInt(Date.now()) * 1_000_000n,
-    };
+      const proofObj: SemanticEquivalenceProof = {
+        node1Id: this.nodeId,
+        node2Id: otherNodeId,
+        inputHash: 'todo', // 실제로는 입력 데이터 해시
+        outputHash: 'todo',
+        snapshot1: this.currentState.snapshot(),
+        snapshot2: otherSnapshot,
+        isEquivalent: false,
+        proofTime: BigInt(Date.now()) * 1_000_000n,
+      };
 
-    // 동등성 검증
-    const equiv =
-      proof.snapshot1.memoryChecksum === proof.snapshot2.memoryChecksum &&
-      proof.snapshot1.instructionCounter === proof.snapshot2.instructionCounter;
+      // 동등성 검증
+      const equiv =
+        proofObj.snapshot1.memoryChecksum === proofObj.snapshot2.memoryChecksum &&
+        proofObj.snapshot1.instructionCounter === proofObj.snapshot2.instructionCounter;
 
-    proof.isEquivalent = equiv;
+      proofObj.isEquivalent = equiv;
 
-    if (equiv) {
-      // 동기화 로그에 기록
-      this.syncLog.addLink(
-        this.executionId,
-        'equivalence_verified',
-        sha256(
-          JSON.stringify(proof, (key, value) =>
-            typeof value === 'bigint' ? value.toString() : value
+      if (equiv) {
+        // 동기화 로그에 기록
+        this.syncLog.addLink(
+          this.executionId,
+          'equivalence_verified',
+          sha256(
+            JSON.stringify(proofObj, (key, value) =>
+              typeof value === 'bigint' ? value.toString() : value
+            )
           )
-        )
-      );
-    }
+        );
+      }
+
+      return proofObj;
+    });
 
     return proof;
   }
@@ -264,7 +276,7 @@ export class SemanticSyncProtocol {
       for (const [nodeId, snapshot] of nodeSnapshots.entries()) {
         if (nodeId === this.nodeId) continue;
 
-        const proof = this.verifyEquivalence(nodeId, snapshot);
+        const proof = await this.verifyEquivalence(nodeId, snapshot);
         proofs.push(proof);
       }
 
@@ -282,8 +294,8 @@ export class SemanticSyncProtocol {
   /**
    * 동기화 로그 검증
    */
-  public verifySyncLog(): boolean {
-    const verification = this.syncLog.verify();
+  public async verifySyncLog(): Promise<boolean> {
+    const verification = await this.syncLog.verify();
     return verification.isValid;
   }
 
@@ -301,61 +313,66 @@ export class SemanticSyncProtocol {
     inconsistentNodes: bigint[];
     proofTime: bigint;
   }> {
-    const startTime = BigInt(Date.now()) * 1_000_000n;
+    const { result } = await measurePerformance(`SemanticSync.verifyGlobalSemanticConsistency ${allNodeSnapshots.size} nodes`, async () => {
+      const startTime = BigInt(Date.now()) * 1_000_000n;
 
-    // 체크섬으로 그룹핑
-    const groups = new Map<string, StateSnapshot[]>();
-
-    for (const [nodeId, snapshot] of allNodeSnapshots.entries()) {
-      const key = snapshot.memoryChecksum;
-      if (!groups.has(key)) {
-        groups.set(key, []);
-      }
-      groups.get(key)!.push(snapshot);
-    }
-
-    // 동등성 검증: 모든 노드가 동일 그룹에 속해야 함
-    const equivalentGroups = Array.from(groups.values());
-    const isConsistent = equivalentGroups.length === 1;
-
-    // 불일치 노드 식별
-    const inconsistentNodes: bigint[] = [];
-    if (!isConsistent) {
-      const majorityGroup = equivalentGroups[0];
-      const majorityHashes = new Set(majorityGroup.map((s) => s.memoryChecksum));
+      // 체크섬으로 그룹핑
+      const groups = new Map<string, StateSnapshot[]>();
 
       for (const [nodeId, snapshot] of allNodeSnapshots.entries()) {
-        if (!majorityHashes.has(snapshot.memoryChecksum)) {
-          inconsistentNodes.push(nodeId);
+        const key = snapshot.memoryChecksum;
+        if (!groups.has(key)) {
+          groups.set(key, []);
+        }
+        groups.get(key)!.push(snapshot);
+      }
+
+      // 동등성 검증: 모든 노드가 동일 그룹에 속해야 함
+      const equivalentGroups = Array.from(groups.values());
+      const isConsistent = equivalentGroups.length === 1;
+
+      // 불일치 노드 식별
+      const inconsistentNodes: bigint[] = [];
+      if (!isConsistent) {
+        const majorityGroup = equivalentGroups[0];
+        const majorityHashes = new Set(majorityGroup.map((s) => s.memoryChecksum));
+
+        for (const [nodeId, snapshot] of allNodeSnapshots.entries()) {
+          if (!majorityHashes.has(snapshot.memoryChecksum)) {
+            inconsistentNodes.push(nodeId);
+          }
         }
       }
-    }
 
-    const proofTime = BigInt(Date.now()) * 1_000_000n - startTime;
+      const proofTime = BigInt(Date.now()) * 1_000_000n - startTime;
 
-    return {
-      isConsistent,
-      equivalentGroups,
-      inconsistentNodes,
-      proofTime,
-    };
+      return {
+        isConsistent,
+        equivalentGroups,
+        inconsistentNodes,
+        proofTime,
+      };
+    });
+
+    return result;
   }
 
   /**
    * Layer 2 통계
    */
-  public getStats(): {
+  public async getStats(): Promise<{
     nodeId: bigint;
     executionsCompleted: number;
     snapshotsTaken: number;
     syncLogValid: boolean;
     currentStateChecksum: string;
-  } {
+  }> {
+    const syncLogValid = await this.verifySyncLog();
     return {
       nodeId: this.nodeId,
       executionsCompleted: Number(this.executionId - 1n),
       snapshotsTaken: this.stateSnapshots.length,
-      syncLogValid: this.verifySyncLog(),
+      syncLogValid,
       currentStateChecksum: this.currentState?.calculateChecksum() || 'N/A',
     };
   }

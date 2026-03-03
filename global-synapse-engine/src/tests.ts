@@ -1,9 +1,12 @@
 // 🧪 Global Synapse Engine - Phase 1 Tests
 // Layer 1 & Layer 2 Comprehensive Tests
+// Week 2: Real Performance Measurement
 
 import { RDMAFabric } from './rdma_fabric';
 import { SemanticSyncProtocol } from './semantic_sync';
 import { HashChain, HashChainVerifier } from './hash_chain';
+import { getGlobalMonitor, measureSync, measureAsync } from './performance-monitor';
+import { getGlobalProfiler } from './memory-profiler';
 
 // 색상 정의
 const colors = {
@@ -47,7 +50,7 @@ async function testHashChainIntegrity(): Promise<void> {
   const link3 = chain.addLink(3n, 'compare_swap', 'sig3');
 
   // 체인 무결성 검증
-  const verification = chain.verify();
+  const verification = await chain.verify();
 
   assert(verification.isValid === true, 'Chain should be valid');
   assert(verification.totalLinks === 3, 'Should have 3 links');
@@ -58,7 +61,7 @@ async function testHashChainIntegrity(): Promise<void> {
   const chain2 = new HashChain();
   chain2.deserialize(serialized);
 
-  const verification2 = chain2.verify();
+  const verification2 = await chain2.verify();
   assert(verification2.isValid === true, 'Deserialized chain should be valid');
 
   // 변조 감지
@@ -66,7 +69,7 @@ async function testHashChainIntegrity(): Promise<void> {
   const chain3 = new HashChain();
   chain3.deserialize(tampered);
 
-  const verification3 = chain3.verify();
+  const verification3 = await chain3.verify();
   assert(verification3.isValid === false, 'Tampering should be detected');
 }
 
@@ -86,7 +89,7 @@ async function testLargeHashChain(): Promise<void> {
     chain.addLink(BigInt(i), `operation_${i}`, `signature_${i}`);
   }
 
-  const verification = chain.verify();
+  const verification = await chain.verify();
 
   assert(verification.isValid === true, 'Large chain should be valid');
   assert(
@@ -127,14 +130,14 @@ async function testRDMAFabricZeroCopy(): Promise<void> {
     readOnly: false,
   };
 
-  const integrity1 = node1.verifyIntegrity();
-  const integrity2 = node2.verifyIntegrity();
+  const integrity1 = await node1.verifyIntegrity();
+  const integrity2 = await node2.verifyIntegrity();
 
   assert(integrity1 === true, 'Node 1 integrity should be valid');
   assert(integrity2 === true, 'Node 2 integrity should be valid');
 
   // 통계 확인
-  const stats1 = node1.getStats();
+  const stats1 = await node1.getStats();
   assert(stats1.integrityValid === true, 'Node 1 stats integrity valid');
   assert(stats1.remoteNodesCount >= 1, 'Node 1 should have remote nodes registered');
 
@@ -155,7 +158,7 @@ async function testRDMAOperationsWithLog(): Promise<void> {
   await fabric.registerRemoteNode(2n);
 
   // 여러 RDMA 작업 수행
-  const integrityBefore = fabric.verifyIntegrity();
+  const integrityBefore = await fabric.verifyIntegrity();
   assert(integrityBefore === true, 'Initial integrity should be valid');
 
   // Compare-and-Swap 작업
@@ -167,10 +170,10 @@ async function testRDMAOperationsWithLog(): Promise<void> {
   // 모든 작업 완료 대기
   await fabric.waitAllOperations();
 
-  const integrityAfter = fabric.verifyIntegrity();
+  const integrityAfter = await fabric.verifyIntegrity();
   assert(integrityAfter === true, 'Integrity should remain valid after operations');
 
-  const stats = fabric.getStats();
+  const stats = await fabric.getStats();
   console.log(`    Total operations completed: ${stats.operationsCompleted}`);
 }
 
@@ -196,8 +199,8 @@ async function testSemanticSyncDeterministic(): Promise<void> {
   await protocol1.startExecution(code, input);
   await protocol2.startExecution(code, input);
 
-  const snapshot1 = protocol1.createSnapshot();
-  const snapshot2 = protocol2.createSnapshot();
+  const snapshot1 = await protocol1.createSnapshot();
+  const snapshot2 = await protocol2.createSnapshot();
 
   assert(snapshot1.executionId === snapshot2.executionId, 'Execution IDs should match');
   assert(
@@ -238,10 +241,10 @@ async function testSemanticEquivalenceProof(): Promise<void> {
   await protocol1.startExecution(code, input);
   await protocol2.startExecution(code, input);
 
-  const snapshot1 = protocol1.createSnapshot();
-  const snapshot2 = protocol2.createSnapshot();
+  const snapshot1 = await protocol1.createSnapshot();
+  const snapshot2 = await protocol2.createSnapshot();
 
-  const proof = protocol1.verifyEquivalence(2n, snapshot2);
+  const proof = await protocol1.verifyEquivalence(2n, snapshot2);
 
   assert(proof.isEquivalent === true, 'Nodes should be semantically equivalent');
   assert(
@@ -279,7 +282,7 @@ async function testGlobalSemanticConsistency(): Promise<void> {
 
   for (const [nodeId, protocol] of protocols.entries()) {
     await protocol.startExecution(code, input);
-    const snapshot = protocol.createSnapshot();
+    const snapshot = await protocol.createSnapshot();
     snapshots.set(nodeId, snapshot);
   }
 
@@ -313,11 +316,11 @@ async function testSyncLogIntegrity(): Promise<void> {
   for (let i = 0; i < 5; i++) {
     const input = new Map<string, string>([['input', String(i)]]);
     await protocol.startExecution('x = input; print(x)', input);
-    protocol.createSnapshot();
+    await protocol.createSnapshot();
   }
 
   const syncLog = protocol.getSyncLog();
-  const verification = syncLog.verify();
+  const verification = await syncLog.verify();
 
   assert(verification.isValid === true, 'Sync log should be valid');
   assert(verification.totalLinks >= 5, 'Should have at least 5 links');
@@ -351,12 +354,12 @@ async function testLayer1Layer2Integration(): Promise<void> {
   await protocol1.startExecution(code, input);
   await protocol2.startExecution(code, input);
 
-  const snap1 = protocol1.createSnapshot();
-  const snap2 = protocol2.createSnapshot();
+  const snap1 = await protocol1.createSnapshot();
+  const snap2 = await protocol2.createSnapshot();
 
   // 전체 통합 검증
-  const fabric1Stats = fabric1.getStats();
-  const protocol1Stats = protocol1.getStats();
+  const fabric1Stats = await fabric1.getStats();
+  const protocol1Stats = await protocol1.getStats();
 
   assert(
     fabric1Stats.integrityValid === true,
@@ -387,21 +390,21 @@ async function testUnforgivingRules(): Promise<void> {
   const fabric = new RDMAFabric(1n, 1024);
 
   // Rule 1: Zero-Copy Guarantee
-  const integrityBefore = fabric.verifyIntegrity();
+  const integrityBefore = await fabric.verifyIntegrity();
   assert(integrityBefore === true, 'Rule 1: Zero-Copy - Integrity 100%');
 
   // Rule 2: Latency <10μs (통과 - 모의 구현)
   assert(true, 'Rule 2: Latency <10μs (passed in simulation)');
 
   // Rule 3: Data Loss = 0%
-  const stats = fabric.getStats();
+  const stats = await fabric.getStats();
   assert(stats.integrityValid === true, 'Rule 3: Data Loss = 0%');
 
   // Rule 4: Semantic Equivalence = 1.0
   const protocol = new SemanticSyncProtocol(1n, fabric);
   const input = new Map<string, string>([['a', '5']]);
   await protocol.startExecution('x = a; print(x)', input);
-  const snap = protocol.createSnapshot();
+  const snap = await protocol.createSnapshot();
   assert(snap.memoryChecksum !== '', 'Rule 4: Semantic Equivalence = 1.0');
 
   console.log(
@@ -418,8 +421,13 @@ async function runAllTests(): Promise<void> {
 ║ 🌐 Global Synapse Engine - Phase 1 Tests                    ║
 ║ Layer 1: Inter-Node Fabric (RDMA)                          ║
 ║ Layer 2: Semantic Sync Protocol                            ║
+║ Week 2: Real Performance Measurement                       ║
 ╚════════════════════════════════════════════════════════════╝
   `);
+
+  // 메모리 프로파일링 시작
+  const profiler = getGlobalProfiler();
+  profiler.start();
 
   const startTime = Date.now();
 
@@ -443,6 +451,14 @@ async function runAllTests(): Promise<void> {
   }
 
   const elapsedMs = Date.now() - startTime;
+  profiler.stop();
+
+  // 성능 모니터 리포트
+  const monitor = getGlobalMonitor();
+  monitor.printReport();
+
+  // 메모리 프로파일 리포트
+  profiler.printReport();
 
   // 결과 요약
   console.log(`
