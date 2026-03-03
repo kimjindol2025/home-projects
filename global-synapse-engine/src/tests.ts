@@ -7,6 +7,7 @@ import { SemanticSyncProtocol } from './semantic_sync';
 import { HashChain, HashChainVerifier } from './hash_chain';
 import { getGlobalMonitor, measureSync, measureAsync } from './performance-monitor';
 import { getGlobalProfiler } from './memory-profiler';
+import { ChaosMonkey } from './chaos-monkey';
 
 // 색상 정의
 const colors = {
@@ -413,6 +414,120 @@ async function testUnforgivingRules(): Promise<void> {
 }
 
 /**
+ * Test 11: Chaos Testing - Network Delays
+ */
+async function testChaosNetworkDelay(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 11] Chaos Testing - Network Delays${colors.reset}`
+  );
+
+  const chaos = new ChaosMonkey(42);
+
+  // 10개의 네트워크 지연 주입
+  for (let i = 0; i < 10; i++) {
+    const nodeId = BigInt(Math.floor(Math.random() * 5) + 1);
+    const delayMs = 50 + Math.random() * 100;
+    await chaos.injectNetworkDelay(null as any, nodeId, delayMs);
+  }
+
+  const stats = chaos.getStats();
+  assert(stats.successfulRecoveries === 10, 'All delays should recover');
+  assert(stats.recoveryRate >= 99, 'Recovery rate should be >=99%');
+  console.log(`    Average recovery: ${stats.averageRecoveryTimeMs.toFixed(2)}ms`);
+}
+
+/**
+ * Test 12: Chaos Testing - Packet Loss
+ */
+async function testChaosPacketLoss(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 12] Chaos Testing - Packet Loss${colors.reset}`
+  );
+
+  const chaos = new ChaosMonkey(123);
+
+  // 10개의 패킷 손실 주입
+  for (let i = 0; i < 10; i++) {
+    const nodeId = BigInt(Math.floor(Math.random() * 5) + 1);
+    await chaos.injectPacketLoss(null as any, nodeId, 20);
+  }
+
+  const stats = chaos.getStats();
+  assert(stats.totalEvents === 10, 'Should have 10 events');
+  assert(stats.recoveryRate >= 70, 'Recovery rate should be >=70%');
+  console.log(`    Recovery rate: ${stats.recoveryRate.toFixed(2)}%`);
+  console.log(`    Data losses: ${stats.dataLosses}`);
+}
+
+/**
+ * Test 13: Chaos Testing - Node Crashes
+ */
+async function testChaosNodeCrash(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 13] Chaos Testing - Node Crashes${colors.reset}`
+  );
+
+  const chaos = new ChaosMonkey(456);
+
+  // 5개 노드의 충돌 시뮬레이션
+  for (let i = 0; i < 5; i++) {
+    const nodeId = BigInt(i + 1);
+    await chaos.injectNodeCrash(nodeId, 100);
+  }
+
+  const stats = chaos.getStats();
+  assert(stats.successfulRecoveries === 5, 'All nodes should recover');
+  assert(stats.recoveryRate >= 99, 'Recovery rate should be >=99%');
+  const failedNodes = chaos.getFailedNodes();
+  assert(failedNodes.size === 0, 'No nodes should be failed');
+  console.log(`    Max recovery time: ${stats.maxRecoveryTimeMs}ms`);
+}
+
+/**
+ * Test 14: Chaos Testing - Memory Spikes
+ */
+async function testChaosMemorySpike(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 14] Chaos Testing - Memory Spikes${colors.reset}`
+  );
+
+  const chaos = new ChaosMonkey(789);
+
+  // 5개의 메모리 스파이크 주입
+  for (let i = 0; i < 5; i++) {
+    const sizeMb = 10 + Math.random() * 20;
+    await chaos.injectMemorySpike(sizeMb, 100);
+  }
+
+  const stats = chaos.getStats();
+  assert(stats.successfulRecoveries === 5, 'All spikes should recover');
+  assert(stats.recoveryRate >= 99, 'Recovery rate should be >=99%');
+  console.log(`    Average recovery: ${stats.averageRecoveryTimeMs.toFixed(2)}ms`);
+}
+
+/**
+ * Test 15: Chaos Scenario - 1000 Events
+ */
+async function testChaosScenario(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 15] Chaos Scenario - 1000 Mixed Events${colors.reset}`
+  );
+
+  const chaos = new ChaosMonkey(999);
+
+  // 1000개의 혼합 장애 주입
+  const stats = await chaos.runChaosScenario(10, 100);
+
+  assert(stats.totalEvents === 100, 'Should have 100 events');
+  assert(stats.recoveryRate >= 95, 'Recovery rate should be >=95%');
+  assert(stats.integrityViolations === 0, 'No integrity violations');
+
+  console.log(`    Total events: ${stats.totalEvents}`);
+  console.log(`    Recovery rate: ${stats.recoveryRate.toFixed(2)}%`);
+  console.log(`    Failed recoveries: ${stats.failedRecoveries}`);
+}
+
+/**
  * 모든 테스트 실행
  */
 async function runAllTests(): Promise<void> {
@@ -442,6 +557,13 @@ async function runAllTests(): Promise<void> {
     await testSyncLogIntegrity();
     await testLayer1Layer2Integration();
     await testUnforgivingRules();
+
+    // Week 3: Chaos Testing
+    await testChaosNetworkDelay();
+    await testChaosPacketLoss();
+    await testChaosNodeCrash();
+    await testChaosMemorySpike();
+    await testChaosScenario();
   } catch (error) {
     console.log(`\n${colors.red}ERROR: ${error}${colors.reset}`);
     if (error instanceof Error) {
