@@ -8,6 +8,13 @@ import { HashChain, HashChainVerifier } from './hash_chain';
 import { getGlobalMonitor, measureSync, measureAsync } from './performance-monitor';
 import { getGlobalProfiler } from './memory-profiler';
 import { ChaosMonkey } from './chaos-monkey';
+import {
+  CircuitBreaker,
+  CircuitBreakerState,
+  RetryStrategy,
+  TimeoutManager,
+  AutoRecoveryOrchestrator,
+} from './auto_recovery';
 
 // 색상 정의
 const colors = {
@@ -528,6 +535,255 @@ async function testChaosScenario(): Promise<void> {
 }
 
 /**
+ * Test 16: Circuit Breaker - Basic State Transitions
+ * Week 4: Auto-Recovery Mechanisms
+ */
+async function testCircuitBreakerStateTransitions(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 16] Circuit Breaker - State Transitions${colors.reset}`
+  );
+
+  const breaker = new CircuitBreaker(3, 2, 500);  // failureThreshold=3, successThreshold=2, timeout=500ms
+  const nodeId = 1n;
+
+  // 초기 상태: CLOSED
+  const status1 = breaker.getStatus(nodeId);
+  assert(status1?.state === CircuitBreakerState.CLOSED, 'Initial state should be CLOSED');
+
+  // 3번 실패 → OPEN 전환
+  for (let i = 0; i < 3; i++) {
+    breaker.recordFailure(nodeId);
+  }
+
+  const status2 = breaker.getStatus(nodeId);
+  assert(status2?.state === CircuitBreakerState.OPEN, 'Should transition to OPEN after 3 failures');
+  assert(status2?.failureCount === 3, 'Should have 3 failures recorded');
+  assert(status2?.totalFailures === 3, 'Should have 3 total failures');
+
+  // OPEN 상태에서 요청 차단
+  const canExecuteOpen = breaker.canExecute(nodeId);
+  assert(!canExecuteOpen, 'Circuit breaker should reject in OPEN state');
+
+  // 타임아웃 후 HALF_OPEN 전환 가능
+  await new Promise(r => setTimeout(r, 550));
+  const canExecuteHalfOpen = breaker.canExecute(nodeId);
+  assert(canExecuteHalfOpen, 'Circuit breaker should allow in HALF_OPEN state after timeout');
+
+  const status3 = breaker.getStatus(nodeId);
+  assert(status3?.state === CircuitBreakerState.HALF_OPEN, 'Should transition to HALF_OPEN after timeout');
+
+  console.log(`    Final state: ${status3?.state}`);
+  console.log(`    Total failures: ${status3?.totalFailures}`);
+}
+
+/**
+ * Test 17: Circuit Breaker - Recovery to CLOSED
+ */
+async function testCircuitBreakerRecovery(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 17] Circuit Breaker - Recovery to CLOSED${colors.reset}`
+  );
+
+  const breaker = new CircuitBreaker(2, 2, 400);  // failureThreshold=2, successThreshold=2, timeout=400ms
+  const nodeId = 2n;
+
+  // 2번 실패 → OPEN
+  for (let i = 0; i < 2; i++) {
+    breaker.recordFailure(nodeId);
+  }
+
+  let status = breaker.getStatus(nodeId);
+  assert(status?.state === CircuitBreakerState.OPEN, 'Should transition to OPEN after 2 failures');
+
+  // Timeout 후 HALF_OPEN 자동 전환
+  await new Promise((r) => setTimeout(r, 450));
+
+  // HALF_OPEN에서 성공 → CLOSED 복구
+  const canExecuteHalfOpen = breaker.canExecute(nodeId);
+  assert(canExecuteHalfOpen, 'Should allow execution in HALF_OPEN');
+
+  for (let i = 0; i < 2; i++) {
+    breaker.recordSuccess(nodeId);
+  }
+
+  status = breaker.getStatus(nodeId);
+  assert(status?.state === CircuitBreakerState.CLOSED, 'Should recover to CLOSED after 2 successes');
+  assert(status?.totalSuccesses === 2, 'Should have 2 successes');
+
+  console.log(`    Recovery successful: ${status?.state}`);
+  console.log(`    Total successes: ${status?.totalSuccesses}`);
+}
+
+/**
+ * Test 18: Retry Strategy - Exponential Backoff
+ */
+async function testRetryStrategyBackoff(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 18] Retry Strategy - Exponential Backoff${colors.reset}`
+  );
+
+  const strategy = new RetryStrategy({
+    maxAttempts: 4,
+    baseDelayMs: 50,
+    maxDelayMs: 500,
+    jitterFactor: 0,  // No jitter for predictable testing
+    backoffMultiplier: 2
+  });
+
+  let attemptCount = 0;
+  const startTime = Date.now();
+
+  const result = await strategy.execute(async () => {
+    attemptCount++;
+    if (attemptCount < 4) {
+      throw new Error('ETIMEDOUT');  // Retryable error
+    }
+    return 'success';
+  }, 'TestOperation');
+
+  const elapsedMs = Date.now() - startTime;
+
+  // 지연: 50ms + 100ms + 200ms = 350ms (최소)
+  assert(result.success, 'Should eventually succeed');
+  assert(result.result === 'success', 'Should return success result');
+  assert(attemptCount === 4, 'Should make 4 attempts total');
+  assert(result.attempts === 4, 'Retry result should show 4 attempts');
+  assert(elapsedMs >= 300, `Should have cumulative delay >= 300ms, got ${elapsedMs}ms`);
+
+  const stats = strategy.getStats();
+  console.log(`    Total attempts: ${attemptCount}`);
+  console.log(`    Elapsed time: ${elapsedMs}ms`);
+  console.log(`    Retry stats: ${stats.totalRetries} retries, ${stats.totalSuccesses} successes`);
+}
+
+/**
+ * Test 19: Timeout Manager - Operation Timeout & Adaptive Adjustment
+ */
+async function testTimeoutManager(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 19] Timeout Manager - Adaptive Timeout${colors.reset}`
+  );
+
+  const manager = new TimeoutManager({
+    rdmaReadMs: 100,
+    rdmaWriteMs: 150,
+    semanticSyncMs: 500,
+    heartbeatMs: 200,
+    globalMs: 1000
+  });
+
+  // 작업 시뮬레이션: 레이턴시 기록
+  for (let i = 0; i < 5; i++) {
+    const latency = 50 + i * 10;  // 50ms, 60ms, 70ms, 80ms, 90ms
+    manager.recordLatency('rdmaRead', latency);
+  }
+
+  // 기본 타임아웃 확인
+  const baseTimeout = manager.getBaseTimeout('rdmaRead');
+  assert(baseTimeout === 100, 'Base timeout for rdmaRead should be 100ms');
+
+  // 적응형 타임아웃 확인 (p99 * 1.5)
+  const adaptiveTimeout = manager.getTimeout('rdmaRead');
+  assert(adaptiveTimeout >= baseTimeout, 'Adaptive timeout should be >= base timeout');
+
+  // 평균 레이턴시 조회
+  const avgLatency = manager.getAverageLatency('rdmaRead');
+  assert(avgLatency > 0, 'Average latency should be recorded');
+
+  // P99 레이턴시 조회
+  const p99Latency = manager.getP99Latency('rdmaRead');
+  assert(p99Latency > 0, 'P99 latency should be calculated');
+
+  console.log(`    Base timeout: ${baseTimeout}ms`);
+  console.log(`    Adaptive timeout: ${adaptiveTimeout}ms`);
+  console.log(`    Average latency: ${avgLatency.toFixed(2)}ms`);
+  console.log(`    P99 latency: ${p99Latency.toFixed(2)}ms`);
+}
+
+/**
+ * Test 20: Auto-Recovery Orchestrator - Full Integration
+ */
+async function testAutoRecoveryOrchestrator(): Promise<void> {
+  console.log(
+    `\n${colors.blue}[TEST 20] Auto-Recovery Orchestrator - Full Integration${colors.reset}`
+  );
+
+  const circuitBreaker = new CircuitBreaker(2, 2, 400);
+  const timeoutManager = new TimeoutManager({
+    rdmaReadMs: 100,
+    rdmaWriteMs: 150,
+    semanticSyncMs: 500,
+    heartbeatMs: 200,
+    globalMs: 1000
+  });
+  const retryStrategy = new RetryStrategy({
+    maxAttempts: 3,
+    baseDelayMs: 50,
+    maxDelayMs: 500,
+    jitterFactor: 0,
+    backoffMultiplier: 2
+  });
+
+  const orchestrator = new AutoRecoveryOrchestrator(
+    circuitBreaker,
+    timeoutManager,
+    retryStrategy
+  );
+
+  const nodeId = 10n;
+  let attemptCount = 0;
+
+  // Scenario 1: 실패했다가 재시도로 복구
+  attemptCount = 0;
+  const result1 = await orchestrator.execute(
+    async () => {
+      attemptCount++;
+      if (attemptCount < 2) throw new Error('ETIMEDOUT');
+      return 'success';
+    },
+    nodeId,
+    'rdmaRead'
+  );
+
+  assert(result1.success, 'Should succeed after retry');
+  assert(attemptCount === 2, 'Should require 2 attempts');
+
+  // Scenario 2: Circuit Breaker가 활성화되도록 여러 실패
+  attemptCount = 0;
+  const result2 = await orchestrator.execute(
+    async () => {
+      attemptCount++;
+      throw new Error('ECONNREFUSED');
+    },
+    nodeId,
+    'rdmaWrite'
+  );
+
+  assert(!result2.success, 'Should fail after retries');
+
+  // Scenario 3: Circuit Breaker OPEN 상태에서 즉시 거절
+  const result3 = await orchestrator.execute(
+    async () => 'should not execute',
+    nodeId,
+    'semanticSync'
+  );
+
+  assert(!result3.success, 'Should be rejected by Circuit Breaker');
+  assert(result3.error?.message.includes('Circuit Breaker OPEN'), 'Error message should mention Circuit Breaker');
+
+  // 통계 확인
+  const stats = orchestrator.getStats();
+  assert(stats.totalAttempts >= 3, 'Should have made multiple attempts');
+  assert(stats.circuitBreakerTrips >= 1, 'Should have circuit breaker trip');
+
+  console.log(`    Total attempts: ${stats.totalAttempts}`);
+  console.log(`    Successful recoveries: ${stats.successfulRecoveries}`);
+  console.log(`    Failed recoveries: ${stats.failedRecoveries}`);
+  console.log(`    Recovery rate: ${stats.recoveryRate.toFixed(2)}%`);
+  console.log(`    Circuit breaker trips: ${stats.circuitBreakerTrips}`);
+}
+
+/**
  * 모든 테스트 실행
  */
 async function runAllTests(): Promise<void> {
@@ -537,6 +793,8 @@ async function runAllTests(): Promise<void> {
 ║ Layer 1: Inter-Node Fabric (RDMA)                          ║
 ║ Layer 2: Semantic Sync Protocol                            ║
 ║ Week 2: Real Performance Measurement                       ║
+║ Week 3: Chaos Testing (Network, Node, Memory)              ║
+║ Week 4: Auto-Recovery (Circuit Breaker, Retry, Timeout)    ║
 ╚════════════════════════════════════════════════════════════╝
   `);
 
@@ -564,6 +822,13 @@ async function runAllTests(): Promise<void> {
     await testChaosNodeCrash();
     await testChaosMemorySpike();
     await testChaosScenario();
+
+    // Week 4: Auto-Recovery Mechanisms
+    await testCircuitBreakerStateTransitions();
+    await testCircuitBreakerRecovery();
+    await testRetryStrategyBackoff();
+    await testTimeoutManager();
+    await testAutoRecoveryOrchestrator();
   } catch (error) {
     console.log(`\n${colors.red}ERROR: ${error}${colors.reset}`);
     if (error instanceof Error) {
