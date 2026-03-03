@@ -1,0 +1,146 @@
+name: CI/CD Pipeline - Week 1 Foundation
+
+on:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  # Job 1: Build + Test (자동화의 뼈대)
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build TypeScript
+      run: npm run build
+
+    - name: Run tests (34/34 must pass)
+      run: npm test
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: test-results
+        path: test-results.json
+        retention-days: 30
+
+  # Job 2: Benchmark (기초 성능 측정)
+  benchmark:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Build
+      run: npm run build
+
+    - name: Run benchmark tests
+      run: npm test 2>&1 | tee benchmark-output.txt
+
+    - name: Extract performance metrics
+      id: metrics
+      run: |
+        cat > extract_metrics.js << 'EOF'
+        const fs = require('fs');
+        const output = fs.readFileSync('benchmark-output.txt', 'utf8');
+
+        // Parse timing from test output
+        const results = {
+          timestamp: new Date().toISOString(),
+          commit: process.env.GITHUB_SHA,
+          branch: process.env.GITHUB_REF,
+          metrics: {
+            total_tests: 34,
+            tests_passed: (output.match(/✅/g) || []).length,
+            execution_time_ms: null,
+            memory_peak_mb: null
+          }
+        };
+
+        // Try to extract execution time
+        const timeMatch = output.match(/⏱️\s+Total Time:\s+(\d+)ms/);
+        if (timeMatch) {
+          results.metrics.execution_time_ms = parseInt(timeMatch[1]);
+        }
+
+        fs.writeFileSync('benchmark.json', JSON.stringify(results, null, 2));
+        console.log(JSON.stringify(results, null, 2));
+        EOF
+        node extract_metrics.js
+
+    - name: Save benchmark result
+      run: |
+        mkdir -p .benchmark-history
+        cp benchmark.json ".benchmark-history/$(date -u +%Y%m%d_%H%M%S)_${{ github.sha }}.json"
+
+    - name: Upload benchmark artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: benchmark-results
+        path: benchmark.json
+        retention-days: 90
+
+    - name: Comment PR with benchmark
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const benchmark = JSON.parse(fs.readFileSync('benchmark.json', 'utf8'));
+          const comment = `
+          ## Benchmark Results
+          - Tests: ${benchmark.metrics.total_tests}/${benchmark.metrics.tests_passed} passed
+          - Execution Time: ${benchmark.metrics.execution_time_ms}ms
+          - Timestamp: ${benchmark.metrics.timestamp}
+          `;
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+
+  # Job 3: Failure detection (실패 즉시 감지)
+  verify-success:
+    runs-on: ubuntu-latest
+    needs: [ build-and-test, benchmark ]
+    if: always()
+
+    steps:
+    - name: Check build status
+      run: |
+        if [ "${{ needs.build-and-test.result }}" != "success" ]; then
+          echo "❌ Build/Test failed"
+          exit 1
+        fi
+        echo "✅ All checks passed"
+
+    - name: Check benchmark status
+      run: |
+        if [ "${{ needs.benchmark.result }}" != "success" ]; then
+          echo "⚠️  Benchmark collection failed (non-blocking)"
+        fi
+        echo "✅ Pipeline complete"
