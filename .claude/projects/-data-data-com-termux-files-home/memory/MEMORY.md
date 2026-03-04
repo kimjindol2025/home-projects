@@ -1,4 +1,43 @@
-# Claude Code 프로젝트 메모리 (압축 v11) - Challenge 13 Sovereign-Pay 완료
+# Claude Code 프로젝트 메모리 (압축 v12) - Sovereign-Mail 설계 시작
+
+---
+
+## 📧 **Project Sovereign-Mail: Black-Box Personal Email Server** 🚀 **[DESIGN COMPLETE]** (2026-03-05)
+
+**상태**: ✅ **설계 완료, 구현 준비 완료**
+**저장소**: https://gogs.dclub.kr/kim/home-projects.git (commit fc89df5e)
+**철학**: "메일이 메모리에 올라오는 순간, 검은 상자가 된다"
+
+**3개 Challenge (예상 7,000줄, 18개 무관용 규칙)**:
+1. **Challenge 14: L0-Mail-Core** (2,300줄, 30T, 6R)
+   - 메모리→암호화→CAS 자동 변환
+   - PGP/OpenPGP 표준 준수
+   - AES-256 + RSA-4096
+   - 규칙: 암호화 <5ms, 복호화 0% 실패
+
+2. **Challenge 15: Sovereign-Naming** (2,400줄, 30T, 6R)
+   - DHT 기반 분산 DNS
+   - kim@sovereign (공개키 주소화)
+   - ICANN 의존도 0%
+   - 규칙: DNS <100ms, 복구 <500ms
+
+3. **Challenge 16: L0NN-Mail-Sentry** (2,300줄, 30T, 6R)
+   - 신경망 스팸 필터 (99.9%)
+   - 8가지 특성 추출
+   - <10µs 추론
+   - 규칙: 오탐 <0.01%, 정확도 ≥99.9%
+
+**구현 일정**:
+- Challenge 14: 2026-03-11 (1주)
+- Challenge 15: 2026-03-18 (1주)
+- Challenge 16: 2026-03-25 (1주)
+- 최종 통합: 2026-04-01
+
+**핵심 혁신**:
+- ✅ 메모리 레벨 E2E 암호화 (<5ms)
+- ✅ 분산 주소 (공개키 기반, 중앙화 없음)
+- ✅ AI 방어 (신경망 99.9% 정확도)
+- ✅ 오프라인 안정성 (네트워크 불필요)
 
 ---
 
