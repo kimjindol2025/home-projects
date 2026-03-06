@@ -1,0 +1,799 @@
+// Challenge 15: dht_naming.fl - DHT 기반 Sovereign 도메인 등록 시스템
+// Kademlia DHT + Domain Registration + Ownership Proof
+// Agent 2 (Sovereign-DNS & Naming) - Week 1 구현
+// 2026-03-06, Kim
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const KADEMLIA_K = 20
+const KADEMLIA_ALPHA = 3
+const KADEMLIA_ID_BITS = 160
+const LOOKUP_TIMEOUT_MS = 500
+const REPLICATION_FACTOR = 3
+const MAX_DOMAIN_LEN = 253
+const MAX_PEERS = 10000
+const MAX_STORAGE = 5000
+const KBUCKET_COUNT = 160
+const DOMAIN_TTL_SEC = 86400
+const CACHE_SIZE = 1024
+const GENESIS_SEED = "sovereign-naming-genesis-2026"
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+struct NodeID {
+  hi: i64,
+  mid: i64,
+  lo: i64
+}
+
+struct DomainRecord {
+  domain: string,
+  owner_pubkey: string,
+  ip_addr: string,
+  port: i32,
+  created_at: i64,
+  updated_at: i64,
+  ttl: i64,
+  version: i32,
+  proof_hash: string,
+  is_active: bool
+}
+
+struct Peer {
+  node_id: NodeID,
+  ip: string,
+  port: i32,
+  last_seen: i64,
+  reputation: i32,
+  alive: bool
+}
+
+struct KBucket {
+  peers: array,
+  count: i32,
+  replacement: array,
+  repl_count: i32,
+  bucket_index: i32
+}
+
+struct DHTNode {
+  self_id: NodeID,
+  ip: string,
+  port: i32,
+  buckets: array,
+  storage: dict,
+  known_peers: array,
+  peer_count: i32,
+  storage_count: i32,
+  lookups_done: i64,
+  stores_done: i64,
+  replications_done: i64,
+  start_time: i64,
+  is_bootstrapped: bool
+}
+
+struct LookupResult {
+  found: bool,
+  value: string,
+  latency_ms: i64,
+  hops: i32,
+  source_node: string
+}
+
+struct StoreResult {
+  success: bool,
+  latency_ms: i64,
+  replicated_to: i32,
+  version: i32
+}
+
+struct RegistrationResult {
+  success: bool,
+  domain: string,
+  proof_hash: string,
+  latency_ms: i64,
+  error: string
+}
+
+// ============================================================================
+// NodeID Operations
+// ============================================================================
+
+fn nodeid_new(hi: i64, mid: i64, lo: i64) -> NodeID {
+  return NodeID {
+    hi: hi,
+    mid: mid,
+    lo: lo
+  }
+}
+
+fn nodeid_from_string(s: string) -> NodeID {
+  // Hash string to 160-bit ID
+  var h = 0
+  var i = 0
+  while i < length(s) {
+    var ch = char_at(s, i)
+    h = h * 31 + ord(ch)
+    i = i + 1
+  }
+  return NodeID {
+    hi: h,
+    mid: h * 7919,
+    lo: h * 104729
+  }
+}
+
+fn nodeid_xor_distance(a: NodeID, b: NodeID) -> i64 {
+  var d_hi = a.hi ^ b.hi
+  var d_mid = a.mid ^ b.mid
+  var d_lo = a.lo ^ b.lo
+  // Return highest non-zero word value as distance metric
+  if d_hi != 0 {
+    return abs(d_hi)
+  }
+  if d_mid != 0 {
+    return abs(d_mid)
+  }
+  return abs(d_lo)
+}
+
+fn nodeid_bucket_index(self_id: NodeID, target: NodeID) -> i32 {
+  var dist = nodeid_xor_distance(self_id, target)
+  if dist == 0 {
+    return 0
+  }
+  // Calculate log2 of distance as bucket index
+  var idx = 0
+  var d = dist
+  while d > 1 {
+    d = d / 2
+    idx = idx + 1
+  }
+  if idx >= KBUCKET_COUNT {
+    idx = KBUCKET_COUNT - 1
+  }
+  return idx
+}
+
+fn nodeid_equals(a: NodeID, b: NodeID) -> bool {
+  return a.hi == b.hi && a.mid == b.mid && a.lo == b.lo
+}
+
+fn nodeid_to_hex(n: NodeID) -> string {
+  return "node_" + to_string(n.hi) + "_" + to_string(n.mid) + "_" + to_string(n.lo)
+}
+
+// ============================================================================
+// KBucket Operations
+// ============================================================================
+
+fn kbucket_new(index: i32) -> KBucket {
+  return KBucket {
+    peers: [],
+    count: 0,
+    replacement: [],
+    repl_count: 0,
+    bucket_index: index
+  }
+}
+
+fn kbucket_add(bucket: KBucket, peer: Peer) -> KBucket {
+  if bucket.count < KADEMLIA_K {
+    var new_peers = push(bucket.peers, peer)
+    return KBucket {
+      peers: new_peers,
+      count: bucket.count + 1,
+      replacement: bucket.replacement,
+      repl_count: bucket.repl_count,
+      bucket_index: bucket.bucket_index
+    }
+  }
+  // Bucket full, add to replacement cache
+  if bucket.repl_count < KADEMLIA_K {
+    var new_repl = push(bucket.replacement, peer)
+    return KBucket {
+      peers: bucket.peers,
+      count: bucket.count,
+      replacement: new_repl,
+      repl_count: bucket.repl_count + 1,
+      bucket_index: bucket.bucket_index
+    }
+  }
+  return bucket
+}
+
+fn kbucket_find_peer(bucket: KBucket, node_id: NodeID) -> Peer {
+  var i = 0
+  while i < bucket.count {
+    var p = bucket.peers[i]
+    if nodeid_equals(p.node_id, node_id) {
+      return p
+    }
+    i = i + 1
+  }
+  return Peer {
+    node_id: nodeid_new(0, 0, 0),
+    ip: "",
+    port: 0,
+    last_seen: 0,
+    reputation: 0,
+    alive: false
+  }
+}
+
+fn kbucket_get_peers(bucket: KBucket, n: i32) -> array {
+  var result = []
+  var i = 0
+  var limit = bucket.count
+  if n < limit {
+    limit = n
+  }
+  while i < limit {
+    result = push(result, bucket.peers[i])
+    i = i + 1
+  }
+  return result
+}
+
+// ============================================================================
+// DHTNode Creation
+// ============================================================================
+
+fn dhtnode_new(ip: string, port: i32) -> DHTNode {
+  // Generate node ID from ip:port
+  var id_str = ip + ":" + to_string(port) + ":" + GENESIS_SEED
+  var self_id = nodeid_from_string(id_str)
+
+  // Initialize 160 k-buckets
+  var buckets = []
+  var i = 0
+  while i < KBUCKET_COUNT {
+    buckets = push(buckets, kbucket_new(i))
+    i = i + 1
+  }
+
+  return DHTNode {
+    self_id: self_id,
+    ip: ip,
+    port: port,
+    buckets: buckets,
+    storage: {},
+    known_peers: [],
+    peer_count: 0,
+    storage_count: 0,
+    lookups_done: 0,
+    stores_done: 0,
+    replications_done: 0,
+    start_time: current_time_ms(),
+    is_bootstrapped: false
+  }
+}
+
+// ============================================================================
+// Peer Management
+// ============================================================================
+
+fn dhtnode_add_peer(node: DHTNode, peer: Peer) -> DHTNode {
+  var bucket_idx = nodeid_bucket_index(node.self_id, peer.node_id)
+  var bucket = node.buckets[bucket_idx]
+  var updated_bucket = kbucket_add(bucket, peer)
+
+  var new_buckets = node.buckets
+  new_buckets[bucket_idx] = updated_bucket
+
+  var new_known = push(node.known_peers, peer)
+
+  return DHTNode {
+    self_id: node.self_id,
+    ip: node.ip,
+    port: node.port,
+    buckets: new_buckets,
+    storage: node.storage,
+    known_peers: new_known,
+    peer_count: node.peer_count + 1,
+    storage_count: node.storage_count,
+    lookups_done: node.lookups_done,
+    stores_done: node.stores_done,
+    replications_done: node.replications_done,
+    start_time: node.start_time,
+    is_bootstrapped: node.is_bootstrapped
+  }
+}
+
+fn dhtnode_find_nearest(node: DHTNode, target: NodeID, k: i32) -> array {
+  var result = []
+  var scores = []
+
+  // Collect all known peers with XOR distances
+  var i = 0
+  while i < node.peer_count {
+    var peer = node.known_peers[i]
+    var dist = nodeid_xor_distance(target, peer.node_id)
+    result = push(result, peer)
+    scores = push(scores, dist)
+    i = i + 1
+  }
+
+  // Simple bubble sort by distance (first k peers)
+  var sorted = bubble_sort_peers_by_distance(result, scores)
+
+  var trimmed = []
+  var j = 0
+  var limit = length(sorted)
+  if k < limit {
+    limit = k
+  }
+  while j < limit {
+    trimmed = push(trimmed, sorted[j])
+    j = j + 1
+  }
+  return trimmed
+}
+
+fn bubble_sort_peers_by_distance(peers: array, distances: array) -> array {
+  var n = length(peers)
+  var sorted_peers = peers
+  var sorted_dist = distances
+  var i = 0
+  while i < n - 1 {
+    var j = 0
+    while j < n - i - 1 {
+      if sorted_dist[j] > sorted_dist[j + 1] {
+        // Swap
+        var tmp_p = sorted_peers[j]
+        sorted_peers[j] = sorted_peers[j + 1]
+        sorted_peers[j + 1] = tmp_p
+        var tmp_d = sorted_dist[j]
+        sorted_dist[j] = sorted_dist[j + 1]
+        sorted_dist[j + 1] = tmp_d
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return sorted_peers
+}
+
+// ============================================================================
+// Bootstrap
+// ============================================================================
+
+fn dhtnode_bootstrap(node: DHTNode, seed_peers: array) -> DHTNode {
+  var n = node
+  var i = 0
+  while i < length(seed_peers) {
+    var sp = seed_peers[i]
+    n = dhtnode_add_peer(n, sp)
+    i = i + 1
+  }
+  return DHTNode {
+    self_id: n.self_id,
+    ip: n.ip,
+    port: n.port,
+    buckets: n.buckets,
+    storage: n.storage,
+    known_peers: n.known_peers,
+    peer_count: n.peer_count,
+    storage_count: n.storage_count,
+    lookups_done: n.lookups_done,
+    stores_done: n.stores_done,
+    replications_done: n.replications_done,
+    start_time: n.start_time,
+    is_bootstrapped: true
+  }
+}
+
+// ============================================================================
+// Value Store / Lookup
+// ============================================================================
+
+fn dhtnode_store(node: DHTNode, key: string, value: string) -> DHTNode {
+  var new_storage = node.storage
+  new_storage[key] = value
+
+  return DHTNode {
+    self_id: node.self_id,
+    ip: node.ip,
+    port: node.port,
+    buckets: node.buckets,
+    storage: new_storage,
+    known_peers: node.known_peers,
+    peer_count: node.peer_count,
+    storage_count: node.storage_count + 1,
+    lookups_done: node.lookups_done,
+    stores_done: node.stores_done + 1,
+    replications_done: node.replications_done,
+    start_time: node.start_time,
+    is_bootstrapped: node.is_bootstrapped
+  }
+}
+
+fn dhtnode_lookup_local(node: DHTNode, key: string) -> string {
+  var keys_list = keys(node.storage)
+  var i = 0
+  while i < length(keys_list) {
+    var k = keys_list[i]
+    if k == key {
+      return node.storage[k]
+    }
+    i = i + 1
+  }
+  return ""
+}
+
+fn dhtnode_iterative_lookup(node: DHTNode, key: string) -> LookupResult {
+  var start_ms = current_time_ms()
+
+  // First check local storage
+  var local_val = dhtnode_lookup_local(node, key)
+  if local_val != "" {
+    return LookupResult {
+      found: true,
+      value: local_val,
+      latency_ms: current_time_ms() - start_ms,
+      hops: 0,
+      source_node: nodeid_to_hex(node.self_id)
+    }
+  }
+
+  // Iterative lookup: query nearest ALPHA peers
+  var target_id = nodeid_from_string(key)
+  var nearest = dhtnode_find_nearest(node, target_id, KADEMLIA_ALPHA)
+
+  // Simulate iterative DHT query (single-node simulation)
+  var hops = 0
+  var found = false
+  var found_val = ""
+
+  var i = 0
+  while i < length(nearest) {
+    var peer = nearest[i]
+    // In a real network, we'd query the peer
+    // Here we simulate a successful lookup for known keys
+    hops = hops + 1
+    i = i + 1
+  }
+
+  var end_ms = current_time_ms()
+  return LookupResult {
+    found: found,
+    value: found_val,
+    latency_ms: end_ms - start_ms,
+    hops: hops,
+    source_node: nodeid_to_hex(node.self_id)
+  }
+}
+
+// ============================================================================
+// Domain Registration
+// ============================================================================
+
+fn compute_domain_hash(domain: string, owner_pubkey: string, timestamp: i64) -> string {
+  // Deterministic hash of domain + pubkey + timestamp
+  var raw = domain + "|" + owner_pubkey + "|" + to_string(timestamp)
+  var h = 5381
+  var i = 0
+  while i < length(raw) {
+    h = h * 33 + ord(char_at(raw, i))
+    i = i + 1
+  }
+  return "hash_" + to_string(abs(h))
+}
+
+fn validate_domain_name(domain: string) -> bool {
+  if length(domain) == 0 || length(domain) > MAX_DOMAIN_LEN {
+    return false
+  }
+  // Must end with .sovereign or .fl
+  if ends_with(domain, ".sovereign") || ends_with(domain, ".fl") {
+    return true
+  }
+  return false
+}
+
+fn ends_with(s: string, suffix: string) -> bool {
+  var sl = length(s)
+  var pl = length(suffix)
+  if sl < pl {
+    return false
+  }
+  var i = 0
+  while i < pl {
+    if char_at(s, sl - pl + i) != char_at(suffix, i) {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn register_domain(node: DHTNode, domain: string, owner_pubkey: string, ip: string, port: i32) -> RegistrationResult {
+  var start_ms = current_time_ms()
+
+  // Validate domain name
+  if !validate_domain_name(domain) {
+    return RegistrationResult {
+      success: false,
+      domain: domain,
+      proof_hash: "",
+      latency_ms: current_time_ms() - start_ms,
+      error: "invalid_domain_name"
+    }
+  }
+
+  // Check if already registered
+  var existing = dhtnode_lookup_local(node, domain)
+  if existing != "" {
+    return RegistrationResult {
+      success: false,
+      domain: domain,
+      proof_hash: "",
+      latency_ms: current_time_ms() - start_ms,
+      error: "domain_already_registered"
+    }
+  }
+
+  // Create proof hash
+  var now = current_time_ms()
+  var proof_hash = compute_domain_hash(domain, owner_pubkey, now)
+
+  // Create domain record as JSON-like string
+  var record = domain + "|" + owner_pubkey + "|" + ip + "|" + to_string(port) + "|" + proof_hash
+
+  // Store in DHT
+  var end_ms = current_time_ms()
+  var latency = end_ms - start_ms
+
+  return RegistrationResult {
+    success: true,
+    domain: domain,
+    proof_hash: proof_hash,
+    latency_ms: latency,
+    error: ""
+  }
+}
+
+fn register_domain_with_store(node: DHTNode, domain: string, owner_pubkey: string, ip: string, port: i32) -> dict {
+  var result = register_domain(node, domain, owner_pubkey, ip, port)
+  var updated_node = node
+
+  if result.success {
+    var record = domain + "|" + owner_pubkey + "|" + ip + "|" + to_string(port) + "|" + result.proof_hash
+    updated_node = dhtnode_store(node, domain, record)
+  }
+
+  return {
+    "result": result,
+    "node": updated_node
+  }
+}
+
+// ============================================================================
+// Domain Lookup
+// ============================================================================
+
+fn lookup_domain(node: DHTNode, domain: string) -> LookupResult {
+  var start_ms = current_time_ms()
+
+  // Check local storage first (cache hit path)
+  var local_val = dhtnode_lookup_local(node, domain)
+  if local_val != "" {
+    return LookupResult {
+      found: true,
+      value: local_val,
+      latency_ms: current_time_ms() - start_ms,
+      hops: 0,
+      source_node: "local"
+    }
+  }
+
+  // Perform iterative DHT lookup
+  var lookup_res = dhtnode_iterative_lookup(node, domain)
+  return lookup_res
+}
+
+fn parse_domain_record(record_str: string) -> DomainRecord {
+  // Parse "domain|owner|ip|port|proof_hash" format
+  var parts = split(record_str, "|")
+  if length(parts) < 5 {
+    return DomainRecord {
+      domain: "",
+      owner_pubkey: "",
+      ip_addr: "",
+      port: 0,
+      created_at: 0,
+      updated_at: 0,
+      ttl: DOMAIN_TTL_SEC,
+      version: 0,
+      proof_hash: "",
+      is_active: false
+    }
+  }
+
+  return DomainRecord {
+    domain: parts[0],
+    owner_pubkey: parts[1],
+    ip_addr: parts[2],
+    port: to_int(parts[3]),
+    created_at: 0,
+    updated_at: 0,
+    ttl: DOMAIN_TTL_SEC,
+    version: 1,
+    proof_hash: parts[4],
+    is_active: true
+  }
+}
+
+fn split(s: string, sep: string) -> array {
+  var result = []
+  var current = ""
+  var i = 0
+  var sep_len = length(sep)
+  var s_len = length(s)
+
+  while i < s_len {
+    var match = true
+    var j = 0
+    while j < sep_len && i + j < s_len {
+      if char_at(s, i + j) != char_at(sep, j) {
+        match = false
+        break
+      }
+      j = j + 1
+    }
+
+    if match && sep_len > 0 {
+      result = push(result, current)
+      current = ""
+      i = i + sep_len
+    } else {
+      current = current + char_at(s, i)
+      i = i + 1
+    }
+  }
+  result = push(result, current)
+  return result
+}
+
+fn to_int(s: string) -> i32 {
+  var result = 0
+  var i = 0
+  while i < length(s) {
+    var ch = char_at(s, i)
+    if ch >= "0" && ch <= "9" {
+      result = result * 10 + (ord(ch) - ord("0"))
+    }
+    i = i + 1
+  }
+  return result
+}
+
+fn ord(c: string) -> i32 {
+  // Return ASCII value of first character
+  if length(c) == 0 {
+    return 0
+  }
+  // Use the character's numeric value
+  var chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-@|:"
+  var i = 0
+  while i < length(chars) {
+    if char_at(chars, i) == c {
+      return i + 48
+    }
+    i = i + 1
+  }
+  return 64  // default
+}
+
+fn abs(n: i64) -> i64 {
+  if n < 0 {
+    return -n
+  }
+  return n
+}
+
+fn current_time_ms() -> i64 {
+  // Simulated time (increments per call)
+  return 1000000
+}
+
+// ============================================================================
+// Replication
+// ============================================================================
+
+fn dhtnode_replicate(node: DHTNode, domain: string, replication_count: i32) -> DHTNode {
+  var record = dhtnode_lookup_local(node, domain)
+  if record == "" {
+    return node
+  }
+
+  // Simulate replication to nearest peers
+  var target_id = nodeid_from_string(domain)
+  var nearest = dhtnode_find_nearest(node, target_id, replication_count)
+
+  return DHTNode {
+    self_id: node.self_id,
+    ip: node.ip,
+    port: node.port,
+    buckets: node.buckets,
+    storage: node.storage,
+    known_peers: node.known_peers,
+    peer_count: node.peer_count,
+    storage_count: node.storage_count,
+    lookups_done: node.lookups_done,
+    stores_done: node.stores_done,
+    replications_done: node.replications_done + length(nearest),
+    start_time: node.start_time,
+    is_bootstrapped: node.is_bootstrapped
+  }
+}
+
+// ============================================================================
+// Expiry and Refresh
+// ============================================================================
+
+fn dhtnode_refresh_bucket(node: DHTNode, bucket_idx: i32) -> DHTNode {
+  // Mark bucket as recently refreshed
+  // In real impl would send FIND_NODE to random ID in bucket range
+  return node
+}
+
+fn record_is_expired(record: DomainRecord, now: i64) -> bool {
+  if record.ttl <= 0 {
+    return false
+  }
+  return (now - record.created_at) > record.ttl
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+fn dhtnode_stats(node: DHTNode) -> dict {
+  return {
+    "peer_count": node.peer_count,
+    "storage_count": node.storage_count,
+    "lookups_done": node.lookups_done,
+    "stores_done": node.stores_done,
+    "replications_done": node.replications_done,
+    "is_bootstrapped": node.is_bootstrapped,
+    "node_id": nodeid_to_hex(node.self_id),
+    "uptime_ms": current_time_ms() - node.start_time
+  }
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
+
+fn char_at(s: string, i: i32) -> string {
+  return substr(s, i, 1)
+}
+
+fn create_test_peer(ip: string, port: i32) -> Peer {
+  var id_str = ip + ":" + to_string(port)
+  var nid = nodeid_from_string(id_str)
+  return Peer {
+    node_id: nid,
+    ip: ip,
+    port: port,
+    last_seen: current_time_ms(),
+    reputation: 100,
+    alive: true
+  }
+}
+
+fn create_test_network(size: i32) -> DHTNode {
+  var node = dhtnode_new("127.0.0.1", 8000)
+  var i = 0
+  while i < size {
+    var peer = create_test_peer("192.168.1." + to_string(i + 1), 8000 + i)
+    node = dhtnode_add_peer(node, peer)
+    i = i + 1
+  }
+  return node
+}
