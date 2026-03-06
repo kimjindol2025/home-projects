@@ -1,0 +1,186 @@
+// Phase 3.1.5 통합 폰트 엔진
+// TTF 파싱 → SDF 생성 → 렌더링 파이프라인
+
+use crate::core::fixed_point::*;
+use crate::core::solver::CubicBezier;
+use crate::parser::{TTFParser, GlyphExtractor, Glyph};
+use crate::render::sdf_generator::{SDFTexture, SDFShader};
+
+#[derive(Clone, Debug)]
+pub struct FontMetrics {
+    pub size_pt: u16,
+    pub scale: Fixed16,
+    pub ascender: Fixed16,
+    pub descender: Fixed16,
+    pub line_height: Fixed16,
+}
+
+pub struct FontEngine {
+    pub parser: TTFParser,
+    pub metrics: FontMetrics,
+    pub shader: SDFShader,
+    pub glyphs: std::collections::HashMap<char, Glyph>,
+}
+
+impl FontEngine {
+    // 새 폰트 엔진 생성
+    pub fn new(ttf_data: Vec<u8>) -> Self {
+        let mut parser = TTFParser::new(ttf_data);
+        parser.parse_header();
+        parser.parse_glyph_count();
+
+        let units_per_em = parser.header.units_per_em as i32;
+        let scale = div(FIXED_ONE, from_int(units_per_em));
+
+        let metrics = FontMetrics {
+            size_pt: 12,
+            scale,
+            ascender: mul(from_int(parser.header.bounds_ymax as i32), scale),
+            descender: mul(from_int(parser.header.bounds_ymin as i32), scale),
+            line_height: mul(from_int(units_per_em), scale),
+        };
+
+        FontEngine {
+            parser,
+            metrics,
+            shader: SDFShader::new(),
+            glyphs: std::collections::HashMap::new(),
+        }
+    }
+
+    // TTF에서 글리프 로드
+    pub fn load_glyph(&mut self, codepoint: char, glyph_offset: usize) {
+        let outline = self.parser.parse_glyph_outline(0, glyph_offset);
+        let glyph = GlyphExtractor::create_glyph(codepoint, &outline, self.parser.header.units_per_em);
+        self.glyphs.insert(codepoint, glyph);
+    }
+
+    // 글리프를 SDF 텍스처로 렌더링
+    pub fn render_glyph(&self, codepoint: char) -> Option<SDFTexture> {
+        match self.glyphs.get(&codepoint) {
+            Some(glyph) => {
+                let sdf = crate::render::sdf_generator::SDFGenerator::rasterize(
+                    &glyph.beziers,
+                    32,
+                    32,
+                );
+                Some(sdf)
+            }
+            None => None,
+        }
+    }
+
+    // 글리프를 지정된 크기로 렌더링
+    pub fn render_glyph_at_size(&self, codepoint: char, size_pt: u16) -> Option<SDFTexture> {
+        match self.glyphs.get(&codepoint) {
+            Some(glyph) => {
+                // 크기에 맞춰 스케일링된 베지어 곡선
+                let scaled_beziers: Vec<CubicBezier> = glyph
+                    .beziers
+                    .iter()
+                    .map(|b| {
+                        let scale = div(from_int(size_pt as i32), from_int(12));  // 기본값 12pt
+                        CubicBezier::new(
+                            b.p0.scale(scale),
+                            b.p1.scale(scale),
+                            b.p2.scale(scale),
+                            b.p3.scale(scale),
+                        )
+                    })
+                    .collect();
+
+                let sdf = crate::render::sdf_generator::SDFGenerator::rasterize(
+                    &scaled_beziers,
+                    32,
+                    32,
+                );
+                Some(sdf)
+            }
+            None => None,
+        }
+    }
+
+    // 텍스트 렌더링 (여러 글리프)
+    pub fn render_text(&self, text: &str, size_pt: u16) -> Vec<SDFTexture> {
+        let mut sdfs = Vec::new();
+
+        for ch in text.chars() {
+            if let Some(sdf) = self.render_glyph_at_size(ch, size_pt) {
+                sdfs.push(sdf);
+            }
+        }
+
+        sdfs
+    }
+
+    // Bold 설정
+    pub fn set_bold(&mut self) {
+        self.shader.set_bold(15);
+    }
+
+    // Normal로 복원
+    pub fn set_normal(&mut self) {
+        self.shader.set_normal();
+    }
+
+    // Thin 설정
+    pub fn set_thin(&mut self) {
+        self.shader.set_thin(10);
+    }
+
+    // 로드된 글리프 개수 반환
+    pub fn loaded_glyph_count(&self) -> usize {
+        self.glyphs.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_font_engine_creation() {
+        let data = vec![0x00; 500];
+        let engine = FontEngine::new(data);
+        assert_eq!(engine.metrics.size_pt, 12);
+        assert_eq!(engine.glyphs.len(), 0);
+    }
+
+    #[test]
+    fn test_render_nonexistent_glyph() {
+        let data = vec![0x00; 500];
+        let engine = FontEngine::new(data);
+        let result = engine.render_glyph('A');
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_render_text_empty() {
+        let data = vec![0x00; 500];
+        let engine = FontEngine::new(data);
+        let sdfs = engine.render_text("ABC", 12);
+        assert_eq!(sdfs.len(), 0);  // 글리프 로드 안 함
+    }
+
+    #[test]
+    fn test_font_metrics() {
+        let data = vec![0x00; 500];
+        let engine = FontEngine::new(data);
+        assert!(engine.metrics.scale > 0);
+    }
+
+    #[test]
+    fn test_bold_thin_settings() {
+        let mut engine = FontEngine::new(vec![0x00; 500]);
+        assert_eq!(engine.shader.threshold, 0);
+
+        engine.set_bold();
+        assert!(engine.shader.threshold < 0);
+
+        engine.set_thin();
+        assert!(engine.shader.threshold > 0);
+
+        engine.set_normal();
+        assert_eq!(engine.shader.threshold, 0);
+    }
+}

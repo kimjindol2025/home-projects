@@ -1,0 +1,337 @@
+/* ============================================================================
+   ARM64 Boot Entry Point & Exception Vector Table
+
+   목적: ARM64 부트 초기화, 예외 벡터 설정, EL2→EL1 전환
+   크기: ~250줄
+   성능: 부팅 < 100ms, 예외 디스패치 < 10µs
+============================================================================ */
+
+// ============================================================================
+// 1. Exception Level (EL) 열거형
+// ============================================================================
+
+pub enum ExceptionLevel {
+    EL0 = 0,    // 사용자 영역 (User mode)
+    EL1 = 1,    // 커널 영역 (Kernel mode, 목표)
+    EL2 = 2,    // 하이퍼바이저 (Hypervisor, Android에서 시작)
+    EL3 = 3,    // 보안 모니터 (Secure monitor)
+}
+
+// ============================================================================
+// 2. ARM64 예외 타입 (VBAR_EL1 벡터 테이블)
+// ============================================================================
+
+pub enum Arm64ExceptionType {
+    // 현재 EL에서 발생한 예외
+    SynchronousCurrentEL     = 0,   // Sync (SVC, Abort 등)
+    IrqCurrentEL             = 1,   // IRQ
+    FiqCurrentEL             = 2,   // FIQ
+    SerrorCurrentEL          = 3,   // SError (System Error)
+
+    // 하위 EL(EL0)에서 발생한 예외
+    SynchronousLowerEL       = 4,   // Sync from lower EL
+    IrqLowerEL               = 5,   // IRQ from lower EL
+    FiqLowerEL               = 6,   // FIQ from lower EL
+    SerrorLowerEL            = 7,   // SError from lower EL
+}
+
+// ============================================================================
+// 3. ARM64 SVC (Supervisor Call) 종류
+// ============================================================================
+
+pub enum SvcNumber {
+    SysWrite      = 0,      // UART 출력
+    SysRead       = 1,      // UART 입력
+    SysAlloc      = 2,      // 메모리 할당
+    SysFree       = 3,      // 메모리 해제
+    SysFork       = 4,      // 프로세스 생성
+    SysExit       = 5,      // 프로세스 종료
+    SysLcdDraw    = 6,      // LCD 픽셀 그리기
+    SysLcdFlush   = 7,      // LCD 버퍼 플러시
+}
+
+// ============================================================================
+// 4. ARM64 예외 벡터 엔트리
+// ============================================================================
+
+pub struct Arm64ExceptionVectorEntry {
+    pub vector_offset: u32,              // VBAR_EL1 오프셋 (0, 128, 256, ...)
+    pub exception_type: Arm64ExceptionType,
+    pub handler_id: u32,                // 핸들러 고유 ID
+}
+
+// ============================================================================
+// 5. ARM64 일반 목적 레지스터 집합
+// ============================================================================
+
+pub struct Arm64Registers {
+    pub x: [u64; 31],       // x0~x30 (x31은 SP, 따로 처리)
+    pub sp: u64,            // Stack Pointer (SP_EL1 또는 SP_EL0)
+    pub pc: u64,            // Program Counter
+    pub pstate: u32,        // Process State (NZCV, exception level 등)
+}
+
+impl Arm64Registers {
+    pub fn new() -> Self {
+        let x: [u64; 31] = [0; 31];
+        Arm64Registers {
+            x: x,
+            sp: 0,
+            pc: 0,
+            pstate: 0,
+        }
+    }
+
+    pub fn get_x0(&self) -> u64 { self.x[0] }
+    pub fn set_x0(&mut self, val: u64) { self.x[0] = val }
+    pub fn get_x30(&self) -> u64 { self.x[30] }  // LR (Link Register)
+    pub fn set_x30(&mut self, val: u64) { self.x[30] = val }
+}
+
+// ============================================================================
+// 6. ARM64 부트 상태
+// ============================================================================
+
+pub struct Arm64BootState {
+    pub current_el: ExceptionLevel,     // 현재 Exception Level
+    pub stack_ptr: u64,                 // SP_EL1 (커널 스택)
+    pub exception_base: u64,            // VBAR_EL1 (벡터 테이블 주소)
+    pub boot_time_ns: u64,              // 부팅 시작 시간 (ns)
+    pub exception_count: u32,           // 처리한 예외 수
+    pub svc_count: u32,                 // 처리한 SVC 호출 수
+}
+
+impl Arm64BootState {
+    pub fn new() -> Self {
+        Arm64BootState {
+            current_el: ExceptionLevel::EL2,
+            stack_ptr: 0,
+            exception_base: 0,
+            boot_time_ns: 0,
+            exception_count: 0,
+            svc_count: 0,
+        }
+    }
+}
+
+// ============================================================================
+// 7. ARM64 부트 정보 (부트로더에서 전달)
+// ============================================================================
+
+pub struct Arm64BootInfo {
+    pub kernel_start: u64,              // 커널 시작 주소
+    pub kernel_size: u64,               // 커널 크기 (바이트)
+    pub framebuffer_addr: u64,          // Framebuffer 물리 주소
+    pub framebuffer_width: u32,         // Framebuffer 너비 (픽셀)
+    pub framebuffer_height: u32,        // Framebuffer 높이 (픽셀)
+    pub framebuffer_bpp: u8,            // 픽셀당 비트 (16 or 32)
+}
+
+// ============================================================================
+// 8. 부팅 함수들
+// ============================================================================
+
+// ARM64 부트 초기화 (< 1ms 목표)
+pub fn arm64_boot_init() -> Arm64BootState {
+    let mut state = Arm64BootState::new();
+
+    // 현재 Exception Level 감지 (시뮬레이션)
+    // 실제 하드웨어에서는 MRS x0, CurrentEL 로 읽음
+    state.current_el = ExceptionLevel::EL2;
+
+    // 부팅 시간 기록 (ns)
+    state.boot_time_ns = 0;  // 시뮬레이션: 실제로는 CNTVCT_EL0에서 읽음
+
+    // 커널 스택 포인터 설정 (0xFFFF_0000_0020_0000)
+    state.stack_ptr = 0xFFFF_0000_0020_0000;
+
+    // 벡터 테이블 주소 설정 (0xFFFF_0000_0000_0000)
+    state.exception_base = 0xFFFF_0000_0000_0000;
+
+    state
+}
+
+// ARM64 예외 벡터 테이블 설정
+pub fn setup_exception_vectors() -> [Arm64ExceptionVectorEntry; 8] {
+    let mut vectors: [Arm64ExceptionVectorEntry; 8] = [
+        Arm64ExceptionVectorEntry {
+            vector_offset: 0,
+            exception_type: Arm64ExceptionType::SynchronousCurrentEL,
+            handler_id: 0,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 128,
+            exception_type: Arm64ExceptionType::IrqCurrentEL,
+            handler_id: 1,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 256,
+            exception_type: Arm64ExceptionType::FiqCurrentEL,
+            handler_id: 2,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 384,
+            exception_type: Arm64ExceptionType::SerrorCurrentEL,
+            handler_id: 3,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 512,
+            exception_type: Arm64ExceptionType::SynchronousLowerEL,
+            handler_id: 4,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 640,
+            exception_type: Arm64ExceptionType::IrqLowerEL,
+            handler_id: 5,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 768,
+            exception_type: Arm64ExceptionType::FiqLowerEL,
+            handler_id: 6,
+        },
+        Arm64ExceptionVectorEntry {
+            vector_offset: 896,
+            exception_type: Arm64ExceptionType::SerrorLowerEL,
+            handler_id: 7,
+        },
+    ];
+
+    vectors
+}
+
+// EL2 → EL1 전환 (Android 환경)
+pub fn switch_to_el1(boot_state: &mut Arm64BootState) -> bool {
+    // 시뮬레이션: EL2 → EL1 전환 성공 여부
+    if boot_state.current_el == ExceptionLevel::EL2 {
+        // 실제 하드웨어에서는:
+        // 1. HCR_EL2 설정 (VM bits)
+        // 2. SCTLR_EL1 설정 (MMU, I-cache, D-cache)
+        // 3. SPSR_EL2 설정 (ERET 대상 상태)
+        // 4. ELR_EL2 설정 (커널 진입점)
+        // 5. ERET 실행 (EL2 → EL1)
+
+        boot_state.current_el = ExceptionLevel::EL1;
+        true
+    } else {
+        false
+    }
+}
+
+// SVC (시스템콜) 디스패치 핸들러
+pub fn handle_svc(svc_num: u32, regs: &mut Arm64Registers) -> u64 {
+    match svc_num {
+        0 => {
+            // SysWrite: x0=파일 디스크립터, x1=버퍼, x2=크기
+            0  // 성공 (시뮬레이션)
+        },
+        1 => {
+            // SysRead: x0=파일 디스크립터, x1=버퍼, x2=크기
+            0
+        },
+        2 => {
+            // SysAlloc: x0=크기, 반환: 할당된 포인터
+            0x0000_1000  // 시뮬레이션: 4KB 할당
+        },
+        3 => {
+            // SysFree: x0=포인터
+            0
+        },
+        4 => {
+            // SysFork: 반환: 자식 PID (부모) 또는 0 (자식)
+            0
+        },
+        5 => {
+            // SysExit: x0=종료 코드
+            0
+        },
+        6 => {
+            // SysLcdDraw: x0=x, x1=y, x2=color
+            0
+        },
+        7 => {
+            // SysLcdFlush: 반환: 플러시 완료 시간 (µs)
+            0
+        },
+        _ => {
+            // 알 수 없는 시스템콜
+            0xFFFFFFFF
+        },
+    }
+}
+
+// Exception handler dispatcher (시뮬레이션)
+pub fn dispatch_exception(
+    exc_type: u32,
+    regs: &mut Arm64Registers,
+    boot_state: &mut Arm64BootState
+) -> bool {
+    // 예외 타입별 처리
+    match exc_type {
+        0 => {
+            // SynchronousCurrentEL: SVC 호출 가능성
+            let svc_num = (regs.pstate >> 16) & 0xFF;
+            let result = handle_svc(svc_num as u32, regs);
+            regs.x[0] = result;
+            boot_state.svc_count += 1;
+            true
+        },
+        1 => {
+            // IrqCurrentEL: 인터럽트 처리
+            boot_state.exception_count += 1;
+            true
+        },
+        _ => {
+            // 다른 예외: 통용 처리
+            boot_state.exception_count += 1;
+            false
+        },
+    }
+}
+
+// ============================================================================
+// 9. 검증 함수 (테스트용)
+// ============================================================================
+
+// ARM64 메모리 레이아웃 검증
+pub fn validate_arm64_memory_layout(boot_info: &Arm64BootInfo) -> bool {
+    // 커널 크기 검증 (< 1MB = 1,048,576 bytes)
+    if boot_info.kernel_size >= 1048576 {
+        return false;
+    }
+
+    // Framebuffer 주소 검증 (0 아님)
+    if boot_info.framebuffer_addr == 0 {
+        return false;
+    }
+
+    // Framebuffer 유효성 검증
+    if boot_info.framebuffer_width == 0 || boot_info.framebuffer_height == 0 {
+        return false;
+    }
+
+    if boot_info.framebuffer_bpp != 16 && boot_info.framebuffer_bpp != 32 {
+        return false;
+    }
+
+    true
+}
+
+// Exception level 전환 검증
+pub fn validate_el_transition() -> bool {
+    let mut boot_state = arm64_boot_init();
+
+    // 초기: EL2
+    if boot_state.current_el as u32 != 2 {
+        return false;
+    }
+
+    // EL2 → EL1 전환
+    switch_to_el1(&mut boot_state);
+
+    // 최종: EL1
+    if boot_state.current_el as u32 != 1 {
+        return false;
+    }
+
+    true
+}

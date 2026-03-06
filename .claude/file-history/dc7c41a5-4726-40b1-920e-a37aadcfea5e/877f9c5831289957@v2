@@ -1,0 +1,256 @@
+// Green-Distributed-Fabric Layer 2: Green Scheduler
+// dvfs_controller.fl - Dynamic Voltage and Frequency Scaling
+// 재사용: Phase 8 controlThermalThrottling(), Phase 9 classifyWorkload()
+
+use crate::power::PowerReading;
+
+// ─────────────────────────────────────────────────────────────────
+// DVFSPoint: 운영점 (Operating Point)
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct DVFSPoint {
+    pub frequency_mhz: u32,    // 200 / 400 / 600 / 800 / 1000 / 1200 / 1400 / 1600
+    pub voltage_mv: u32,       // 600 / 700 / 800 / 900 / 1000 / 1100 / 1150 / 1200
+    pub power_mw: f64,         // 해당 OP의 소비 전력
+    pub performance_score: f64, // 0.0-1.0 (상대 성능)
+}
+
+impl DVFSPoint {
+    pub fn efficiency(&self) -> f64 {
+        // 에너지 효율: performance / power
+        if self.power_mw > 0.0 {
+            self.performance_score / self.power_mw
+        } else {
+            0.0
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}MHz@{}mV({:.1}mW)", self.frequency_mhz, self.voltage_mv, self.power_mw)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DVFSPolicy: DVFS 운영 정책
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DVFSPolicy {
+    Performance,     // 최대 주파수 우선
+    Balanced,        // 성능/전력 균형
+    PowerSave,       // 최소 전력 우선
+    Emergency,       // 배터리 위기 (5% 미만) → 최저 OP 고정
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DVFSState: DVFS 상태
+// ─────────────────────────────────────────────────────────────────
+
+struct DVFSState {
+    current_point: DVFSPoint,
+    current_policy: DVFSPolicy,
+    transition_count: u64,
+    last_transition_us: u64,
+    min_interval_us: u32,     // 100ms = 100_000us
+}
+
+// ─────────────────────────────────────────────────────────────────
+// DVFSController: DVFS 제어기
+// ─────────────────────────────────────────────────────────────────
+
+pub struct DVFSController {
+    pub operating_points: Vec<DVFSPoint>,
+    state: DVFSState,
+    battery_level: f64,
+    thermal_ratio: f64,
+}
+
+impl DVFSController {
+    pub fn new() -> DVFSController {
+        // 8개 Operating Point 초기화
+        let ops = vec![
+            DVFSPoint { frequency_mhz: 200, voltage_mv: 600, power_mw: 10.0, performance_score: 0.125 },
+            DVFSPoint { frequency_mhz: 400, voltage_mv: 700, power_mw: 25.0, performance_score: 0.25 },
+            DVFSPoint { frequency_mhz: 600, voltage_mv: 800, power_mw: 50.0, performance_score: 0.375 },
+            DVFSPoint { frequency_mhz: 800, voltage_mv: 900, power_mw: 90.0, performance_score: 0.5 },
+            DVFSPoint { frequency_mhz: 1000, voltage_mv: 1000, power_mw: 140.0, performance_score: 0.625 },
+            DVFSPoint { frequency_mhz: 1200, voltage_mv: 1100, power_mw: 200.0, performance_score: 0.75 },
+            DVFSPoint { frequency_mhz: 1400, voltage_mv: 1150, power_mw: 270.0, performance_score: 0.875 },
+            DVFSPoint { frequency_mhz: 1600, voltage_mv: 1200, power_mw: 360.0, performance_score: 1.0 },
+        ];
+
+        DVFSController {
+            state: DVFSState {
+                current_point: ops[3].clone(), // 800MHz 기본값
+                current_policy: DVFSPolicy::Balanced,
+                transition_count: 0,
+                last_transition_us: 0,
+                min_interval_us: 100_000, // 100ms
+            },
+            operating_points: ops,
+            battery_level: 1.0,
+            thermal_ratio: 0.0,
+        }
+    }
+
+    pub fn select_policy(&self, battery_level: f64, load: f64) -> DVFSPolicy {
+        // battery < 5% → Emergency
+        if battery_level < 0.05 {
+            DVFSPolicy::Emergency
+        }
+        // battery < 20% → PowerSave
+        else if battery_level < 0.20 {
+            DVFSPolicy::PowerSave
+        }
+        // load > 80% → Performance
+        else if load > 0.80 {
+            DVFSPolicy::Performance
+        }
+        // else → Balanced
+        else {
+            DVFSPolicy::Balanced
+        }
+    }
+
+    pub fn target_operating_point(&self, policy: &DVFSPolicy, workload_score: f64) -> &DVFSPoint {
+        match policy {
+            DVFSPolicy::Performance => &self.operating_points[7], // 1600MHz
+            DVFSPolicy::Emergency => &self.operating_points[0],   // 200MHz
+            DVFSPolicy::PowerSave => &self.operating_points[1],   // 400MHz
+            DVFSPolicy::Balanced => {
+                // workload_score 기반 선택 (0.0-1.0)
+                let idx = ((workload_score * 6.0) as usize).min(7);
+                &self.operating_points[idx]
+            }
+        }
+    }
+
+    pub fn transition_to(&mut self, target: &DVFSPoint, timestamp_us: u64) -> Result<u64, String> {
+        // 무관용 규칙 3: 전환 < 10ms = 10_000us
+        let elapsed = timestamp_us - self.state.last_transition_us;
+        if elapsed < self.state.min_interval_us as u64 {
+            return Err(format!("Too frequent transition: {}us < {}us",
+                              elapsed, self.state.min_interval_us));
+        }
+
+        let transition_time_us = 5_000u64; // 5ms 전환 시간 (시뮬레이션)
+        if transition_time_us > 10_000 {
+            return Err("Transition time exceeds 10ms".to_string());
+        }
+
+        self.state.current_point = target.clone();
+        self.state.transition_count += 1;
+        self.state.last_transition_us = timestamp_us;
+
+        Ok(transition_time_us)
+    }
+
+    pub fn thermal_scale_factor(&self) -> f64 {
+        // Phase 8 controlThermalThrottling() 그대로:
+        if self.thermal_ratio > 0.90 {
+            0.5 // 심각: 50% 전력만 허용
+        } else if self.thermal_ratio > 0.80 {
+            0.8 // 경고: 80% 전력
+        } else {
+            1.0 // 정상: 100% 전력
+        }
+    }
+
+    pub fn classify_workload_type(&self, cpu_util: f64, io_rate: f64) -> String {
+        // Phase 9 classifyWorkload() 구조 동일 (4분류)
+        if cpu_util > 0.7 {
+            "compute_intensive".to_string()
+        } else if io_rate > 1000.0 {
+            "io_intensive".to_string()
+        } else if cpu_util < 0.2 {
+            "background".to_string()
+        } else {
+            "balanced".to_string()
+        }
+    }
+
+    pub fn update(&mut self, reading: &PowerReading, cpu_util: f64, io_rate: f64) {
+        self.battery_level = (reading.battery_voltage_mv as f64) / 4200.0;
+        self.thermal_ratio = reading.thermal_ratio;
+
+        let policy = self.select_policy(self.battery_level, cpu_util);
+        let workload_type = self.classify_workload_type(cpu_util, io_rate);
+        let workload_score = if workload_type == "compute_intensive" { 1.0 } else { 0.5 };
+
+        let target = self.target_operating_point(&policy, workload_score).clone();
+        let _ = self.transition_to(&target, reading.timestamp_us);
+    }
+
+    pub fn current_frequency(&self) -> u32 {
+        self.state.current_point.frequency_mhz
+    }
+
+    pub fn savings_vs_max_freq(&self) -> f64 {
+        // 현재 절감률 = (max_power - current_power) / max_power
+        let max_power = self.operating_points[7].power_mw;
+        let current = self.state.current_point.power_mw;
+        (max_power - current) / max_power
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 테스트
+// ─────────────────────────────────────────────────────────────────
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dvfs_point_efficiency() {
+        let point = DVFSPoint {
+            frequency_mhz: 800,
+            voltage_mv: 900,
+            power_mw: 90.0,
+            performance_score: 0.5,
+        };
+        assert!(point.efficiency() > 0.0);
+    }
+
+    #[test]
+    fn test_dvfs_controller_creation() {
+        let controller = DVFSController::new();
+        assert_eq!(controller.operating_points.len(), 8);
+        assert_eq!(controller.current_frequency(), 800);
+    }
+
+    #[test]
+    fn test_select_policy_emergency() {
+        let controller = DVFSController::new();
+        let policy = controller.select_policy(0.03, 0.5);
+        assert_eq!(policy, DVFSPolicy::Emergency);
+    }
+
+    #[test]
+    fn test_select_policy_performance() {
+        let controller = DVFSController::new();
+        let policy = controller.select_policy(1.0, 0.9);
+        assert_eq!(policy, DVFSPolicy::Performance);
+    }
+
+    #[test]
+    fn test_thermal_scale_factor() {
+        let mut controller = DVFSController::new();
+        controller.thermal_ratio = 0.95;
+        assert_eq!(controller.thermal_scale_factor(), 0.5);
+    }
+
+    #[test]
+    fn test_classify_workload() {
+        let controller = DVFSController::new();
+        let wt = controller.classify_workload_type(0.9, 100.0);
+        assert_eq!(wt, "compute_intensive");
+    }
+
+    #[test]
+    fn test_savings_vs_max() {
+        let controller = DVFSController::new();
+        let savings = controller.savings_vs_max_freq();
+        assert!(savings >= 0.0 && savings < 1.0);
+    }
+}

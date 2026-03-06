@@ -1,0 +1,300 @@
+// Phase 3.2 프레임버퍼 관리
+// SDF 렌더링 → 픽셀 쓰기 → 화면 출력
+
+use crate::core::fixed_point::*;
+
+// 화면 해상도
+pub const FB_WIDTH: usize = 800;
+pub const FB_HEIGHT: usize = 600;
+pub const FB_BPP: usize = 4;  // 32-bit RGBA
+
+#[derive(Clone, Copy, Debug)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+impl Color {
+    pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
+        Color { r, g, b, a }
+    }
+
+    pub fn white() -> Self {
+        Color { r: 255, g: 255, b: 255, a: 255 }
+    }
+
+    pub fn black() -> Self {
+        Color { r: 0, g: 0, b: 0, a: 255 }
+    }
+
+    pub fn transparent() -> Self {
+        Color { r: 0, g: 0, b: 0, a: 0 }
+    }
+
+    pub fn to_u32(&self) -> u32 {
+        ((self.r as u32) << 24)
+            | ((self.g as u32) << 16)
+            | ((self.b as u32) << 8)
+            | (self.a as u32)
+    }
+
+    pub fn from_u32(val: u32) -> Self {
+        Color {
+            r: ((val >> 24) & 0xFF) as u8,
+            g: ((val >> 16) & 0xFF) as u8,
+            b: ((val >> 8) & 0xFF) as u8,
+            a: (val & 0xFF) as u8,
+        }
+    }
+}
+
+pub struct FrameBuffer {
+    pub pixels: Vec<u32>,
+    pub width: usize,
+    pub height: usize,
+    pub dirty: Vec<bool>,  // 더티 플래그 (변경된 픽셀 추적)
+}
+
+impl FrameBuffer {
+    pub fn new(width: usize, height: usize) -> Self {
+        let pixel_count = width * height;
+        FrameBuffer {
+            pixels: vec![0; pixel_count],
+            width,
+            height,
+            dirty: vec![false; pixel_count],
+        }
+    }
+
+    // 화면 해상도의 기본 프레임버퍼
+    pub fn new_default() -> Self {
+        Self::new(FB_WIDTH, FB_HEIGHT)
+    }
+
+    // 픽셀 쓰기 (경계 검사)
+    pub fn write_pixel(&mut self, x: usize, y: usize, color: Color) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+
+        let idx = y * self.width + x;
+        self.pixels[idx] = color.to_u32();
+        self.dirty[idx] = true;
+    }
+
+    // 픽셀 읽기
+    pub fn read_pixel(&self, x: usize, y: usize) -> Color {
+        if x >= self.width || y >= self.height {
+            return Color::black();
+        }
+
+        let idx = y * self.width + x;
+        Color::from_u32(self.pixels[idx])
+    }
+
+    // Alpha blending: src over dst
+    pub fn blend_pixel(&mut self, x: usize, y: usize, src: Color) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+
+        let dst = self.read_pixel(x, y);
+
+        // Alpha compositing: C_out = C_src × α_src + C_dst × (1 - α_src)
+        let alpha_src = (src.a as i32) << 8;  // [0, 255] → [0, 65280]
+        let alpha_dst_weight = 256 - (src.a as i32);
+
+        let r = ((src.r as i32 * alpha_src) + (dst.r as i32 * alpha_dst_weight)) >> 8;
+        let g = ((src.g as i32 * alpha_src) + (dst.g as i32 * alpha_dst_weight)) >> 8;
+        let b = ((src.b as i32 * alpha_src) + (dst.b as i32 * alpha_dst_weight)) >> 8;
+        let a = ((src.a as i32 * 256) + (dst.a as i32 * alpha_dst_weight)) >> 8;
+
+        let blended = Color {
+            r: (r as u8).min(255),
+            g: (g as u8).min(255),
+            b: (b as u8).min(255),
+            a: (a as u8).min(255),
+        };
+
+        self.write_pixel(x, y, blended);
+    }
+
+    // 직사각형 채우기
+    pub fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: Color) {
+        for dy in 0..height {
+            for dx in 0..width {
+                self.write_pixel(x + dx, y + dy, color);
+            }
+        }
+    }
+
+    // 화면 전체 지우기
+    pub fn clear(&mut self, color: Color) {
+        self.fill_rect(0, 0, self.width, self.height, color);
+    }
+
+    // 더티 영역 초기화
+    pub fn clear_dirty(&mut self) {
+        for d in &mut self.dirty {
+            *d = false;
+        }
+    }
+
+    // 더티 픽셀 개수
+    pub fn dirty_count(&self) -> usize {
+        self.dirty.iter().filter(|&&d| d).count()
+    }
+
+    // 더티 영역 경계 계산 (최적화)
+    pub fn dirty_bounds(&self) -> Option<(usize, usize, usize, usize)> {
+        let mut min_x = self.width;
+        let mut min_y = self.height;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        let mut found = false;
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let idx = y * self.width + x;
+                if self.dirty[idx] {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                    found = true;
+                }
+            }
+        }
+
+        if found {
+            Some((min_x, min_y, max_x + 1, max_y + 1))
+        } else {
+            None
+        }
+    }
+
+    // 메모리 사용량 (bytes)
+    pub fn memory_usage(&self) -> usize {
+        self.pixels.len() * 4 + self.dirty.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_frame_buffer_creation() {
+        let fb = FrameBuffer::new(800, 600);
+        assert_eq!(fb.width, 800);
+        assert_eq!(fb.height, 600);
+        assert_eq!(fb.pixels.len(), 800 * 600);
+    }
+
+    #[test]
+    fn test_frame_buffer_default() {
+        let fb = FrameBuffer::new_default();
+        assert_eq!(fb.width, FB_WIDTH);
+        assert_eq!(fb.height, FB_HEIGHT);
+    }
+
+    #[test]
+    fn test_write_read_pixel() {
+        let mut fb = FrameBuffer::new(100, 100);
+        let color = Color::white();
+
+        fb.write_pixel(50, 50, color);
+        let read = fb.read_pixel(50, 50);
+
+        assert_eq!(read.r, 255);
+        assert_eq!(read.g, 255);
+        assert_eq!(read.b, 255);
+    }
+
+    #[test]
+    fn test_write_pixel_bounds() {
+        let mut fb = FrameBuffer::new(100, 100);
+        let color = Color::white();
+
+        fb.write_pixel(999, 999, color);  // Out of bounds
+        let read = fb.read_pixel(999, 999);
+        assert_eq!(read.a, 255);  // Black by default
+    }
+
+    #[test]
+    fn test_color_to_from_u32() {
+        let color = Color::new(255, 128, 64, 32);
+        let u32_val = color.to_u32();
+        let restored = Color::from_u32(u32_val);
+
+        assert_eq!(restored.r, 255);
+        assert_eq!(restored.g, 128);
+        assert_eq!(restored.b, 64);
+        assert_eq!(restored.a, 32);
+    }
+
+    #[test]
+    fn test_alpha_blending() {
+        let mut fb = FrameBuffer::new(100, 100);
+
+        let src = Color::new(255, 0, 0, 128);  // 반투명 빨강
+        let dst = Color::white();
+
+        fb.write_pixel(50, 50, dst);
+        fb.blend_pixel(50, 50, src);
+
+        let result = fb.read_pixel(50, 50);
+        // 블렌딩: (255, 0, 0, 128) over (255, 255, 255, 255)
+        assert!(result.r > 200);  // 빨강 >= 200
+        assert!(result.g < 200);  // 초록 < 200
+        assert!(result.b < 200);  // 파랑 < 200
+    }
+
+    #[test]
+    fn test_fill_rect() {
+        let mut fb = FrameBuffer::new(100, 100);
+        let color = Color::white();
+
+        fb.fill_rect(10, 10, 20, 20, color);
+
+        // 내부 픽셀 확인
+        let inside = fb.read_pixel(15, 15);
+        assert_eq!(inside.r, 255);
+
+        // 외부 픽셀 확인
+        let outside = fb.read_pixel(5, 5);
+        assert_eq!(outside.r, 0);
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut fb = FrameBuffer::new(100, 100);
+        fb.clear(Color::white());
+
+        let pixel = fb.read_pixel(50, 50);
+        assert_eq!(pixel.r, 255);
+    }
+
+    #[test]
+    fn test_dirty_tracking() {
+        let mut fb = FrameBuffer::new(100, 100);
+        fb.write_pixel(50, 50, Color::white());
+
+        assert!(fb.dirty[50 * 100 + 50]);
+        assert!(fb.dirty_count() > 0);
+
+        fb.clear_dirty();
+        assert_eq!(fb.dirty_count(), 0);
+    }
+
+    #[test]
+    fn test_memory_usage() {
+        let fb = FrameBuffer::new(800, 600);
+        let memory = fb.memory_usage();
+
+        // 800×600×4 = 1,920,000 + 480,000 = 2,400,000 bytes
+        assert!(memory > 2_000_000);
+    }
+}

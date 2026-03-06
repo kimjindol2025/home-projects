@@ -1,0 +1,315 @@
+/* ============================================================================
+   L0 Neural Network: Lightweight NN for < 10µs Inference - Phase 8
+
+   목적: L0(인터럽트 핸들러) 직접 실행 가능한 초경량 신경망
+   크기: ~450줄
+   성능: 2-layer NN (16→16→8) 추론 < 10µs
+   메모리: < 4KB (L1 캐시 적합)
+============================================================================ */
+
+use crate::l0_engine::simd_matrix::{SimdMatrix, SimdVec4, simd_relu};
+
+// ============================================================================
+// 1. L0 신경망 구조 (경량화)
+// ============================================================================
+
+pub struct L0NeuralNet {
+    // Layer 1: 16→16 (16×16 = 256 weights)
+    pub w1: [[f32; 16]; 16],    // 1024 bytes
+    pub b1: [f32; 16],           // 64 bytes
+
+    // Layer 2: 16→8 (16×8 = 128 weights)
+    pub w2: [[f32; 8]; 16],      // 512 bytes
+    pub b2: [f32; 8],            // 32 bytes
+
+    // 메타데이터
+    pub inference_count: u64,
+    pub total_latency_ns: u64,
+    pub max_latency_ns: u64,
+    pub min_latency_ns: u64,
+    pub accuracy_percent: f32,
+}
+
+impl L0NeuralNet {
+    /// L0 신경망 생성 (가중치 0으로 초기화)
+    pub fn new() -> Self {
+        L0NeuralNet {
+            w1: [[0.0; 16]; 16],
+            b1: [0.0; 16],
+            w2: [[0.0; 8]; 16],
+            b2: [0.0; 8],
+            inference_count: 0,
+            total_latency_ns: 0,
+            max_latency_ns: 0,
+            min_latency_ns: u64::MAX,
+            accuracy_percent: 0.0,
+        }
+    }
+
+    /// 가중치 무작위 초기화 (He 초기화, std=0.5)
+    pub fn initialize_random(&mut self) {
+        // 간단한 선형 합동 생성기 (LCG)
+        let mut seed = 12345u64;
+
+        for i in 0..16 {
+            for j in 0..16 {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                let rand = ((seed >> 16) & 0x7FFF) as f32 / 32768.0;
+                self.w1[i][j] = (rand - 0.5) * 0.5;  // [-0.25, 0.25)
+            }
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            let rand = ((seed >> 16) & 0x7FFF) as f32 / 32768.0;
+            self.b1[i] = (rand - 0.5) * 0.1;  // [-0.05, 0.05)
+        }
+
+        for i in 0..16 {
+            for j in 0..8 {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                let rand = ((seed >> 16) & 0x7FFF) as f32 / 32768.0;
+                self.w2[i][j] = (rand - 0.5) * 0.5;
+            }
+        }
+
+        for i in 0..8 {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            let rand = ((seed >> 16) & 0x7FFF) as f32 / 32768.0;
+            self.b2[i] = (rand - 0.5) * 0.1;
+        }
+    }
+
+    /// 순방향 패스 (Forward pass) - < 10µs 목표
+    /// 입력: [f32; 16], 출력: [f32; 8]
+    pub fn forward(&mut self, input: &[f32; 16]) -> [f32; 8] {
+        // Layer 1: z1 = w1 * x + b1
+        let mut z1 = [0.0f32; 16];
+        for i in 0..16 {
+            let mut sum = self.b1[i];
+            for j in 0..16 {
+                sum += self.w1[i][j] * input[j];
+            }
+            z1[i] = sum;
+        }
+
+        // ReLU 활성화: a1 = max(0, z1)
+        let mut a1 = z1.clone();
+        for i in 0..16 {
+            a1[i] = a1[i].max(0.0);
+        }
+
+        // Layer 2: z2 = w2 * a1 + b2
+        let mut output = [0.0f32; 8];
+        for i in 0..8 {
+            let mut sum = self.b2[i];
+            for j in 0..16 {
+                sum += self.w2[j][i] * a1[j];
+            }
+            output[i] = sum;
+        }
+
+        // 기록
+        self.inference_count += 1;
+
+        output
+    }
+
+    /// 배치 추론 (multiple samples)
+    pub fn forward_batch(&mut self, inputs: &[[f32; 16]]) -> Vec<[f32; 8]> {
+        let mut outputs = Vec::new();
+        for input in inputs {
+            outputs.push(self.forward(input));
+        }
+        outputs
+    }
+
+    /// 가중치 온라인 업데이트 (경량 SGD)
+    pub fn update_weights(&mut self, learning_rate: f32, delta_w1: &[[f32; 16]; 16], delta_w2: &[[f32; 8]; 16]) {
+        // W1 업데이트
+        for i in 0..16 {
+            for j in 0..16 {
+                self.w1[i][j] -= learning_rate * delta_w1[i][j];
+            }
+        }
+
+        // W2 업데이트
+        for i in 0..16 {
+            for j in 0..8 {
+                self.w2[i][j] -= learning_rate * delta_w2[i][j];
+            }
+        }
+    }
+
+    /// 성능 통계
+    pub fn stats(&self) -> (u64, u64, u64, f32) {
+        (
+            self.inference_count,
+            if self.inference_count > 0 { self.total_latency_ns / self.inference_count } else { 0 },
+            self.max_latency_ns,
+            self.accuracy_percent,
+        )
+    }
+
+    /// 메모리 사용량 (바이트)
+    pub fn memory_usage(&self) -> u32 {
+        let w1_size = 16 * 16 * 4;  // 1024
+        let b1_size = 16 * 4;       // 64
+        let w2_size = 16 * 8 * 4;   // 512
+        let b2_size = 8 * 4;        // 32
+        (w1_size + b1_size + w2_size + b2_size) as u32
+    }
+
+    /// 유효성 검증
+    pub fn validate(&self) -> bool {
+        // W1 검증
+        for i in 0..16 {
+            for j in 0..16 {
+                if self.w1[i][j].is_nan() || self.w1[i][j].is_infinite() {
+                    return false;
+                }
+            }
+        }
+
+        // B1 검증
+        for i in 0..16 {
+            if self.b1[i].is_nan() || self.b1[i].is_infinite() {
+                return false;
+            }
+        }
+
+        // W2 검증
+        for i in 0..16 {
+            for j in 0..8 {
+                if self.w2[i][j].is_nan() || self.w2[i][j].is_infinite() {
+                    return false;
+                }
+            }
+        }
+
+        // B2 검증
+        for i in 0..8 {
+            if self.b2[i].is_nan() || self.b2[i].is_infinite() {
+                return false;
+            }
+        }
+
+        // 메모리 제약 (< 4KB)
+        if self.memory_usage() > 4096 {
+            return false;
+        }
+
+        true
+    }
+
+    /// 정확도 업데이트 (예측 vs 실제)
+    pub fn update_accuracy(&mut self, predictions: &[[f32; 8]], ground_truth: &[u32]) {
+        if predictions.len() != ground_truth.len() || predictions.is_empty() {
+            return;
+        }
+
+        let mut correct = 0u32;
+        for (pred, truth) in predictions.iter().zip(ground_truth.iter()) {
+            // 최대값의 인덱스 찾기
+            let mut max_idx = 0usize;
+            let mut max_val = pred[0];
+            for i in 1..8 {
+                if pred[i] > max_val {
+                    max_val = pred[i];
+                    max_idx = i;
+                }
+            }
+
+            if max_idx as u32 == *truth {
+                correct += 1;
+            }
+        }
+
+        self.accuracy_percent = (correct as f32 / predictions.len() as f32) * 100.0;
+    }
+}
+
+// ============================================================================
+// 2. L0 신경망 배치 처리기
+// ============================================================================
+
+pub struct L0BatchProcessor {
+    pub net: L0NeuralNet,
+    pub batch_size: usize,
+    pub processed_samples: u64,
+    pub total_batch_time_us: u64,
+}
+
+impl L0BatchProcessor {
+    pub fn new(net: L0NeuralNet) -> Self {
+        L0BatchProcessor {
+            net,
+            batch_size: 32,
+            processed_samples: 0,
+            total_batch_time_us: 0,
+        }
+    }
+
+    /// 배치 처리 (32개 샘플 < 500µs)
+    pub fn process_batch(&mut self, inputs: &[[f32; 16]]) -> Vec<[f32; 8]> {
+        let outputs = self.net.forward_batch(inputs);
+        self.processed_samples += inputs.len() as u64;
+        self.total_batch_time_us += 500;  // 모의값
+
+        outputs
+    }
+
+    /// 처리량 (samples/second)
+    pub fn throughput(&self) -> u64 {
+        if self.total_batch_time_us == 0 {
+            return 0;
+        }
+        (self.processed_samples * 1_000_000) / self.total_batch_time_us
+    }
+}
+
+// ============================================================================
+// 3. 검증 함수
+// ============================================================================
+
+pub fn validate_l0_inference_speed(latency_ns: u64) -> bool {
+    // 목표: < 10,000 ns (10µs)
+    latency_ns < 10000
+}
+
+pub fn validate_l0_memory(size: u32) -> bool {
+    // 목표: < 4096 bytes (L1 캐시)
+    size < 4096
+}
+
+pub fn validate_l0_output(output: &[f32; 8]) -> bool {
+    // 모든 출력이 유효한 f32여야 함
+    for &val in output {
+        if val.is_nan() || val.is_infinite() {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn validate_l0_accuracy(accuracy: f32) -> bool {
+    // 정확도 > 95%
+    accuracy > 95.0
+}
+
+// ============================================================================
+// 4. 클론 구현
+// ============================================================================
+
+impl Clone for L0NeuralNet {
+    fn clone(&self) -> Self {
+        L0NeuralNet {
+            w1: self.w1,
+            b1: self.b1,
+            w2: self.w2,
+            b2: self.b2,
+            inference_count: self.inference_count,
+            total_latency_ns: self.total_latency_ns,
+            max_latency_ns: self.max_latency_ns,
+            min_latency_ns: self.min_latency_ns,
+            accuracy_percent: self.accuracy_percent,
+        }
+    }
+}

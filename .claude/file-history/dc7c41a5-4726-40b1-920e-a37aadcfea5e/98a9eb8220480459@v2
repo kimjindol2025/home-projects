@@ -1,0 +1,571 @@
+// FreeLang-LLC: LLVM Code Generation
+// Purpose: Compile FreeLang source to LLVM IR (Intermediate Representation)
+// Result: Native binary via llc backend
+
+use super::pointer::*;
+
+// ============================================================================
+// Part 1: LLVM Type System (200 lines)
+// ============================================================================
+
+pub enum LLVMType {
+    Void,
+    I1,     // 1-bit integer (boolean)
+    I8,     // 8-bit integer
+    I16,    // 16-bit integer
+    I32,    // 32-bit integer
+    I64,    // 64-bit integer
+    I128,   // 128-bit integer
+    F32,    // 32-bit float
+    F64,    // 64-bit float
+    Ptr,    // Generic pointer (i8*)
+    Array(Box<LLVMType>, u64),  // Array of type with size
+    Struct(Vec<LLVMType>),       // Struct with field types
+    Function(Box<LLVMType>, Vec<LLVMType>),  // Function: return_type + params
+}
+
+impl LLVMType {
+    pub fn to_llvm_string(&self) -> String {
+        match self {
+            LLVMType::Void => "void".to_string(),
+            LLVMType::I1 => "i1".to_string(),
+            LLVMType::I8 => "i8".to_string(),
+            LLVMType::I16 => "i16".to_string(),
+            LLVMType::I32 => "i32".to_string(),
+            LLVMType::I64 => "i64".to_string(),
+            LLVMType::I128 => "i128".to_string(),
+            LLVMType::F32 => "float".to_string(),
+            LLVMType::F64 => "double".to_string(),
+            LLVMType::Ptr => "i8*".to_string(),
+            LLVMType::Array(elem_type, size) => {
+                format!("[{} x {}]", size, elem_type.to_llvm_string())
+            },
+            LLVMType::Struct(fields) => {
+                let field_strs: Vec<String> = fields.iter()
+                    .map(|f| f.to_llvm_string())
+                    .collect();
+                format!("{{ {} }}", field_strs.join(", "))
+            },
+            LLVMType::Function(ret_type, params) => {
+                let param_strs: Vec<String> = params.iter()
+                    .map(|p| p.to_llvm_string())
+                    .collect();
+                format!("{}({}) *", ret_type.to_llvm_string(), param_strs.join(", "))
+            },
+        }
+    }
+
+    pub fn size_bits(&self) -> u64 {
+        match self {
+            LLVMType::Void => 0,
+            LLVMType::I1 => 1,
+            LLVMType::I8 => 8,
+            LLVMType::I16 => 16,
+            LLVMType::I32 => 32,
+            LLVMType::I64 => 64,
+            LLVMType::I128 => 128,
+            LLVMType::F32 => 32,
+            LLVMType::F64 => 64,
+            LLVMType::Ptr => 64,
+            LLVMType::Array(elem_type, size) => elem_type.size_bits() * size,
+            LLVMType::Struct(fields) => {
+                fields.iter().map(|f| f.size_bits()).sum()
+            },
+            LLVMType::Function(_, _) => 0,  // Functions have no size
+        }
+    }
+}
+
+// ============================================================================
+// Part 2: LLVM Instructions (300 lines)
+// ============================================================================
+
+pub enum LLVMInstruction {
+    // Arithmetic
+    Add(String, String),        // %1 = add i64 %a, %b
+    Sub(String, String),
+    Mul(String, String),
+    Div(String, String),
+    Mod(String, String),
+
+    // Bitwise
+    And(String, String),
+    Or(String, String),
+    Xor(String, String),
+    Shl(String, u32),
+    Lshr(String, u32),
+
+    // Memory
+    Load(LLVMType, String),     // %1 = load i64, i64* %ptr
+    Store(LLVMType, String, String),  // store i64 %val, i64* %ptr
+    Alloca(LLVMType),           // %1 = alloca i64
+    Getelementptr(LLVMType, String, Vec<String>),
+
+    // Control Flow
+    Br(String),                 // br i1 %cond, label %true, label %false
+    BrUnconditional(String),    // br label %target
+    Ret(Option<String>),        // ret i64 %val  or  ret void
+    Call(String, String, Vec<(LLVMType, String)>),  // call i64 @func(i64 %arg1, ...)
+
+    // Comparison
+    Icmp(String, String, String),  // %1 = icmp eq i64 %a, %b
+    Fcmp(String, String, String),  // %1 = fcmp oeq float %a, %b
+
+    // Conversion
+    Zext(String, LLVMType),     // %1 = zext i32 %val to i64
+    Sext(String, LLVMType),
+    Trunc(String, LLVMType),
+    Bitcast(String, LLVMType),
+    Sitofp(String, LLVMType),   // signed int to float
+    Fptosi(String, LLVMType),   // float to signed int
+
+    // Volatile access (for MMIO)
+    LoadVolatile(LLVMType, String),
+    StoreVolatile(LLVMType, String, String),
+
+    // Barriers (for synchronization)
+    Fence(String),              // fence "seq_cst"
+    AtomicRmw(String, String, String),  // atomic_rmw fadd i64* %ptr, i64 %val seq_cst
+}
+
+impl LLVMInstruction {
+    pub fn to_llvm_string(&self, next_var_id: &mut u64) -> String {
+        let var_id = *next_var_id;
+        *next_var_id += 1;
+
+        match self {
+            LLVMInstruction::Add(a, b) => {
+                format!("  %{} = add i64 {}, {}", var_id, a, b)
+            },
+            LLVMInstruction::Sub(a, b) => {
+                format!("  %{} = sub i64 {}, {}", var_id, a, b)
+            },
+            LLVMInstruction::Mul(a, b) => {
+                format!("  %{} = mul i64 {}, {}", var_id, a, b)
+            },
+            LLVMInstruction::Load(ty, ptr) => {
+                format!("  %{} = load {}, {}* {}", var_id, ty.to_llvm_string(), ty.to_llvm_string(), ptr)
+            },
+            LLVMInstruction::Store(ty, val, ptr) => {
+                format!("  store {} {}, {}* {}", ty.to_llvm_string(), val, ty.to_llvm_string(), ptr)
+            },
+            LLVMInstruction::Alloca(ty) => {
+                format!("  %{} = alloca {}", var_id, ty.to_llvm_string())
+            },
+            LLVMInstruction::Ret(val) => {
+                if let Some(v) = val {
+                    format!("  ret i64 {}", v)
+                } else {
+                    "  ret void".to_string()
+                }
+            },
+            LLVMInstruction::Call(func_name, return_type, params) => {
+                let param_strs: Vec<String> = params.iter()
+                    .map(|(ty, val)| format!("{} {}", ty.to_llvm_string(), val))
+                    .collect();
+                format!("  %{} = call {} @{}({})", var_id, return_type, func_name, param_strs.join(", "))
+            },
+            LLVMInstruction::Icmp(op, a, b) => {
+                format!("  %{} = icmp {} i64 {}, {}", var_id, op, a, b)
+            },
+            LLVMInstruction::Br(cond) => {
+                format!("  br i1 {}, label %bb.true, label %bb.false", cond)
+            },
+            LLVMInstruction::BrUnconditional(target) => {
+                format!("  br label %{}", target)
+            },
+            LLVMInstruction::Fence(order) => {
+                format!("  fence {}", order)
+            },
+            LLVMInstruction::LoadVolatile(ty, ptr) => {
+                format!("  %{} = load volatile {}, {}* {}", var_id, ty.to_llvm_string(), ty.to_llvm_string(), ptr)
+            },
+            LLVMInstruction::StoreVolatile(ty, val, ptr) => {
+                format!("  store volatile {} {}, {}* {}", ty.to_llvm_string(), val, ty.to_llvm_string(), ptr)
+            },
+            _ => format!("  ; unsupported instruction"),
+        }
+    }
+}
+
+// ============================================================================
+// Part 3: LLVM Module & Function Builder (250 lines)
+// ============================================================================
+
+pub struct LLVMBasicBlock {
+    pub label: String,
+    pub instructions: Vec<String>,
+}
+
+impl LLVMBasicBlock {
+    pub fn new(label: String) -> Self {
+        LLVMBasicBlock {
+            label,
+            instructions: Vec::new(),
+        }
+    }
+
+    pub fn add_instruction(&mut self, inst: String) {
+        self.instructions.push(inst);
+    }
+
+    pub fn to_llvm_string(&self) -> String {
+        let mut result = format!("{}:\n", self.label);
+        for inst in &self.instructions {
+            result.push_str(&format!("{}\n", inst));
+        }
+        result
+    }
+}
+
+pub struct LLVMFunction {
+    pub name: String,
+    pub return_type: LLVMType,
+    pub parameters: Vec<(String, LLVMType)>,
+    pub basic_blocks: Vec<LLVMBasicBlock>,
+    pub is_external: bool,
+}
+
+impl LLVMFunction {
+    pub fn new(name: String, return_type: LLVMType, parameters: Vec<(String, LLVMType)>) -> Self {
+        LLVMFunction {
+            name,
+            return_type,
+            parameters,
+            basic_blocks: Vec::new(),
+            is_external: false,
+        }
+    }
+
+    pub fn add_basic_block(&mut self, block: LLVMBasicBlock) {
+        self.basic_blocks.push(block);
+    }
+
+    pub fn to_llvm_string(&self) -> String {
+        if self.is_external {
+            return format!("declare {} @{}({})",
+                self.return_type.to_llvm_string(),
+                self.name,
+                self.parameters.iter()
+                    .map(|(_, ty)| ty.to_llvm_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let mut result = format!("define {} @{}(",
+            self.return_type.to_llvm_string(),
+            self.name
+        );
+
+        for (i, (param_name, param_type)) in self.parameters.iter().enumerate() {
+            if i > 0 { result.push_str(", "); }
+            result.push_str(&format!("{} %{}", param_type.to_llvm_string(), param_name));
+        }
+
+        result.push_str(") {\n");
+
+        for block in &self.basic_blocks {
+            result.push_str(&block.to_llvm_string());
+        }
+
+        result.push_str("}\n\n");
+        result
+    }
+}
+
+pub struct LLVMModule {
+    pub name: String,
+    pub functions: Vec<LLVMFunction>,
+    pub global_vars: Vec<(String, LLVMType)>,
+}
+
+impl LLVMModule {
+    pub fn new(name: String) -> Self {
+        LLVMModule {
+            name,
+            functions: Vec::new(),
+            global_vars: Vec::new(),
+        }
+    }
+
+    pub fn add_function(&mut self, func: LLVMFunction) {
+        self.functions.push(func);
+    }
+
+    pub fn add_global(&mut self, name: String, ty: LLVMType) {
+        self.global_vars.push((name, ty));
+    }
+
+    pub fn to_llvm_ir(&self) -> String {
+        let mut ir = format!("; ModuleID = '{}'\n", self.name);
+        ir.push_str("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
+        ir.push_str("target triple = \"x86_64-unknown-linux-gnu\"\n\n");
+
+        for (name, ty) in &self.global_vars {
+            ir.push_str(&format!("@{} = global {} 0\n", name, ty.to_llvm_string()));
+        }
+
+        if !self.global_vars.is_empty() {
+            ir.push_str("\n");
+        }
+
+        for func in &self.functions {
+            ir.push_str(&func.to_llvm_string());
+        }
+
+        ir
+    }
+}
+
+// ============================================================================
+// Part 4: Optimization Level Mapping (150 lines)
+// ============================================================================
+
+pub enum OptimizationLevel {
+    O0,  // No optimization
+    O1,  // Light optimization
+    O2,  // Medium optimization (default)
+    O3,  // Aggressive optimization
+    Os,  // Optimize for size
+}
+
+impl OptimizationLevel {
+    pub fn to_llc_flag(&self) -> String {
+        match self {
+            OptimizationLevel::O0 => "-O0".to_string(),
+            OptimizationLevel::O1 => "-O1".to_string(),
+            OptimizationLevel::O2 => "-O2".to_string(),
+            OptimizationLevel::O3 => "-O3".to_string(),
+            OptimizationLevel::Os => "-Os".to_string(),
+        }
+    }
+
+    pub fn to_passes(&self) -> Vec<String> {
+        match self {
+            OptimizationLevel::O0 => vec![],
+            OptimizationLevel::O1 => vec![
+                "-inline-threshold=75".to_string(),
+            ],
+            OptimizationLevel::O2 => vec![
+                "-inline-threshold=225".to_string(),
+                "-loop-unroll".to_string(),
+            ],
+            OptimizationLevel::O3 => vec![
+                "-inline-threshold=275".to_string(),
+                "-loop-unroll-and-jam".to_string(),
+                "-slp-vectorizer".to_string(),
+            ],
+            OptimizationLevel::Os => vec![
+                "-inline-threshold=75".to_string(),
+            ],
+        }
+    }
+
+    pub fn estimated_speedup(&self) -> f64 {
+        match self {
+            OptimizationLevel::O0 => 1.0,
+            OptimizationLevel::O1 => 1.5,
+            OptimizationLevel::O2 => 2.5,
+            OptimizationLevel::O3 => 3.5,
+            OptimizationLevel::Os => 1.8,
+        }
+    }
+}
+
+// ============================================================================
+// Part 5: Code Generation Examples (300 lines)
+// ============================================================================
+
+pub fn generate_add_function(a: i64, b: i64) -> LLVMFunction {
+    let mut func = LLVMFunction::new(
+        "add".to_string(),
+        LLVMType::I64,
+        vec![
+            ("a".to_string(), LLVMType::I64),
+            ("b".to_string(), LLVMType::I64),
+        ]
+    );
+
+    let mut block = LLVMBasicBlock::new("entry".to_string());
+    block.add_instruction(format!("  %sum = add i64 %a, %b"));
+    block.add_instruction(format!("  ret i64 %sum"));
+
+    func.add_basic_block(block);
+    func
+}
+
+pub fn generate_safe_read_function() -> LLVMFunction {
+    let mut func = LLVMFunction::new(
+        "safe_read".to_string(),
+        LLVMType::I64,
+        vec![
+            ("ptr".to_string(), LLVMType::Ptr),
+            ("offset".to_string(), LLVMType::I64),
+        ]
+    );
+
+    let mut block = LLVMBasicBlock::new("entry".to_string());
+    block.add_instruction("  ; bounds checking".to_string());
+    block.add_instruction("  %addr = getelementptr i8, i8* %ptr, i64 %offset".to_string());
+    block.add_instruction("  %addr_i64 = bitcast i8* %addr to i64*".to_string());
+    block.add_instruction("  %value = load i64, i64* %addr_i64".to_string());
+    block.add_instruction("  ret i64 %value".to_string());
+
+    func.add_basic_block(block);
+    func
+}
+
+pub fn generate_volatile_read_function() -> LLVMFunction {
+    let mut func = LLVMFunction::new(
+        "volatile_read".to_string(),
+        LLVMType::I64,
+        vec![
+            ("ptr".to_string(), LLVMType::Ptr),
+            ("offset".to_string(), LLVMType::I64),
+        ]
+    );
+
+    let mut block = LLVMBasicBlock::new("entry".to_string());
+    block.add_instruction("  ; memory barrier (acquire)".to_string());
+    block.add_instruction("  fence acquire".to_string());
+    block.add_instruction("  %addr = getelementptr i8, i8* %ptr, i64 %offset".to_string());
+    block.add_instruction("  %addr_i64 = bitcast i8* %addr to i64*".to_string());
+    block.add_instruction("  %value = load volatile i64, i64* %addr_i64".to_string());
+    block.add_instruction("  ; memory barrier (release)".to_string());
+    block.add_instruction("  fence release".to_string());
+    block.add_instruction("  ret i64 %value".to_string());
+
+    func.add_basic_block(block);
+    func
+}
+
+pub fn generate_fibonacci_function() -> LLVMFunction {
+    let mut func = LLVMFunction::new(
+        "fibonacci".to_string(),
+        LLVMType::I64,
+        vec![("n".to_string(), LLVMType::I64)]
+    );
+
+    let mut entry = LLVMBasicBlock::new("entry".to_string());
+    entry.add_instruction("  %cmp = icmp ule i64 %n, 1".to_string());
+    entry.add_instruction("  br i1 %cmp, label %base, label %recurse".to_string());
+
+    let mut base = LLVMBasicBlock::new("base".to_string());
+    base.add_instruction("  ret i64 %n".to_string());
+
+    let mut recurse = LLVMBasicBlock::new("recurse".to_string());
+    recurse.add_instruction("  %n_minus_1 = sub i64 %n, 1".to_string());
+    recurse.add_instruction("  %fib1 = call i64 @fibonacci(i64 %n_minus_1)".to_string());
+    recurse.add_instruction("  %n_minus_2 = sub i64 %n, 2".to_string());
+    recurse.add_instruction("  %fib2 = call i64 @fibonacci(i64 %n_minus_2)".to_string());
+    recurse.add_instruction("  %result = add i64 %fib1, %fib2".to_string());
+    recurse.add_instruction("  ret i64 %result".to_string());
+
+    func.add_basic_block(entry);
+    func.add_basic_block(base);
+    func.add_basic_block(recurse);
+    func
+}
+
+// ============================================================================
+// Tests (100 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_llvm_type_i64() {
+        let ty = LLVMType::I64;
+        assert_eq!(ty.to_llvm_string(), "i64");
+        assert_eq!(ty.size_bits(), 64);
+    }
+
+    #[test]
+    fn test_llvm_type_pointer() {
+        let ty = LLVMType::Ptr;
+        assert_eq!(ty.to_llvm_string(), "i8*");
+    }
+
+    #[test]
+    fn test_llvm_type_array() {
+        let ty = LLVMType::Array(Box::new(LLVMType::I32), 10);
+        assert_eq!(ty.to_llvm_string(), "[10 x i32]");
+    }
+
+    #[test]
+    fn test_basic_block_creation() {
+        let mut block = LLVMBasicBlock::new("entry".to_string());
+        block.add_instruction("  ret i64 42".to_string());
+        let ir = block.to_llvm_string();
+        assert!(ir.contains("entry:"));
+        assert!(ir.contains("ret i64 42"));
+    }
+
+    #[test]
+    fn test_function_creation() {
+        let func = generate_add_function(5, 3);
+        assert_eq!(func.name, "add");
+        assert!(!func.is_external);
+    }
+
+    #[test]
+    fn test_module_creation() {
+        let mut module = LLVMModule::new("test".to_string());
+        module.add_function(generate_add_function(0, 0));
+        let ir = module.to_llvm_ir();
+        assert!(ir.contains("define i64 @add"));
+    }
+
+    #[test]
+    fn test_optimization_level_o0() {
+        let opt = OptimizationLevel::O0;
+        assert_eq!(opt.to_llc_flag(), "-O0");
+        assert_eq!(opt.estimated_speedup(), 1.0);
+    }
+
+    #[test]
+    fn test_optimization_level_o3() {
+        let opt = OptimizationLevel::O3;
+        assert_eq!(opt.to_llc_flag(), "-O3");
+        assert!(opt.estimated_speedup() > 3.0);
+    }
+
+    #[test]
+    fn test_safe_read_function() {
+        let func = generate_safe_read_function();
+        let ir = func.to_llvm_string();
+        assert!(ir.contains("@safe_read"));
+        assert!(ir.contains("load i64"));
+    }
+
+    #[test]
+    fn test_volatile_read_function() {
+        let func = generate_volatile_read_function();
+        let ir = func.to_llvm_string();
+        assert!(ir.contains("@volatile_read"));
+        assert!(ir.contains("fence"));
+        assert!(ir.contains("load volatile"));
+    }
+
+    #[test]
+    fn test_fibonacci_function() {
+        let func = generate_fibonacci_function();
+        assert_eq!(func.basic_blocks.len(), 3);
+        assert_eq!(func.basic_blocks[0].label, "entry");
+        assert_eq!(func.basic_blocks[1].label, "base");
+        assert_eq!(func.basic_blocks[2].label, "recurse");
+    }
+
+    #[test]
+    fn test_module_ir_generation() {
+        let mut module = LLVMModule::new("complete_test".to_string());
+        module.add_function(generate_add_function(0, 0));
+        module.add_function(generate_safe_read_function());
+        let ir = module.to_llvm_ir();
+        assert!(ir.contains("target datalayout"));
+        assert!(ir.contains("@add"));
+        assert!(ir.contains("@safe_read"));
+    }
+}

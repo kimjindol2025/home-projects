@@ -1,0 +1,364 @@
+/* ============================================================================
+   SDF Generator: Distance Field Generation - Phase 2
+
+   목적: Bezier 곡선을 거리 필드로 변환
+   크기: ~150줄
+   성능: < 100µs per glyph
+============================================================================ */
+
+use crate::fonts::ttf_parser::QuadraticBezier;
+use crate::fonts::glyph_data::{GlyphData, BoundingBox};
+use crate::sdf::bezier_math::*;
+
+// ============================================================================
+// 1. SDF 버퍼 (32-bit float 거리 필드)
+// ============================================================================
+
+pub struct SDFBuffer {
+    pub width: u32,                    // 텍스처 너비 (픽셀)
+    pub height: u32,                   // 텍스처 높이 (픽셀)
+    pub data: Vec<f32>,                // 32-bit float 거리 값
+    pub bounds: BoundingBox,           // 원본 글자 경계상자
+}
+
+impl SDFBuffer {
+    /// SDF 버퍼 생성
+    ///
+    /// 표준 크기: 64×64 (4KB per glyph)
+    /// 256 glyph = 1MB (합리적)
+    pub fn new(width: u32, height: u32) -> Self {
+        SDFBuffer {
+            width: width,
+            height: height,
+            data: vec![0.0; (width * height) as usize],
+            bounds: BoundingBox::empty(),
+        }
+    }
+
+    /// SDF 값 설정
+    pub fn set(&mut self, x: u32, y: u32, distance: f32) -> bool {
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+
+        let index = (y * self.width + x) as usize;
+        self.data[index] = distance;
+        true
+    }
+
+    /// SDF 값 조회
+    pub fn get(&self, x: u32, y: u32) -> Option<f32> {
+        if x >= self.width || y >= self.height {
+            None
+        } else {
+            let index = (y * self.width + x) as usize;
+            Some(self.data[index])
+        }
+    }
+
+    /// 메모리 사용량 (바이트)
+    pub fn memory_usage(&self) -> u64 {
+        (self.width as u64) * (self.height as u64) * 4
+    }
+
+    /// 모든 거리 값을 정규화 (spread 기준)
+    pub fn normalize(&mut self, spread: f32) {
+        for value in self.data.iter_mut() {
+            if *value != 0.0 {
+                *value = (*value / spread).max(-1.0).min(1.0);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 2. Scanline 기반 SDF 생성
+// ============================================================================
+
+pub struct SDFGenerator {
+    pub spread: f32,                   // 거리 필드 범위 (픽셀)
+    pub samples_per_pixel: u32,        // 픽셀당 샘플 수 (정밀도)
+}
+
+impl SDFGenerator {
+    pub fn new(spread: f32, samples: u32) -> Self {
+        SDFGenerator {
+            spread: spread,
+            samples_per_pixel: samples,
+        }
+    }
+
+    /// 글자를 SDF 버퍼로 변환
+    ///
+    /// 알고리즘:
+    /// 1. 글자의 Bezier 곡선 추출
+    /// 2. Scanline로 각 픽셀 처리
+    /// 3. 각 픽셀에서 모든 곡선까지의 거리 계산
+    /// 4. 부호 결정 (내부/외부)
+    /// 5. 정규화
+    pub fn generate_sdf(
+        &self,
+        glyph: &GlyphData,
+        width: u32,
+        height: u32,
+    ) -> SDFBuffer {
+        let mut buffer = SDFBuffer::new(width, height);
+
+        // 원본 글자의 경계상자
+        let bounds = &glyph.metrics.bounds;
+        buffer.bounds = bounds.clone();
+
+        // 변환된 Bezier 곡선
+        let curves = glyph.get_transformed_curves();
+
+        if curves.is_empty() {
+            return buffer;
+        }
+
+        // 픽셀 좌표를 글자 좌표로 변환하기 위한 스케일
+        let glyph_width = bounds.width();
+        let glyph_height = bounds.height();
+
+        if glyph_width < 1e-6 || glyph_height < 1e-6 {
+            return buffer;  // 공 글자
+        }
+
+        let scale_x = glyph_width / width as f32;
+        let scale_y = glyph_height / height as f32;
+
+        // Scanline 처리
+        for py in 0..height {
+            for px in 0..width {
+                // 픽셀 좌표 → 글자 좌표
+                let glyph_x = bounds.x_min + px as f32 * scale_x;
+                let glyph_y = bounds.y_min + py as f32 * scale_y;
+
+                // 거리 계산
+                let point = crate::fonts::ttf_parser::Vector2::new(glyph_x, glyph_y);
+                let distance = self.compute_pixel_distance(&point, &curves);
+
+                let _ = buffer.set(px, py, distance);
+            }
+        }
+
+        // 정규화
+        buffer.normalize(self.spread);
+
+        buffer
+    }
+
+    /// 픽셀에서 모든 곡선까지의 거리 계산
+    fn compute_pixel_distance(
+        &self,
+        point: &crate::fonts::ttf_parser::Vector2,
+        curves: &[QuadraticBezier],
+    ) -> f32 {
+        // 모든 곡선까지의 최단 거리
+        let mut min_distance = f32::INFINITY;
+
+        for curve in curves {
+            let dist = distance_point_to_bezier(point, curve);
+            if dist < min_distance {
+                min_distance = dist;
+            }
+        }
+
+        // 부호 결정
+        if is_point_inside_outline(point, curves) {
+            -min_distance  // 음수 (내부)
+        } else {
+            min_distance   // 양수 (외부)
+        }
+    }
+}
+
+// ============================================================================
+// 3. SDF에서 Alpha 값 변환
+// ============================================================================
+
+/// SDF 값을 렌더링 알파 값으로 변환
+///
+/// SDF 값 범위: [-spread, +spread]
+/// Alpha 범위: [0.0, 1.0]
+///
+/// 선형 보간:
+/// alpha(sdf) = 0.5 + sdf / (2 * spread)
+pub fn sdf_to_alpha(sdf: f32, spread: f32) -> f32 {
+    let half_spread = spread * 0.5;
+
+    if sdf <= -spread {
+        1.0  // 충분히 내부
+    } else if sdf >= spread {
+        0.0  // 충분히 외부
+    } else {
+        0.5 + sdf / (2.0 * spread)
+    }
+}
+
+/// 안티에일리어싱을 적용한 Alpha 계산 (부드러운 엣지)
+pub fn sdf_to_alpha_aa(sdf: f32, spread: f32, transition_width: f32) -> f32 {
+    let half_spread = spread * 0.5;
+    let half_transition = transition_width * 0.5;
+
+    // 전환 범위를 좁히면 더 sharp한 엣지
+    // spread를 줄이면 더 안티에일리어싱
+    let smoothness = (sdf + half_spread) / (2.0 * half_spread);
+
+    // Smoothstep 함수 (3t² - 2t³)
+    let t = clamp_f32(smoothness, 0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 값 범위 제한
+fn clamp_f32(value: f32, min: f32, max: f32) -> f32 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
+
+// ============================================================================
+// 4. SDF 캐시 (성능 최적화)
+// ============================================================================
+
+pub struct SDFCache {
+    pub glyphs: Vec<Option<SDFBuffer>>,  // 글자별 SDF 버퍼
+    pub glyph_count: u32,
+}
+
+impl SDFCache {
+    pub fn new(glyph_count: u32) -> Self {
+        let mut glyphs = Vec::new();
+        for _ in 0..glyph_count {
+            glyphs.push(None);
+        }
+
+        SDFCache {
+            glyphs: glyphs,
+            glyph_count: glyph_count,
+        }
+    }
+
+    /// SDF 버퍼 저장
+    pub fn store(&mut self, glyph_id: u32, buffer: SDFBuffer) -> bool {
+        if glyph_id >= self.glyph_count {
+            return false;
+        }
+
+        self.glyphs[glyph_id as usize] = Some(buffer);
+        true
+    }
+
+    /// SDF 버퍼 조회
+    pub fn get(&self, glyph_id: u32) -> Option<&SDFBuffer> {
+        if glyph_id >= self.glyph_count {
+            None
+        } else {
+            self.glyphs[glyph_id as usize].as_ref()
+        }
+    }
+
+    /// 캐시 메모리 사용량
+    pub fn memory_usage(&self) -> u64 {
+        let mut total = 0u64;
+
+        for glyph_opt in &self.glyphs {
+            if let Some(buffer) = glyph_opt {
+                total += buffer.memory_usage();
+            }
+        }
+
+        total
+    }
+
+    /// 캐시 통계
+    pub fn cached_glyphs(&self) -> u32 {
+        let mut count = 0u32;
+
+        for glyph_opt in &self.glyphs {
+            if glyph_opt.is_some() {
+                count += 1;
+            }
+        }
+
+        count
+    }
+}
+
+// ============================================================================
+// 5. 검증 함수
+// ============================================================================
+
+/// SDF 버퍼 유효성 검증
+pub fn validate_sdf_buffer(buffer: &SDFBuffer) -> bool {
+    // 크기 검증
+    if buffer.width == 0 || buffer.height == 0 {
+        return false;
+    }
+
+    // 데이터 크기 검증
+    if buffer.data.len() != (buffer.width * buffer.height) as usize {
+        return false;
+    }
+
+    // NaN/Infinity 검사
+    for &value in &buffer.data {
+        if value.is_nan() || value.is_infinite() {
+            return false;
+        }
+    }
+
+    // 값 범위 검증 (정규화된 경우: [-1.0, 1.0])
+    for &value in &buffer.data {
+        if value < -1.5 || value > 1.5 {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// SDF 생성 성능 검증
+///
+/// 목표: < 100µs per glyph (64×64 버퍼)
+pub fn validate_sdf_performance(generation_time_us: u64) -> bool {
+    // 목표: 64×64 버퍼 생성 < 100µs
+    generation_time_us < 100
+}
+
+/// 정밀도 검증
+///
+/// 목표: 거리 오차 < 0.01 픽셀
+pub fn validate_sdf_precision(expected_distance: f32, actual_distance: f32) -> bool {
+    let error = (expected_distance - actual_distance).abs();
+    error < 0.01
+}
+
+// ============================================================================
+// 6. 클론 구현 (SDFBuffer)
+// ============================================================================
+
+impl Clone for SDFBuffer {
+    fn clone(&self) -> Self {
+        SDFBuffer {
+            width: self.width,
+            height: self.height,
+            data: self.data.clone(),
+            bounds: self.bounds.clone(),
+        }
+    }
+}
+
+impl Clone for BoundingBox {
+    fn clone(&self) -> Self {
+        BoundingBox {
+            x_min: self.x_min,
+            y_min: self.y_min,
+            x_max: self.x_max,
+            y_max: self.y_max,
+        }
+    }
+}

@@ -1,0 +1,571 @@
+// FreeLang-LLC: Inline Assembly Parser & Validator
+// Purpose: Parse asm! { ... } blocks and translate to LLVM inline assembly
+// Strategy: Direct syntax validation + constraint mapping + SIMD instruction support
+
+use super::pointer::ManagedPointer;
+use super::intrinsics::*;
+
+// ============================================================================
+// Part 1: Assembly Syntax Lexer (150 lines)
+// ============================================================================
+
+pub enum InlineAsmToken {
+    AsmKeyword,              // "asm!"
+    OpenBrace,               // "{"
+    CloseBrace,              // "}"
+    Colon,                   // ":"
+    Semicolon,               // ";"
+    String(String),          // "mov $0, $1"
+    Constraint(String),      // "=r", "r", "m", "cc"
+    Register(String),        // "rax", "xmm0", "r0"
+    Modifier(String),        // "=", "+", "~", "&"
+    Number(u64),             // 0, 1, 2 (operand indices)
+    Identifier(String),      // variable names
+    EOF,
+}
+
+pub struct AsmLexer {
+    input: Vec<char>,
+    position: usize,
+}
+
+impl AsmLexer {
+    pub fn new(input: String) -> Self {
+        AsmLexer {
+            input: input.chars().collect(),
+            position: 0,
+        }
+    }
+
+    pub fn next_token(&mut self) -> InlineAsmToken {
+        // Skip whitespace
+        while self.position < self.input.len() && self.input[self.position].is_whitespace() {
+            self.position += 1;
+        }
+
+        if self.position >= self.input.len() {
+            return InlineAsmToken::EOF;
+        }
+
+        let ch = self.input[self.position];
+
+        match ch {
+            '{' => {
+                self.position += 1;
+                InlineAsmToken::OpenBrace
+            }
+            '}' => {
+                self.position += 1;
+                InlineAsmToken::CloseBrace
+            }
+            ':' => {
+                self.position += 1;
+                InlineAsmToken::Colon
+            }
+            ';' => {
+                self.position += 1;
+                InlineAsmToken::Semicolon
+            }
+            '"' => self.read_string(),
+            '=' | '+' | '~' | '&' => {
+                let modifier = ch.to_string();
+                self.position += 1;
+                InlineAsmToken::Modifier(modifier)
+            }
+            '0'..='9' => self.read_number(),
+            'a'..='z' | 'A'..='Z' | '_' => self.read_identifier_or_register(),
+            _ => {
+                self.position += 1;
+                InlineAsmToken::Identifier("unknown".to_string())
+            }
+        }
+    }
+
+    fn read_string(&mut self) -> InlineAsmToken {
+        self.position += 1;  // Skip opening quote
+        let mut s = String::new();
+
+        while self.position < self.input.len() && self.input[self.position] != '"' {
+            s.push(self.input[self.position]);
+            self.position += 1;
+        }
+
+        if self.position < self.input.len() {
+            self.position += 1;  // Skip closing quote
+        }
+
+        InlineAsmToken::String(s)
+    }
+
+    fn read_identifier_or_register(&mut self) -> InlineAsmToken {
+        let mut s = String::new();
+
+        while self.position < self.input.len() {
+            let ch = self.input[self.position];
+            if ch.is_alphanumeric() || ch == '_' {
+                s.push(ch);
+                self.position += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Check if it's a register
+        match s.as_str() {
+            "asm" => InlineAsmToken::AsmKeyword,
+            "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "r8" | "r9" |
+            "r10" | "r11" | "r12" | "r13" | "r14" | "r15" |
+            "xmm0" | "xmm1" | "xmm2" | "xmm3" | "xmm4" | "xmm5" | "xmm6" | "xmm7" |
+            "ymm0" | "ymm1" | "ymm2" | "ymm3" | "ymm4" | "ymm5" | "ymm6" | "ymm7" |
+            "zmm0" | "zmm1" | "zmm2" | "zmm3" | "zmm4" | "zmm5" | "zmm6" | "zmm7" => {
+                InlineAsmToken::Register(s)
+            }
+            _ => InlineAsmToken::Identifier(s),
+        }
+    }
+
+    fn read_number(&mut self) -> InlineAsmToken {
+        let mut num = 0u64;
+
+        while self.position < self.input.len() && self.input[self.position].is_numeric() {
+            let digit = (self.input[self.position] as u64) - ('0' as u64);
+            num = num * 10 + digit;
+            self.position += 1;
+        }
+
+        InlineAsmToken::Number(num)
+    }
+}
+
+// ============================================================================
+// Part 2: Constraint Parser & Validator (180 lines)
+// ============================================================================
+
+#[derive(Clone)]
+pub enum ConstraintType {
+    Input,       // "r" - input register
+    Output,      // "=r" - output register
+    InOut,       // "+r" - input/output register
+    Memory,      // "m" - memory constraint
+    Immediate,   // "i" - immediate value
+    Register,    // "X" - specific register
+    CarryFlag,   // "cc" - carry/cmp flags
+}
+
+#[derive(Clone)]
+pub struct AsmConstraint {
+    pub constraint_type: ConstraintType,
+    pub register_class: String,  // "r", "x", "y", "z" for SIMD
+    pub operand_index: u64,
+    pub is_early_clobber: bool,
+}
+
+impl AsmConstraint {
+    pub fn from_string(constraint_str: &str, operand_idx: u64) -> Result<Self, String> {
+        let mut chars = constraint_str.chars().peekable();
+        let mut is_early_clobber = false;
+        let mut constraint_type = ConstraintType::Input;
+        let mut register_class = "r".to_string();
+
+        // Check modifiers
+        if let Some(&ch) = chars.peek() {
+            match ch {
+                '=' => {
+                    constraint_type = ConstraintType::Output;
+                    chars.next();
+                }
+                '+' => {
+                    constraint_type = ConstraintType::InOut;
+                    chars.next();
+                }
+                '&' => {
+                    is_early_clobber = true;
+                    chars.next();
+                }
+                _ => {}
+            }
+        }
+
+        // Get constraint letter
+        if let Some(ch) = chars.next() {
+            match ch {
+                'r' => register_class = "r".to_string(),
+                'x' => register_class = "x".to_string(),  // XMM (SSE)
+                'y' => register_class = "y".to_string(),  // YMM (AVX)
+                'z' => register_class = "z".to_string(),  // ZMM (AVX-512)
+                'm' => constraint_type = ConstraintType::Memory,
+                'i' => constraint_type = ConstraintType::Immediate,
+                'c' => constraint_type = ConstraintType::CarryFlag,
+                _ => return Err(format!("Unknown constraint: {}", ch)),
+            }
+        }
+
+        Ok(AsmConstraint {
+            constraint_type,
+            register_class,
+            operand_index: operand_idx,
+            is_early_clobber,
+        })
+    }
+
+    pub fn to_llvm_string(&self) -> String {
+        let mut constraint = String::new();
+
+        // Add modifiers
+        match self.constraint_type {
+            ConstraintType::Output => constraint.push('='),
+            ConstraintType::InOut => constraint.push('+'),
+            _ => {}
+        }
+
+        if self.is_early_clobber {
+            constraint.push('&');
+        }
+
+        // Add constraint letter
+        match self.constraint_type {
+            ConstraintType::Memory => constraint.push('m'),
+            ConstraintType::Immediate => constraint.push('i'),
+            ConstraintType::CarryFlag => constraint.push('c'),
+            _ => {
+                match self.register_class.as_str() {
+                    "x" => constraint.push('x'),  // XMM
+                    "y" => constraint.push('y'),  // YMM
+                    "z" => constraint.push('z'),  // ZMM
+                    _ => constraint.push('r'),    // General register
+                }
+            }
+        }
+
+        constraint
+    }
+}
+
+// ============================================================================
+// Part 3: Inline Assembly AST & Parser (200 lines)
+// ============================================================================
+
+pub struct InlineAsmBlock {
+    pub template: String,           // "mov $0, $1"
+    pub input_constraints: Vec<AsmConstraint>,
+    pub output_constraints: Vec<AsmConstraint>,
+    pub clobbers: Vec<String>,      // Clobbered registers
+    pub side_effects: bool,
+    pub volatile: bool,
+}
+
+pub struct AsmParser {
+    lexer: AsmLexer,
+    current_token: InlineAsmToken,
+}
+
+impl AsmParser {
+    pub fn new(input: String) -> Self {
+        let mut lexer = AsmLexer::new(input);
+        let current_token = lexer.next_token();
+        AsmParser { lexer, current_token }
+    }
+
+    pub fn parse(&mut self) -> Result<InlineAsmBlock, String> {
+        // Expect: asm! { "template" : outputs : inputs : clobbers : options }
+
+        if !matches!(self.current_token, InlineAsmToken::AsmKeyword) {
+            return Err("Expected 'asm!' keyword".to_string());
+        }
+        self.advance();
+
+        if !matches!(self.current_token, InlineAsmToken::OpenBrace) {
+            return Err("Expected '{' after 'asm!'".to_string());
+        }
+        self.advance();
+
+        // Parse template string
+        let template = match &self.current_token {
+            InlineAsmToken::String(s) => s.clone(),
+            _ => return Err("Expected template string".to_string()),
+        };
+        self.advance();
+
+        let mut output_constraints = Vec::new();
+        let mut input_constraints = Vec::new();
+        let mut clobbers = Vec::new();
+        let mut volatile = false;
+        let mut side_effects = true;
+
+        // Parse constraint sections
+        while !matches!(self.current_token, InlineAsmToken::CloseBrace | InlineAsmToken::EOF) {
+            if !matches!(self.current_token, InlineAsmToken::Colon) {
+                break;
+            }
+            self.advance();
+
+            // Parse constraint list
+            while !matches!(self.current_token, InlineAsmToken::Colon | InlineAsmToken::CloseBrace) {
+                let constraint_str = match &self.current_token {
+                    InlineAsmToken::Identifier(s) => s.clone(),
+                    InlineAsmToken::String(s) => s.clone(),
+                    InlineAsmToken::Modifier(m) => {
+                        let mut constraint = m.clone();
+                        self.advance();
+                        if let InlineAsmToken::Identifier(s) = &self.current_token {
+                            constraint.push_str(&s);
+                            s.clone()
+                        } else {
+                            constraint
+                        }
+                    }
+                    _ => break,
+                };
+
+                let constraint = AsmConstraint::from_string(&constraint_str, 0)?;
+
+                // Determine if output or input based on modifier
+                match constraint.constraint_type {
+                    ConstraintType::Output | ConstraintType::InOut => {
+                        output_constraints.push(constraint);
+                    }
+                    _ => {
+                        input_constraints.push(constraint);
+                    }
+                }
+
+                self.advance();
+
+                if matches!(self.current_token, InlineAsmToken::Semicolon) {
+                    self.advance();
+                }
+            }
+        }
+
+        if matches!(self.current_token, InlineAsmToken::CloseBrace) {
+            self.advance();
+        }
+
+        Ok(InlineAsmBlock {
+            template,
+            input_constraints,
+            output_constraints,
+            clobbers,
+            side_effects,
+            volatile,
+        })
+    }
+
+    fn advance(&mut self) {
+        self.current_token = self.lexer.next_token();
+    }
+}
+
+// ============================================================================
+// Part 4: LLVM Inline Assembly Codegen (150 lines)
+// ============================================================================
+
+pub struct LLVMInlineAsm {
+    pub template: String,
+    pub constraints: String,
+    pub side_effects: bool,
+    pub volatile: bool,
+}
+
+impl LLVMInlineAsm {
+    pub fn from_asm_block(block: &InlineAsmBlock) -> Self {
+        // Build constraint string: outputs : inputs : clobbers
+        let mut constraints = String::new();
+
+        // Output constraints
+        for constraint in &block.output_constraints {
+            if !constraints.is_empty() {
+                constraints.push(',');
+            }
+            constraints.push_str(&constraint.to_llvm_string());
+        }
+
+        constraints.push(':');
+
+        // Input constraints
+        for constraint in &block.input_constraints {
+            if constraints.ends_with(':') {
+                // First input
+            } else {
+                constraints.push(',');
+            }
+            constraints.push_str(&constraint.to_llvm_string());
+        }
+
+        constraints.push(':');
+
+        // Clobbers
+        for clobber in &block.clobbers {
+            if !constraints.ends_with(':') {
+                constraints.push(',');
+            }
+            constraints.push('~');
+            constraints.push_str(&clobber);
+        }
+
+        LLVMInlineAsm {
+            template: block.template.clone(),
+            constraints,
+            side_effects: block.side_effects,
+            volatile: block.volatile,
+        }
+    }
+
+    pub fn to_llvm_ir(&self) -> String {
+        let mut ir = String::new();
+        ir.push_str("call void asm sideeffect \"");
+        ir.push_str(&self.template);
+        ir.push_str("\", \"");
+        ir.push_str(&self.constraints);
+        ir.push_str("\"()");
+        ir
+    }
+}
+
+// ============================================================================
+// Part 5: SIMD Assembly Validator (120 lines)
+// ============================================================================
+
+pub struct SIMDInstructionValidator {
+    instruction: String,
+}
+
+impl SIMDInstructionValidator {
+    pub fn new(instruction: String) -> Self {
+        SIMDInstructionValidator { instruction }
+    }
+
+    pub fn validate(&self) -> Result<String, String> {
+        let parts: Vec<&str> = self.instruction.split_whitespace().collect();
+
+        if parts.is_empty() {
+            return Err("Empty instruction".to_string());
+        }
+
+        let mnemonic = parts[0];
+
+        // Validate SIMD instruction formats
+        match mnemonic {
+            // SSE instructions
+            "movdqa" | "movdqu" | "paddb" | "paddd" | "paddq" | "paddw" |
+            "psubb" | "psubd" | "psubq" | "psubw" |
+            "pmaddwd" | "pmuludq" | "pmullw" |
+            "pshufd" | "shufps" | "shufpd" => {
+                if parts.len() < 3 {
+                    return Err(format!("Instruction '{}' requires 2 operands", mnemonic));
+                }
+                Ok(format!("Valid SSE instruction: {}", mnemonic))
+            }
+
+            // AVX instructions
+            "vmovdqa" | "vmovdqu" | "vpaddb" | "vpaddd" | "vpaddq" | "vpaddw" |
+            "vpsubb" | "vpsubd" | "vpsubq" | "vpsubw" |
+            "vpmaddwd" | "vpmulld" | "vpmullw" |
+            "vpshufd" | "vpshufb" | "vshufps" | "vshufpd" => {
+                if parts.len() < 3 {
+                    return Err(format!("Instruction '{}' requires 2 operands", mnemonic));
+                }
+                Ok(format!("Valid AVX instruction: {}", mnemonic))
+            }
+
+            // AVX-512 instructions
+            "vpaddb" | "vpaddd" | "vpaddq" | "vpaddw" |
+            "vpmullq" | "vpmullw" |
+            "vpshufd" | "vpshufi32x4" => {
+                if parts.len() < 3 {
+                    return Err(format!("Instruction '{}' requires 2 operands", mnemonic));
+                }
+                Ok(format!("Valid AVX-512 instruction: {}", mnemonic))
+            }
+
+            // General instructions
+            "mov" | "add" | "sub" | "xor" | "and" | "or" |
+            "shl" | "shr" | "sar" | "rol" | "ror" |
+            "imul" | "mul" | "idiv" | "div" |
+            "lea" | "pop" | "push" => {
+                if parts.len() < 3 && mnemonic != "pop" && mnemonic != "push" {
+                    return Err(format!("Instruction '{}' requires 2 operands", mnemonic));
+                }
+                Ok(format!("Valid instruction: {}", mnemonic))
+            }
+
+            // Barrier instructions
+            "mfence" | "lfence" | "sfence" | "cpuid" | "nop" | "pause" => {
+                Ok(format!("Valid barrier/special instruction: {}", mnemonic))
+            }
+
+            _ => Err(format!("Unknown instruction: {}", mnemonic)),
+        }
+    }
+}
+
+// ============================================================================
+// Tests (120 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_asm_lexer_basic() {
+        let mut lexer = AsmLexer::new("asm! { \"mov $0, $1\" }".to_string());
+        match lexer.next_token() {
+            InlineAsmToken::AsmKeyword => {},
+            _ => panic!("Expected AsmKeyword"),
+        }
+    }
+
+    #[test]
+    fn test_constraint_output() {
+        let constraint = AsmConstraint::from_string("=r", 0).unwrap();
+        assert_eq!(constraint.to_llvm_string(), "=r");
+    }
+
+    #[test]
+    fn test_constraint_input() {
+        let constraint = AsmConstraint::from_string("r", 0).unwrap();
+        assert_eq!(constraint.to_llvm_string(), "r");
+    }
+
+    #[test]
+    fn test_constraint_memory() {
+        let constraint = AsmConstraint::from_string("m", 0).unwrap();
+        assert_eq!(constraint.to_llvm_string(), "m");
+    }
+
+    #[test]
+    fn test_constraint_simd_xmm() {
+        let constraint = AsmConstraint::from_string("=x", 0).unwrap();
+        assert_eq!(constraint.to_llvm_string(), "=x");
+    }
+
+    #[test]
+    fn test_simd_instruction_sse() {
+        let validator = SIMDInstructionValidator::new("movdqa xmm0, xmm1".to_string());
+        assert!(validator.validate().is_ok());
+    }
+
+    #[test]
+    fn test_simd_instruction_avx() {
+        let validator = SIMDInstructionValidator::new("vpaddb ymm0, ymm1, ymm2".to_string());
+        assert!(validator.validate().is_ok());
+    }
+
+    #[test]
+    fn test_simd_instruction_avx512() {
+        let validator = SIMDInstructionValidator::new("vpmullq zmm0, zmm1, zmm2".to_string());
+        assert!(validator.validate().is_ok());
+    }
+
+    #[test]
+    fn test_general_instruction_mov() {
+        let validator = SIMDInstructionValidator::new("mov rax, rbx".to_string());
+        assert!(validator.validate().is_ok());
+    }
+
+    #[test]
+    fn test_barrier_instruction() {
+        let validator = SIMDInstructionValidator::new("mfence".to_string());
+        assert!(validator.validate().is_ok());
+    }
+}

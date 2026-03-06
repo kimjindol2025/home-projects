@@ -1,0 +1,370 @@
+# FreeLang v2.5.0 문제 해결 플랜 (차분히 정리)
+
+## Context
+탐색 에이전트 2개가 코드베이스와 KPM을 전수 조사한 결과,
+v2.4.0이 "완성"으로 기록되었지만 실제로는 3가지 치명적 문제가 있음을 발견.
+저장소: /data/data/com.termux/files/home/freelang-final/
+
+---
+
+## 🔴 발견된 핵심 문제 3가지
+
+### 문제 1 [Critical]: FreeLang 실행 자체 불가
+- `.fl` 파일들은 FreeLang 문법 텍스트이며 **Node.js 실행 불가**
+- `node main.fl` → `SyntaxError: Invalid or unexpected token`
+- 파일 간 `import` 없음 (main.fl → lexer.fl 호출이 텍스트로만 존재)
+- `stdlib_io.fl`의 `print()`/`println()` 자체가 stub → 출력 없음
+- `package.json "main": "main.fl"` → `require('freelang')` 즉시 crash
+- **원인**: 자체호스팅 부트스트래핑 미완성 (실행할 호스트 런타임 없음)
+
+### 문제 2 [High]: KPM 통합 불가
+- 로컬 `kpm`은 **Kibana Plugin Manager** (FreeLang용이 아님, 2016년 코드)
+- `api.js:29` → `localhost:4000` 하드코딩, `api-config.js`는 완전 사문화
+- 253 서버 포트 4000 미응답 (KPM Phase 2 Step 2~3 pending 상태)
+
+### 문제 3 [Medium]: stdlib 다수 stub
+- `stdlib_io.fl`: read/write/print 전부 stub
+- `stdlib_string.fl`: upper(), lower() → `return ""`
+- `stdlib_math.fl`: 삼각함수/지수 → `return 0.0`
+- `stdlib_advanced.fl`: unique/flatten/union → `return []`
+
+---
+
+## 🎯 해결 플랜 (3단계)
+
+### Step 1: JS 브릿지 런타임 구축 (즉시, ~2시간)
+
+**목표**: `require('freelang')` 이 실제로 동작하도록
+
+**생성 파일 1**: `freelang-final/index.js` (~50줄)
+```js
+// Node.js 진입점 - .fl 실행 대신 JS 런타임 제공
+const runtime = require('./src/runtime');
+module.exports = runtime;
+```
+
+**생성 파일 2**: `freelang-final/src/runtime.js` (~300줄)
+```js
+// 내장 함수 10개 JS 구현
+module.exports = {
+  print: (v) => process.stdout.write(String(v)),
+  println: (v) => console.log(v),
+  read_file: (path) => { try { return {ok:true, value: fs.readFileSync(path,'utf8')} } catch(e) { return {ok:false, error:e.message} } },
+  write_file: (path, content) => { ... },
+  fetch: (url) => { ... },           // http/https
+  json_parse: (str) => { ... },      // JSON.parse
+  json_stringify: (obj) => { ... },  // JSON.stringify
+  get_env: (key) => process.env[key] || '',
+  get_argv: () => process.argv.slice(2),
+  now: () => Date.now(),
+  sleep: (ms) => new Promise(r => setTimeout(r, ms))
+};
+```
+
+**수정 파일**: `package.json`
+- `"main": "main.fl"` → `"main": "index.js"` 변경 (1줄)
+
+---
+
+### Step 2: KPM 수정 (선택적, ~30분)
+
+**방법 A**: `api.js:29` 수정 → `api-config.js` import
+```js
+// 수정 전
+params.url = `http://localhost:4000/api${params.url}`;
+// 수정 후
+const config = require('./api-config');
+params.url = `${config.baseUrl}${params.url}`;
+```
+
+**방법 B**: 253 서버 SSH로 KPM 서버 직접 기동
+
+**선택**: A 먼저 시도 후 B
+
+---
+
+### Step 3: 주요 stub 실제 구현 (~1시간)
+
+`stdlib_string.fl` 우선:
+- `upper(s)` → `let result = ""` + 문자 순회로 실제 구현
+- `lower(s)` → 동일
+- `split(s, sep)` → 이미 구현됨 확인
+
+`stdlib_math.fl` 우선:
+- `sin(x)`, `cos(x)` → 테일러급수로 구현 (네이티브 없으므로)
+
+---
+
+## 📁 수정 대상 파일
+
+| 파일 | 작업 | 예상 줄수 |
+|------|------|----------|
+| `freelang-final/index.js` | 신규 생성 | 50줄 |
+| `freelang-final/src/runtime.js` | 신규 생성 | 300줄 |
+| `freelang-final/package.json` | main 필드 수정 | 1줄 |
+| `kpm/lib/api.js` | baseUrl 수정 | 3줄 |
+
+---
+
+## ✅ 검증
+
+```bash
+# Step 1 검증
+node -e "const fl = require('./freelang-final'); fl.println('Hello!');"
+# → Hello! 출력
+
+# Step 2 검증
+node /path/kpm/index.js publish ~/freelang-final
+# → publish success
+
+# 최종 통합
+npm list -g freelang
+node -e "require('freelang').println('FreeLang v2.5.0 works!')"
+```
+
+---
+
+## 🌐 GOGS 저장 (즉시 실행)
+
+모든 작업 후:
+```bash
+cd ~/freelang-final
+git add .
+git commit -m "feat: v2.5.0 JS 런타임 브릿지 + KPM 연동 수정"
+git push origin master
+```
+
+GOGS: https://gogs.dclub.kr/kim/freelang-final
+
+## 기존 분석 결과 (핵심 문제점)
+- `for-in` 루프: lexer에 키워드만 있고 parser 미구현
+- `return` 조기종료: TODO 상태 (현재 작동 안함)
+- 딕셔너리 `{}` 리터럴: 블록으로만 처리, 파싱 불가
+- `.` 멤버 접근: dot 토큰은 있지만 parser 미구현
+- stdlib stub들: floor/ceil/split/join/trim 등 return 0 상태
+- struct/enum: 전혀 없음
+- 에러 처리: null 반환만 (Result 없음)
+- 디버깅: assert 메시지 없음, 스택 트레이스 없음
+- 맵 유틸: keys/values/entries 없음
+
+---
+
+## 구현 범위 (7개 영역, ~2,000줄 추가)
+
+### 영역 A: 언어 핵심 수정 (lexer + parser + interpreter)
+
+**수정 파일**:
+- `lexer.fl` (현재 389줄 → +100줄)
+- `parser.fl` (현재 643줄 → +250줄)
+- `interpreter_v2.fl` (현재 374줄 → +200줄)
+
+**추가 기능**:
+
+1. **`for-in` 루프** (parser.fl에 parseForStatement 추가)
+   ```freeLang
+   for item in arr { ... }
+   for i in range(0, 10) { ... }
+   ```
+   - parser: `for` → identifier → `in` → expression → block
+   - interpreter: evalFor(node) 실제 구현
+
+2. **`return` 조기 종료 수정** (interpreter_v2.fl)
+   - 현재: evalBlock이 return 후 계속 실행됨
+   - 수정: RETURN_SIGNAL 특수값으로 전파
+
+3. **딕셔너리 리터럴 `{}` 파싱** (parser.fl)
+   ```freeLang
+   let obj = {"name": "alice", "age": 30}
+   ```
+   - parser: `{` string `:` expr (`,` string `:` expr)* `}`
+   - interpreter: map 타입으로 평가
+
+4. **`.` 멤버 접근** (parser.fl)
+   ```freeLang
+   obj.name        # 읽기
+   obj.name = "bob" # 쓰기
+   ```
+   - parser: primary `.` identifier [= expr]
+   - interpreter: map["key"] 형태로 변환
+
+5. **`struct` 기초 지원** (lexer + parser + interpreter)
+   ```freeLang
+   struct User {
+     name: string,
+     age: i32
+   }
+   let u = User { name: "alice", age: 30 }
+   ```
+   - lexer: `struct` 키워드 추가
+   - parser: parseStructDefinition, parseStructLiteral
+   - interpreter: struct를 map 기반으로 구현
+
+---
+
+### 영역 B: stdlib 완성 (stub → 실제 구현)
+
+**수정 파일**:
+- `stdlib_math.fl` (+150줄)
+- `stdlib_string.fl` (+250줄)
+- `stdlib_array.fl` (+200줄)
+
+**math 완성 (8개 함수 실제 구현)**:
+- `floor(x: f64): i32` - 소수점 버림
+- `ceil(x: f64): i32` - 소수점 올림
+- `round(x: f64): i32` - 반올림
+- `gcd(a: i32, b: i32): i32` - 유클리드 호제법 (신규)
+- `lcm(a: i32, b: i32): i32` - 최소공배수 (신규)
+- `isPrime(n: i32): bool` - 소수 판별 (신규)
+- `factorial(n: i32): i32` - 팩토리얼 (신규)
+- `fibonacci(n: i32): i32` - 피보나치 (신규)
+
+**string 완성 (10개 함수 실제 구현)**:
+- `split(s, sep): [string]` - 문자열 분할
+- `join(arr, sep): string` - 배열 연결
+- `trim(s): string` - 앞뒤 공백 제거
+- `trimStart(s): string` / `trimEnd(s): string`
+- `replace(s, search, rep): string` - 첫 번째만
+- `replaceAll(s, search, rep): string` - 전부
+- `toInt(s): i32` - 문자열→정수 (신규)
+- `toFloat(s): f64` - 문자열→실수 (신규)
+- `isNumeric(s): bool` - 숫자 여부 (신규)
+- `format(tpl, args): string` - 문자열 포매팅 (신규)
+
+**array 완성 (6개 함수 실제 구현)**:
+- `push(arr, item): [any]` - 뒤에 추가 (신규)
+- `pop(arr): any` - 뒤에서 제거 (신규)
+- `sort(arr, fn): [any]` - Quick Sort로 완성
+- `zip(arr1, arr2): [[any]]` - 두 배열 묶기 (신규)
+- `chunk(arr, size): [[any]]` - 청크 분할 (신규)
+- `compact(arr): [any]` - null 제거 (신규)
+
+---
+
+### 영역 C: 에러 처리 모듈 (신규)
+
+**신규 파일**: `stdlib_result.fl` (+200줄)
+```freeLang
+# Result 패턴
+fn ok(value: any): map { return {"ok": true, "value": value, "error": null} }
+fn err(message: string): map { return {"ok": false, "value": null, "error": message} }
+fn is_ok(result: map): bool { return result["ok"] }
+fn is_err(result: map): bool { return not result["ok"] }
+fn unwrap(result: map): any { ... }
+fn unwrap_or(result: map, default: any): any { ... }
+fn result_map(result: map, fn): map { ... }
+fn result_and_then(result: map, fn): map { ... }
+```
+
+---
+
+### 영역 D: 디버깅 도구 (신규)
+
+**신규 파일**: `stdlib_debug.fl` (+150줄)
+```freeLang
+fn assert_eq(a: any, b: any, msg: string): null { ... }
+fn assert_ne(a: any, b: any, msg: string): null { ... }
+fn assert_true(cond: bool, msg: string): null { ... }
+fn trace(label: string, value: any): any { ... }  # 값 출력 후 그대로 반환
+fn timer_start(): map { ... }
+fn timer_elapsed(timer: map): f64 { ... }
+fn debug_type(value: any): string { ... }
+```
+
+---
+
+### 영역 E: 맵 유틸리티 (신규)
+
+**신규 파일**: `stdlib_map.fl` (+200줄)
+```freeLang
+fn map_get(m: map, key: string): any { return m[key] }
+fn map_set(m: map, key: string, val: any): map { m[key] = val; return m }
+fn map_delete(m: map, key: string): map { ... }
+fn map_keys(m: map): [string] { ... }
+fn map_values(m: map): [any] { ... }
+fn map_entries(m: map): [[any]] { ... }  # [["key", val], ...]
+fn map_has(m: map, key: string): bool { ... }
+fn map_merge(m1: map, m2: map): map { ... }
+fn map_size(m: map): i32 { ... }
+fn map_from_entries(entries: [[any]]): map { ... }
+```
+
+---
+
+### 영역 F: 고급 함수형 완성
+
+**수정 파일**: `stdlib_advanced.fl` (+150줄)
+- `groupBy(arr, keyFn)` 실제 구현 (map 기반)
+- `memoize(fn)` 실제 구현 (map 캐시 사용)
+- `once(fn)` 실제 구현 (호출 여부 플래그)
+- `pipe(value, fns)` 완성
+- 중복 제거 (array.fl과 겹치는 stub들 정리)
+
+---
+
+### 영역 G: 테스트 스위트 (신규)
+
+**신규 파일**: `v2_4_tests.fl` (+400줄)
+- 총 40개 테스트 (영역별 5-8개)
+- 8개 무관용 규칙
+
+**무관용 규칙 (Unforgiving Rules)**:
+1. `for-in` 루프 100% 동작 (arr, range 모두)
+2. `return` 조기종료 함수 중간 탈출 100% 동작
+3. 딕셔너리 `{}` 리터럴 생성/접근 완전 동작
+4. `string.split("a,b,c", ",")` 정확히 `["a","b","c"]` 반환
+5. `Result ok/err` 패턴 unwrap/map 완전 동작
+6. v2.2.0 stdlib 100% 하위 호환 (기존 fn 전부 동작)
+7. `assert_eq` 실패 시 메시지 포함 에러 출력
+8. `timer_elapsed` 0 이상 f64 반환
+
+---
+
+## 파일 구조 (최종)
+
+```
+freelang-final/
+├── lexer.fl          (~490줄) ← 수정
+├── parser.fl         (~900줄) ← 수정
+├── interpreter_v2.fl (~580줄) ← 수정
+├── stdlib_math.fl    (~650줄) ← 보완
+├── stdlib_string.fl  (~590줄) ← 보완
+├── stdlib_array.fl   (~660줄) ← 보완
+├── stdlib_advanced.fl (~550줄) ← 보완
+├── stdlib_result.fl  (~200줄) ← 신규
+├── stdlib_debug.fl   (~150줄) ← 신규
+├── stdlib_map.fl     (~200줄) ← 신규
+└── v2_4_tests.fl     (~400줄) ← 신규
+```
+
+**총 추가**: ~2,000줄
+**총 최종**: ~6,370줄
+**테스트**: 40개 신규 + 기존 유지
+**무관용 규칙**: 8개
+
+---
+
+## 구현 순서
+
+1. **A-1**: interpreter_v2.fl - return 조기종료 수정 (50줄)
+2. **A-2**: parser.fl - for-in 루프 + 딕셔너리 + 멤버접근 (200줄)
+3. **A-3**: lexer.fl - struct 키워드 + 인터프리터 struct 처리 (100줄)
+4. **B**: stdlib 완성 (string split/join/trim, math floor/ceil, array push/pop/sort)
+5. **C**: stdlib_result.fl 신규
+6. **D**: stdlib_debug.fl 신규
+7. **E**: stdlib_map.fl 신규
+8. **F**: stdlib_advanced.fl 보완
+9. **G**: v2_4_tests.fl - 40개 테스트
+
+---
+
+## 검증
+
+```bash
+cd ~/freelang-final
+wc -l *.fl
+# 전체 테스트 실행
+# git log --oneline
+# git push origin master
+```
+
+GOGS: https://gogs.dclub.kr/kim/freelang-final

@@ -1,0 +1,330 @@
+/* ============================================================================
+   Rendering Engine: SDF to Screen Rasterization - Phase 3
+
+   목적: SDF 거리 필드를 화면 픽셀로 변환 (Alpha blending)
+   크기: ~400줄
+   성능: < 1ms per glyph (64×64 SDF → 화면 출력)
+============================================================================ */
+
+use crate::sdf::{SDFBuffer, sdf_to_alpha, sdf_to_alpha_aa};
+use crate::rendering::dma_controller::{DMARenderPipeline, Pixel32, FramebufferMMIO};
+
+// ============================================================================
+// 1. 글자 렌더링 설정
+// ============================================================================
+
+pub struct GlyphRenderConfig {
+    pub sdf_to_screen_scale: f32,    // SDF → Screen 스케일
+    pub screen_x: i32,                // Screen 위치 X
+    pub screen_y: i32,                // Screen 위치 Y
+    pub foreground: u32,              // 전경색 (ARGB)
+    pub background: u32,              // 배경색 (ARGB)
+    pub use_aa: bool,                 // 안티에일리어싱 사용
+    pub transition_width: f32,         // AA 전환 폭
+}
+
+impl GlyphRenderConfig {
+    pub fn new(screen_x: i32, screen_y: i32, fg: u32) -> Self {
+        GlyphRenderConfig {
+            sdf_to_screen_scale: 1.0,
+            screen_x,
+            screen_y,
+            foreground: fg,
+            background: 0xFF000000,  // 검은색
+            use_aa: true,
+            transition_width: 1.0,
+        }
+    }
+
+    pub fn with_colors(mut self, fg: u32, bg: u32) -> Self {
+        self.foreground = fg;
+        self.background = bg;
+        self
+    }
+
+    pub fn validate(&self) -> bool {
+        self.transition_width > 0.0 && self.sdf_to_screen_scale > 0.0
+    }
+}
+
+// ============================================================================
+// 2. 글자 래스터라이저 (SDF → Bitmap)
+// ============================================================================
+
+pub struct GlyphRasterizer {
+    pub output_width: u32,       // 출력 너비
+    pub output_height: u32,      // 출력 높이
+    pub bitmap: Vec<Pixel32>,    // 출력 비트맵
+    pub render_time_us: u64,     // 렌더 시간
+}
+
+impl GlyphRasterizer {
+    pub fn new(width: u32, height: u32) -> Self {
+        let size = (width * height) as usize;
+        GlyphRasterizer {
+            output_width: width,
+            output_height: height,
+            bitmap: vec![Pixel32::new(0, 0, 0, 0); size],
+            render_time_us: 0,
+        }
+    }
+
+    /// SDF 버퍼를 비트맵으로 래스터라이즈
+    pub fn rasterize_sdf(
+        &mut self,
+        sdf: &SDFBuffer,
+        config: &GlyphRenderConfig,
+    ) -> bool {
+        if !config.validate() {
+            return false;
+        }
+
+        let fg = Pixel32::from_u32(config.foreground);
+        let bg = Pixel32::from_u32(config.background);
+
+        // SDF 버퍼의 각 픽셀을 출력 비트맵으로 매핑
+        for sdf_y in 0..sdf.height {
+            for sdf_x in 0..sdf.width {
+                // SDF 값 읽기
+                if let Some(sdf_value) = sdf.get(sdf_x, sdf_y) {
+                    // 화면 좌표 계산
+                    let screen_x = config.screen_x + (sdf_x as i32);
+                    let screen_y = config.screen_y + (sdf_y as i32);
+
+                    // 경계 검사
+                    if screen_x < 0 || screen_x >= self.output_width as i32 ||
+                       screen_y < 0 || screen_y >= self.output_height as i32 {
+                        continue;
+                    }
+
+                    // Alpha 계산
+                    let alpha = if config.use_aa {
+                        sdf_to_alpha_aa(sdf_value, sdf.bounds.width() / 2.0, config.transition_width)
+                    } else {
+                        sdf_to_alpha(sdf_value, sdf.bounds.width() / 2.0)
+                    };
+
+                    // 색상 보간
+                    let mut pixel = fg.clone();
+                    pixel.a = (alpha * 255.0) as u8;
+                    pixel = pixel.blend(&bg);
+
+                    // 비트맵에 쓰기
+                    let idx = (screen_y as u32 * self.output_width + screen_x as u32) as usize;
+                    if idx < self.bitmap.len() {
+                        self.bitmap[idx] = pixel;
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    /// 비트맵을 DMA 렌더 파이프라인으로 전송
+    pub fn flush_to_dma(&self, pipeline: &mut DMARenderPipeline) -> bool {
+        if pipeline.framebuffer.width != self.output_width ||
+           pipeline.framebuffer.height != self.output_height {
+            return false;
+        }
+
+        // 비트맵을 u32로 변환
+        for (i, pixel) in self.bitmap.iter().enumerate() {
+            let color = pixel.to_u32();
+            let x = (i as u32) % self.output_width;
+            let y = (i as u32) / self.output_width;
+            let _ = pipeline.write_pixel(x, y, color);
+        }
+
+        true
+    }
+
+    /// 렌더 통계
+    pub fn stats(&self) -> (u32, u32, u64) {
+        (self.output_width, self.output_height, self.render_time_us)
+    }
+
+    /// 비트맵 메모리 사용량
+    pub fn memory_usage(&self) -> u32 {
+        (self.output_width * self.output_height * 4) as u32
+    }
+}
+
+// ============================================================================
+// 3. 텍스트 렌더 엔진 (여러 글자)
+// ============================================================================
+
+pub struct TextRenderEngine {
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub pipeline: DMARenderPipeline,
+    pub glyphs_rendered: u32,
+    pub total_render_time_us: u64,
+}
+
+impl TextRenderEngine {
+    pub fn new(width: u32, height: u32, fb_addr: u64) -> Self {
+        TextRenderEngine {
+            screen_width: width,
+            screen_height: height,
+            pipeline: DMARenderPipeline::new(fb_addr, width, height),
+            glyphs_rendered: 0,
+            total_render_time_us: 0,
+        }
+    }
+
+    /// 배경 클리어
+    pub fn clear(&mut self, color: u32) {
+        self.pipeline.clear(color);
+    }
+
+    /// 단일 글자 렌더 (SDF → Screen)
+    pub fn render_glyph(
+        &mut self,
+        sdf: &SDFBuffer,
+        x: i32,
+        y: i32,
+        fg_color: u32,
+    ) -> bool {
+        let config = GlyphRenderConfig::new(x, y, fg_color);
+
+        let mut rasterizer = GlyphRasterizer::new(self.screen_width, self.screen_height);
+
+        if !rasterizer.rasterize_sdf(sdf, &config) {
+            return false;
+        }
+
+        if !rasterizer.flush_to_dma(&mut self.pipeline) {
+            return false;
+        }
+
+        self.glyphs_rendered += 1;
+        self.total_render_time_us += rasterizer.render_time_us;
+
+        true
+    }
+
+    /// 텍스트 렌더 및 DMA 플러시
+    pub fn present(&mut self) -> bool {
+        // DMA를 통한 Framebuffer 플러시
+        self.pipeline.dma_flush()
+    }
+
+    /// 성능 통계
+    pub fn stats(&self) -> (u32, u64, u32) {
+        (self.glyphs_rendered, self.total_render_time_us, self.screen_width)
+    }
+
+    /// 렌더 대기 시간 측정 (< 1ms 목표)
+    pub fn latency_us(&self) -> u64 {
+        self.total_render_time_us / self.glyphs_rendered.max(1) as u64
+    }
+}
+
+// ============================================================================
+// 4. 렌더링 캐시 (성능 최적화)
+// ============================================================================
+
+pub struct RenderCache {
+    pub cached_frames: Vec<Vec<u32>>,  // 캐시된 프레임들
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+}
+
+impl RenderCache {
+    pub fn new(capacity: u32) -> Self {
+        RenderCache {
+            cached_frames: Vec::new(),
+            cache_hits: 0,
+            cache_misses: 0,
+        }
+    }
+
+    /// 프레임 캐시에 저장
+    pub fn cache_frame(&mut self, frame_data: Vec<u32>) -> bool {
+        if self.cached_frames.len() >= 16 {
+            return false;  // 캐시 용량 초과
+        }
+
+        self.cached_frames.push(frame_data);
+        true
+    }
+
+    /// 캐시 통계
+    pub fn stats(&self) -> (u32, u32, usize) {
+        (self.cache_hits, self.cache_misses, self.cached_frames.len())
+    }
+
+    /// 캐시 메모리 사용량
+    pub fn memory_usage(&self) -> u64 {
+        self.cached_frames.iter()
+            .map(|frame| (frame.len() as u64) * 4)
+            .sum()
+    }
+}
+
+// ============================================================================
+// 5. 검증 함수
+// ============================================================================
+
+/// 글자 렌더 설정 유효성
+pub fn validate_glyph_config(config: &GlyphRenderConfig) -> bool {
+    config.validate() && config.sdf_to_screen_scale > 0.0
+}
+
+/// 래스터라이저 출력 유효성
+pub fn validate_rasterizer_output(rasterizer: &GlyphRasterizer) -> bool {
+    if rasterizer.output_width == 0 || rasterizer.output_height == 0 {
+        return false;
+    }
+
+    let expected_size = (rasterizer.output_width * rasterizer.output_height) as usize;
+    rasterizer.bitmap.len() == expected_size
+}
+
+/// 렌더 성능 검증 (< 1ms per glyph)
+pub fn validate_render_performance(time_us: u64) -> bool {
+    // 목표: < 1000µs per glyph
+    time_us < 1000
+}
+
+/// 텍스트 엔진 레이턴시 검증
+pub fn validate_engine_latency(engine: &TextRenderEngine) -> bool {
+    if engine.glyphs_rendered == 0 {
+        return false;
+    }
+
+    let latency = engine.latency_us();
+    // 목표: < 100µs per glyph (SDF→screen fast path)
+    latency < 100
+}
+
+/// DMA 플러시 성능 검증 (< 500ns per pixel)
+pub fn validate_dma_flush_speed(pixels: u32, time_us: u64) -> bool {
+    if pixels == 0 {
+        return false;
+    }
+
+    let time_ns = time_us * 1000;
+    let ns_per_pixel = time_ns / (pixels as u64);
+
+    ns_per_pixel < 500
+}
+
+// ============================================================================
+// 6. 클론 구현
+// ============================================================================
+
+impl Clone for GlyphRenderConfig {
+    fn clone(&self) -> Self {
+        GlyphRenderConfig {
+            sdf_to_screen_scale: self.sdf_to_screen_scale,
+            screen_x: self.screen_x,
+            screen_y: self.screen_y,
+            foreground: self.foreground,
+            background: self.background,
+            use_aa: self.use_aa,
+            transition_width: self.transition_width,
+        }
+    }
+}

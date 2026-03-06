@@ -1,0 +1,408 @@
+// Green-Distributed-Fabric Phase 2+ Week 2: Predictive Sleep Manager
+// Purpose: Predict and optimize sleep state transitions for ultra-low power
+// Strategy: Sleep duration prediction, wakeup latency minimization, power gating optimization
+
+// ============================================================================
+// Part 1: Sleep State Model (240 lines)
+// ============================================================================
+
+pub enum SleepState {
+    C0,            // Active (0mW - no sleep, running)
+    C1Light,       // Light sleep (10mW - <100µs wakeup)
+    C2Medium,      // Medium sleep (5mW - <1ms wakeup)
+    C3Deep,        // Deep sleep (1mW - <10ms wakeup)
+    C6PowerGate,   // Power gate (0.1mW - <100ms wakeup)
+}
+
+pub struct SleepStateTransition {
+    pub from_state: SleepState,
+    pub to_state: SleepState,
+    pub transition_latency_us: u32,
+    pub power_cost_uj: u32,           // Microjoules for transition
+    pub exit_latency_us: u32,         // Wakeup time from sleep
+}
+
+impl SleepStateTransition {
+    pub fn new(from: SleepState, to: SleepState) -> Self {
+        // Transition latencies and costs
+        let (latency, power_cost, exit_latency) = match (&from, &to) {
+            // Entry into sleep states
+            (SleepState::C0, SleepState::C1Light) => (50, 100, 50),
+            (SleepState::C0, SleepState::C2Medium) => (200, 300, 500),
+            (SleepState::C0, SleepState::C3Deep) => (500, 1000, 5000),
+            (SleepState::C0, SleepState::C6PowerGate) => (2000, 5000, 50000),
+
+            // Exit from sleep states
+            (SleepState::C1Light, SleepState::C0) => (50, 50, 0),
+            (SleepState::C2Medium, SleepState::C0) => (200, 200, 0),
+            (SleepState::C3Deep, SleepState::C0) => (500, 500, 0),
+            (SleepState::C6PowerGate, SleepState::C0) => (2000, 2000, 0),
+
+            // Intermediate transitions
+            (SleepState::C1Light, SleepState::C3Deep) => (300, 500, 5000),
+            (SleepState::C2Medium, SleepState::C3Deep) => (400, 800, 5000),
+            _ => (100, 100, 100),  // Default
+        };
+
+        SleepStateTransition {
+            from_state: from,
+            to_state: to,
+            transition_latency_us: latency,
+            power_cost_uj: power_cost,
+            exit_latency_us: exit_latency,
+        }
+    }
+
+    pub fn is_worth_transition(&self, idle_duration_ms: u32) -> bool {
+        // Only transition if sleep duration > exit latency
+        let exit_duration_ms = self.exit_latency_us / 1000;
+        idle_duration_ms > exit_duration_ms + 2  // +2ms margin
+    }
+
+    pub fn describe(&self) -> String {
+        let from_name = match self.from_state {
+            SleepState::C0 => "C0",
+            SleepState::C1Light => "C1",
+            SleepState::C2Medium => "C2",
+            SleepState::C3Deep => "C3",
+            SleepState::C6PowerGate => "C6",
+        };
+
+        let to_name = match self.to_state {
+            SleepState::C0 => "C0",
+            SleepState::C1Light => "C1",
+            SleepState::C2Medium => "C2",
+            SleepState::C3Deep => "C3",
+            SleepState::C6PowerGate => "C6",
+        };
+
+        format!(
+            "{} → {}: latency={}µs, power_cost={}µJ, exit={}µs",
+            from_name, to_name, self.transition_latency_us,
+            self.power_cost_uj, self.exit_latency_us
+        )
+    }
+}
+
+// ============================================================================
+// Part 2: Sleep Duration Predictor (260 lines)
+// ============================================================================
+
+pub struct SleepDurationPredictor {
+    pub idle_periods_ms: Vec<u32>,     // Historical idle durations
+    pub wakeup_patterns: Vec<u32>,     // Time between wakeups
+    pub confidence: f64,
+    pub predicted_duration_ms: u32,
+    pub prediction_error_percent: f64,
+}
+
+impl SleepDurationPredictor {
+    pub fn new() -> Self {
+        SleepDurationPredictor {
+            idle_periods_ms: Vec::new(),
+            wakeup_patterns: Vec::new(),
+            confidence: 0.0,
+            predicted_duration_ms: 0,
+            prediction_error_percent: 0.0,
+        }
+    }
+
+    pub fn record_idle_period(&mut self, duration_ms: u32) {
+        self.idle_periods_ms.push(duration_ms);
+
+        // Keep rolling window of 30 periods
+        if self.idle_periods_ms.len() > 30 {
+            self.idle_periods_ms.remove(0);
+        }
+    }
+
+    pub fn record_wakeup_interval(&mut self, interval_ms: u32) {
+        self.wakeup_patterns.push(interval_ms);
+
+        if self.wakeup_patterns.len() > 30 {
+            self.wakeup_patterns.remove(0);
+        }
+    }
+
+    pub fn predict_next_duration(&mut self) -> u32 {
+        if self.idle_periods_ms.is_empty() {
+            return 10;  // Default 10ms
+        }
+
+        // Technique 1: Average of recent periods
+        let recent_count = self.idle_periods_ms.len().min(10);
+        let recent_periods = &self.idle_periods_ms[self.idle_periods_ms.len() - recent_count..];
+        let avg_duration = recent_periods.iter().sum::<u32>() / recent_count as u32;
+
+        // Technique 2: Trend detection (increasing/decreasing pattern)
+        let trend_factor = if self.idle_periods_ms.len() > 5 {
+            let recent = self.idle_periods_ms[self.idle_periods_ms.len() - 1];
+            let older = self.idle_periods_ms[self.idle_periods_ms.len() - 5];
+
+            if recent > older { 1.05 } else { 0.95 }  // Slight trend adjustment
+        } else {
+            1.0
+        };
+
+        // Technique 3: Periodicity detection (if pattern exists)
+        let periodicity_factor = self.detect_periodicity();
+
+        // Combine techniques
+        let predicted = (avg_duration as f64 * trend_factor * periodicity_factor) as u32;
+
+        self.predicted_duration_ms = predicted.max(5).min(1000);  // Clamp 5-1000ms
+
+        // Estimate prediction error based on variance
+        let variance = recent_periods.iter()
+            .map(|p| (*p as i32 - avg_duration as i32).pow(2))
+            .sum::<i32>() / recent_count.max(1) as i32;
+
+        let stddev = (variance as f64).sqrt();
+        self.prediction_error_percent = (stddev / avg_duration as f64) * 100.0;
+
+        // Confidence grows with sample size
+        self.confidence = (recent_count as f64 / 30.0).min(1.0);
+
+        self.predicted_duration_ms
+    }
+
+    fn detect_periodicity(&self) -> f64 {
+        // Check if there's repeating period pattern
+        if self.idle_periods_ms.len() < 6 {
+            return 1.0;
+        }
+
+        // Simple check: look for repeating 3-sample pattern
+        let last3: Vec<u32> = self.idle_periods_ms[self.idle_periods_ms.len() - 3..]
+            .iter().cloned().collect();
+
+        let repeat_count = self.idle_periods_ms.windows(3)
+            .take(self.idle_periods_ms.len() - 3)
+            .filter(|w| w == last3.as_slice())
+            .count();
+
+        // If pattern repeats, confidence up to 1.1 (slight boost)
+        if repeat_count > 2 { 1.05 } else { 1.0 }
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "Sleep Duration Predictor: samples={}, \
+            predicted={}ms, error={:.0}%, confidence={:.0}%",
+            self.idle_periods_ms.len(), self.predicted_duration_ms,
+            self.prediction_error_percent, self.confidence * 100.0
+        )
+    }
+}
+
+// ============================================================================
+// Part 3: Sleep Optimization Engine (240 lines)
+// ============================================================================
+
+pub struct SleepOptimizer {
+    pub current_state: SleepState,
+    pub target_state: SleepState,
+    pub idle_duration_ms: u32,
+    pub latency_budget_ms: u32,        // Acceptable wakeup latency
+    pub energy_saved_uj: u32,
+    pub total_sleep_time_ms: u64,
+}
+
+impl SleepOptimizer {
+    pub fn new() -> Self {
+        SleepOptimizer {
+            current_state: SleepState::C0,
+            target_state: SleepState::C0,
+            idle_duration_ms: 0,
+            latency_budget_ms: 10,  // Default: can tolerate 10ms wakeup
+            energy_saved_uj: 0,
+            total_sleep_time_ms: 0,
+        }
+    }
+
+    pub fn select_optimal_sleep_state(&mut self, idle_ms: u32, latency_budget_ms: u32) -> SleepState {
+        self.idle_duration_ms = idle_ms;
+        self.latency_budget_ms = latency_budget_ms;
+
+        // Decision matrix based on idle duration and latency budget
+        self.target_state = match (idle_ms, latency_budget_ms) {
+            // Too short to sleep
+            (0..=5, _) => SleepState::C0,
+
+            // Short idle, tight latency budget
+            (6..=100, 0..=1) => SleepState::C1Light,
+
+            // Medium idle, medium latency
+            (101..=500, 2..=10) => SleepState::C2Medium,
+
+            // Long idle, loose latency budget
+            (501..=2000, 11..=100) => SleepState::C3Deep,
+
+            // Very long idle, very loose latency
+            (2001..=u32::MAX, 101..=u32::MAX) => SleepState::C6PowerGate,
+
+            _ => SleepState::C0,
+        };
+
+        self.target_state
+    }
+
+    pub fn apply_sleep_transition(&mut self) {
+        // Create transition
+        let transition = SleepStateTransition::new(
+            match &self.current_state {
+                SleepState::C0 => SleepState::C0,
+                SleepState::C1Light => SleepState::C1Light,
+                SleepState::C2Medium => SleepState::C2Medium,
+                SleepState::C3Deep => SleepState::C3Deep,
+                SleepState::C6PowerGate => SleepState::C6PowerGate,
+            },
+            match &self.target_state {
+                SleepState::C0 => SleepState::C0,
+                SleepState::C1Light => SleepState::C1Light,
+                SleepState::C2Medium => SleepState::C2Medium,
+                SleepState::C3Deep => SleepState::C3Deep,
+                SleepState::C6PowerGate => SleepState::C6PowerGate,
+            }
+        );
+
+        // Check if transition is worthwhile
+        if transition.is_worth_transition(self.idle_duration_ms) {
+            self.current_state = self.target_state;
+            self.energy_saved_uj = transition.power_cost_uj;
+            self.total_sleep_time_ms += self.idle_duration_ms as u64;
+        }
+    }
+
+    pub fn power_consumption_mw(&self) -> f64 {
+        match self.current_state {
+            SleepState::C0 => 200.0,           // Full power
+            SleepState::C1Light => 10.0,       // Light sleep
+            SleepState::C2Medium => 5.0,       // Medium sleep
+            SleepState::C3Deep => 1.0,         // Deep sleep
+            SleepState::C6PowerGate => 0.1,    // Power gate (minimal)
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        let current_name = match self.current_state {
+            SleepState::C0 => "C0",
+            SleepState::C1Light => "C1",
+            SleepState::C2Medium => "C2",
+            SleepState::C3Deep => "C3",
+            SleepState::C6PowerGate => "C6",
+        };
+
+        let target_name = match self.target_state {
+            SleepState::C0 => "C0",
+            SleepState::C1Light => "C1",
+            SleepState::C2Medium => "C2",
+            SleepState::C3Deep => "C3",
+            SleepState::C6PowerGate => "C6",
+        };
+
+        format!(
+            "Sleep Optimizer: current={}, target={}, idle={}ms, \
+            latency_budget={}ms, power={:.1}mW, total_sleep={}ms",
+            current_name, target_name, self.idle_duration_ms,
+            self.latency_budget_ms, self.power_consumption_mw(), self.total_sleep_time_ms
+        )
+    }
+}
+
+// ============================================================================
+// Tests (120 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sleep_state_transition_creation() {
+        let trans = SleepStateTransition::new(SleepState::C0, SleepState::C3Deep);
+        assert!(trans.transition_latency_us > 0);
+        assert!(trans.exit_latency_us > 0);
+    }
+
+    #[test]
+    fn test_transition_worth_check() {
+        let trans = SleepStateTransition::new(SleepState::C0, SleepState::C3Deep);
+        let exit_latency_ms = trans.exit_latency_us / 1000;
+
+        // Worth it if idle > exit_latency + 2ms
+        let worth = trans.is_worth_transition(exit_latency_ms + 3);
+        assert!(worth);
+
+        let not_worth = trans.is_worth_transition(exit_latency_ms);
+        assert!(!not_worth);
+    }
+
+    #[test]
+    fn test_sleep_duration_predictor() {
+        let mut predictor = SleepDurationPredictor::new();
+
+        for i in 0..10 {
+            predictor.record_idle_period(50 + (i as u32 * 5));
+        }
+
+        let predicted = predictor.predict_next_duration();
+        assert!(predicted > 0);
+    }
+
+    #[test]
+    fn test_periodicity_detection() {
+        let mut predictor = SleepDurationPredictor::new();
+
+        // Create periodic pattern: 50, 60, 70, 50, 60, 70, ...
+        for _ in 0..3 {
+            predictor.record_idle_period(50);
+            predictor.record_idle_period(60);
+            predictor.record_idle_period(70);
+        }
+
+        predictor.predict_next_duration();
+        // Should detect period, increase confidence
+        assert!(predictor.confidence > 0.5);
+    }
+
+    #[test]
+    fn test_sleep_optimizer_state_selection() {
+        let mut optimizer = SleepOptimizer::new();
+
+        // Short idle, tight latency
+        let state = optimizer.select_optimal_sleep_state(50, 1);
+        assert!(matches!(state, SleepState::C1Light));
+
+        // Long idle, loose latency
+        let state = optimizer.select_optimal_sleep_state(1000, 50);
+        assert!(matches!(state, SleepState::C3Deep | SleepState::C6PowerGate));
+    }
+
+    #[test]
+    fn test_power_consumption_by_state() {
+        let mut optimizer = SleepOptimizer::new();
+
+        optimizer.current_state = SleepState::C0;
+        assert_eq!(optimizer.power_consumption_mw() as u32, 200);
+
+        optimizer.current_state = SleepState::C3Deep;
+        assert!(optimizer.power_consumption_mw() < 2.0);
+
+        optimizer.current_state = SleepState::C6PowerGate;
+        assert!(optimizer.power_consumption_mw() < 1.0);
+    }
+
+    #[test]
+    fn test_sleep_time_accumulation() {
+        let mut optimizer = SleepOptimizer::new();
+        optimizer.current_state = SleepState::C0;
+
+        // Simulate multiple sleep periods
+        for _ in 0..5 {
+            optimizer.idle_duration_ms = 100;
+            optimizer.apply_sleep_transition();
+        }
+
+        assert!(optimizer.total_sleep_time_ms > 0);
+    }
+}

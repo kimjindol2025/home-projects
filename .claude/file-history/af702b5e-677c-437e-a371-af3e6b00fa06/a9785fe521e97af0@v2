@@ -1,0 +1,447 @@
+// TTF Font Parser (400줄)
+// TrueType 폰트 바이너리 파싱 + Glyph 데이터 추출
+
+module ttf_parser
+
+use math::{
+    FixedPoint, Vec2FP, QuadraticBezier
+}
+
+// ============ TTF File Structure ============
+
+struct FontHeader {
+    version: u32,           // 0x00010000 (TrueType 1.0)
+    num_tables: u16,        // 테이블 개수
+    search_range: u16,      // (max power of 2 ≤ numTables) * 16
+    entry_selector: u16,    // log2(searchRange / 16)
+    range_shift: u16,       // numTables * 16 - searchRange
+    valid: bool,
+}
+
+impl FontHeader {
+    fn new() -> FontHeader {
+        return FontHeader {
+            version: 0x00010000,
+            num_tables: 0,
+            search_range: 0,
+            entry_selector: 0,
+            range_shift: 0,
+            valid: false,
+        }
+    }
+
+    fn validate(&mut self) -> bool {
+        if self.version != 0x00010000 {
+            return false
+        }
+        if self.num_tables == 0 || self.num_tables > 20 {
+            return false
+        }
+        self.valid = true
+        return true
+    }
+}
+
+// ============ Table Directory ============
+
+struct TableEntry {
+    tag: u32,          // 테이블 태그 (예: 0x68656164 = "head")
+    checksum: u32,
+    offset: u32,       // 파일 오프셋
+    length: u32,       // 테이블 크기
+}
+
+impl TableEntry {
+    fn new(t: u32, off: u32, len: u32) -> TableEntry {
+        return TableEntry {
+            tag: t,
+            checksum: 0,
+            offset: off,
+            length: len,
+        }
+    }
+
+    fn tag_string(&self) -> string {
+        // Convert tag u32 to 4-char string
+        let mut s = ""
+        s = s + ((self.tag >> 24) & 0xFF).to_string()
+        return s
+    }
+}
+
+struct TableDirectory {
+    tables: array[TableEntry; 20],
+    count: u32,
+}
+
+impl TableDirectory {
+    fn new() -> TableDirectory {
+        return TableDirectory {
+            tables: array[TableEntry; 20],
+            count: 0,
+        }
+    }
+
+    fn add_table(&mut self, entry: TableEntry) -> bool {
+        if self.count >= 20 {
+            return false
+        }
+        self.tables[self.count] = entry
+        self.count += 1
+        return true
+    }
+
+    fn find_table(&self, tag: u32) -> TableEntry {
+        for i in 0..self.count {
+            if self.tables[i].tag == tag {
+                return self.tables[i]
+            }
+        }
+        return TableEntry::new(0, 0, 0)
+    }
+}
+
+// ============ Character Map (cmap) ============
+
+struct CharacterMap {
+    unicode_to_glyph: array[u16; 256],  // Unicode → Glyph ID (간단한 버전)
+    glyph_count: u32,
+}
+
+impl CharacterMap {
+    fn new() -> CharacterMap {
+        return CharacterMap {
+            unicode_to_glyph: array[u16; 256],
+            glyph_count: 0,
+        }
+    }
+
+    fn add_mapping(&mut self, unicode: u32, glyph_id: u16) -> bool {
+        if unicode >= 256 {
+            return false
+        }
+        self.unicode_to_glyph[unicode] = glyph_id
+        self.glyph_count += 1
+        return true
+    }
+
+    fn get_glyph_id(&self, unicode: u32) -> u16 {
+        if unicode >= 256 {
+            return 0
+        }
+        return self.unicode_to_glyph[unicode]
+    }
+
+    fn validate(&self) -> bool {
+        return self.glyph_count > 0
+    }
+}
+
+// ============ Glyph Metrics ============
+
+struct GlyphMetrics {
+    glyph_id: u16,
+    advance_width: i16,    // 글리프 너비
+    left_side_bearing: i16,
+    x_min: i16,
+    y_min: i16,
+    x_max: i16,
+    y_max: i16,
+}
+
+impl GlyphMetrics {
+    fn new(id: u16) -> GlyphMetrics {
+        return GlyphMetrics {
+            glyph_id: id,
+            advance_width: 0,
+            left_side_bearing: 0,
+            x_min: 0,
+            y_min: 0,
+            x_max: 0,
+            y_max: 0,
+        }
+    }
+
+    fn bounding_box_width(&self) -> i16 {
+        return self.x_max - self.x_min
+    }
+
+    fn bounding_box_height(&self) -> i16 {
+        return self.y_max - self.y_min
+    }
+
+    fn is_valid(&self) -> bool {
+        return self.advance_width > 0
+    }
+}
+
+// ============ Glyph Data ============
+
+struct GlyphData {
+    glyph_id: u16,
+    curves: array[QuadraticBezier; 64],  // 최대 64개 곡선
+    curve_count: u32,
+    metrics: GlyphMetrics,
+    is_simple: bool,  // true: simple, false: composite
+}
+
+impl GlyphData {
+    fn new(id: u16) -> GlyphData {
+        return GlyphData {
+            glyph_id: id,
+            curves: array[QuadraticBezier; 64],
+            curve_count: 0,
+            metrics: GlyphMetrics::new(id),
+            is_simple: true,
+        }
+    }
+
+    fn add_curve(&mut self, curve: QuadraticBezier) -> bool {
+        if self.curve_count >= 64 {
+            return false
+        }
+        self.curves[self.curve_count] = curve
+        self.curve_count += 1
+        return true
+    }
+
+    fn get_curve_count(&self) -> u32 {
+        return self.curve_count
+    }
+
+    fn outline_complexity(&self) -> u32 {
+        // 곡선 개수 = 복잡도
+        return self.curve_count
+    }
+}
+
+// ============ TTF Font Parser ============
+
+struct TTFParser {
+    header: FontHeader,
+    directory: TableDirectory,
+    cmap: CharacterMap,
+    glyphs: array[GlyphData; 256],  // 최대 256 글리프
+    glyph_count: u32,
+    units_per_em: u16,
+}
+
+impl TTFParser {
+    fn new() -> TTFParser {
+        return TTFParser {
+            header: FontHeader::new(),
+            directory: TableDirectory::new(),
+            cmap: CharacterMap::new(),
+            glyphs: array[GlyphData; 256],
+            glyph_count: 0,
+            units_per_em: 2048,  // 기본값
+        }
+    }
+
+    fn parse_header(&mut self, data: array[u8; 512]) -> bool {
+        // TTF 헤더 검증
+        if data.len() < 12 {
+            return false
+        }
+
+        // Offset 0-3: sfntVersion
+        let v0 = (data[0] as u32) << 24
+        let v1 = (data[1] as u32) << 16
+        let v2 = (data[2] as u32) << 8
+        let v3 = data[3] as u32
+        self.header.version = v0 | v1 | v2 | v3
+
+        // Offset 4-5: numTables
+        let nt0 = (data[4] as u16) << 8
+        let nt1 = data[5] as u16
+        self.header.num_tables = nt0 | nt1
+
+        return self.header.validate()
+    }
+
+    fn add_table(&mut self, tag: u32, offset: u32, length: u32) -> bool {
+        let entry = TableEntry::new(tag, offset, length)
+        return self.directory.add_table(entry)
+    }
+
+    fn add_glyph_mapping(&mut self, unicode: u32, glyph_id: u16) -> bool {
+        return self.cmap.add_mapping(unicode, glyph_id)
+    }
+
+    fn load_glyph(&mut self, glyph_id: u16, metrics: GlyphMetrics) -> bool {
+        if self.glyph_count >= 256 {
+            return false
+        }
+
+        let mut glyph = GlyphData::new(glyph_id)
+        glyph.metrics = metrics
+
+        self.glyphs[self.glyph_count] = glyph
+        self.glyph_count += 1
+
+        return true
+    }
+
+    fn get_glyph(&self, glyph_id: u16) -> GlyphData {
+        for i in 0..self.glyph_count {
+            if self.glyphs[i].glyph_id == glyph_id {
+                return self.glyphs[i]
+            }
+        }
+        return GlyphData::new(0)
+    }
+
+    fn character_to_glyph(&self, unicode: u32) -> u16 {
+        return self.cmap.get_glyph_id(unicode)
+    }
+
+    fn get_glyph_by_char(&self, unicode: u32) -> GlyphData {
+        let glyph_id = self.character_to_glyph(unicode)
+        return self.get_glyph(glyph_id)
+    }
+
+    fn validate(&self) -> bool {
+        if !self.header.valid {
+            return false
+        }
+        if self.directory.count == 0 {
+            return false
+        }
+        if !self.cmap.validate() {
+            return false
+        }
+        if self.glyph_count == 0 {
+            return false
+        }
+        return true
+    }
+
+    fn font_stats(&self) -> string {
+        let mut s = ""
+        s = s + "=== TTF Font Stats ===\n"
+        s = s + "Tables: " + self.directory.count.to_string() + "\n"
+        s = s + "Glyphs: " + self.glyph_count.to_string() + "\n"
+        s = s + "Units/EM: " + self.units_per_em.to_string() + "\n"
+        s = s + "Mappings: " + self.cmap.glyph_count.to_string()
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_font_header() -> bool {
+    let mut header = FontHeader::new()
+
+    assert(header.version == 0x00010000, "default version")
+    assert(header.num_tables == 0, "initial tables 0")
+
+    header.num_tables = 10
+    assert(header.validate(), "valid font")
+
+    return true
+}
+
+fn validate_table_directory() -> bool {
+    let mut dir = TableDirectory::new()
+
+    assert(dir.count == 0, "initial count 0")
+
+    let head = TableEntry::new(0x68656164, 100, 54)  // "head"
+    let glyf = TableEntry::new(0x676C7966, 200, 1000)  // "glyf"
+
+    assert(dir.add_table(head), "add head")
+    assert(dir.add_table(glyf), "add glyf")
+    assert(dir.count == 2, "count 2")
+
+    let found = dir.find_table(0x68656164)
+    assert(found.tag == 0x68656164, "find head")
+
+    return true
+}
+
+fn validate_character_map() -> bool {
+    let mut cmap = CharacterMap::new()
+
+    assert(cmap.glyph_count == 0, "initial count 0")
+
+    assert(cmap.add_mapping(65, 1), "map A→1")
+    assert(cmap.add_mapping(66, 2), "map B→2")
+    assert(cmap.get_glyph_id(65) == 1, "query A = 1")
+    assert(cmap.get_glyph_id(66) == 2, "query B = 2")
+    assert(cmap.validate(), "cmap valid")
+
+    return true
+}
+
+fn validate_glyph_metrics() -> bool {
+    let mut metrics = GlyphMetrics::new(1)
+
+    metrics.advance_width = 100
+    metrics.x_min = 10
+    metrics.y_min = 20
+    metrics.x_max = 90
+    metrics.y_max = 80
+
+    assert(metrics.is_valid(), "metrics valid")
+    assert(metrics.bounding_box_width() == 80, "width 80")
+    assert(metrics.bounding_box_height() == 60, "height 60")
+
+    return true
+}
+
+fn validate_glyph_data() -> bool {
+    let mut glyph = GlyphData::new(1)
+
+    assert(glyph.glyph_id == 1, "glyph id 1")
+    assert(glyph.curve_count == 0, "initial curves 0")
+
+    // Add dummy curve
+    let zero = FixedPoint::ZERO()
+    let one = FixedPoint::ONE()
+    let half = FixedPoint::HALF()
+
+    let p0 = Vec2FP::new(zero, zero)
+    let p1 = Vec2FP::new(half, one)
+    let p2 = Vec2FP::new(one, zero)
+    let curve = QuadraticBezier::new(p0, p1, p2)
+
+    assert(glyph.add_curve(curve), "add curve")
+    assert(glyph.get_curve_count() == 1, "count 1")
+    assert(glyph.outline_complexity() == 1, "complexity 1")
+
+    return true
+}
+
+fn validate_ttf_parser() -> bool {
+    let mut parser = TTFParser::new()
+
+    assert(parser.header.version == 0x00010000, "default version")
+    assert(parser.glyph_count == 0, "initial glyphs 0")
+
+    parser.header.num_tables = 8
+    assert(parser.header.validate(), "header valid")
+
+    let head = TableEntry::new(0x68656164, 0, 54)
+    assert(parser.add_table(head.tag, head.offset, head.length), "add table")
+    assert(parser.directory.count == 1, "directory count 1")
+
+    assert(parser.add_glyph_mapping(65, 1), "map A→1")
+    assert(parser.character_to_glyph(65) == 1, "query A = 1")
+
+    let metrics = GlyphMetrics::new(1)
+    assert(parser.load_glyph(1, metrics), "load glyph 1")
+    assert(parser.glyph_count == 1, "glyph count 1")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

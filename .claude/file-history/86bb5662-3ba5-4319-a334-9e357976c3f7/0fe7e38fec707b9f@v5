@@ -1,0 +1,276 @@
+# Challenge 11 Atomic-Ledger: 커널 내장 DAG 원장
+
+## Context
+
+기존 은행 DB 해킹/조작 문제를 해결하기 위해, **Sovereign-FS(Challenge 8)와 연동된**
+DAG(Directed Acyclic Graph) 기반 분산 원장을 커널 I/O 계층에 직접 내장.
+
+**핵심**: 모든 거래는 commit되는 순간 커널의 하드웨어 해시 엔진을 통해 영구 불변 청크로 저장.
+**무관용 규칙**: 원장 기록 지연 < 1ms, 데이터 무결성 검증 100%.
+
+**재사용 가능한 기존 자산**:
+- `sovereign-fs/src/cas/{hash_engine.fl, chunk_store.fl, cas_core.fl}` - HashEngine + CAS 저장소
+- `sovereign-fs/src/integrity/{integrity_checker.fl, realtime_monitor.fl}` - 무결성 검증
+- `freelang-signal/src/zkp/commitment.fl` - PedersenCommitment, CommitmentChain
+- `freelang-signal/src/transport/zero_copy_bus.fl` - ZeroCopyRingBuffer (Zero-Copy 버스)
+- `freelang-signal/src/crypto/sha3_hash.fl` - sha3_256(), hmac_sha256(), HKDF
+- `freelang-os-kernel/src/audit/hash_chain.rs` - AuditEntry (DAG Node 기반), HashChainedAuditLog
+- `freelang-nano-kernel/src/boot/nano_memory.fl` - NanoPagePool (정적 메모리 풀)
+
+---
+
+## 저장소 위치
+
+```
+~/freelang-atomic-ledger/
+├── src/
+│   ├── dag/
+│   │   ├── dag_node.fl          (~400줄) - DAG 트랜잭션 노드 (parent_hash_1/2 이중 참조)
+│   │   ├── dag_store.fl         (~400줄) - 정적 노드 풀 + DAG 위상 관리
+│   │   └── mod.fl               (~30줄)
+│   ├── ledger/
+│   │   ├── tx_engine.fl         (~400줄) - 트랜잭션 커밋 엔진 (< 1ms, 이중지출 방지)
+│   │   ├── hash_engine.fl       (~350줄) - 하드웨어 해시 엔진 (SHA-3 + Sovereign-FS 연동)
+│   │   └── mod.fl               (~30줄)
+│   ├── kernel_io/
+│   │   ├── io_layer.fl          (~400줄) - 커널 I/O 계층 (Sovereign-FS CAS 연동)
+│   │   ├── commit_bus.fl        (~350줄) - Zero-Copy 커밋 버스 (배치 처리 64tx)
+│   │   └── mod.fl               (~30줄)
+│   ├── integrity/
+│   │   ├── chain_verifier.fl    (~400줄) - 연쇄 무결성 검증 (Sovereign-FS 재사용)
+│   │   ├── audit_log.fl         (~300줄) - 불변 감사 로그 (DAG 에포크 스냅샷)
+│   │   └── mod.fl               (~30줄)
+│   └── lib.fl                   (~100줄) - 통합 진입점
+├── tests/
+│   └── atomic_ledger_tests.fl   (~1,800줄) - 48개 무관용 테스트 (8그룹×6)
+└── docs/
+    └── ATOMIC_LEDGER_DESIGN.md
+```
+
+**총 코드: ~3,600줄**
+**총 테스트: 48개 무관용 (A-H 그룹, 각 6개)**
+
+---
+
+## 4개 계층 + 8개 무관용 규칙
+
+### Layer 1: DAG Layer (Day 1-2, ~830줄)
+
+**dag_node.fl** (~400줄) — `hash_chain.rs::AuditEntry` 패턴 재사용 (이중 부모로 확장):
+```
+pub struct DagNode {
+    pub node_id: u64,
+    pub parent_hash_1: [u8; 32],   // 첫 번째 부모 (genesis: [0;32])
+    pub parent_hash_2: [u8; 32],   // 두 번째 부모 (DAG 핵심: 이중 참조)
+    pub tx_data: [u8; 256],        // 트랜잭션 데이터
+    pub tx_amount: u64,
+    pub nonce: u64,
+    pub timestamp: u64,
+    pub self_hash: [u8; 32],       // H(parent1 || parent2 || tx_data || nonce || timestamp)
+    pub amount_commitment: [u8; 32], // Pedersen commitment (금액 은닉)
+}
+// 재사용: sha3_256(parent1 || parent2 || tx_data) → self_hash
+// 재사용: PedersenCommitment.commit(amount, rand) → amount_commitment
+```
+
+**dag_store.fl** (~400줄) — `nano_memory.fl::NanoPagePool` 재사용 (노드 수 4096으로 확장):
+```
+pub struct DagNodePool {
+    node_slots: [u64; 4096],       // 4096 × 512B = 2MB
+    alloc_bitmap: [u32; 128],      // 4096비트 할당 맵
+    total_nodes: u32,
+    active_nodes: u32,
+    peak_dag_size: u32,
+}
+pub struct DagTips {
+    tips: Vec<[u8; 32]>,           // 현재 팁 해시 목록 (아직 자식 없는 노드)
+    tip_count: u32,
+}
+pub fn alloc_dag_node() -> Option<u64>  // O(1) 할당
+pub fn is_dag_valid(store: &DagStore) -> bool   // 위상 순환 없음 검증
+```
+
+**테스트 A1-A6**: DAG 노드 생성, 이중 부모 연결, 위상 정렬, 제네시스 노드, 팁 갱신
+
+---
+
+### Layer 2: Ledger Layer (Day 3-4, ~780줄)
+
+**hash_engine.fl** (~350줄) — `sovereign-fs.HashEngine.sha256()` + `sha3_hash.fl.sha3_256()` 연동:
+```
+pub struct LedgerHashEngine {
+    pub sfs_engine: HashEngine,     // Sovereign-FS SHA-256 엔진 (재사용)
+    pub total_hashes: u64,
+    pub last_hash_ns: u64,          // < 1ms 추적
+}
+pub fn hash_dag_node(node: &DagNode) -> [u8; 32]    // SHA-3-256 (ARM64 가속)
+pub fn verify_node_hash(node: &DagNode) -> bool     // 재계산 검증
+pub fn batch_hash(nodes: &[DagNode]) -> Vec<[u8;32]> // 배치 해싱
+// 규칙 2: 해시 검증 100% (재계산 일치)
+```
+
+**tx_engine.fl** (~400줄) — 이중 지출 방지 + < 1ms 커밋:
+```
+pub struct TxEngine {
+    pub dag_store: DagStore,
+    pub spent_nonces: [u64; 8192],  // Nonce 캐시 (이중지출 방지)
+    pub balance_map: HashMap<u64, u64>,  // 계정 잔액 (추적)
+    pub commit_count: u64,
+    pub rejected_count: u64,
+}
+pub enum TxResult { Committed(u64), Rejected(String), Duplicate }
+pub fn commit_tx(tx: &Transaction) -> TxResult   // < 1ms 보장
+pub fn check_double_spend(nonce: u64) -> bool    // O(1) nonce 확인
+pub fn validate_balance(from: u64, amount: u64) -> bool
+// 규칙 1: commit_tx < 1ms (1000µs)
+// 규칙 3: 이중 지출 방지 100%
+```
+
+**테스트 B1-B6**: 해시 엔진 속도, Sovereign-FS SHA-256 연동, 배치 해싱
+**테스트 C1-C6**: 트랜잭션 커밋 < 1ms, 이중 지출 거부, 잔액 검증
+
+---
+
+### Layer 3: Kernel I/O Layer (Day 5-6, ~780줄)
+
+**io_layer.fl** (~400줄) — `sovereign-fs.CASCore.store_file()` 직접 재사용:
+```
+pub struct LedgerIoLayer {
+    pub cas: CASCore,               // Sovereign-FS CAS 재사용 (청크 저장)
+    pub integrity: IntegrityChecker, // Sovereign-FS 무결성 재사용
+    pub monitor: RealtimeMonitor,   // Sovereign-FS 실시간 모니터 재사용
+}
+pub fn persist_block(node: &DagNode) -> FileManifest  // CAS에 4KB 청크 저장
+pub fn retrieve_block(hash: &[u8; 32]) -> Option<DagNode>  // CAS에서 복원
+pub fn verify_block(manifest: &FileManifest) -> IntegrityStatus  // 무결성 검증
+// 규칙 6: 감사 로그 보존 100% (CAS 불변 저장)
+// 규칙 7: 복구 가능성 100% (청크 재구성)
+```
+
+**commit_bus.fl** (~350줄) — `zero_copy_bus.fl::ZeroCopyRingBuffer` 직접 재사용:
+```
+// TxEvent = SignalEvent 구조 재사용 (필드 의미만 변경)
+pub struct TxEvent {
+    pub shard_id: u64,             // = channel_id
+    pub tx_sequence: u64,          // = sequence
+    pub tx_payload: [u8; 512],     // = payload
+    pub payload_len: u16,
+    pub timestamp_ns: u64,
+    pub dag_node_hash: [u8; 32],   // = zkp_proof_hash (DAG 노드 해시)
+}
+pub struct CommitBus {
+    ring: ZeroCopyRingBuffer,      // Phase 8 패턴 직접 재사용
+    commit_batch_size: u32,        // 64 (원자 배치)
+    committed_epochs: u64,
+}
+pub fn submit_tx(event: TxEvent) -> bool  // O(1) 투입
+pub fn commit_batch() -> Vec<TxEvent>     // 원자 배치 커밋
+// 규칙 5: > 10,000 tx/s 처리량
+```
+
+**테스트 D1-D6**: Sovereign-FS CAS 저장/복원, 무결성 검증, Zero-Copy 버스 처리량
+
+---
+
+### Layer 4: Integrity Layer (Day 7-8, ~700줄 + 테스트)
+
+**chain_verifier.fl** (~400줄) — `hash_chain.rs::HashChainedAuditLog` 재사용 + DAG 확장:
+```
+pub struct DagChainVerifier {
+    pub genesis_hash: [u8; 32],
+    pub epoch_checkpoints: Vec<(u64, [u8; 32])>, // (에포크, 루트 해시)
+    pub verified_nodes: u64,
+    pub integrity_violations: u64,
+}
+pub fn verify_dag_path(from: &[u8;32], to: &[u8;32]) -> bool  // 경로 무결성
+pub fn verify_from_checkpoint(epoch: u64) -> (bool, [u8;32])  // 에포크 기반 부분 검증
+pub fn full_dag_scan() -> (bool, u64)   // 전체 DAG 순회 검증
+// 규칙 2: 데이터 무결성 검증 100%
+```
+
+**audit_log.fl** (~300줄) — `sovereign-fs.ConsistencySnapshot` 재사용:
+```
+pub struct LedgerAuditLog {
+    pub cas: CASCore,
+    pub snapshots: Vec<EpochSnapshot>,
+    pub total_epochs: u32,
+}
+pub struct EpochSnapshot {
+    pub epoch_id: u64,
+    pub dag_root_hash: [u8; 32],
+    pub tx_count: u64,
+    pub manifest: FileManifest,   // Sovereign-FS 매니페스트
+    pub health: f64,
+}
+pub fn take_snapshot(epoch: u64, dag: &DagStore) -> EpochSnapshot  // 불변 스냅샷
+pub fn verify_epoch(epoch: u64) -> bool  // 에포크 무결성 검증
+// 규칙 4: DAG 수렴 보장 (모든 팁 → 제네시스)
+```
+
+**테스트 E1-E6**: 체인 검증, 변조 탐지, 에포크 체크포인트
+**테스트 F1-F6**: 감사 로그, Sovereign-FS CAS 영구 저장, 스냅샷 복원
+**테스트 G1-G6**: 처리량 > 10K tx/s, DAG 수렴, 배치 커밋
+**테스트 H1-H6 (E2E)**:
+- H1: 제네시스 → 100개 트랜잭션 → DAG 검증 → CAS 저장 전체 플로우
+- H2: 이중 지출 100번 시도 → 전부 거부
+- H3: Sovereign-FS 무결성 검증 (100% 통과)
+- H4: 1,000 tx 배치 처리량 > 10K tx/s
+- H5: 변조 시뮬레이션 → DAG 무결성 100% 탐지
+- H6: 8개 무관용 규칙 최종 검증
+
+---
+
+## 8개 무관용 규칙
+
+| # | 규칙 | 목표 | 측정 방법 |
+|---|------|------|---------|
+| 1 | **원장 기록 지연** | < 1ms | `commit_tx()` 레이턴시 |
+| 2 | **데이터 무결성** | 100% | `chain_verifier.full_dag_scan()` |
+| 3 | **이중 지출 방지** | 100% | `TxEngine.check_double_spend()` |
+| 4 | **DAG 수렴** | 100% | 모든 팁 → 제네시스 경로 존재 |
+| 5 | **배치 처리량** | > 10,000 tx/s | `CommitBus.commit_batch()` 측정 |
+| 6 | **감사 로그 보존** | 100% | `Sovereign-FS CAS` 불변 저장 |
+| 7 | **복구 가능성** | 100% | 에포크 체크포인트 복원 |
+| 8 | **완전 자립** | 0% 외부 DB | 외부 DB 의존 0% |
+
+---
+
+## 구현 순서
+
+1. **Day 1-2**: `dag/` + 테스트 A1-A6 (DAG 노드, 이중 부모, 위상 정렬)
+2. **Day 3-4**: `ledger/` + 테스트 B1-C6 (해시 엔진, tx 커밋 < 1ms, 이중 지출 방지)
+3. **Day 5-6**: `kernel_io/` + 테스트 D1-D6 (Sovereign-FS 연동, Zero-Copy 버스)
+4. **Day 7-8**: `integrity/` + 테스트 E1-H6 (체인 검증, 감사 로그, E2E)
+
+---
+
+## GOGS 저장소
+
+저장소: `freelang-atomic-ledger`
+API 토큰: `ffab4b9176ee59ee8ff729ca8a5225b31064be22`
+리모트: `https://gogs.dclub.kr/kim/freelang-atomic-ledger.git`
+
+**최종 검증 목표**:
+```
+✅ 원장 기록: < 1ms
+✅ 데이터 무결성: 100%
+✅ 이중 지출 방지: 100%
+✅ DAG 수렴: 100%
+✅ 처리량: > 10,000 tx/s
+✅ 감사 로그 보존: 100%
+✅ 복구 가능성: 100%
+✅ 외부 DB 의존: 0%
+```
+
+**Sovereign-FS 연동 핵심**:
+```
+[트랜잭션 커밋]
+    ↓ < 1ms
+[DAG Node 생성] ← sha3_256() 해시
+    ↓ 불변 저장
+[Sovereign-FS CASCore.store_file()] ← HashEngine.sha256()
+    ↓ 청크화
+[ChunkStore 4KB 청크] ← FileManifest (불변)
+    ↓ 검증
+[IntegrityChecker.verify_file()] → 100% 무결성
+```

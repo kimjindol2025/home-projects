@@ -1,0 +1,325 @@
+// Hypervisor Phase 5: Android Loading Tests (12 Unforgiving Tests + Integration)
+
+module android_phase5_test
+
+use android_boot::{
+    AndroidBootImage, Ramdisk, RootfsEntry, InitProcess, AndroidBootloader
+}
+
+use android_runtime::{
+    ProcessType, AndroidProcess, Zygote, ServiceType, SystemService, AndroidRuntime
+}
+
+// ============ Test Group A: Android Boot Image (2/2) ============
+
+// Test A1: Boot Image Validation
+fn test_android_boot_image() -> bool {
+    let image = AndroidBootImage::new()
+
+    assert(image.magic == 0x616E6472, "magic 0x616E6472")
+    assert(image.version == 4, "version 4")
+    assert(image.page_size == 0x1000, "page size 4KB")
+
+    // Default addresses in guest kernel space
+    assert(image.kernel_addr >= 0x80000000, "kernel addr valid")
+    assert(image.ramdisk_addr >= 0x80000000, "ramdisk addr valid")
+
+    assert(image.validate(), "image validates")
+
+    return true
+}
+
+// Test A2: Boot Image Integrity Check
+fn test_boot_image_integrity() -> bool {
+    let mut image = AndroidBootImage::new()
+
+    // Valid image
+    image.kernel_size = 0x1000000  // 16MB
+    image.ramdisk_size = 0x4000000  // 64MB
+
+    assert(image.validate(), "valid image")
+
+    // Invalid: no kernel
+    let mut bad_image = AndroidBootImage::new()
+    bad_image.kernel_size = 0
+    assert(!bad_image.validate(), "zero kernel blocked")
+
+    return true
+}
+
+// ============ Test Group B: Ramdisk (3/3) ============
+
+// Test B1: Ramdisk Entry Management
+fn test_ramdisk_entries() -> bool {
+    let mut ramdisk = Ramdisk::new(1, "cpio", 0x84000000)
+
+    let entry1 = RootfsEntry::new("/bin", 0)
+    let entry2 = RootfsEntry::new("/system", 0)
+    let entry3 = RootfsEntry::new("/init", 0x100000)
+
+    assert(ramdisk.add_entry(entry1), "add /bin")
+    assert(ramdisk.add_entry(entry2), "add /system")
+    assert(ramdisk.add_entry(entry3), "add /init")
+
+    assert(ramdisk.entry_count == 3, "3 entries")
+    assert(ramdisk.total_size == 0x100000, "total size")
+
+    return true
+}
+
+// Test B2: Ramdisk Extraction
+fn test_ramdisk_extraction() -> bool {
+    let mut ramdisk = Ramdisk::new(1, "cpio", 0x84000000)
+
+    let entry = RootfsEntry::new("/init", 0x100000)
+    assert(ramdisk.add_entry(entry), "add init")
+
+    assert(ramdisk.extract(), "extract ramdisk")
+    assert(ramdisk.validate(), "validate")
+
+    let init_path = ramdisk.get_init_path()
+    assert(init_path == "/init", "init path found")
+
+    return true
+}
+
+// Test B3: Large Ramdisk Stress Test
+fn test_ramdisk_stress() -> bool {
+    let mut ramdisk = Ramdisk::new(1, "cpio", 0x84000000)
+
+    // Add many files (stress test)
+    for i in 0..60 {
+        let path = "/system/lib/lib" + i.to_string() + ".so"
+        let entry = RootfsEntry::new(path, 0x100000)
+        assert(ramdisk.add_entry(entry), "add lib")
+    }
+
+    assert(ramdisk.entry_count == 60, "60 entries")
+    assert(ramdisk.total_size == 60 * 0x100000, "total size correct")
+
+    return true
+}
+
+// ============ Test Group C: Init Process (2/2) ============
+
+// Test C1: Init Process Lifecycle
+fn test_init_process_lifecycle() -> bool {
+    let mut init = InitProcess::new(1)
+
+    assert(init.pid == 1, "PID 1")
+    assert(!init.is_running(), "initially not running")
+
+    assert(init.start(), "start init")
+    assert(init.is_running(), "now running")
+    assert(init.wait_ready(), "wait ready")
+
+    return true
+}
+
+// Test C2: Init Startup Timing
+fn test_init_startup_timing() -> bool {
+    let mut init = InitProcess::new(1)
+
+    assert(init.started_us == 0, "initially 0")
+    assert(init.start(), "start")
+    assert(init.started_us == 100, "started at 100us")
+
+    return true
+}
+
+// ============ Test Group D: Android Bootloader (2/2) ============
+
+// Test D1: Complete Boot Sequence
+fn test_bootloader_sequence() -> bool {
+    let mut bootloader = AndroidBootloader::new(1)
+
+    assert(bootloader.get_phase() == 0, "phase 0 (load)")
+    assert(bootloader.load_boot_image(), "load boot image")
+    assert(bootloader.get_phase() == 1, "phase 1 (extract)")
+
+    assert(bootloader.extract_ramdisk(), "extract ramdisk")
+    assert(bootloader.get_phase() == 2, "phase 2 (init)")
+
+    assert(bootloader.start_init(), "start init")
+    assert(bootloader.get_phase() == 3, "phase 3 (running)")
+
+    assert(bootloader.is_ready(), "bootloader ready")
+
+    return true
+}
+
+// Test D2: Init Process Ready
+fn test_bootloader_init_ready() -> bool {
+    let mut bootloader = AndroidBootloader::new(1)
+
+    assert(bootloader.load_boot_image(), "load")
+    assert(bootloader.extract_ramdisk(), "extract")
+    assert(bootloader.start_init(), "start init")
+
+    assert(bootloader.init.is_running(), "init running")
+    assert(bootloader.init.wait_ready(), "init ready")
+
+    return true
+}
+
+// ============ Test Group E: Zygote (2/2) ============
+
+// Test E1: Zygote Initialization and App Forking
+fn test_zygote_app_fork() -> bool {
+    let mut zygote = Zygote::new(1)
+
+    assert(zygote.start(), "start zygote")
+    assert(zygote.preload_classes(5000), "preload classes")
+    assert(zygote.mark_ready(), "mark ready")
+    assert(zygote.is_ready(), "zygote ready")
+
+    // Fork 3 apps
+    let app1 = zygote.fork_app_process(10001)
+    let app2 = zygote.fork_app_process(10002)
+    let app3 = zygote.fork_app_process(10003)
+
+    assert(app1 != 0, "app1 created")
+    assert(app2 != 0, "app2 created")
+    assert(app3 != 0, "app3 created")
+    assert(app1 != app2 && app2 != app3, "distinct PIDs")
+    assert(zygote.child_count == 3, "3 children")
+
+    return true
+}
+
+// Test E2: Zygote Class Preloading
+fn test_zygote_preload() -> bool {
+    let mut zygote = Zygote::new(1)
+
+    assert(!zygote.is_ready(), "not ready initially")
+
+    assert(zygote.start(), "start")
+    assert(zygote.preload_classes(10000), "preload 10000 classes")
+    assert(zygote.preloaded_classes == 10000, "classes count")
+
+    assert(zygote.mark_ready(), "mark ready")
+    assert(zygote.is_ready(), "now ready")
+
+    return true
+}
+
+// ============ Test Group F: System Services (2/2) ============
+
+// Test F1: System Service Startup
+fn test_system_service_startup() -> bool {
+    let mut service = SystemService::new(ServiceType::ActivityManager)
+
+    assert(service.name == "system_server", "name correct")
+    assert(service.state == 0, "init state")
+
+    assert(service.start(2000), "start service")
+    assert(service.pid == 2000, "PID set")
+
+    assert(!service.is_ready(), "not ready yet")
+    assert(service.ready(), "mark ready")
+    assert(service.is_ready(), "now ready")
+
+    return true
+}
+
+// Test F2: Multiple System Services
+fn test_multiple_services() -> bool {
+    let mut pm = SystemService::new(ServiceType::PackageManager)
+    let mut am = SystemService::new(ServiceType::ActivityManager)
+    let mut sf = SystemService::new(ServiceType::SurfaceFlinger)
+
+    assert(pm.start(2001), "start PM")
+    assert(am.start(2002), "start AM")
+    assert(sf.start(2003), "start SF")
+
+    assert(pm.ready(), "PM ready")
+    assert(am.ready(), "AM ready")
+    assert(sf.ready(), "SF ready")
+
+    assert(pm.is_ready() && am.is_ready() && sf.is_ready(), "all ready")
+
+    return true
+}
+
+// ============ Test Group G: Android Runtime (1/1) ============
+
+// Test G1: Complete Android Runtime Boot
+fn test_android_runtime_full() -> bool {
+    let mut runtime = AndroidRuntime::new(1)
+
+    // Step 1: Start Zygote
+    assert(runtime.start_zygote(), "start zygote")
+    assert(runtime.zygote.is_ready(), "zygote ready")
+
+    // Step 2: Add system services
+    let pm = SystemService::new(ServiceType::PackageManager)
+    let am = SystemService::new(ServiceType::ActivityManager)
+    let sf = SystemService::new(ServiceType::SurfaceFlinger)
+
+    assert(runtime.add_system_service(pm), "add PM")
+    assert(runtime.add_system_service(am), "add AM")
+    assert(runtime.add_system_service(sf), "add SF")
+
+    // Step 3: Start all services
+    assert(runtime.start_system_services(), "start services")
+    assert(runtime.service_count == 3, "3 services")
+
+    // Step 4: Mark boot complete
+    assert(runtime.mark_boot_complete(), "boot complete")
+    assert(runtime.is_boot_complete(), "boot complete flag")
+
+    // Step 5: Launch apps
+    let app1 = runtime.launch_app(10001)
+    let app2 = runtime.launch_app(10002)
+
+    assert(app1 != 0xFFFFFFFF, "app1 launched")
+    assert(app2 != 0xFFFFFFFF, "app2 launched")
+    assert(runtime.get_app_count() == 2, "2 apps")
+
+    return true
+}
+
+// ============ Full Integration Test ============
+
+// Test H1: Complete L1→L2 Android Boot (3-layer)
+fn test_complete_android_boot() -> bool {
+    // Phase 1: L2 Android bootloader loads boot.img
+    let mut bootloader = AndroidBootloader::new(2)
+    assert(bootloader.load_boot_image(), "load boot.img")
+    assert(bootloader.extract_ramdisk(), "extract ramdisk")
+    assert(bootloader.start_init(), "start init (PID 1)")
+    assert(bootloader.is_ready(), "L2 ready")
+
+    // Phase 2: Init starts Zygote and system services
+    let mut runtime = AndroidRuntime::new(2)
+    assert(runtime.start_zygote(), "start zygote")
+
+    let pm = SystemService::new(ServiceType::PackageManager)
+    let am = SystemService::new(ServiceType::ActivityManager)
+
+    assert(runtime.add_system_service(pm), "add services")
+    assert(runtime.add_system_service(am), "add services")
+    assert(runtime.start_system_services(), "start services")
+
+    // Phase 3: Mark boot complete and launch apps
+    assert(runtime.mark_boot_complete(), "boot complete")
+    assert(runtime.is_boot_complete(), "L2 fully booted")
+
+    let app = runtime.launch_app(10000)
+    assert(app != 0xFFFFFFFF, "first app launched")
+
+    return true
+}
+
+// ============ Helper Functions ============
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

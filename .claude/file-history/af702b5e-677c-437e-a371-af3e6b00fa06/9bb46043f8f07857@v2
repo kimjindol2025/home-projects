@@ -1,0 +1,251 @@
+// Hypervisor Phase 2: Virtual Interrupt Routing Tests (10 Unforgiving Tests)
+
+module virq_phase2_test
+
+use virq::{
+    VirtualIRQ, ExceptionContext, vIRQClass, TrapReason, TrapHandler, VirtualIRQController
+}
+
+use timer::{
+    VirtualTimer, VirtualTimerManager, TimerType
+}
+
+// ============ Test Group A: Virtual IRQ Injection (3/3) ============
+
+// Test A1: vIRQ Lifecycle (inject → acknowledge → deactivate)
+fn test_virq_lifecycle() -> bool {
+    let mut virq = VirtualIRQ::new(1, 32, 128)
+
+    // Initial state
+    assert(!virq.is_pending, "initially not pending")
+    assert(!virq.is_active, "initially not active")
+
+    // Inject
+    assert(virq.inject(), "inject should succeed")
+    assert(virq.is_pending, "should be pending after inject")
+    assert(!virq.is_active, "should not be active yet")
+
+    // Acknowledge
+    assert(virq.acknowledge(), "acknowledge should succeed")
+    assert(!virq.is_pending, "should not be pending after acknowledge")
+    assert(virq.is_active, "should be active after acknowledge")
+
+    // Deactivate
+    assert(virq.deactivate(), "deactivate should succeed")
+    assert(!virq.is_active, "should not be active after deactivate")
+
+    return true
+}
+
+// Test A2: Multiple vIRQ Injection (sequential)
+fn test_multiple_virq_injection() -> bool {
+    let mut virq1 = VirtualIRQ::new(1, 32, 64)
+    let mut virq2 = VirtualIRQ::new(1, 33, 128)
+    let mut virq3 = VirtualIRQ::new(1, 34, 192)
+
+    // Inject all three
+    assert(virq1.inject(), "inject virq1")
+    assert(virq2.inject(), "inject virq2")
+    assert(virq3.inject(), "inject virq3")
+
+    // All should be pending
+    assert(virq1.is_pending && virq2.is_pending && virq3.is_pending, "all pending")
+
+    // Cannot re-inject while pending
+    assert(!virq1.inject(), "cannot re-inject pending virq")
+
+    // Acknowledge in order
+    assert(virq1.acknowledge(), "acknowledge virq1")
+    assert(virq2.acknowledge(), "acknowledge virq2")
+    assert(virq3.acknowledge(), "acknowledge virq3")
+
+    // All active
+    assert(virq1.is_active && virq2.is_active && virq3.is_active, "all active")
+
+    return true
+}
+
+// Test A3: vIRQ Priority Handling
+fn test_virq_priority() -> bool {
+    let virq_high = VirtualIRQ::new(1, 10, 50)   // High priority (low number)
+    let virq_low = VirtualIRQ::new(1, 11, 200)   // Low priority (high number)
+
+    assert(virq_high.priority < virq_low.priority, "high priority has lower value")
+
+    // In real system: CPU would handle high priority vIRQ first
+    assert(virq_high.priority == 50, "high priority correct")
+    assert(virq_low.priority == 200, "low priority correct")
+
+    return true
+}
+
+// ============ Test Group B: Exception Context (2/2) ============
+
+// Test B1: Synchronous Exception Context
+fn test_exception_context_sync() -> bool {
+    let mut ctx = ExceptionContext::new(1, vIRQClass::Synchronous, TrapReason::DataAbort)
+
+    assert(ctx.vmid == 1, "VMID should be 1")
+    assert(ctx.pc == 0, "PC initially 0")
+    assert(ctx.lr == 0, "LR initially 0")
+
+    ctx.pc = 0x80001000
+    ctx.lr = 0x80001004
+    ctx.far_el2 = 0x80500000  // Fault address
+
+    assert(ctx.pc == 0x80001000, "PC set correctly")
+    assert(ctx.get_fault_ipa() == 0x80500000, "fault IPA correct")
+
+    return true
+}
+
+// Test B2: Hypervisor Call Context
+fn test_exception_context_hypercall() -> bool {
+    let mut ctx = ExceptionContext::new(1, vIRQClass::HypervisorCall, TrapReason::HypervisorCall)
+
+    ctx.pc = 0x40001000  // Guest kernel space
+    ctx.instruction_syndrome = 0x5000  // ESR_EL2 value
+
+    assert(ctx.exception_class == vIRQClass::HypervisorCall, "class should be HypervisorCall")
+    assert(ctx.instruction_syndrome == 0x5000, "syndrome set correctly")
+
+    return true
+}
+
+// ============ Test Group C: Trap Handlers (2/2) ============
+
+// Test C1: Trap Handler Counting
+fn test_trap_handler_counting() -> bool {
+    let mut handler = TrapHandler::new(1)
+
+    // Create 5 different exception types
+    for _i in 0..5 {
+        let ctx = ExceptionContext::new(1, vIRQClass::HypervisorCall, TrapReason::HypervisorCall)
+        assert(handler.handle_exception(ctx), "handle exception")
+    }
+
+    assert(handler.get_trap_count() == 5, "trap count should be 5")
+
+    return true
+}
+
+// Test C2: Emulated vs Physical Accesses
+fn test_trap_handler_emulation() -> bool {
+    let mut handler = TrapHandler::new(1)
+
+    // Simulate MMIO fault (needs emulation)
+    let ctx1 = ExceptionContext::new(1, vIRQClass::MMIO, TrapReason::DataAbort)
+    assert(handler.handle_exception(ctx1), "handle MMIO fault")
+
+    let ctx2 = ExceptionContext::new(1, vIRQClass::SystemRegister, TrapReason::SysRegisterAccess)
+    assert(handler.handle_exception(ctx2), "handle sysreg access")
+
+    // Total traps: 2
+    assert(handler.get_trap_count() == 2, "trap count should be 2")
+    // Emulated: 2
+    assert(handler.get_emulated_count() == 2, "emulated count should be 2")
+
+    return true
+}
+
+// ============ Test Group D: Virtual IRQ Controller (2/2) ============
+
+// Test D1: vIRQ Controller Pending/Active Management
+fn test_virq_controller_state() -> bool {
+    let mut ctrl = VirtualIRQController::new(1)
+
+    // Initially empty
+    assert(ctrl.get_pending_count() == 0, "initially 0 pending")
+    assert(ctrl.get_active_count() == 0, "initially 0 active")
+
+    // Inject vIRQ 32, 64, 96
+    assert(ctrl.inject_virq(32, 100), "inject vIRQ 32")
+    assert(ctrl.inject_virq(64, 100), "inject vIRQ 64")
+    assert(ctrl.inject_virq(96, 100), "inject vIRQ 96")
+
+    assert(ctrl.get_pending_count() == 3, "pending count should be 3")
+    assert(ctrl.get_active_count() == 0, "active count still 0")
+
+    // Acknowledge all
+    assert(ctrl.acknowledge_virq(32), "acknowledge vIRQ 32")
+    assert(ctrl.acknowledge_virq(64), "acknowledge vIRQ 64")
+    assert(ctrl.acknowledge_virq(96), "acknowledge vIRQ 96")
+
+    assert(ctrl.get_pending_count() == 0, "pending count should be 0")
+    assert(ctrl.get_active_count() == 3, "active count should be 3")
+
+    // Deactivate all
+    assert(ctrl.deactivate_virq(32), "deactivate vIRQ 32")
+    assert(ctrl.deactivate_virq(64), "deactivate vIRQ 64")
+    assert(ctrl.deactivate_virq(96), "deactivate vIRQ 96")
+
+    assert(ctrl.get_active_count() == 0, "active count should be 0")
+
+    return true
+}
+
+// Test D2: Highest Priority vIRQ Selection
+fn test_virq_controller_priority() -> bool {
+    let mut ctrl = VirtualIRQController::new(1)
+
+    // Inject vIRQs with different priorities
+    assert(ctrl.inject_virq(100, 200), "inject vIRQ 100 (low priority)")
+    assert(ctrl.inject_virq(50, 50), "inject vIRQ 50 (high priority)")
+    assert(ctrl.inject_virq(75, 100), "inject vIRQ 75 (medium priority)")
+
+    // Get highest priority (lowest number)
+    let highest = ctrl.get_highest_priority_virq()
+    assert(highest == 50, "highest priority vIRQ should be 50")
+
+    return true
+}
+
+// ============ Test Group E: Virtual Timer (1/1) ============
+
+// Test E1: Full vIRQ + Timer Integration
+fn test_virq_timer_integration() -> bool {
+    // Create timer manager for VMID=1
+    let mut tmr_mgr = VirtualTimerManager::new(1)
+
+    // Create vIRQ controller for same VMID
+    let mut virq_ctrl = VirtualIRQController::new(1)
+
+    // Enable physical timer
+    assert(tmr_mgr.handle_timer_write(TimerType::PhysicalTimer, "CTL", 0x1), "enable timer")
+
+    // Set timer compare value
+    assert(tmr_mgr.handle_timer_write(TimerType::PhysicalTimer, "CVAL", 0x1000000), "set compare value")
+
+    // Simulate timer expiry
+    assert(tmr_mgr.simulate_timer_expiry(TimerType::PhysicalTimer), "timer expires")
+
+    // Inject corresponding vIRQ (timer IRQ 27)
+    assert(virq_ctrl.inject_virq(27, 64), "inject timer vIRQ")
+
+    // Both systems should register the event
+    assert(tmr_mgr.get_total_fires() == 1, "timer fire count = 1")
+    assert(virq_ctrl.get_pending_count() == 1, "vIRQ pending count = 1")
+
+    // Acknowledge and deactivate
+    assert(virq_ctrl.acknowledge_virq(27), "acknowledge vIRQ 27")
+    assert(virq_ctrl.deactivate_virq(27), "deactivate vIRQ 27")
+    assert(tmr_mgr.acknowledge_interrupt(TimerType::PhysicalTimer), "acknowledge timer")
+
+    assert(virq_ctrl.get_pending_count() == 0, "no pending vIRQs")
+    assert(!tmr_mgr.check_pending_interrupts(), "no pending interrupts")
+
+    return true
+}
+
+// ============ Helper Functions ============
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

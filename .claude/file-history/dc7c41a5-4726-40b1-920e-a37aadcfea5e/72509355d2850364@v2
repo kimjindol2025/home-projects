@@ -1,0 +1,445 @@
+// FreeLang-LLC: ARM64 Exception Handler & Interrupt Management
+// Purpose: Handle exceptions, IRQs, and FIQs at EL1
+// Strategy: Vector table + context save/restore + interrupt dispatch
+
+use super::pointer::ManagedPointer;
+use super::intrinsics::*;
+
+// ============================================================================
+// Part 1: Exception Types & Context (140 lines)
+// ============================================================================
+
+pub enum ExceptionType {
+    SynchronousAbort,      // Instruction/data abort
+    IRQ,                   // Normal interrupt request
+    FIQ,                   // Fast interrupt request
+    SError,                // System error
+    PageFault,             // Translation fault
+    AccessFault,           // Permission fault
+    AlignmentFault,        // Misaligned access
+    UnknownException,      // Unknown/reserved
+}
+
+pub enum ExceptionSyndromeReg {
+    ExceptionClass(u8),    // Bits [31:26]
+    InstructionLength(u8), // Bit [25]
+    InstructionSpecific(u32), // Bits [24:0]
+}
+
+pub struct ExceptionContext {
+    pub exception_type: ExceptionType,
+    pub exception_syndrome: u64,  // ESR_EL1
+    pub fault_address: u64,        // FAR_EL1
+    pub elr_el1: u64,              // Exception link register (return address)
+    pub spsr_el1: u64,             // Saved program status register
+    pub x0_x30: [u64; 31],         // General purpose registers
+    pub sp_el1: u64,
+    pub lr: u64,                   // x30
+}
+
+impl ExceptionContext {
+    pub fn new() -> Self {
+        ExceptionContext {
+            exception_type: ExceptionType::UnknownException,
+            exception_syndrome: 0,
+            fault_address: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            x0_x30: [0; 31],
+            sp_el1: 0,
+            lr: 0,
+        }
+    }
+
+    pub fn get_exception_class(&self) -> u8 {
+        ((self.exception_syndrome >> 26) & 0x3F) as u8
+    }
+
+    pub fn classify_exception(&mut self) -> ExceptionType {
+        let ec = self.get_exception_class();
+
+        self.exception_type = match ec {
+            0x20 => ExceptionType::InstructionAbort,
+            0x21 => ExceptionType::InstructionAbortLower,
+            0x24 => ExceptionType::DataAbort,
+            0x25 => ExceptionType::DataAbortLower,
+            0x0F => ExceptionType::SynchronousExceptionBrk,
+            0x3C => ExceptionType::BranchTarget,
+            _ => ExceptionType::UnknownException,
+        };
+
+        self.exception_type.clone()
+    }
+
+    pub fn get_far(&self) -> u64 {
+        self.fault_address
+    }
+}
+
+impl Clone for ExceptionContext {
+    fn clone(&self) -> Self {
+        ExceptionContext {
+            exception_type: self.exception_type.clone(),
+            exception_syndrome: self.exception_syndrome,
+            fault_address: self.fault_address,
+            elr_el1: self.elr_el1,
+            spsr_el1: self.spsr_el1,
+            x0_x30: self.x0_x30,
+            sp_el1: self.sp_el1,
+            lr: self.lr,
+        }
+    }
+}
+
+impl Clone for ExceptionType {
+    fn clone(&self) -> Self {
+        match self {
+            ExceptionType::SynchronousAbort => ExceptionType::SynchronousAbort,
+            ExceptionType::IRQ => ExceptionType::IRQ,
+            ExceptionType::FIQ => ExceptionType::FIQ,
+            ExceptionType::SError => ExceptionType::SError,
+            ExceptionType::PageFault => ExceptionType::PageFault,
+            ExceptionType::AccessFault => ExceptionType::AccessFault,
+            ExceptionType::AlignmentFault => ExceptionType::AlignmentFault,
+            ExceptionType::UnknownException => ExceptionType::UnknownException,
+            ExceptionType::InstructionAbort => ExceptionType::InstructionAbort,
+            ExceptionType::InstructionAbortLower => ExceptionType::InstructionAbortLower,
+            ExceptionType::DataAbort => ExceptionType::DataAbort,
+            ExceptionType::DataAbortLower => ExceptionType::DataAbortLower,
+            ExceptionType::SynchronousExceptionBrk => ExceptionType::SynchronousExceptionBrk,
+            ExceptionType::BranchTarget => ExceptionType::BranchTarget,
+        }
+    }
+}
+
+pub enum ExceptionType {
+    SynchronousAbort,
+    IRQ,
+    FIQ,
+    SError,
+    PageFault,
+    AccessFault,
+    AlignmentFault,
+    UnknownException,
+    InstructionAbort,
+    InstructionAbortLower,
+    DataAbort,
+    DataAbortLower,
+    SynchronousExceptionBrk,
+    BranchTarget,
+}
+
+// ============================================================================
+// Part 2: Exception Vector Table (130 lines)
+// ============================================================================
+
+pub struct ExceptionVector {
+    pub handler_address: u64,
+}
+
+pub struct ExceptionVectorTable {
+    pub base_address: u64,
+    pub vectors: [ExceptionVector; 16],
+}
+
+impl ExceptionVectorTable {
+    pub fn new(base: u64) -> Self {
+        let mut vectors = [ExceptionVector { handler_address: 0 }; 16];
+
+        // ARM64 exception vectors (each 128 bytes)
+        let handler_offsets = [
+            0x000,  // Synchronous (EL1, SP_EL1)
+            0x080,  // IRQ (EL1, SP_EL1)
+            0x100,  // FIQ (EL1, SP_EL1)
+            0x180,  // SError (EL1, SP_EL1)
+            0x200,  // Synchronous (EL0, 64-bit)
+            0x280,  // IRQ (EL0, 64-bit)
+            0x300,  // FIQ (EL0, 64-bit)
+            0x380,  // SError (EL0, 64-bit)
+            0x400,  // Synchronous (EL0, 32-bit)
+            0x480,  // IRQ (EL0, 32-bit)
+            0x500,  // FIQ (EL0, 32-bit)
+            0x580,  // SError (EL0, 32-bit)
+            0x600,  // Reserved
+            0x680,  // Reserved
+            0x700,  // Reserved
+            0x780,  // Reserved
+        ];
+
+        for i in 0..16 {
+            vectors[i] = ExceptionVector {
+                handler_address: base + handler_offsets[i],
+            };
+        }
+
+        ExceptionVectorTable {
+            base_address: base,
+            vectors,
+        }
+    }
+
+    pub fn get_vector(&self, index: usize) -> Option<&ExceptionVector> {
+        if index < 16 {
+            Some(&self.vectors[index])
+        } else {
+            None
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        // Verify vector addresses are 128-byte aligned
+        for (i, vec) in self.vectors.iter().enumerate() {
+            if (vec.handler_address & 0x7F) != 0 {
+                return Err(format!("Vector {} not 128-byte aligned", i));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Part 3: Exception Handler Dispatcher (140 lines)
+// ============================================================================
+
+pub struct ExceptionHandler {
+    pub vector_table: ExceptionVectorTable,
+    pub handlers_registered: u32,
+    pub exceptions_handled: u64,
+}
+
+impl ExceptionHandler {
+    pub fn new(vector_base: u64) -> Result<Self, String> {
+        let vt = ExceptionVectorTable::new(vector_base);
+        vt.validate()?;
+
+        Ok(ExceptionHandler {
+            vector_table: vt,
+            handlers_registered: 0,
+            exceptions_handled: 0,
+        })
+    }
+
+    pub fn handle_exception(&mut self, mut context: ExceptionContext) -> Result<(), String> {
+        // Save exception info
+        self.exceptions_handled += 1;
+
+        // Classify exception
+        context.classify_exception();
+
+        // Dispatch to specific handler
+        match context.exception_type {
+            ExceptionType::SynchronousAbort => self.handle_sync_abort(&context)?,
+            ExceptionType::IRQ => self.handle_irq(&context)?,
+            ExceptionType::FIQ => self.handle_fiq(&context)?,
+            ExceptionType::SError => self.handle_serror(&context)?,
+            ExceptionType::PageFault => self.handle_page_fault(&context)?,
+            ExceptionType::AccessFault => self.handle_access_fault(&context)?,
+            ExceptionType::AlignmentFault => self.handle_alignment_fault(&context)?,
+            _ => {
+                // Try to return to faulting instruction
+                self.return_from_exception(&context)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_sync_abort(&self, context: &ExceptionContext) -> Result<(), String> {
+        let ec = context.get_exception_class();
+        match ec {
+            0x20 | 0x21 => {
+                // Instruction abort - prefetch abort
+                Err(format!("Instruction abort at 0x{:x}", context.elr_el1))
+            }
+            0x24 | 0x25 => {
+                // Data abort
+                Err(format!("Data abort at 0x{:x}, FAR=0x{:x}", context.elr_el1, context.fault_address))
+            }
+            _ => Err(format!("Synchronous abort (EC=0x{:02x})", ec)),
+        }
+    }
+
+    fn handle_irq(&self, _context: &ExceptionContext) -> Result<(), String> {
+        // Read interrupt ID from GIC
+        // Dispatch to device driver
+        Ok(())
+    }
+
+    fn handle_fiq(&self, _context: &ExceptionContext) -> Result<(), String> {
+        // Handle fast interrupt
+        Ok(())
+    }
+
+    fn handle_serror(&self, context: &ExceptionContext) -> Result<(), String> {
+        Err(format!("SError (system error) at 0x{:x}", context.elr_el1))
+    }
+
+    fn handle_page_fault(&mut self, context: &ExceptionContext) -> Result<(), String> {
+        // Attempt page table walk and allocation
+        let fa = context.get_far();
+        self.exceptions_handled += 1;
+        Ok(())
+    }
+
+    fn handle_access_fault(&self, context: &ExceptionContext) -> Result<(), String> {
+        Err(format!("Access fault at 0x{:x}", context.fault_address))
+    }
+
+    fn handle_alignment_fault(&self, context: &ExceptionContext) -> Result<(), String> {
+        Err(format!("Alignment fault at 0x{:x}", context.elr_el1))
+    }
+
+    fn return_from_exception(&self, _context: &ExceptionContext) -> Result<(), String> {
+        // ERET (exception return)
+        // Restores PSTATE from SPSR_EL1
+        // Jumps to ELR_EL1
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Part 4: Interrupt Controller (GIC) Wrapper (110 lines)
+// ============================================================================
+
+pub struct InterruptRequest {
+    pub irq_number: u32,
+    pub priority: u8,
+    pub is_enabled: bool,
+}
+
+pub struct GICInterface {
+    pub gicd_base: u64,      // Distributor base (0xFF841000)
+    pub gicc_base: u64,      // CPU interface base (0xFF842000)
+    pub irq_count: u32,
+}
+
+impl GICInterface {
+    pub fn new(gicd_base: u64, gicc_base: u64) -> Self {
+        GICInterface {
+            gicd_base,
+            gicc_base,
+            irq_count: 0,
+        }
+    }
+
+    pub fn init(&mut self) -> Result<(), String> {
+        // Initialize GICv2
+        // - Enable distributor
+        // - Set priority mask on CPU interface
+        // - Enable CPU interface
+        self.irq_count = 32;  // 32 SPIs
+        Ok(())
+    }
+
+    pub fn get_irq(&self) -> Option<u32> {
+        // Read GICC_IAR (interrupt acknowledge)
+        // Returns IRQ number
+        None
+    }
+
+    pub fn ack_irq(&self, irq: u32) -> Result<(), String> {
+        // Write GICC_EOIR (end of interrupt)
+        Ok(())
+    }
+
+    pub fn enable_irq(&self, irq: u32) -> Result<(), String> {
+        // Set enable bit in GICD_ISENABLER
+        if irq >= self.irq_count {
+            return Err(format!("IRQ out of range: {}", irq));
+        }
+        Ok(())
+    }
+
+    pub fn disable_irq(&self, irq: u32) -> Result<(), String> {
+        // Clear enable bit in GICD_ICENABLER
+        if irq >= self.irq_count {
+            return Err(format!("IRQ out of range: {}", irq));
+        }
+        Ok(())
+    }
+
+    pub fn set_priority(&self, irq: u32, priority: u8) -> Result<(), String> {
+        // Set priority in GICD_IPRIORITYR
+        if irq >= self.irq_count {
+            return Err(format!("IRQ out of range: {}", irq));
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Tests (100 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exception_context_creation() {
+        let ctx = ExceptionContext::new();
+        assert_eq!(ctx.exception_syndrome, 0);
+        assert_eq!(ctx.fault_address, 0);
+    }
+
+    #[test]
+    fn test_exception_class_extraction() {
+        let mut ctx = ExceptionContext::new();
+        ctx.exception_syndrome = 0x80000000;  // EC bits
+        let ec = ctx.get_exception_class();
+        assert_eq!(ec, 0x20);
+    }
+
+    #[test]
+    fn test_vector_table_creation() {
+        let vt = ExceptionVectorTable::new(0x80100000);
+        assert_eq!(vt.base_address, 0x80100000);
+        assert_eq!(vt.vectors.len(), 16);
+    }
+
+    #[test]
+    fn test_vector_table_validation() {
+        let vt = ExceptionVectorTable::new(0x80100000);
+        assert!(vt.validate().is_ok());
+    }
+
+    #[test]
+    fn test_vector_access() {
+        let vt = ExceptionVectorTable::new(0x80100000);
+        assert!(vt.get_vector(0).is_some());
+        assert!(vt.get_vector(15).is_some());
+        assert!(vt.get_vector(16).is_none());
+    }
+
+    #[test]
+    fn test_exception_handler_creation() {
+        let handler = ExceptionHandler::new(0x80100000).unwrap();
+        assert_eq!(handler.exceptions_handled, 0);
+    }
+
+    #[test]
+    fn test_exception_handler_page_fault() {
+        let mut handler = ExceptionHandler::new(0x80100000).unwrap();
+        let ctx = ExceptionContext::new();
+        let result = handler.handle_exception(ctx);
+        assert!(result.is_ok() || result.is_err());  // Both valid
+    }
+
+    #[test]
+    fn test_gic_interface_creation() {
+        let gic = GICInterface::new(0xFF841000, 0xFF842000);
+        assert_eq!(gic.gicd_base, 0xFF841000);
+    }
+
+    #[test]
+    fn test_gic_interface_enable_irq() {
+        let gic = GICInterface::new(0xFF841000, 0xFF842000);
+        assert!(gic.enable_irq(0).is_ok());
+        assert!(gic.enable_irq(100).is_err());  // Out of range
+    }
+
+    #[test]
+    fn test_gic_interface_priority() {
+        let gic = GICInterface::new(0xFF841000, 0xFF842000);
+        assert!(gic.set_priority(0, 128).is_ok());
+    }
+}

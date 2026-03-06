@@ -1,0 +1,300 @@
+// Green-Distributed-Fabric Layer 1: Power Sensing
+// power_sensor.fl - 전력 측정 및 배터리 상태 추적
+// 재사용: Phase 8 calculateEnergyPerOperation() + controlThermalThrottling()
+
+use std::collections::VecDeque;
+
+// ─────────────────────────────────────────────────────────────────
+// PowerReading: 전력 측정값 데이터 구조
+// ─────────────────────────────────────────────────────────────────
+
+struct PowerReading {
+    timestamp_us: u64,            // 마이크로초 타임스탬프
+    battery_voltage_mv: u32,      // 배터리 전압 (mV): 3000-4200
+    current_ma: i32,              // 전류 (mA): 음수=충전, 양수=방전
+    temperature_celsius: f64,     // 온도 (°C)
+    cpu_frequency_mhz: u32,       // CPU 주파수 (MHz)
+    power_consumption_mw: f64,    // 전력 소모 (mW)
+    thermal_ratio: f64,           // 열 비율 (0.0-1.0): Phase 7 thermal_level
+}
+
+impl PowerReading {
+    pub fn new(
+        timestamp_us: u64,
+        voltage_mv: u32,
+        current_ma: i32,
+        temp: f64,
+        cpu_freq_mhz: u32,
+    ) -> PowerReading {
+        let power_mw = ((voltage_mv as f64) * ((current_ma.abs()) as f64)) / 1_000_000.0;
+        PowerReading {
+            timestamp_us,
+            battery_voltage_mv: voltage_mv,
+            current_ma,
+            temperature_celsius: temp,
+            cpu_frequency_mhz: cpu_freq_mhz,
+            power_consumption_mw: power_mw,
+            thermal_ratio: temp / 100.0, // 정규화: 0°C-100°C → 0.0-1.0
+        }
+    }
+
+    pub fn power_mw(&self) -> f64 {
+        self.power_consumption_mw
+    }
+
+    pub fn is_critical_drain(&self) -> bool {
+        self.current_ma > 500 // 500mA 이상 = 과소비
+    }
+
+    pub fn is_charging(&self) -> bool {
+        self.current_ma < 0
+    }
+
+    pub fn thermal_ratio_from_temp(&self) -> f64 {
+        (self.temperature_celsius / 100.0).min(1.0).max(0.0)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// BatteryState: 배터리 상태 추적
+// ─────────────────────────────────────────────────────────────────
+
+struct BatteryState {
+    capacity_mah: u32,            // 배터리 용량 (mAh): 기본 1200
+    remaining_mah: u32,           // 남은 용량 (mAh)
+    level_percent: f64,           // 배터리 레벨 (0.0-1.0)
+    estimated_life_minutes: u32,  // 잔여 수명 (분)
+    charge_cycles: u32,           // 충방전 사이클 수
+    health_ratio: f64,            // 건강도 (0.0-1.0): 사이클 반영
+}
+
+impl BatteryState {
+    pub fn new(capacity_mah: u32) -> BatteryState {
+        BatteryState {
+            capacity_mah,
+            remaining_mah: capacity_mah,
+            level_percent: 1.0,
+            estimated_life_minutes: 0,
+            charge_cycles: 0,
+            health_ratio: 1.0,
+        }
+    }
+
+    pub fn update_from_reading(&mut self, reading: &PowerReading, elapsed_sec: f64) {
+        if reading.is_charging() {
+            self.remaining_mah = (self.remaining_mah as f64 + (reading.current_ma.abs() as f64) * (elapsed_sec / 3600.0)) as u32;
+            self.remaining_mah = self.remaining_mah.min(self.capacity_mah);
+        } else {
+            let drain_mah = (reading.current_ma.abs() as f64) * (elapsed_sec / 3600.0);
+            self.remaining_mah = (self.remaining_mah as f64 - drain_mah).max(0.0) as u32;
+        }
+
+        self.level_percent = (self.remaining_mah as f64) / (self.capacity_mah as f64);
+
+        // 수명 추정: remaining_mah / drain_rate
+        let drain_rate = self.drain_rate_mah_per_hour();
+        if drain_rate > 0.0 {
+            self.estimated_life_minutes = ((self.remaining_mah as f64) / drain_rate * 60.0) as u32;
+        }
+
+        // 건강도: 사이클 반영 (100 사이클마다 1% 저하)
+        self.health_ratio = 1.0 - ((self.charge_cycles as f64) / 10000.0);
+    }
+
+    pub fn is_low(&self) -> bool {
+        self.level_percent < 0.2
+    }
+
+    pub fn is_critical(&self) -> bool {
+        self.level_percent < 0.05
+    }
+
+    pub fn drain_rate_mah_per_hour(&self) -> f64 {
+        // 간단한 선형 추정
+        100.0 // 기본 100mAh/h (시뮬레이션)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PowerSensor: 전력 센싱 엔진
+// ─────────────────────────────────────────────────────────────────
+
+struct PowerSensor {
+    readings: VecDeque<PowerReading>,  // 최근 N개 측정값 (순환 버퍼)
+    battery: BatteryState,
+    max_readings: usize,               // 기본 100
+    baseline_mw: f64,                  // Linux 기준: 250mW
+    last_update_us: u64,
+}
+
+impl PowerSensor {
+    pub fn new(capacity_mah: u32, baseline_mw: f64) -> PowerSensor {
+        PowerSensor {
+            readings: VecDeque::new(),
+            battery: BatteryState::new(capacity_mah),
+            max_readings: 100,
+            baseline_mw,
+            last_update_us: 0,
+        }
+    }
+
+    pub fn sample(&mut self, reading: PowerReading) {
+        let elapsed_sec = if self.last_update_us > 0 {
+            ((reading.timestamp_us - self.last_update_us) as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
+
+        self.battery.update_from_reading(&reading, elapsed_sec);
+        self.readings.push_back(reading);
+
+        if self.readings.len() > self.max_readings {
+            self.readings.pop_front();
+        }
+
+        self.last_update_us = reading.timestamp_us;
+    }
+
+    pub fn average_consumption_mw(&self) -> f64 {
+        if self.readings.is_empty() {
+            return 0.0;
+        }
+
+        let sum: f64 = self.readings.iter().map(|r| r.power_consumption_mw).sum();
+        sum / (self.readings.len() as f64)
+    }
+
+    pub fn calculate_mw_per_cycle(&self, freq_mhz: u32) -> f64 {
+        // Phase 8 calculateEnergyPerOperation() 수식:
+        // energy(pJ) = power(mW) / (freq(MHz) × 1_000_000) × 1_000_000_000
+        // 여기선 mW/cycle로 정규화
+        let avg_mw = self.average_consumption_mw();
+        if freq_mhz > 0 {
+            avg_mw / (freq_mhz as f64)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn savings_vs_baseline(&self) -> f64 {
+        let current = self.average_consumption_mw();
+        if self.baseline_mw > 0.0 {
+            ((self.baseline_mw - current) / self.baseline_mw).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn thermal_throttle_factor(&self) -> f64 {
+        // Phase 8 controlThermalThrottling() 그대로:
+        let latest_thermal = self.readings.back().map(|r| r.thermal_ratio).unwrap_or(0.0);
+
+        if latest_thermal > 0.90 {
+            0.5 // 심각: 50% 전력만 허용
+        } else if latest_thermal > 0.80 {
+            0.8 // 경고: 80% 전력
+        } else {
+            1.0 // 정상: 100% 전력
+        }
+    }
+
+    pub fn current_reading(&self) -> Option<&PowerReading> {
+        self.readings.back()
+    }
+
+    pub fn battery_state(&self) -> &BatteryState {
+        &self.battery
+    }
+
+    pub fn battery_state_mut(&mut self) -> &mut BatteryState {
+        &mut self.battery
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 테스트
+// ─────────────────────────────────────────────────────────────────
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_power_reading_calculation() {
+        let reading = PowerReading::new(1000, 3700, 100, 25.0, 1000);
+        assert_eq!(reading.power_mw(), 370.0); // 3700 * 100 / 1_000_000
+        assert!(!reading.is_critical_drain());
+        assert!(!reading.is_charging());
+    }
+
+    #[test]
+    fn test_thermal_ratio() {
+        let reading = PowerReading::new(1000, 3700, 100, 75.0, 1000);
+        assert_eq!(reading.thermal_ratio, 0.75);
+    }
+
+    #[test]
+    fn test_battery_state_update() {
+        let mut battery = BatteryState::new(1200);
+        let reading = PowerReading::new(1000, 3700, 100, 25.0, 1000);
+
+        battery.update_from_reading(&reading, 1.0); // 1초 경과
+        assert!(!battery.is_low());
+        assert!(!battery.is_critical());
+    }
+
+    #[test]
+    fn test_sensor_sampling() {
+        let mut sensor = PowerSensor::new(1200, 250.0);
+
+        for i in 0..10 {
+            let reading = PowerReading::new(
+                (i * 1_000) as u64,
+                3700,
+                (100 + i as i32) as i32,
+                25.0 + (i as f64) * 0.5,
+                1000,
+            );
+            sensor.sample(reading);
+        }
+
+        assert_eq!(sensor.readings.len(), 10);
+        let avg = sensor.average_consumption_mw();
+        assert!(avg > 0.0);
+    }
+
+    #[test]
+    fn test_savings_vs_baseline() {
+        let mut sensor = PowerSensor::new(1200, 250.0);
+
+        // 150mW 소비 → 40% 절감
+        let reading = PowerReading::new(1000, 3700, 40, 25.0, 1000);
+        sensor.sample(reading);
+
+        let savings = sensor.savings_vs_baseline();
+        assert!(savings >= 0.39 && savings <= 0.41); // 대략 40%
+    }
+
+    #[test]
+    fn test_thermal_throttle_factor() {
+        let mut sensor = PowerSensor::new(1200, 250.0);
+
+        // 95°C → 열 비율 0.95 → throttle 0.5
+        let reading = PowerReading::new(1000, 3700, 100, 95.0, 1000);
+        sensor.sample(reading);
+
+        let factor = sensor.thermal_throttle_factor();
+        assert_eq!(factor, 0.5);
+    }
+
+    #[test]
+    fn test_critical_drain() {
+        let reading = PowerReading::new(1000, 3700, 600, 25.0, 1000);
+        assert!(reading.is_critical_drain());
+    }
+
+    #[test]
+    fn test_charging_detection() {
+        let reading = PowerReading::new(1000, 3700, -500, 25.0, 1000);
+        assert!(reading.is_charging());
+    }
+}

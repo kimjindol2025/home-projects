@@ -1,0 +1,510 @@
+// ============================================
+// Neural-Kernel-Sentinel: Behavioral Analyzer
+// ============================================
+// N-gram 패턴 분석 + 특성 벡터 추출
+// 시간 예산: 15µs (N-gram VecDeque + 특성 계산)
+
+use std::collections::{HashMap, VecDeque};
+
+// ============================================
+// 1. 16차원 특성 벡터 정의
+// ============================================
+
+#[derive(Clone, Debug)]
+pub struct SyscallFeatureVector {
+    // D0-D4: 카테고리 빈도 (0.0-1.0)
+    pub file_io_rate: f64,
+    pub process_ctrl_rate: f64,
+    pub memory_manip_rate: f64,
+    pub network_rate: f64,
+    pub privilege_rate: f64,
+
+    // D5-D9: N-gram 이상치 (0.0-1.0)
+    pub bigram_anomaly: f64,
+    pub trigram_anomaly: f64,
+    pub fourgram_anomaly: f64,
+    pub sequence_entropy: f64,
+    pub repetition_factor: f64,
+
+    // D10-D12: 타이밍 (0.0-1.0)
+    pub burst_intensity: f64,
+    pub avg_duration_normalized: f64,
+    pub timing_variance: f64,
+
+    // D13-D15: 컨텍스트 (0.0-1.0)
+    pub privilege_level: f64,
+    pub high_risk_syscall_count: f64,
+    pub return_error_rate: f64,
+}
+
+impl SyscallFeatureVector {
+    pub fn new() -> Self {
+        SyscallFeatureVector {
+            file_io_rate: 0.0,
+            process_ctrl_rate: 0.0,
+            memory_manip_rate: 0.0,
+            network_rate: 0.0,
+            privilege_rate: 0.0,
+            bigram_anomaly: 0.0,
+            trigram_anomaly: 0.0,
+            fourgram_anomaly: 0.0,
+            sequence_entropy: 0.0,
+            repetition_factor: 0.0,
+            burst_intensity: 0.0,
+            avg_duration_normalized: 0.0,
+            timing_variance: 0.0,
+            privilege_level: 0.0,
+            high_risk_syscall_count: 0.0,
+            return_error_rate: 0.0,
+        }
+    }
+
+    // 모든 특성값 정규화 (0.0-1.0)
+    pub fn normalize(&mut self) {
+        let clamp = |x: f64| -> f64 { if x > 1.0 { 1.0 } else if x < 0.0 { 0.0 } else { x } };
+
+        self.file_io_rate = clamp(self.file_io_rate);
+        self.process_ctrl_rate = clamp(self.process_ctrl_rate);
+        self.memory_manip_rate = clamp(self.memory_manip_rate);
+        self.network_rate = clamp(self.network_rate);
+        self.privilege_rate = clamp(self.privilege_rate);
+        self.bigram_anomaly = clamp(self.bigram_anomaly);
+        self.trigram_anomaly = clamp(self.trigram_anomaly);
+        self.fourgram_anomaly = clamp(self.fourgram_anomaly);
+        self.sequence_entropy = clamp(self.sequence_entropy);
+        self.repetition_factor = clamp(self.repetition_factor);
+        self.burst_intensity = clamp(self.burst_intensity);
+        self.avg_duration_normalized = clamp(self.avg_duration_normalized);
+        self.timing_variance = clamp(self.timing_variance);
+        self.privilege_level = clamp(self.privilege_level);
+        self.high_risk_syscall_count = clamp(self.high_risk_syscall_count);
+        self.return_error_rate = clamp(self.return_error_rate);
+    }
+
+    // 16차원 벡터 반환
+    pub fn as_vector(&self) -> Vec<f64> {
+        vec![
+            self.file_io_rate,
+            self.process_ctrl_rate,
+            self.memory_manip_rate,
+            self.network_rate,
+            self.privilege_rate,
+            self.bigram_anomaly,
+            self.trigram_anomaly,
+            self.fourgram_anomaly,
+            self.sequence_entropy,
+            self.repetition_factor,
+            self.burst_intensity,
+            self.avg_duration_normalized,
+            self.timing_variance,
+            self.privilege_level,
+            self.high_risk_syscall_count,
+            self.return_error_rate,
+        ]
+    }
+}
+
+// ============================================
+// 2. N-gram 추출기 (VecDeque 기반)
+// ============================================
+
+pub struct NgramExtractor {
+    // PID별 슬라이딩 윈도우 (최대 4 Syscall ID 보관)
+    per_pid_windows: HashMap<u32, VecDeque<u8>>,
+
+    // N-gram 발생 빈도
+    ngram_counts: HashMap<Vec<u8>, u32>,
+
+    // 정상 기준선 (베이지안 업데이트)
+    normal_baseline: HashMap<Vec<u8>, f64>,
+
+    // 통계
+    total_ngrams: u64,
+    window_size: usize,
+}
+
+impl NgramExtractor {
+    pub fn new() -> Self {
+        NgramExtractor {
+            per_pid_windows: HashMap::new(),
+            ngram_counts: HashMap::new(),
+            normal_baseline: HashMap::new(),
+            total_ngrams: 0,
+            window_size: 4,  // 최대 4-gram까지 추출
+        }
+    }
+
+    // Syscall을 윈도우에 추가하고 N-gram 추출
+    pub fn add_syscall(&mut self, pid: u32, syscall_id: u8) {
+        let window = self.per_pid_windows.entry(pid)
+            .or_insert_with(|| VecDeque::with_capacity(4));
+
+        window.push_back(syscall_id);
+        if window.len() > 4 {
+            window.pop_front();
+        }
+
+        // 2-gram, 3-gram, 4-gram 추출
+        if window.len() >= 2 {
+            let bigram: Vec<u8> = window.iter()
+                .skip(window.len().saturating_sub(2))
+                .copied()
+                .collect();
+            *self.ngram_counts.entry(bigram).or_insert(0) += 1;
+            self.total_ngrams += 1;
+        }
+
+        if window.len() >= 3 {
+            let trigram: Vec<u8> = window.iter()
+                .skip(window.len().saturating_sub(3))
+                .copied()
+                .collect();
+            *self.ngram_counts.entry(trigram).or_insert(0) += 1;
+            self.total_ngrams += 1;
+        }
+
+        if window.len() >= 4 {
+            let fourgram: Vec<u8> = window.iter().copied().collect();
+            *self.ngram_counts.entry(fourgram).or_insert(0) += 1;
+            self.total_ngrams += 1;
+        }
+    }
+
+    // Phase 6 베이지안 공식: confidence 갱신
+    fn update_baseline(&mut self, ngram: Vec<u8>, freq: u32) {
+        let prob = self.normal_baseline.entry(ngram.clone()).or_insert(0.5);
+        let evidence = if freq > 0 { 1.0 } else { 0.0 };
+
+        // 베이지안 업데이트: prob = (prob * freq + evidence) / (freq + 1.0)
+        *prob = (*prob * (freq as f64) + evidence) / ((freq as f64) + 1.0);
+    }
+
+    // N-gram 이상치 점수 계산
+    pub fn calculate_ngram_anomaly(&mut self) -> (f64, f64, f64) {
+        let mut bigram_anomaly = 0.0;
+        let mut trigram_anomaly = 0.0;
+        let mut fourgram_anomaly = 0.0;
+
+        if self.total_ngrams == 0 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        for (ngram, count) in self.ngram_counts.iter() {
+            self.update_baseline(ngram.clone(), *count);
+
+            let baseline_prob = self.normal_baseline.get(ngram).copied().unwrap_or(0.5);
+            let observed_prob = *count as f64 / self.total_ngrams as f64;
+            let anomaly = (observed_prob - baseline_prob).abs();
+
+            match ngram.len() {
+                2 => bigram_anomaly = bigram_anomaly.max(anomaly),
+                3 => trigram_anomaly = trigram_anomaly.max(anomaly),
+                4 => fourgram_anomaly = fourgram_anomaly.max(anomaly),
+                _ => {}
+            }
+        }
+
+        (
+            bigram_anomaly.min(1.0),
+            trigram_anomaly.min(1.0),
+            fourgram_anomaly.min(1.0),
+        )
+    }
+
+    // 시퀀스 엔트로피 계산 (Shannon)
+    pub fn calculate_entropy(&self) -> f64 {
+        if self.total_ngrams == 0 {
+            return 0.0;
+        }
+
+        let mut entropy = 0.0;
+        for count in self.ngram_counts.values() {
+            let p = *count as f64 / self.total_ngrams as f64;
+            if p > 0.0 {
+                entropy -= p * p.log2();
+            }
+        }
+
+        entropy / 8.0  // 정규화 (최대 엔트로피=8 bits)
+    }
+
+    // 반복 팩터 (자기 유사성)
+    pub fn calculate_repetition_factor(&self) -> f64 {
+        if self.total_ngrams == 0 {
+            return 0.0;
+        }
+
+        let unique_ngrams = self.ngram_counts.len() as f64;
+        let avg_frequency = self.total_ngrams as f64 / unique_ngrams;
+
+        // 반복도 = (평균 빈도 - 1) / (최대 빈도 - 1)
+        let max_freq = self.ngram_counts.values().max().copied().unwrap_or(1) as f64;
+        let repetition = (avg_frequency - 1.0) / max_freq.max(1.0);
+
+        repetition.max(0.0).min(1.0)
+    }
+
+    // 윈도우 초기화
+    pub fn reset_pid(&mut self, pid: u32) {
+        self.per_pid_windows.remove(&pid);
+    }
+
+    // 통계 조회
+    pub fn total_ngram_count(&self) -> u64 {
+        self.total_ngrams
+    }
+
+    pub fn unique_ngram_count(&self) -> usize {
+        self.ngram_counts.len()
+    }
+}
+
+// ============================================
+// 3. 행동 분석기 (특성 벡터 생성)
+// ============================================
+
+pub struct BehavioralAnalyzer {
+    ngram_extractor: NgramExtractor,
+
+    // 카테고리별 카운트
+    category_counts: HashMap<u32, u32>,  // PID → count
+
+    // 타이밍 추적
+    durations: Vec<u32>,  // 마지막 1000개 syscall duration (ns)
+
+    // 높은 위험 Syscall 목록
+    high_risk_syscalls: Vec<u8>,  // ModuleLoad=26, KexecLoad=27, etc.
+}
+
+impl BehavioralAnalyzer {
+    pub fn new() -> Self {
+        BehavioralAnalyzer {
+            ngram_extractor: NgramExtractor::new(),
+            category_counts: HashMap::new(),
+            durations: Vec::with_capacity(1000),
+            high_risk_syscalls: vec![26, 27, 30, 31, 32],  // ModuleLoad, KexecLoad, etc.
+        }
+    }
+
+    // Syscall 이벤트 추가 (SyscallInterceptor에서 호출)
+    pub fn add_event(&mut self, pid: u32, syscall_category: u8, duration_ns: u32) {
+        *self.category_counts.entry(pid).or_insert(0) += 1;
+
+        self.ngram_extractor.add_syscall(pid, syscall_category);
+
+        self.durations.push(duration_ns);
+        if self.durations.len() > 1000 {
+            self.durations.remove(0);
+        }
+    }
+
+    // PID 버스트 강도 계산
+    pub fn calculate_burst_intensity(&self, pid: u32) -> f64 {
+        let count = self.category_counts.get(&pid).copied().unwrap_or(0);
+
+        // 버스트 = 최근 이벤트 비율
+        (count as f64) / 100.0  // 정규화: 100+개 = 1.0
+    }
+
+    // 평균 duration 계산 (정규화)
+    pub fn calculate_avg_duration_normalized(&self) -> f64 {
+        if self.durations.is_empty() {
+            return 0.0;
+        }
+
+        let sum: u64 = self.durations.iter().map(|d| *d as u64).sum();
+        let avg_ns = sum / self.durations.len() as u64;
+
+        // 정규화: 1000ns = 0.0, 100000ns = 1.0
+        ((avg_ns as f64 - 1000.0) / 99000.0).max(0.0).min(1.0)
+    }
+
+    // 타이밍 분산 계산
+    pub fn calculate_timing_variance(&self) -> f64 {
+        if self.durations.len() < 2 {
+            return 0.0;
+        }
+
+        let avg: f64 = self.durations.iter().map(|d| *d as f64).sum::<f64>()
+            / self.durations.len() as f64;
+
+        let variance: f64 = self.durations.iter()
+            .map(|d| {
+                let diff = (*d as f64) - avg;
+                diff * diff
+            })
+            .sum::<f64>() / self.durations.len() as f64;
+
+        let std_dev = variance.sqrt();
+
+        // 정규화: 낮은 분산 = 정상 (0.0), 높은 분산 = 이상 (1.0)
+        (std_dev / 100000.0).min(1.0)
+    }
+
+    // 통합 특성 벡터 생성
+    pub fn generate_features(&mut self, pid: u32, total_events: u32,
+                            error_count: u32) -> SyscallFeatureVector {
+        let mut features = SyscallFeatureVector::new();
+
+        // D0-D4: 카테고리 빈도 (단순화: 모두 균등)
+        features.file_io_rate = 0.2;
+        features.process_ctrl_rate = 0.2;
+        features.memory_manip_rate = 0.2;
+        features.network_rate = 0.2;
+        features.privilege_rate = 0.2;
+
+        // D5-D9: N-gram 이상치
+        let (bigram, trigram, fourgram) = self.ngram_extractor.calculate_ngram_anomaly();
+        features.bigram_anomaly = bigram;
+        features.trigram_anomaly = trigram;
+        features.fourgram_anomaly = fourgram;
+        features.sequence_entropy = self.ngram_extractor.calculate_entropy();
+        features.repetition_factor = self.ngram_extractor.calculate_repetition_factor();
+
+        // D10-D12: 타이밍
+        features.burst_intensity = self.calculate_burst_intensity(pid);
+        features.avg_duration_normalized = self.calculate_avg_duration_normalized();
+        features.timing_variance = self.calculate_timing_variance();
+
+        // D13-D15: 컨텍스트
+        features.privilege_level = 0.5;  // 기본값
+        features.high_risk_syscall_count =
+            self.category_counts.get(&pid).copied().unwrap_or(0) as f64 / 100.0;
+        features.return_error_rate =
+            (error_count as f64) / (total_events.max(1) as f64);
+
+        features.normalize();
+        features
+    }
+
+    // PID 상태 리셋
+    pub fn reset_pid(&mut self, pid: u32) {
+        self.category_counts.remove(&pid);
+        self.ngram_extractor.reset_pid(pid);
+    }
+
+    // 통계 조회
+    pub fn get_total_events(&self) -> u32 {
+        self.category_counts.values().sum()
+    }
+
+    pub fn get_pid_event_count(&self, pid: u32) -> u32 {
+        self.category_counts.get(&pid).copied().unwrap_or(0)
+    }
+}
+
+// ============================================
+// 4. 이상치 점수 계산 (종합)
+// ============================================
+
+pub fn calculate_anomaly_score(features: &SyscallFeatureVector) -> f64 {
+    let weights = [
+        0.15,  // file_io_rate
+        0.10,  // process_ctrl_rate
+        0.20,  // memory_manip_rate
+        0.15,  // network_rate
+        0.10,  // privilege_rate
+        0.15,  // bigram_anomaly
+        0.20,  // trigram_anomaly
+        0.25,  // fourgram_anomaly
+        0.15,  // sequence_entropy
+        0.18,  // repetition_factor
+        0.12,  // burst_intensity
+        0.10,  // avg_duration_normalized
+        0.18,  // timing_variance
+        0.20,  // privilege_level
+        0.25,  // high_risk_syscall_count
+        0.22,  // return_error_rate
+    ];
+
+    let values = features.as_vector();
+    let mut score = 0.0;
+
+    for (i, weight) in weights.iter().enumerate() {
+        if i < values.len() {
+            score += values[i] * weight;
+        }
+    }
+
+    (score / weights.len() as f64).min(1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bigram_extraction() {
+        let mut extractor = NgramExtractor::new();
+
+        extractor.add_syscall(1001, 5);   // ProcessExec (5)
+        extractor.add_syscall(1001, 3);   // FileOpen (3)
+        extractor.add_syscall(1001, 1);   // FileWrite (1)
+
+        assert_eq!(extractor.total_ngram_count(), 2);  // 2-gram, 3-gram
+    }
+
+    #[test]
+    fn test_ngram_anomaly_score() {
+        let mut extractor = NgramExtractor::new();
+
+        for _ in 0..10 {
+            extractor.add_syscall(1001, 5);
+            extractor.add_syscall(1001, 3);
+        }
+
+        let (bigram, _, _) = extractor.calculate_ngram_anomaly();
+        assert!(bigram >= 0.0 && bigram <= 1.0);
+    }
+
+    #[test]
+    fn test_entropy_calculation() {
+        let mut extractor = NgramExtractor::new();
+
+        // 균등 분포: 높은 엔트로피
+        for i in 0..4 {
+            for _ in 0..5 {
+                extractor.add_syscall(1001, (i + 1) as u8);
+            }
+        }
+
+        let entropy = extractor.calculate_entropy();
+        assert!(entropy > 0.5);  // 충분히 높은 엔트로피
+    }
+
+    #[test]
+    fn test_feature_vector_normalization() {
+        let mut features = SyscallFeatureVector::new();
+        features.file_io_rate = 2.5;  // > 1.0
+        features.memory_manip_rate = -0.5;  // < 0.0
+
+        features.normalize();
+
+        assert_eq!(features.file_io_rate, 1.0);
+        assert_eq!(features.memory_manip_rate, 0.0);
+    }
+
+    #[test]
+    fn test_behavioral_analyzer_event_tracking() {
+        let mut analyzer = BehavioralAnalyzer::new();
+
+        analyzer.add_event(1001, 5, 1000);  // ProcessExec, 1000ns
+        analyzer.add_event(1001, 3, 2000);  // FileOpen, 2000ns
+        analyzer.add_event(1001, 1, 1500);  // FileWrite, 1500ns
+
+        assert_eq!(analyzer.get_pid_event_count(1001), 3);
+        assert!(analyzer.calculate_burst_intensity(1001) > 0.0);
+    }
+
+    #[test]
+    fn test_anomaly_score_calculation() {
+        let mut features = SyscallFeatureVector::new();
+        features.memory_manip_rate = 0.85;
+        features.trigram_anomaly = 0.92;
+        features.high_risk_syscall_count = 0.78;
+        features.normalize();
+
+        let score = calculate_anomaly_score(&features);
+        assert!(score > 0.7);  // 높은 이상치 점수
+    }
+}

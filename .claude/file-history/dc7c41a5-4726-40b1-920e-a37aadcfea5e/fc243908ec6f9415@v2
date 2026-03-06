@@ -1,0 +1,326 @@
+// Green-Distributed-Fabric Phase 2: Workload Simulator
+// Purpose: Generate realistic power patterns for 6+ workload types
+// Strategy: Profile-based power generation with temporal variation
+
+// ============================================================================
+// Part 1: Workload Profile Definitions (200 lines)
+// ============================================================================
+
+pub enum WorkloadProfile {
+    IdleWait,           // 10mW (battery drain minimal)
+    ComputeHeavy,       // 200mW (CPU intensive, low memory)
+    IOIntensive,        // 150mW (Network/Disk, high latency)
+    MixedWorkload,      // 120mW (balanced CPU/IO/memory)
+    PeriodicBurst,      // 250mW → 10mW (spike then sleep)
+    InterruptStorm,     // 180mW (many context switches)
+    MemoryIntensive,    // 130mW (memory allocation, GC)
+    ThermalThrottle,    // 90mW (throttled due to heat)
+}
+
+pub struct PowerPattern {
+    pub profile: WorkloadProfile,
+    pub base_power_mw: f64,
+    pub peak_power_mw: f64,
+    pub variance: f64,           // 0.0-1.0, how much fluctuation
+    pub duration_ms: u32,        // How long this pattern runs
+    pub cpu_utilization: f64,    // 0.0-1.0
+    pub memory_usage_mb: u32,
+    pub io_operations_per_sec: u32,
+}
+
+impl PowerPattern {
+    pub fn new(profile: WorkloadProfile) -> Self {
+        let (base, peak, var, cpu, mem, io) = match profile {
+            WorkloadProfile::IdleWait => (10.0, 15.0, 0.1, 0.05, 512, 0),
+            WorkloadProfile::ComputeHeavy => (200.0, 250.0, 0.2, 0.95, 1024, 10),
+            WorkloadProfile::IOIntensive => (150.0, 180.0, 0.3, 0.50, 1536, 500),
+            WorkloadProfile::MixedWorkload => (120.0, 160.0, 0.25, 0.60, 1024, 100),
+            WorkloadProfile::PeriodicBurst => (250.0, 280.0, 0.4, 0.90, 2048, 50),
+            WorkloadProfile::InterruptStorm => (180.0, 220.0, 0.35, 0.70, 512, 1000),
+            WorkloadProfile::MemoryIntensive => (130.0, 170.0, 0.2, 0.40, 3072, 50),
+            WorkloadProfile::ThermalThrottle => (90.0, 120.0, 0.15, 0.30, 512, 20),
+        };
+
+        PowerPattern {
+            profile,
+            base_power_mw: base,
+            peak_power_mw: peak,
+            variance: var,
+            duration_ms: 10000,  // 10 seconds default
+            cpu_utilization: cpu,
+            memory_usage_mb: mem,
+            io_operations_per_sec: io,
+        }
+    }
+
+    pub fn set_duration(&mut self, ms: u32) {
+        self.duration_ms = ms;
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "{:?}: base={:.0}mW, peak={:.0}mW, cpu={:.0}%, mem={}MB, io={}/s",
+            self.profile, self.base_power_mw, self.peak_power_mw,
+            self.cpu_utilization * 100.0, self.memory_usage_mb, self.io_operations_per_sec
+        )
+    }
+}
+
+// ============================================================================
+// Part 2: Temporal Power Generator (250 lines)
+// ============================================================================
+
+pub struct PowerGenerator {
+    pub pattern: PowerPattern,
+    pub elapsed_ms: u32,
+    pub random_seed: u64,
+    pub timestamp_ms: u64,
+}
+
+impl PowerGenerator {
+    pub fn new(pattern: PowerPattern) -> Self {
+        PowerGenerator {
+            pattern,
+            elapsed_ms: 0,
+            random_seed: 12345,  // Pseudo-random seed
+            timestamp_ms: 0,
+        }
+    }
+
+    pub fn next_power_reading(&mut self) -> f64 {
+        if self.elapsed_ms >= self.pattern.duration_ms {
+            self.elapsed_ms = 0;  // Reset pattern
+        }
+
+        // Base power with temporal variation
+        let mut power = self.pattern.base_power_mw;
+
+        // Add sinusoidal variation (breathing pattern)
+        let phase = (self.elapsed_ms as f64) / (self.pattern.duration_ms as f64);
+        let breathing = (phase * std::f64::consts::PI * 2.0).sin() * 0.15;
+        power += breathing * self.pattern.peak_power_mw;
+
+        // Add periodic spikes (context switches, interrupts)
+        if self.pattern.io_operations_per_sec > 0 {
+            let spike_rate = (self.pattern.io_operations_per_sec as f64) / 1000.0;
+            if self.pseudo_random() < spike_rate {
+                power += self.pattern.peak_power_mw * 0.3;
+            }
+        }
+
+        // Add random noise
+        let noise = (self.pseudo_random() - 0.5) * self.pattern.variance * self.pattern.peak_power_mw;
+        power += noise;
+
+        // Clamp to valid range
+        power = power.max(self.pattern.base_power_mw * 0.5).min(self.pattern.peak_power_mw * 1.5);
+
+        self.elapsed_ms += 100;  // 100ms step
+        self.timestamp_ms += 100;
+        self.random_seed = self.random_seed.wrapping_mul(1103515245).wrapping_add(12345);
+
+        power
+    }
+
+    fn pseudo_random(&self) -> f64 {
+        ((self.random_seed >> 16) & 0x7fff) as f64 / 32767.0
+    }
+
+    pub fn get_cpu_utilization(&self) -> f64 {
+        let phase = (self.elapsed_ms as f64) / (self.pattern.duration_ms as f64);
+        let base = self.pattern.cpu_utilization;
+        let modulation = (phase * std::f64::consts::PI * 2.0).sin() * 0.2;
+        (base + modulation).max(0.0).min(1.0)
+    }
+
+    pub fn get_memory_usage(&self) -> u32 {
+        self.pattern.memory_usage_mb
+    }
+}
+
+// ============================================================================
+// Part 3: Workload Sequence & Multi-Pattern (200 lines)
+// ============================================================================
+
+pub struct WorkloadSequence {
+    pub patterns: Vec<PowerPattern>,
+    pub current_pattern_idx: usize,
+    pub generator: Option<PowerGenerator>,
+    pub pattern_history: Vec<(u32, f64)>,  // (timestamp_ms, power_mw)
+}
+
+impl WorkloadSequence {
+    pub fn new() -> Self {
+        WorkloadSequence {
+            patterns: Vec::new(),
+            current_pattern_idx: 0,
+            generator: None,
+            pattern_history: Vec::new(),
+        }
+    }
+
+    pub fn add_pattern(&mut self, pattern: PowerPattern) {
+        self.patterns.push(pattern);
+    }
+
+    pub fn start(&mut self) -> Result<(), String> {
+        if self.patterns.is_empty() {
+            return Err("No patterns defined".to_string());
+        }
+
+        let first_pattern = self.patterns[0].clone();
+        self.generator = Some(PowerGenerator::new(first_pattern));
+        Ok(())
+    }
+
+    pub fn next_reading(&mut self) -> Result<f64, String> {
+        if let Some(ref mut gen) = self.generator {
+            let power = gen.next_power_reading();
+            self.pattern_history.push((gen.elapsed_ms, power));
+
+            // Check if pattern finished
+            if gen.elapsed_ms >= gen.pattern.duration_ms {
+                self.advance_pattern()?;
+            }
+
+            Ok(power)
+        } else {
+            Err("Workload not started".to_string())
+        }
+    }
+
+    fn advance_pattern(&mut self) -> Result<(), String> {
+        self.current_pattern_idx += 1;
+        if self.current_pattern_idx >= self.patterns.len() {
+            return Err("All patterns completed".to_string());
+        }
+
+        let next_pattern = self.patterns[self.current_pattern_idx].clone();
+        self.generator = Some(PowerGenerator::new(next_pattern));
+        Ok(())
+    }
+
+    pub fn get_average_power(&self) -> f64 {
+        if self.pattern_history.is_empty() {
+            return 0.0;
+        }
+
+        let total: f64 = self.pattern_history.iter().map(|(_, p)| p).sum();
+        total / self.pattern_history.len() as f64
+    }
+
+    pub fn get_peak_power(&self) -> f64 {
+        self.pattern_history.iter()
+            .map(|(_, p)| *p)
+            .fold(0.0, f64::max)
+    }
+
+    pub fn completed(&self) -> bool {
+        self.current_pattern_idx >= self.patterns.len() &&
+        self.generator.is_none()
+    }
+}
+
+// Implement Clone for PowerPattern
+impl Clone for PowerPattern {
+    fn clone(&self) -> Self {
+        PowerPattern {
+            profile: match self.profile {
+                WorkloadProfile::IdleWait => WorkloadProfile::IdleWait,
+                WorkloadProfile::ComputeHeavy => WorkloadProfile::ComputeHeavy,
+                WorkloadProfile::IOIntensive => WorkloadProfile::IOIntensive,
+                WorkloadProfile::MixedWorkload => WorkloadProfile::MixedWorkload,
+                WorkloadProfile::PeriodicBurst => WorkloadProfile::PeriodicBurst,
+                WorkloadProfile::InterruptStorm => WorkloadProfile::InterruptStorm,
+                WorkloadProfile::MemoryIntensive => WorkloadProfile::MemoryIntensive,
+                WorkloadProfile::ThermalThrottle => WorkloadProfile::ThermalThrottle,
+            },
+            base_power_mw: self.base_power_mw,
+            peak_power_mw: self.peak_power_mw,
+            variance: self.variance,
+            duration_ms: self.duration_ms,
+            cpu_utilization: self.cpu_utilization,
+            memory_usage_mb: self.memory_usage_mb,
+            io_operations_per_sec: self.io_operations_per_sec,
+        }
+    }
+}
+
+impl Clone for WorkloadProfile {
+    fn clone(&self) -> Self {
+        match self {
+            WorkloadProfile::IdleWait => WorkloadProfile::IdleWait,
+            WorkloadProfile::ComputeHeavy => WorkloadProfile::ComputeHeavy,
+            WorkloadProfile::IOIntensive => WorkloadProfile::IOIntensive,
+            WorkloadProfile::MixedWorkload => WorkloadProfile::MixedWorkload,
+            WorkloadProfile::PeriodicBurst => WorkloadProfile::PeriodicBurst,
+            WorkloadProfile::InterruptStorm => WorkloadProfile::InterruptStorm,
+            WorkloadProfile::MemoryIntensive => WorkloadProfile::MemoryIntensive,
+            WorkloadProfile::ThermalThrottle => WorkloadProfile::ThermalThrottle,
+        }
+    }
+}
+
+// ============================================================================
+// Tests (50 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_power_pattern_creation() {
+        let pattern = PowerPattern::new(WorkloadProfile::ComputeHeavy);
+        assert!(pattern.base_power_mw > 0.0);
+        assert!(pattern.peak_power_mw > pattern.base_power_mw);
+    }
+
+    #[test]
+    fn test_power_generator() {
+        let pattern = PowerPattern::new(WorkloadProfile::IdleWait);
+        let mut gen = PowerGenerator::new(pattern);
+
+        let power1 = gen.next_power_reading();
+        assert!(power1 > 0.0 && power1 < 100.0);  // Idle range
+    }
+
+    #[test]
+    fn test_workload_sequence() {
+        let mut seq = WorkloadSequence::new();
+        seq.add_pattern(PowerPattern::new(WorkloadProfile::IdleWait));
+        seq.add_pattern(PowerPattern::new(WorkloadProfile::ComputeHeavy));
+
+        assert!(seq.start().is_ok());
+    }
+
+    #[test]
+    fn test_pattern_history() {
+        let pattern = PowerPattern::new(WorkloadProfile::ComputeHeavy);
+        let mut gen = PowerGenerator::new(pattern);
+
+        for _ in 0..10 {
+            let _ = gen.next_power_reading();
+        }
+
+        assert_eq!(gen.elapsed_ms, 1000);  // 10 steps × 100ms
+    }
+
+    #[test]
+    fn test_all_workload_profiles() {
+        let profiles = vec![
+            WorkloadProfile::IdleWait,
+            WorkloadProfile::ComputeHeavy,
+            WorkloadProfile::IOIntensive,
+            WorkloadProfile::MixedWorkload,
+            WorkloadProfile::PeriodicBurst,
+            WorkloadProfile::InterruptStorm,
+            WorkloadProfile::MemoryIntensive,
+            WorkloadProfile::ThermalThrottle,
+        ];
+
+        for profile in profiles {
+            let pattern = PowerPattern::new(profile);
+            assert!(pattern.base_power_mw > 0.0);
+        }
+    }
+}

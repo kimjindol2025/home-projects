@@ -1,0 +1,364 @@
+// Hypervisor Phase 1: Stage 2 MMU - Guest Memory Isolation (500줄)
+// L0 (FreeLang) → L1 (Linux Guest) 메모리 격리 완전 구현
+
+module hypervisor
+
+// ============ VTTBR (Virtual Translation Table Base Register) ============
+
+enum TranslationGranule {
+    FourKB,      // 4KB pages
+    SixteenKB,   // 16KB pages
+    SixtyFourKB, // 64KB pages
+}
+
+struct VTTBR {
+    base_address: u64,      // [51:12] VMID+T0SZ config
+    vmid: u16,              // Virtual Machine ID [63:48]
+    granule: TranslationGranule,
+    t0sz: u32,              // Translation Offset Size [5:0]
+    sl0: u32,               // Starting Level of Translation [7:6]
+    ps: u32,                // Physical Address Size [3:0]
+}
+
+impl VTTBR {
+    fn new(vmid: u16, base_addr: u64) -> VTTBR {
+        return VTTBR {
+            base_address: base_addr & 0xFFFFFFFFF000,  // [51:12] aligned
+            vmid: vmid & 0xFFFF,
+            granule: TranslationGranule::FourKB,
+            t0sz: 25,    // 39-bit guest VA (512GB)
+            sl0: 2,      // Start at L2 (3-level table)
+            ps: 4,       // 4KB page size
+        }
+    }
+
+    fn to_register_value(&self) -> u64 {
+        // Encode as ARM64 VTTBR_EL2 format
+        let mut value: u64 = 0
+
+        // [51:12] base address
+        value |= self.base_address & 0xFFFFFFFFF000
+
+        // [63:48] VMID
+        value |= ((self.vmid as u64) << 48) & 0xFFFF000000000000
+
+        // [5:0] T0SZ
+        value |= (self.t0sz as u64) & 0x3F
+
+        // [7:6] SL0
+        value |= ((self.sl0 as u64) << 6) & 0xC0
+
+        // [3:0] PS (Physical Address Size)
+        value |= (self.ps as u64) & 0x0F
+
+        return value
+    }
+
+    fn get_vmid(&self) -> u16 {
+        return self.vmid
+    }
+
+    fn get_base_address(&self) -> u64 {
+        return self.base_address
+    }
+
+    fn validate(&self) -> bool {
+        // VTTBR must be 4K aligned
+        if (self.base_address & 0xFFF) != 0 {
+            return false
+        }
+
+        // VMID must be valid (0-65535)
+        if self.vmid > 0xFFFF {
+            return false
+        }
+
+        // T0SZ must be valid (0-63)
+        if self.t0sz > 63 {
+            return false
+        }
+
+        return true
+    }
+}
+
+// ============ Stage 2 Page Table Entry (S2PTE) ============
+
+struct Stage2PTE {
+    value: u64,
+    is_valid: bool,
+    is_block: bool,     // Block or Table descriptor
+}
+
+impl Stage2PTE {
+    fn new() -> Stage2PTE {
+        return Stage2PTE {
+            value: 0,
+            is_valid: false,
+            is_block: false,
+        }
+    }
+
+    fn set_block_descriptor(&mut self, ipa: u64, pa: u64, writable: bool) -> bool {
+        // Create Block descriptor (maps 2MB)
+        // [51:21] Output Address
+        // [9] XN (Execute Never)
+        // [7] AP[1] (Writable)
+        // [2:0] Type (Block=001)
+
+        self.value = 0
+        self.value |= (pa & 0xFFFFFFFFE00000)  // [51:21] PA
+        self.value |= 0x1  // [2:0] = 001 (Block descriptor)
+
+        if writable {
+            self.value |= 0x80  // [7] AP[1] = 1 (writable)
+        } else {
+            self.value |= 0x00  // [7] AP[1] = 0 (read-only)
+        }
+
+        self.is_valid = true
+        self.is_block = true
+
+        return true
+    }
+
+    fn set_table_descriptor(&mut self, table_addr: u64) -> bool {
+        // Create Table descriptor (points to next level)
+        // [51:12] Table address
+        // [2:0] Type (Table=011)
+
+        self.value = 0
+        self.value |= (table_addr & 0xFFFFFFFFF000)  // [51:12]
+        self.value |= 0x3  // [2:0] = 011 (Table descriptor)
+
+        self.is_valid = true
+        self.is_block = false
+
+        return true
+    }
+
+    fn get_output_address(&self) -> u64 {
+        if self.is_block {
+            return self.value & 0xFFFFFFFFE00000  // Block: [51:21]
+        } else {
+            return self.value & 0xFFFFFFFFF000    // Table: [51:12]
+        }
+    }
+
+    fn is_writable(&self) -> bool {
+        return (self.value & 0x80) != 0
+    }
+
+    fn is_executable(&self) -> bool {
+        return (self.value & 0x200) == 0  // XN = 0
+    }
+}
+
+// ============ Stage 2 Page Table (3-level) ============
+
+struct Stage2PageTable {
+    level: u32,                              // 0, 1, or 2
+    entries: array[Stage2PTE; 512],         // 512 entries
+    table_address: u64,
+}
+
+impl Stage2PageTable {
+    fn new(lv: u32, addr: u64) -> Stage2PageTable {
+        let mut pt = Stage2PageTable {
+            level: lv,
+            entries: array[Stage2PTE; 512],
+            table_address: addr,
+        }
+
+        for i in 0..512 {
+            pt.entries[i] = Stage2PTE::new()
+        }
+
+        return pt
+    }
+
+    fn index_from_ipa(&self, ipa: u64) -> u32 {
+        // Extract 9-bit index based on level
+        let shift = match self.level {
+            2 => 21,  // L2: [30:21]
+            1 => 30,  // L1: [39:30]
+            0 => 39,  // L0: [47:39]
+            _ => 0,
+        }
+
+        return ((ipa >> shift) & 0x1FF) as u32
+    }
+
+    fn get_entry(&self, index: u32) -> Stage2PTE {
+        if index >= 512 {
+            return Stage2PTE::new()
+        }
+        return self.entries[index]
+    }
+
+    fn set_entry(&mut self, index: u32, entry: Stage2PTE) -> bool {
+        if index >= 512 {
+            return false
+        }
+        self.entries[index] = entry
+        return true
+    }
+
+    fn get_level(&self) -> u32 {
+        return self.level
+    }
+}
+
+// ============ Guest Virtual Address Translation ============
+
+struct GuestAddressSpace {
+    vmid: u16,
+    vttbr: VTTBR,
+    l0_table: Stage2PageTable,    // Root level
+    l1_tables: array[Stage2PageTable; 512],  // Up to 512 L1 tables
+    l2_tables: array[Stage2PageTable; 512],  // Up to 512 L2 tables
+    mappings: u32,
+}
+
+impl GuestAddressSpace {
+    fn new(vm_id: u16, base_addr: u64) -> GuestAddressSpace {
+        return GuestAddressSpace {
+            vmid: vm_id,
+            vttbr: VTTBR::new(vm_id, base_addr),
+            l0_table: Stage2PageTable::new(0, base_addr),
+            l1_tables: array[Stage2PageTable; 512],
+            l2_tables: array[Stage2PageTable; 512],
+            mappings: 0,
+        }
+    }
+
+    fn map_region(&mut self, guest_ipa_start: u64, host_pa_start: u64, size: u64, writable: bool) -> bool {
+        // Map guest IPA → host PA
+        // Each block maps 2MB
+
+        let block_size = 0x200000  // 2MB blocks
+        let num_blocks = (size + block_size - 1) / block_size
+
+        let mut guest_ipa = guest_ipa_start
+        let mut host_pa = host_pa_start
+
+        for _block in 0..num_blocks {
+            // Calculate indices
+            let l1_idx = ((guest_ipa >> 30) & 0x1FF) as u32
+            let l2_idx = ((guest_ipa >> 21) & 0x1FF) as u32
+
+            // Ensure L1 table exists
+            if !self.l1_tables[l1_idx].get_entry(0).is_valid {
+                self.l1_tables[l1_idx] = Stage2PageTable::new(1, 0x80000000 + ((l1_idx as u64) * 0x1000))
+            }
+
+            // Create L2 entry
+            let mut l2_entry = Stage2PTE::new()
+            l2_entry.set_block_descriptor(guest_ipa, host_pa, writable)
+
+            self.l2_tables[l2_idx].set_entry(l2_idx, l2_entry)
+
+            self.mappings += 1
+            guest_ipa += block_size
+            host_pa += block_size
+        }
+
+        return true
+    }
+
+    fn translate_ipa_to_pa(&self, guest_ipa: u64) -> u64 {
+        // Walk Stage 2 page table: IPA → PA
+        // L0 → L1 → L2 → PA
+
+        let l1_idx = ((guest_ipa >> 30) & 0x1FF) as u32
+        let l2_idx = ((guest_ipa >> 21) & 0x1FF) as u32
+
+        let l2_entry = self.l2_tables[l2_idx].get_entry(l2_idx)
+
+        if !l2_entry.is_valid {
+            return 0  // Translation fault
+        }
+
+        // Extract PA and add offset within 2MB block
+        let page_offset = guest_ipa & 0x1FFFFF
+        return l2_entry.get_output_address() + page_offset
+    }
+
+    fn get_mapping_count(&self) -> u32 {
+        return self.mappings
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Guest Address Space (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "VTTBR: 0x" + self.vttbr.to_register_value().to_string() + "\\n"
+        s = s + "Mappings: " + self.mappings.to_string() + "\\n"
+        s = s + "Max Size: 512GB (39-bit IPA)"
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_vttbr() -> bool {
+    let vttbr = VTTBR::new(1, 0x80000000)
+
+    if !vttbr.validate() {
+        return false
+    }
+
+    if vttbr.get_vmid() != 1 {
+        return false
+    }
+
+    let reg_val = vttbr.to_register_value()
+    if reg_val == 0 {
+        return false
+    }
+
+    return true
+}
+
+fn validate_stage2_pte() -> bool {
+    let mut pte = Stage2PTE::new()
+
+    pte.set_block_descriptor(0x80000000, 0x80000000, true)
+
+    if !pte.is_valid {
+        return false
+    }
+
+    if !pte.is_writable() {
+        return false
+    }
+
+    let pa = pte.get_output_address()
+    if pa != 0x80000000 {
+        return false
+    }
+
+    return true
+}
+
+fn validate_guest_address_space() -> bool {
+    let mut gas = GuestAddressSpace::new(1, 0x80000000)
+
+    // Map 512MB region: guest IPA 0x0 → host PA 0x80000000
+    let size = 512 * 1024 * 1024  // 512MB
+    if !gas.map_region(0x0, 0x80000000, size as u64, true) {
+        return false
+    }
+
+    if gas.get_mapping_count() < 100 {  // 512MB / 2MB = 256 blocks
+        return false
+    }
+
+    // Test translation
+    let pa = gas.translate_ipa_to_pa(0x100000)  // IPA 1MB
+    if pa == 0 {
+        return false
+    }
+
+    return true
+}
+

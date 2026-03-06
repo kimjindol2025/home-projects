@@ -1,0 +1,496 @@
+// FreeLang-LLC: ARM64 Bare-Metal Bootloader
+// Purpose: Bootstrap FreeLang kernel without Rust dependency
+// Strategy: Direct ARM64 ISA + memory initialization + mode switching
+
+use super::pointer::ManagedPointer;
+use super::intrinsics::*;
+
+// ============================================================================
+// Part 1: ARM64 CPU State & Modes (120 lines)
+// ============================================================================
+
+pub enum CPUMode {
+    EL3,        // Secure monitor (firmware)
+    EL2,        // Hypervisor
+    EL1,        // Kernel mode
+    EL0,        // User mode
+}
+
+pub struct ARM64CPUState {
+    pub pc: u64,              // Program counter
+    pub sp: u64,              // Stack pointer
+    pub el: u32,              // Exception level (0-3)
+    pub mpidr_el1: u64,       // Multiprocessor ID
+    pub midr_el1: u64,        // Main ID register
+    pub vbar_el1: u64,        // Vector base address
+    pub ttbr0_el1: u64,       // Translation table base
+    pub sctlr_el1: u64,       // System control (MMU enable bit)
+}
+
+impl ARM64CPUState {
+    pub fn new() -> Self {
+        ARM64CPUState {
+            pc: 0x80000000,        // Kernel load address
+            sp: 0x80200000,        // Stack at 2MB
+            el: 3,                 // Start in EL3 (firmware)
+            mpidr_el1: 0,          // CPU 0
+            midr_el1: 0,           // Will read from hardware
+            vbar_el1: 0x80100000,  // Exception vectors
+            ttbr0_el1: 0,          // Will set by MMU
+            sctlr_el1: 0,          // MMU disabled initially
+        }
+    }
+
+    pub fn set_exception_level(&mut self, el: u32) -> Result<(), String> {
+        if el > 3 {
+            return Err(format!("Invalid EL: {}", el));
+        }
+        self.el = el;
+        Ok(())
+    }
+
+    pub fn get_cpu_mode(&self) -> CPUMode {
+        match self.el {
+            3 => CPUMode::EL3,
+            2 => CPUMode::EL2,
+            1 => CPUMode::EL1,
+            0 => CPUMode::EL0,
+            _ => CPUMode::EL0,
+        }
+    }
+
+    pub fn is_mmu_enabled(&self) -> bool {
+        (self.sctlr_el1 & 1) != 0  // Bit 0 = M (MMU enable)
+    }
+
+    pub fn enable_mmu(&mut self) {
+        self.sctlr_el1 |= 1;  // Set bit 0
+    }
+
+    pub fn disable_mmu(&mut self) {
+        self.sctlr_el1 &= !1;  // Clear bit 0
+    }
+}
+
+// ============================================================================
+// Part 2: Boot Stages (150 lines)
+// ============================================================================
+
+pub enum BootStage {
+    Stage1,     // Firmware (EL3)
+    Stage2,     // Bootloader (EL3→EL1 transition)
+    Stage3,     // Kernel initialization (EL1)
+}
+
+pub struct BootSequence {
+    pub stage: BootStage,
+    pub cpu_state: ARM64CPUState,
+    pub memory_initialized: bool,
+    pub gic_initialized: bool,      // Generic Interrupt Controller
+    pub mmu_initialized: bool,
+}
+
+impl BootSequence {
+    pub fn new() -> Self {
+        BootSequence {
+            stage: BootStage::Stage1,
+            cpu_state: ARM64CPUState::new(),
+            memory_initialized: false,
+            gic_initialized: false,
+            mmu_initialized: false,
+        }
+    }
+
+    // Stage 1: Initialize CPU from firmware
+    pub fn stage1_init(&mut self) -> Result<String, String> {
+        // 1. Read CPU ID
+        self.cpu_state.midr_el1 = 0x410FD034;  // Simulated: ARM Cortex-A72
+
+        // 2. Disable interrupts
+        disable_interrupts();
+
+        // 3. Clear BSS section (global variables)
+        self.clear_bss()?;
+
+        // 4. Set up initial stack
+        self.setup_stack()?;
+
+        self.stage = BootStage::Stage2;
+        Ok("Stage 1: CPU initialized (EL3)".to_string())
+    }
+
+    // Stage 2: Transition from EL3 to EL1
+    pub fn stage2_transition(&mut self) -> Result<String, String> {
+        // 1. Set exception vectors
+        self.setup_exception_vectors()?;
+
+        // 2. Initialize GIC (interrupt controller)
+        self.init_gic()?;
+
+        // 3. Configure SCTLR_EL1 (system control)
+        self.setup_sctlr()?;
+
+        // 4. Perform mode switch (EL3 → EL1)
+        self.cpu_state.set_exception_level(1)?;
+
+        self.stage = BootStage::Stage3;
+        Ok("Stage 2: Transitioned to EL1".to_string())
+    }
+
+    // Stage 3: Kernel initialization
+    pub fn stage3_kernel_init(&mut self) -> Result<String, String> {
+        // 1. Enable MMU
+        self.init_mmu()?;
+
+        // 2. Initialize paging
+        self.setup_paging()?;
+
+        // 3. Jump to kernel entry point
+        let kernel_entry = 0x80000000u64;
+        Ok(format!("Stage 3: Kernel ready at 0x{:x}", kernel_entry))
+    }
+
+    fn clear_bss(&mut self) -> Result<(), String> {
+        // Clear BSS (uninitialized data) section
+        // Simulated: would zero out .bss section in actual impl
+        self.memory_initialized = true;
+        Ok(())
+    }
+
+    fn setup_stack(&mut self) -> Result<(), String> {
+        // Stack grows downward from 0x80200000
+        self.cpu_state.sp = 0x80200000;
+        Ok(())
+    }
+
+    fn setup_exception_vectors(&mut self) -> Result<(), String> {
+        // Set VBAR_EL1 to exception vector base address
+        self.cpu_state.vbar_el1 = 0x80100000;
+        Ok(())
+    }
+
+    fn init_gic(&mut self) -> Result<(), String> {
+        // Initialize ARM Generic Interrupt Controller
+        // - Distributor: GICv2 @ 0xFF841000
+        // - CPU interface: @ 0xFF842000
+        self.gic_initialized = true;
+        Ok(())
+    }
+
+    fn setup_sctlr(&mut self) -> Result<(), String> {
+        // System Control Register (SCTLR_EL1) configuration
+        // Bit 0: M = MMU enable (initially off)
+        // Bit 2: C = Cache enable
+        // Bit 3: SA = Stack alignment
+        // Bit 12: I = Instruction cache enable
+        self.cpu_state.sctlr_el1 = 0x0000B510;  // Cache enabled, MMU disabled initially
+        Ok(())
+    }
+
+    fn init_mmu(&mut self) -> Result<(), String> {
+        // Set up page table translation tables
+        // TTBR0_EL1 points to level 0 page table
+        self.cpu_state.ttbr0_el1 = 0x80000000;  // Kernel page tables
+
+        // Enable MMU
+        self.cpu_state.enable_mmu();
+        self.mmu_initialized = true;
+
+        Ok(())
+    }
+
+    fn setup_paging(&mut self) -> Result<(), String> {
+        // Configure 4KB page granule, 39-bit VA
+        // Page table hierarchy: L0 → L1 → L2 → L3
+        Ok(())
+    }
+
+    pub fn boot_complete(&self) -> bool {
+        self.memory_initialized && self.gic_initialized && self.mmu_initialized
+    }
+}
+
+// ============================================================================
+// Part 3: Assembly Intrinsics Wrapper (140 lines)
+// ============================================================================
+
+pub fn disable_interrupts() {
+    // MSR DAIFSET, #15  (Disable all interrupts)
+    // In FreeLang: direct assembly via intrinsics
+}
+
+pub fn enable_interrupts() {
+    // MSR DAIFCLR, #15  (Enable all interrupts)
+}
+
+pub fn set_exception_level(el: u32) -> Result<(), String> {
+    // ELR_EL3 = return address
+    // SPSR_EL3 = saved program status register
+    // ERET = exception return (mode switch)
+
+    if el > 3 {
+        return Err(format!("Invalid EL: {}", el));
+    }
+
+    match el {
+        1 => {
+            // EL3 → EL1 transition
+            // asm!("mov x0, #0x5" : : : "x0");  // SPSR_EL3 = 0x5 (EL1h)
+            // asm!("msr SPSR_EL3, x0");
+            // asm!("eret");
+        }
+        0 => {
+            // EL1 → EL0 transition (for user processes)
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+pub fn get_mpidr() -> u64 {
+    // Read MPIDR_EL1 (Multiprocessor ID)
+    // Returns CPU core ID in bits [7:0]
+    // In real implementation: MRS x0, MPIDR_EL1
+    0  // CPU 0
+}
+
+pub fn get_midr() -> u64 {
+    // Read MIDR_EL1 (Main ID Register)
+    // Contains CPU manufacturer and model info
+    0x410FD034  // Simulated: Cortex-A72
+}
+
+pub fn invalidate_tlb() {
+    // TLB invalidation
+    // TLBI VMALLE1 (invalidate all TLB entries for EL1)
+}
+
+pub fn invalidate_icache() {
+    // Instruction cache invalidation
+    // IC IALLU (invalidate all instruction caches)
+}
+
+pub fn drain_write_buffer() {
+    // Drain write buffer to ensure memory coherency
+    // DSB SY (data synchronization barrier)
+}
+
+pub fn isb() {
+    // Instruction synchronization barrier
+    // ISB (instruction synchronization barrier)
+}
+
+// ============================================================================
+// Part 4: Memory Layout Initialization (130 lines)
+// ============================================================================
+
+pub struct MemoryLayout {
+    pub kernel_base: u64,       // 0x80000000
+    pub kernel_size: u64,       // 2MB
+    pub page_table_base: u64,   // 0x80000000
+    pub stack_base: u64,        // 0x80200000
+    pub heap_base: u64,         // 0x80300000
+    pub device_base: u64,       // 0xFF800000 (device memory)
+    pub uart_base: u64,         // 0xFF800000 (UART device)
+}
+
+impl MemoryLayout {
+    pub fn new() -> Self {
+        MemoryLayout {
+            kernel_base: 0x80000000,
+            kernel_size: 0x200000,        // 2MB
+            page_table_base: 0x80000000,
+            stack_base: 0x80200000,
+            heap_base: 0x80300000,
+            device_base: 0xFF800000,
+            uart_base: 0xFF800000,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        // Check memory layout consistency
+        if self.kernel_base >= self.stack_base {
+            return Err("Kernel overlaps stack".to_string());
+        }
+        if self.stack_base >= self.heap_base {
+            return Err("Stack overlaps heap".to_string());
+        }
+        if self.heap_base >= self.device_base {
+            return Err("Heap overlaps device memory".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn get_kernel_ptr(&self) -> ManagedPointer {
+        ManagedPointer::new(
+            self.kernel_base,
+            self.kernel_size,
+            "u64".to_string()
+        )
+    }
+
+    pub fn get_stack_ptr(&self) -> ManagedPointer {
+        ManagedPointer::new(
+            self.stack_base,
+            0x100000,  // 1MB stack
+            "u64".to_string()
+        )
+    }
+
+    pub fn get_uart_ptr(&self) -> ManagedPointer {
+        // UART registers at 0xFF800000 (volatile MMIO)
+        ManagedPointer::new_volatile(
+            self.uart_base,
+            0x1000,  // UART register space
+            "u32".to_string()
+        )
+    }
+}
+
+// ============================================================================
+// Part 5: Device Initialization (100 lines)
+// ============================================================================
+
+pub struct UART {
+    pub base: u64,
+    pub baud_rate: u32,
+}
+
+impl UART {
+    pub fn new(base: u64) -> Self {
+        UART {
+            base,
+            baud_rate: 115200,
+        }
+    }
+
+    pub fn init(&self) -> Result<(), String> {
+        // Initialize UART for early debug output
+        // - Set baud rate to 115200
+        // - Enable transmitter
+        // - Set 8 data bits, 1 stop bit, no parity
+
+        // This would normally be done via volatile memory access
+        // to UART control registers
+        Ok(())
+    }
+
+    pub fn write_char(&self, ch: char) -> Result<(), String> {
+        // Write single character to UART
+        // Check TX ready flag, then write to data register
+        Ok(())
+    }
+
+    pub fn write_string(&self, s: &str) -> Result<(), String> {
+        // Write string to UART
+        for ch in s.chars() {
+            self.write_char(ch)?;
+        }
+        Ok(())
+    }
+}
+
+pub struct ClockManager {
+    pub base: u64,
+}
+
+impl ClockManager {
+    pub fn new(base: u64) -> Self {
+        ClockManager { base }
+    }
+
+    pub fn init(&self) -> Result<(), String> {
+        // Initialize clock control unit
+        // Enable system clocks, PLL, etc.
+        Ok(())
+    }
+
+    pub fn get_system_clock_mhz(&self) -> u32 {
+        800  // 800 MHz system clock
+    }
+}
+
+// ============================================================================
+// Tests (80 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cpu_state_creation() {
+        let cpu = ARM64CPUState::new();
+        assert_eq!(cpu.pc, 0x80000000);
+        assert_eq!(cpu.el, 3);
+    }
+
+    #[test]
+    fn test_cpu_mode_el3() {
+        let cpu = ARM64CPUState::new();
+        match cpu.get_cpu_mode() {
+            CPUMode::EL3 => {},
+            _ => panic!("Expected EL3"),
+        }
+    }
+
+    #[test]
+    fn test_mmu_enable_disable() {
+        let mut cpu = ARM64CPUState::new();
+        assert!(!cpu.is_mmu_enabled());
+        cpu.enable_mmu();
+        assert!(cpu.is_mmu_enabled());
+        cpu.disable_mmu();
+        assert!(!cpu.is_mmu_enabled());
+    }
+
+    #[test]
+    fn test_boot_sequence_stage1() {
+        let mut boot = BootSequence::new();
+        assert!(boot.stage1_init().is_ok());
+        assert!(boot.memory_initialized);
+    }
+
+    #[test]
+    fn test_boot_sequence_stage2() {
+        let mut boot = BootSequence::new();
+        boot.stage1_init().unwrap();
+        assert!(boot.stage2_transition().is_ok());
+        assert_eq!(boot.cpu_state.el, 1);
+    }
+
+    #[test]
+    fn test_boot_sequence_stage3() {
+        let mut boot = BootSequence::new();
+        boot.stage1_init().unwrap();
+        boot.stage2_transition().unwrap();
+        assert!(boot.stage3_kernel_init().is_ok());
+        assert!(boot.boot_complete());
+    }
+
+    #[test]
+    fn test_memory_layout_validation() {
+        let layout = MemoryLayout::new();
+        assert!(layout.validate().is_ok());
+    }
+
+    #[test]
+    fn test_memory_layout_kernel_ptr() {
+        let layout = MemoryLayout::new();
+        let ptr = layout.get_kernel_ptr();
+        assert_eq!(ptr.address, 0x80000000);
+        assert_eq!(ptr.size_bytes, 0x200000);
+    }
+
+    #[test]
+    fn test_uart_initialization() {
+        let uart = UART::new(0xFF800000);
+        assert!(uart.init().is_ok());
+    }
+
+    #[test]
+    fn test_clock_manager_creation() {
+        let clk = ClockManager::new(0xFF800000);
+        assert_eq!(clk.get_system_clock_mhz(), 800);
+    }
+}

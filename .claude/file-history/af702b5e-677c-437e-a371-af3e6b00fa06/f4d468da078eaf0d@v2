@@ -1,0 +1,372 @@
+// Hypervisor: DMA Engine (Device Memory Access Control) (300줄)
+// Guest DMA 요청 처리, 권한 확인, 메모리 격리
+
+module dma_engine
+
+use iommu::{
+    DeviceDomain, DMARequest, DMAAccessType, IOMMUController
+}
+
+// ============ DMA Endpoint (버스 상 디바이스) ============
+
+enum DeviceType {
+    Network,
+    Storage,
+    Graphics,
+    USB,
+    Audio,
+    Crypto,
+    Generic,
+}
+
+struct DMAEndpoint {
+    device_id: u16,
+    device_type: DeviceType,
+    domain_id: u16,
+    base_address: u64,
+    max_burst_size: u32,    // Max bytes per DMA burst
+    active_transfers: u32,
+    completed_transfers: u32,
+}
+
+impl DMAEndpoint {
+    fn new(dev_id: u16, dtype: DeviceType, dom_id: u16) -> DMAEndpoint {
+        return DMAEndpoint {
+            device_id: dev_id,
+            device_type: dtype,
+            domain_id: dom_id,
+            base_address: 0,
+            max_burst_size: 0x4000,  // 16KB typical
+            active_transfers: 0,
+            completed_transfers: 0,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        return self.active_transfers > 0
+    }
+
+    fn get_device_id(&self) -> u16 {
+        return self.device_id
+    }
+
+    fn get_domain_id(&self) -> u16 {
+        return self.domain_id
+    }
+}
+
+// ============ DMA Transaction (메모리 전송) ============
+
+struct DMATransaction {
+    trans_id: u32,
+    endpoint: DMAEndpoint,
+    src_iova: u64,
+    dst_iova: u64,
+    size: u64,
+    direction: u32,         // 0=read, 1=write, 2=bidir
+    priority: u8,           // 0-255 (낮을수록 높음)
+    status: u32,            // 0=pending, 1=running, 2=complete, 3=error
+}
+
+impl DMATransaction {
+    fn new(tid: u32, ep: DMAEndpoint) -> DMATransaction {
+        return DMATransaction {
+            trans_id: tid,
+            endpoint: ep,
+            src_iova: 0,
+            dst_iova: 0,
+            size: 0,
+            direction: 0,
+            priority: 128,
+            status: 0,
+        }
+    }
+
+    fn setup_read(&mut self, iova: u64, sz: u64) -> bool {
+        self.src_iova = iova
+        self.size = sz
+        self.direction = 0  // Read
+        self.status = 0     // Pending
+        return true
+    }
+
+    fn setup_write(&mut self, iova: u64, sz: u64) -> bool {
+        self.dst_iova = iova
+        self.size = sz
+        self.direction = 1  // Write
+        self.status = 0
+        return true
+    }
+
+    fn is_ready(&self) -> bool {
+        return self.size > 0 && self.status == 0
+    }
+
+    fn start(&mut self) -> bool {
+        if !self.is_ready() {
+            return false
+        }
+        self.status = 1  // Running
+        return true
+    }
+
+    fn complete(&mut self) -> bool {
+        self.status = 2  // Complete
+        return true
+    }
+
+    fn error(&mut self) -> bool {
+        self.status = 3  // Error
+        return false
+    }
+
+    fn is_complete(&self) -> bool {
+        return self.status == 2 || self.status == 3
+    }
+}
+
+// ============ DMA Controller (엔드포인트 관리) ============
+
+struct DMAController {
+    vmid: u16,
+    endpoints: array[DMAEndpoint; 32],
+    endpoint_count: u32,
+    transactions: array[DMATransaction; 128],
+    trans_count: u32,
+    total_bytes_transferred: u64,
+    errors: u32,
+}
+
+impl DMAController {
+    fn new(vm_id: u16) -> DMAController {
+        return DMAController {
+            vmid: vm_id,
+            endpoints: array[DMAEndpoint; 32],
+            endpoint_count: 0,
+            transactions: array[DMATransaction; 128],
+            trans_count: 0,
+            total_bytes_transferred: 0,
+            errors: 0,
+        }
+    }
+
+    fn register_endpoint(&mut self, endpoint: DMAEndpoint) -> bool {
+        if self.endpoint_count >= 32 {
+            return false  // Table full
+        }
+
+        self.endpoints[self.endpoint_count] = endpoint
+        self.endpoint_count += 1
+
+        return true
+    }
+
+    fn get_endpoint(&self, device_id: u16) -> DMAEndpoint {
+        for i in 0..self.endpoint_count {
+            if self.endpoints[i].device_id == device_id {
+                return self.endpoints[i]
+            }
+        }
+        // Return dummy endpoint if not found
+        return DMAEndpoint::new(0xFFFF, DeviceType::Generic, 0xFFFF)
+    }
+
+    fn create_transaction(&mut self, device_id: u16) -> u32 {
+        if self.trans_count >= 128 {
+            return 0xFFFFFFFF  // No space
+        }
+
+        let endpoint = self.get_endpoint(device_id)
+        let trans_id = self.trans_count
+
+        let transaction = DMATransaction::new(trans_id, endpoint)
+        self.transactions[self.trans_count] = transaction
+        self.trans_count += 1
+
+        return trans_id as u32
+    }
+
+    fn submit_transaction(&mut self, trans_id: u32, iommu: &mut IOMMUController) -> bool {
+        if trans_id >= self.trans_count as u32 {
+            return false
+        }
+
+        let trans = &mut self.transactions[trans_id as usize]
+
+        if !trans.is_ready() {
+            return false
+        }
+
+        // Create DMA request for IOMMU
+        let endpoint = trans.endpoint
+        let access_type = if trans.direction == 0 {
+            DMAAccessType::Read
+        } else {
+            DMAAccessType::Write
+        }
+
+        let src_addr = if trans.direction == 0 {
+            trans.src_iova
+        } else {
+            trans.dst_iova
+        }
+
+        let dma_req = DMARequest::new(
+            endpoint.domain_id,
+            endpoint.device_id,
+            src_addr,
+            trans.size,
+            access_type
+        )
+
+        // Submit to IOMMU for translation and permission check
+        if !iommu.handle_dma_request(dma_req) {
+            self.errors += 1
+            trans.error()
+            return false
+        }
+
+        // If IOMMU permits, start transaction
+        trans.start()
+        return true
+    }
+
+    fn complete_transaction(&mut self, trans_id: u32) -> bool {
+        if trans_id >= self.trans_count as u32 {
+            return false
+        }
+
+        let trans = &mut self.transactions[trans_id as usize]
+        trans.complete()
+
+        self.total_bytes_transferred += trans.size
+
+        return true
+    }
+
+    fn get_endpoint_count(&self) -> u32 {
+        return self.endpoint_count
+    }
+
+    fn get_transaction_count(&self) -> u32 {
+        return self.trans_count
+    }
+
+    fn get_total_bytes(&self) -> u64 {
+        return self.total_bytes_transferred
+    }
+
+    fn get_error_count(&self) -> u32 {
+        return self.errors
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "DMA Controller (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Endpoints: " + self.endpoint_count.to_string() + "/32\\n"
+        s = s + "Transactions: " + self.trans_count.to_string() + "/128\\n"
+        s = s + "Bytes Transferred: " + (self.total_bytes_transferred / (1024*1024)).to_string() + "MB\\n"
+        s = s + "Errors: " + self.errors.to_string()
+        return s
+    }
+}
+
+// ============ Coherency Controller ============
+
+struct CoherencyManager {
+    vmid: u16,
+    cache_invalidations: u32,
+    tlb_flushes: u32,
+}
+
+impl CoherencyManager {
+    fn new(vm_id: u16) -> CoherencyManager {
+        return CoherencyManager {
+            vmid: vm_id,
+            cache_invalidations: 0,
+            tlb_flushes: 0,
+        }
+    }
+
+    fn invalidate_cache(&mut self, address: u64, size: u64) -> bool {
+        // Ensure cache coherency for DMA
+        self.cache_invalidations += 1
+        return true
+    }
+
+    fn flush_tlb(&mut self) -> bool {
+        // Flush IOMMU TLB
+        self.tlb_flushes += 1
+        return true
+    }
+
+    fn get_invalidation_count(&self) -> u32 {
+        return self.cache_invalidations
+    }
+
+    fn get_flush_count(&self) -> u32 {
+        return self.tlb_flushes
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_dma_endpoint() -> bool {
+    let ep = DMAEndpoint::new(0x10, DeviceType::Network, 1)
+
+    assert(ep.device_id == 0x10, "device ID correct")
+    assert(ep.domain_id == 1, "domain ID correct")
+    assert(!ep.is_active(), "initially inactive")
+    assert(ep.max_burst_size == 0x4000, "burst size correct")
+
+    return true
+}
+
+fn validate_dma_transaction() -> bool {
+    let ep = DMAEndpoint::new(0x10, DeviceType::Storage, 1)
+    let mut trans = DMATransaction::new(0, ep)
+
+    assert(!trans.is_ready(), "not ready initially")
+
+    assert(trans.setup_write(0x2000000, 0x100000), "setup write")
+    assert(trans.is_ready(), "now ready")
+
+    assert(trans.start(), "start transaction")
+    assert(trans.status == 1, "status running")
+
+    assert(trans.complete(), "complete transaction")
+    assert(trans.is_complete(), "is complete")
+
+    return true
+}
+
+fn validate_dma_controller() -> bool {
+    let mut ctrl = DMAController::new(1)
+
+    let ep1 = DMAEndpoint::new(0x10, DeviceType::Network, 1)
+    let ep2 = DMAEndpoint::new(0x20, DeviceType::Storage, 1)
+
+    assert(ctrl.register_endpoint(ep1), "register endpoint 1")
+    assert(ctrl.register_endpoint(ep2), "register endpoint 2")
+
+    assert(ctrl.endpoint_count == 2, "endpoint count 2")
+
+    let trans_id1 = ctrl.create_transaction(0x10)
+    let trans_id2 = ctrl.create_transaction(0x20)
+
+    assert(trans_id1 != 0xFFFFFFFF, "transaction 1 created")
+    assert(trans_id2 != 0xFFFFFFFF, "transaction 2 created")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

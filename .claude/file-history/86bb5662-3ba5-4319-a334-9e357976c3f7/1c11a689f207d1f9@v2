@@ -1,0 +1,611 @@
+/* ============================================================================
+   TTF Font Parser - Phase 1
+
+   목적: TTF 바이너리 파일을 Bezier 곡선으로 변환
+   크기: ~300줄
+   성능: 256 glyph 로드 < 100ms, 버퍼 오버플로우 = 0
+============================================================================ */
+
+// ============================================================================
+// 1. TTF 기본 구조
+// ============================================================================
+
+pub struct TTFHeader {
+    pub version: u32,               // 0x00010000 (normal) 또는 0x4F54544F ('OTTO', CFF)
+    pub num_tables: u16,            // 폰트 테이블 수
+    pub search_range: u16,          // (max power of 2 ≤ numTables) × 16
+    pub entry_selector: u16,        // log₂(max power of 2 ≤ numTables)
+    pub range_shift: u16,           // numTables × 16 - searchRange
+}
+
+pub struct TableRecord {
+    pub tag: [u8; 4],              // 테이블 태그 (예: 'glyf', 'head', 'hhea')
+    pub checksum: u32,             // 테이블 체크섬
+    pub offset: u32,               // 파일에서의 오프셋
+    pub length: u32,               // 테이블 크기 (바이트)
+}
+
+// ============================================================================
+// 2. 'head' 테이블 (폰트 메타데이터)
+// ============================================================================
+
+pub struct HeadTable {
+    pub version: u32,              // 0x00010000
+    pub font_revision: u32,        // 폰트 리비전
+    pub checksum_adjustment: u32,  // 전체 체크섬 조정값
+    pub magic_number: u32,         // 0x5F0F3CF5 (검증용)
+    pub flags: u16,
+    pub units_per_em: u16,         // 일반적으로 1000 또는 2048
+    pub created: u64,              // 생성 날짜 (Unix 타임)
+    pub modified: u64,             // 수정 날짜
+    pub x_min: i16,                // 폰트 경계상자
+    pub y_min: i16,
+    pub x_max: i16,
+    pub y_max: i16,
+    pub mac_style: u16,
+    pub lowest_rec_ppem: u16,      // 최소 렌더링 크기
+}
+
+// ============================================================================
+// 3. 'maxp' 테이블 (글자 수 등)
+// ============================================================================
+
+pub struct MaxpTable {
+    pub version: u32,              // 0x00010000
+    pub num_glyphs: u16,           // 전체 글자 수
+    pub max_points: u16,           // 가장 많은 점을 가진 글자의 점 수
+    pub max_contours: u16,         // 가장 많은 윤곽의 윤곽 수
+    pub max_composite_points: u16, // 복합 글자의 최대 점 수
+    pub max_composite_contours: u16, // 복합 글자의 최대 윤곽 수
+}
+
+// ============================================================================
+// 4. 'glyf' 테이블 (글자 데이터)
+// ============================================================================
+
+pub enum GlyphComponent {
+    Simple(SimpleGlyph),            // 단순 글자
+    Composite(CompositeGlyph),      // 복합 글자 (다른 글자 조합)
+}
+
+pub struct SimpleGlyph {
+    pub num_contours: i16,         // 윤곽 수 (>0: simple, <0: composite)
+    pub x_min: i16,                // 경계상자
+    pub y_min: i16,
+    pub x_max: i16,
+    pub y_max: i16,
+    pub end_pts_of_contours: Vec<u16>, // 각 윤곽의 마지막 점 인덱스
+    pub instructions: Vec<u8>,     // TrueType 프로그램 (무시 가능)
+    pub flags: Vec<u8>,            // 각 점의 플래그
+    pub x_coordinates: Vec<i16>,   // X 좌표 (상대값)
+    pub y_coordinates: Vec<i16>,   // Y 좌표 (상대값)
+}
+
+pub struct CompositeGlyph {
+    pub num_contours: i16,         // 항상 -1
+    pub x_min: i16,
+    pub y_min: i16,
+    pub x_max: i16,
+    pub y_max: i16,
+    pub components: Vec<Component>, // 조합된 글자들
+}
+
+pub struct Component {
+    pub glyph_index: u16,          // 참조할 글자 인덱스
+    pub arg1: i16,                 // X offset 또는 match point
+    pub arg2: i16,                 // Y offset 또는 match point
+    pub flags: u16,                // 변환 플래그
+    pub scale_x: f32,              // 스케일 (있으면)
+    pub scale_y: f32,
+    pub xy_scale: f32,             // 2x2 행렬 (있으면)
+}
+
+// ============================================================================
+// 5. Quadratic Bezier 곡선 (TrueType 표준)
+// ============================================================================
+
+pub struct Vector2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Vector2 {
+    pub fn new(x: f32, y: f32) -> Self {
+        Vector2 { x, y }
+    }
+
+    pub fn sub(&self, other: &Vector2) -> Vector2 {
+        Vector2 {
+            x: self.x - other.x,
+            y: self.y - other.y,
+        }
+    }
+}
+
+pub struct QuadraticBezier {
+    pub p0: Vector2,               // 시작점 (anchor)
+    pub p1: Vector2,               // 제어점 (off-curve)
+    pub p2: Vector2,               // 끝점 (anchor)
+}
+
+// ============================================================================
+// 6. TTF 파서 상태
+// ============================================================================
+
+pub struct TTFParser {
+    pub data: Vec<u8>,             // 파일 데이터
+    pub header: Option<TTFHeader>,
+    pub table_records: Vec<TableRecord>,
+    pub num_glyphs: u16,
+    pub units_per_em: u16,
+    pub glyf_offset: u32,
+    pub loca_offset: u32,
+}
+
+impl TTFParser {
+    pub fn new(data: Vec<u8>) -> Self {
+        TTFParser {
+            data: data,
+            header: None,
+            table_records: Vec::new(),
+            num_glyphs: 0,
+            units_per_em: 1000,
+            glyf_offset: 0,
+            loca_offset: 0,
+        }
+    }
+
+    // ========================================================================
+    // 7. 핵심 파싱 함수
+    // ========================================================================
+
+    // 읽기 헬퍼 함수
+    pub fn read_u8(&self, offset: usize) -> Option<u8> {
+        if offset < self.data.len() {
+            Some(self.data[offset])
+        } else {
+            None
+        }
+    }
+
+    pub fn read_u16(&self, offset: usize) -> Option<u16> {
+        if offset + 1 < self.data.len() {
+            let val = ((self.data[offset] as u16) << 8) | (self.data[offset + 1] as u16);
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    pub fn read_u32(&self, offset: usize) -> Option<u32> {
+        if offset + 3 < self.data.len() {
+            let val = ((self.data[offset] as u32) << 24) |
+                      ((self.data[offset + 1] as u32) << 16) |
+                      ((self.data[offset + 2] as u32) << 8) |
+                      (self.data[offset + 3] as u32);
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    pub fn read_i16(&self, offset: usize) -> Option<i16> {
+        self.read_u16(offset).map(|v| v as i16)
+    }
+
+    // TTF 헤더 파싱
+    pub fn parse_header(&mut self) -> bool {
+        // 오프셋 0: TTF 헤더 (12 bytes)
+        if let Some(version) = self.read_u32(0) {
+            // Magic number 검증
+            if version != 0x00010000 && version != 0x4F54544F {
+                // 'OTTO' (CFF) 또는 0x00010000 (TrueType)
+                return false;
+            }
+
+            if let (Some(num_tables), Some(search_range), Some(entry_sel), Some(range_shift)) =
+                (self.read_u16(4), self.read_u16(6), self.read_u16(8), self.read_u16(10)) {
+                self.header = Some(TTFHeader {
+                    version: version,
+                    num_tables: num_tables,
+                    search_range: search_range,
+                    entry_selector: entry_sel,
+                    range_shift: range_shift,
+                });
+                return true;
+            }
+        }
+
+        false
+    }
+
+    // 테이블 레코드 읽기
+    pub fn parse_table_directory(&mut self) -> bool {
+        if let Some(header) = &self.header {
+            for i in 0..header.num_tables as usize {
+                let offset = 12 + i * 16;
+
+                // 테이블 태그 (4 bytes)
+                let mut tag = [0u8; 4];
+                for j in 0..4 {
+                    if let Some(b) = self.read_u8(offset + j) {
+                        tag[j] = b;
+                    } else {
+                        return false;
+                    }
+                }
+
+                // 체크섬, 오프셋, 길이
+                if let (Some(checksum), Some(tbl_offset), Some(length)) = (
+                    self.read_u32(offset + 4),
+                    self.read_u32(offset + 8),
+                    self.read_u32(offset + 12),
+                ) {
+                    let record = TableRecord {
+                        tag: tag,
+                        checksum: checksum,
+                        offset: tbl_offset,
+                        length: length,
+                    };
+
+                    self.table_records.push(record);
+
+                    // 테이블 태그 분석
+                    if tag == *b"glyf" {
+                        self.glyf_offset = tbl_offset;
+                    } else if tag == *b"loca" {
+                        self.loca_offset = tbl_offset;
+                    }
+                } else {
+                    return false;
+                }
+            }
+
+            true
+        } else {
+            false
+        }
+    }
+
+    // 'head' 테이블에서 메타데이터 읽기
+    pub fn parse_head_table(&mut self) -> bool {
+        // 'head' 테이블 찾기
+        for record in &self.table_records {
+            if record.tag == *b"head" {
+                let offset = record.offset as usize;
+
+                // head 테이블은 이후 처리 (여기서는 units_per_em만 필요)
+                if let Some(units) = self.read_u16(offset + 18) {
+                    self.units_per_em = units;
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    // 'maxp' 테이블에서 glyph 수 읽기
+    pub fn parse_maxp_table(&mut self) -> bool {
+        for record in &self.table_records {
+            if record.tag == *b"maxp" {
+                let offset = record.offset as usize;
+
+                if let Some(num_glyphs) = self.read_u16(offset + 4) {
+                    self.num_glyphs = num_glyphs;
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    // ========================================================================
+    // 8. 글자 데이터 추출
+    // ========================================================================
+
+    // glyph 오프셋 계산 ('loca' 테이블 사용)
+    pub fn get_glyph_offset(&self, glyph_index: u16) -> Option<u32> {
+        if glyph_index >= self.num_glyphs {
+            return None;
+        }
+
+        let offset = self.loca_offset as usize + (glyph_index as usize) * 4;
+
+        // loca 테이블: 각 glyph의 오프셋 (32-bit)
+        self.read_u32(offset)
+    }
+
+    // Simple glyph 파싱
+    pub fn parse_simple_glyph(&self, glyph_offset: u32) -> Option<SimpleGlyph> {
+        let offset = glyph_offset as usize;
+
+        // Glyph 헤더 (10 bytes)
+        let num_contours = self.read_i16(offset)?;
+        let x_min = self.read_i16(offset + 2)?;
+        let y_min = self.read_i16(offset + 4)?;
+        let x_max = self.read_i16(offset + 6)?;
+        let y_max = self.read_i16(offset + 8)?;
+
+        if num_contours <= 0 {
+            return None;  // Composite 또는 empty
+        }
+
+        let mut end_pts = Vec::new();
+        let mut offset_pos = offset + 10;
+
+        // End points 배열
+        for _ in 0..num_contours as usize {
+            if let Some(end_pt) = self.read_u16(offset_pos) {
+                end_pts.push(end_pt);
+                offset_pos += 2;
+            } else {
+                return None;
+            }
+        }
+
+        // instruction 길이
+        let instr_len = self.read_u16(offset_pos)? as usize;
+        offset_pos += 2;
+
+        // instructions 스킵 (TrueType 프로그램, 무시)
+        offset_pos += instr_len;
+
+        // 총 점 수
+        let num_points = if let Some(&last_pt) = end_pts.last() {
+            last_pt as usize + 1
+        } else {
+            0
+        };
+
+        // 플래그 배열
+        let mut flags = Vec::new();
+        for _ in 0..num_points {
+            if let Some(flag) = self.read_u8(offset_pos) {
+                flags.push(flag);
+                offset_pos += 1;
+
+                // 플래그 비트 3: repeat count
+                if (flag & 0x08) != 0 {
+                    if let Some(repeat_count) = self.read_u8(offset_pos) {
+                        for _ in 0..repeat_count {
+                            flags.push(flag);
+                        }
+                        offset_pos += 1;
+                    }
+                }
+            } else {
+                return None;
+            }
+        }
+
+        // X 좌표 (상대값)
+        let mut x_coords = Vec::new();
+        for &flag in &flags {
+            let x_byte_size = if (flag & 0x02) != 0 { 1 } else { 2 };
+            let x_same = (flag & 0x10) != 0;
+
+            let x = if x_byte_size == 1 {
+                let b = self.read_u8(offset_pos)?;
+                offset_pos += 1;
+                if x_same { b as i16 } else { -(b as i16) }
+            } else {
+                let val = self.read_i16(offset_pos)?;
+                offset_pos += 2;
+                val
+            };
+
+            x_coords.push(x);
+        }
+
+        // Y 좌표 (상대값)
+        let mut y_coords = Vec::new();
+        for &flag in &flags {
+            let y_byte_size = if (flag & 0x04) != 0 { 1 } else { 2 };
+            let y_same = (flag & 0x20) != 0;
+
+            let y = if y_byte_size == 1 {
+                let b = self.read_u8(offset_pos)?;
+                offset_pos += 1;
+                if y_same { b as i16 } else { -(b as i16) }
+            } else {
+                let val = self.read_i16(offset_pos)?;
+                offset_pos += 2;
+                val
+            };
+
+            y_coords.push(y);
+        }
+
+        Some(SimpleGlyph {
+            num_contours: num_contours,
+            x_min: x_min,
+            y_min: y_min,
+            x_max: x_max,
+            y_max: y_max,
+            end_pts_of_contours: end_pts,
+            instructions: Vec::new(),
+            flags: flags,
+            x_coordinates: x_coords,
+            y_coordinates: y_coords,
+        })
+    }
+
+    // ========================================================================
+    // 9. Quadratic Bezier 곡선 재구성
+    // ========================================================================
+
+    pub fn extract_bezier_curves(&self, simple_glyph: &SimpleGlyph) -> Vec<QuadraticBezier> {
+        let mut curves = Vec::new();
+
+        // 상대 좌표를 절대 좌표로 변환
+        let mut abs_x = Vec::new();
+        let mut abs_y = Vec::new();
+
+        let mut x_sum = 0i32;
+        let mut y_sum = 0i32;
+
+        for (i, &flag) in simple_glyph.flags.iter().enumerate() {
+            x_sum += simple_glyph.x_coordinates[i] as i32;
+            y_sum += simple_glyph.y_coordinates[i] as i32;
+
+            abs_x.push(x_sum as f32 / self.units_per_em as f32);
+            abs_y.push(y_sum as f32 / self.units_per_em as f32);
+        }
+
+        // 윤곽선별 처리
+        let mut prev_contour_end = 0;
+
+        for &contour_end in &simple_glyph.end_pts_of_contours {
+            let contour_end = contour_end as usize;
+
+            // 이 윤곽의 점들
+            for pt_idx in prev_contour_end..=contour_end {
+                let curr_flag = simple_glyph.flags[pt_idx];
+                let is_on_curve = (curr_flag & 0x01) != 0;
+
+                if is_on_curve {
+                    // On-curve: anchor point
+                    let p0 = Vector2::new(abs_x[pt_idx], abs_y[pt_idx]);
+
+                    // 다음 점 (wrap around)
+                    let next_idx = if pt_idx == contour_end {
+                        prev_contour_end
+                    } else {
+                        pt_idx + 1
+                    };
+                    let next_flag = simple_glyph.flags[next_idx];
+                    let next_on_curve = (next_flag & 0x01) != 0;
+
+                    if next_on_curve {
+                        // 다음도 on-curve: 직선
+                        // (Bezier 생성 안 함, 직선으로 처리)
+                    } else {
+                        // 다음이 off-curve (제어점)
+                        let p1 = Vector2::new(abs_x[next_idx], abs_y[next_idx]);
+
+                        // 그 다음 점
+                        let next_next_idx = if next_idx == contour_end {
+                            prev_contour_end
+                        } else {
+                            next_idx + 1
+                        };
+                        let next_next_flag = simple_glyph.flags[next_next_idx];
+                        let next_next_on_curve = (next_next_flag & 0x01) != 0;
+
+                        let p2 = if next_next_on_curve {
+                            // Quadratic Bezier: P0 (on) -> P1 (off) -> P2 (on)
+                            Vector2::new(abs_x[next_next_idx], abs_y[next_next_idx])
+                        } else {
+                            // P1과 next_next_next의 중점 (implicit on-curve point)
+                            let next_next_next_idx = if next_next_idx == contour_end {
+                                prev_contour_end
+                            } else {
+                                next_next_idx + 1
+                            };
+                            Vector2::new(
+                                (abs_x[next_idx] + abs_x[next_next_idx]) / 2.0,
+                                (abs_y[next_idx] + abs_y[next_next_idx]) / 2.0,
+                            )
+                        };
+
+                        curves.push(QuadraticBezier {
+                            p0: p0,
+                            p1: p1,
+                            p2: p2,
+                        });
+                    }
+                }
+            }
+
+            prev_contour_end = contour_end + 1;
+        }
+
+        curves
+    }
+
+    // ========================================================================
+    // 10. 검증 함수
+    // ========================================================================
+
+    pub fn validate(&self) -> bool {
+        // TTF 헤더 검증
+        if let Some(header) = &self.header {
+            if header.version != 0x00010000 && header.version != 0x4F54544F {
+                return false;
+            }
+
+            if header.num_tables == 0 || header.num_tables > 1000 {
+                return false;  // 비정상적인 테이블 수
+            }
+        } else {
+            return false;
+        }
+
+        // glyph 수 검증
+        if self.num_glyphs == 0 || self.num_glyphs > 65535 {
+            return false;
+        }
+
+        // 필수 테이블 확인
+        let mut has_glyf = false;
+        let mut has_loca = false;
+        let mut has_head = false;
+        let mut has_maxp = false;
+
+        for record in &self.table_records {
+            if record.tag == *b"glyf" { has_glyf = true; }
+            if record.tag == *b"loca" { has_loca = true; }
+            if record.tag == *b"head" { has_head = true; }
+            if record.tag == *b"maxp" { has_maxp = true; }
+        }
+
+        has_glyf && has_loca && has_head && has_maxp
+    }
+}
+
+// ============================================================================
+// 11. 고수준 파싱 함수
+// ============================================================================
+
+pub fn parse_ttf_file(data: Vec<u8>) -> Option<(TTFParser, Vec<Vec<QuadraticBezier>>)> {
+    let mut parser = TTFParser::new(data);
+
+    // 1. 헤더 파싱
+    if !parser.parse_header() {
+        return None;
+    }
+
+    // 2. 테이블 디렉토리 파싱
+    if !parser.parse_table_directory() {
+        return None;
+    }
+
+    // 3. 메타데이터 읽기
+    let _ = parser.parse_head_table();
+    let _ = parser.parse_maxp_table();
+
+    // 4. 검증
+    if !parser.validate() {
+        return None;
+    }
+
+    // 5. 모든 glyph 파싱
+    let mut all_curves = Vec::new();
+
+    for glyph_idx in 0..parser.num_glyphs {
+        if let Some(glyph_offset) = parser.get_glyph_offset(glyph_idx) {
+            if let Some(simple_glyph) = parser.parse_simple_glyph(glyph_offset) {
+                let curves = parser.extract_bezier_curves(&simple_glyph);
+                all_curves.push(curves);
+            } else {
+                all_curves.push(Vec::new());  // Composite 또는 empty glyph
+            }
+        } else {
+            all_curves.push(Vec::new());
+        }
+    }
+
+    Some((parser, all_curves))
+}

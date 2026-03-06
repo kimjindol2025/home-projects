@@ -1,0 +1,390 @@
+/* ============================================================================
+   Text Layout Engine: Kerning, Shaping, Unicode - Phase 4
+
+   목적: 고급 텍스트 레이아웃 (kerning, ligatures, BiDi)
+   크기: ~300줄
+   성능: < 100µs per 100 characters
+============================================================================ */
+
+// ============================================================================
+// 1. Unicode 지원
+// ============================================================================
+
+pub struct UnicodeChar {
+    pub codepoint: u32,          // Unicode 코드 포인트
+    pub width: u8,               // 문자 너비 (1=ASCII, 2=CJK)
+    pub category: UnicodeCategory,
+    pub combining: bool,         // 결합 문자 여부
+}
+
+pub enum UnicodeCategory {
+    Lu,  // Letter, Uppercase
+    Ll,  // Letter, Lowercase
+    Lo,  // Letter, Other
+    Nd,  // Number, Decimal Digit
+    Pc,  // Punctuation, Connector
+    Po,  // Punctuation, Other
+    Zs,  // Separator, Space
+    Cf,  // Other, Format
+}
+
+impl UnicodeChar {
+    pub fn from_codepoint(cp: u32) -> Self {
+        let category = match cp {
+            0x41..=0x5A => UnicodeCategory::Lu,      // A-Z
+            0x61..=0x7A => UnicodeCategory::Ll,      // a-z
+            0x30..=0x39 => UnicodeCategory::Nd,      // 0-9
+            0x20 => UnicodeCategory::Zs,              // Space
+            0x2E | 0x2C => UnicodeCategory::Po,      // . ,
+            _ => UnicodeCategory::Lo,
+        };
+
+        // CJK 범위 검사 (간단한 휴리스틱)
+        let width = if (cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK Unified Ideographs
+                      (cp >= 0x3040 && cp <= 0x309F) ||  // Hiragana
+                      (cp >= 0x30A0 && cp <= 0x30FF) {   // Katakana
+            2
+        } else {
+            1
+        };
+
+        UnicodeChar {
+            codepoint: cp,
+            width,
+            category,
+            combining: false,
+        }
+    }
+
+    pub fn is_whitespace(&self) -> bool {
+        matches!(self.category, UnicodeCategory::Zs)
+    }
+
+    pub fn is_punctuation(&self) -> bool {
+        matches!(self.category, UnicodeCategory::Pc | UnicodeCategory::Po)
+    }
+
+    pub fn is_letter(&self) -> bool {
+        matches!(self.category, UnicodeCategory::Lu | UnicodeCategory::Ll | UnicodeCategory::Lo)
+    }
+}
+
+// ============================================================================
+// 2. Kerning 테이블
+// ============================================================================
+
+pub struct KernPair {
+    pub left: u32,               // 왼쪽 문자
+    pub right: u32,              // 오른쪽 문자
+    pub offset: i8,              // Kerning 오프셋 (픽셀)
+}
+
+pub struct KerningTable {
+    pub pairs: Vec<KernPair>,
+    pub enabled: bool,
+}
+
+impl KerningTable {
+    pub fn new() -> Self {
+        KerningTable {
+            pairs: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    pub fn add_pair(&mut self, left: u32, right: u32, offset: i8) {
+        self.pairs.push(KernPair { left, right, offset });
+    }
+
+    pub fn lookup(&self, left: u32, right: u32) -> Option<i8> {
+        if !self.enabled {
+            return None;
+        }
+
+        for pair in &self.pairs {
+            if pair.left == left && pair.right == right {
+                return Some(pair.offset);
+            }
+        }
+
+        None
+    }
+
+    pub fn count(&self) -> u32 {
+        self.pairs.len() as u32
+    }
+}
+
+// ============================================================================
+// 3. 단어 분석 및 라인 브레이킹
+// ============================================================================
+
+pub struct Word {
+    pub text: Vec<u32>,          // Unicode 코드 포인트
+    pub width: u32,              // 단어 너비 (문자)
+    pub start_pos: u32,          // 원본 위치
+}
+
+impl Word {
+    pub fn new(text: Vec<u32>, start_pos: u32) -> Self {
+        let width = text.iter()
+            .map(|&cp| UnicodeChar::from_codepoint(cp).width as u32)
+            .sum();
+
+        Word { text, width, start_pos }
+    }
+
+    pub fn measure_width(&self) -> u32 {
+        self.text.iter()
+            .map(|&cp| UnicodeChar::from_codepoint(cp).width as u32)
+            .sum()
+    }
+}
+
+pub struct LineLayout {
+    pub words: Vec<Word>,
+    pub width: u32,              // 라인 너비 (문자)
+    pub height: u32,             // 라인 높이 (픽셀)
+    pub line_number: u32,
+}
+
+impl LineLayout {
+    pub fn new(width: u32, line_number: u32) -> Self {
+        LineLayout {
+            words: Vec::new(),
+            width,
+            height: 0,
+            line_number,
+        }
+    }
+
+    pub fn fits_word(&self, word: &Word) -> bool {
+        let current_width: u32 = self.words.iter()
+            .map(|w| w.width)
+            .sum::<u32>() + self.words.len() as u32;  // 공백 포함
+
+        current_width + word.width <= self.width
+    }
+
+    pub fn add_word(&mut self, word: Word) -> bool {
+        if !self.fits_word(&word) {
+            return false;
+        }
+
+        self.words.push(word);
+        true
+    }
+
+    pub fn measure(&mut self) -> u32 {
+        self.words.iter()
+            .map(|w| w.width)
+            .sum::<u32>() + self.words.len().saturating_sub(1) as u32  // 단어 간 공백
+    }
+}
+
+// ============================================================================
+// 4. 텍스트 레이아웃 엔진
+// ============================================================================
+
+pub struct TextLayoutEngine {
+    pub kerning_table: KerningTable,
+    pub line_height: u32,
+    pub char_width: u32,          // 기본 문자 너비
+    pub ligatures_enabled: bool,
+}
+
+impl TextLayoutEngine {
+    pub fn new() -> Self {
+        TextLayoutEngine {
+            kerning_table: KerningTable::new(),
+            line_height: 16,
+            char_width: 8,
+            ligatures_enabled: true,
+        }
+    }
+
+    pub fn enable_kerning(&mut self, enabled: bool) {
+        self.kerning_table.enabled = enabled;
+    }
+
+    /// 텍스트를 단어로 분할
+    pub fn split_words(&self, text: &[u32]) -> Vec<Word> {
+        let mut words = Vec::new();
+        let mut current_word = Vec::new();
+        let mut start_pos = 0u32;
+
+        for (i, &cp) in text.iter().enumerate() {
+            let uc = UnicodeChar::from_codepoint(cp);
+
+            if uc.is_whitespace() {
+                if !current_word.is_empty() {
+                    words.push(Word::new(current_word.clone(), start_pos));
+                    current_word.clear();
+                }
+                start_pos = i as u32 + 1;
+            } else {
+                current_word.push(cp);
+            }
+        }
+
+        if !current_word.is_empty() {
+            words.push(Word::new(current_word, start_pos));
+        }
+
+        words
+    }
+
+    /// 라인 브레이킹
+    pub fn layout_lines(&mut self, text: &[u32], width: u32) -> Vec<LineLayout> {
+        let words = self.split_words(text);
+        let mut lines = Vec::new();
+        let mut current_line = LineLayout::new(width, 0);
+
+        for word in words {
+            if !current_line.add_word(word.clone()) {
+                // 새 라인 시작
+                let line_number = lines.len() as u32;
+                lines.push(current_line);
+                current_line = LineLayout::new(width, line_number + 1);
+                let _ = current_line.add_word(word);
+            }
+        }
+
+        if !current_line.words.is_empty() {
+            lines.push(current_line);
+        }
+
+        lines
+    }
+
+    /// 글자 높이 계산
+    pub fn measure_text_height(&self, num_lines: u32) -> u32 {
+        num_lines * self.line_height
+    }
+
+    /// Kerning 값 조회
+    pub fn get_kerning(&self, left: u32, right: u32) -> i8 {
+        self.kerning_table.lookup(left, right).unwrap_or(0)
+    }
+}
+
+// ============================================================================
+// 5. 쌍방향 텍스트 (BiDi) 기본 지원
+// ============================================================================
+
+pub struct BiDiLevel {
+    pub level: u8,               // BiDi 레벨 (0=LTR, 1=RTL)
+    pub start: u32,              // 시작 위치
+    pub end: u32,                // 종료 위치
+}
+
+pub struct BiDiAnalyzer {
+    pub levels: Vec<BiDiLevel>,
+    pub base_level: u8,          // 0=LTR, 1=RTL
+}
+
+impl BiDiAnalyzer {
+    pub fn new(base_level: u8) -> Self {
+        BiDiAnalyzer {
+            levels: Vec::new(),
+            base_level,
+        }
+    }
+
+    /// 간단한 BiDi 분석 (LTR만 지원)
+    pub fn analyze(&mut self, text: &[u32]) {
+        // 현재는 LTR만 지원 (RTL은 향후 확장)
+        if text.len() > 0 {
+            self.levels.push(BiDiLevel {
+                level: self.base_level,
+                start: 0,
+                end: text.len() as u32,
+            });
+        }
+    }
+
+    pub fn is_rtl(&self) -> bool {
+        self.base_level == 1
+    }
+}
+
+// ============================================================================
+// 6. 검증 함수
+// ============================================================================
+
+pub fn validate_unicode_char(uc: &UnicodeChar) -> bool {
+    uc.width > 0 && uc.width <= 2
+}
+
+pub fn validate_kerning_table(table: &KerningTable) -> bool {
+    for pair in &table.pairs {
+        if pair.left == 0 || pair.right == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn validate_text_layout(layout: &LineLayout) -> bool {
+    if layout.width == 0 {
+        return false;
+    }
+
+    let measured = layout.measure();
+    measured <= layout.width
+}
+
+pub fn validate_layout_engine_performance(text_len: u32, time_us: u64) -> bool {
+    // 목표: < 100µs per 100 characters
+    if text_len == 0 {
+        return false;
+    }
+
+    let time_per_100 = (time_us * 100) / (text_len as u64);
+    time_per_100 < 100
+}
+
+// ============================================================================
+// 7. 클론 구현
+// ============================================================================
+
+impl Clone for UnicodeChar {
+    fn clone(&self) -> Self {
+        UnicodeChar {
+            codepoint: self.codepoint,
+            width: self.width,
+            category: match self.category {
+                UnicodeCategory::Lu => UnicodeCategory::Lu,
+                UnicodeCategory::Ll => UnicodeCategory::Ll,
+                UnicodeCategory::Lo => UnicodeCategory::Lo,
+                UnicodeCategory::Nd => UnicodeCategory::Nd,
+                UnicodeCategory::Pc => UnicodeCategory::Pc,
+                UnicodeCategory::Po => UnicodeCategory::Po,
+                UnicodeCategory::Zs => UnicodeCategory::Zs,
+                UnicodeCategory::Cf => UnicodeCategory::Cf,
+            },
+            combining: self.combining,
+        }
+    }
+}
+
+impl Clone for Word {
+    fn clone(&self) -> Self {
+        Word {
+            text: self.text.clone(),
+            width: self.width,
+            start_pos: self.start_pos,
+        }
+    }
+}
+
+impl Clone for KerningTable {
+    fn clone(&self) -> Self {
+        let mut new_table = KerningTable::new();
+        for pair in &self.pairs {
+            new_table.add_pair(pair.left, pair.right, pair.offset);
+        }
+        new_table.enabled = self.enabled;
+        new_table
+    }
+}

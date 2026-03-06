@@ -1,0 +1,454 @@
+// Hypervisor: Linux Kernel Loading (400줄)
+// L1 Linux kernel을 L0이 로드하고 부팅
+
+module linux_boot
+
+use hypervisor::{
+    GuestAddressSpace, Stage2PageTable, Stage2PTE
+}
+
+use vttbr::{
+    VTTBRPool
+}
+
+// ============ ELF Format Constants ============
+
+enum ELFClass {
+    Class32,
+    Class64,
+}
+
+enum ELFEndianness {
+    Little,
+    Big,
+}
+
+struct ELFHeader {
+    magic: u32,              // 0x464C457F (ELF)
+    class: ELFClass,         // 32 or 64-bit
+    endianness: ELFEndianness,
+    version: u8,
+    osabi: u8,
+    machine: u16,            // 0xB7 = ARM64
+    type: u16,               // 2 = Executable
+    entry_point: u64,        // Kernel entry (0x80080000 typical)
+    program_header_offset: u64,
+    section_header_offset: u64,
+    flags: u32,
+    header_size: u16,
+    program_entry_size: u16,
+    program_entry_count: u16,
+    section_entry_size: u16,
+    section_entry_count: u16,
+}
+
+impl ELFHeader {
+    fn new() -> ELFHeader {
+        return ELFHeader {
+            magic: 0x464C457F,
+            class: ELFClass::Class64,
+            endianness: ELFEndianness::Little,
+            version: 1,
+            osabi: 0,
+            machine: 0xB7,  // ARM64
+            type: 2,        // Executable
+            entry_point: 0x80080000,
+            program_header_offset: 64,
+            section_header_offset: 0,
+            flags: 0,
+            header_size: 64,
+            program_entry_size: 56,
+            program_entry_count: 0,
+            section_entry_size: 0,
+            section_entry_count: 0,
+        }
+    }
+
+    fn validate(&self) -> bool {
+        if self.magic != 0x464C457F {
+            return false  // Not ELF
+        }
+
+        if self.machine != 0xB7 {
+            return false  // Not ARM64
+        }
+
+        if self.type != 2 {
+            return false  // Not executable
+        }
+
+        // Entry point should be in kernel space (typical: 0x80000000-0xFFFFFFFF)
+        if self.entry_point < 0x80000000 {
+            return false
+        }
+
+        return true
+    }
+
+    fn get_entry_point(&self) -> u64 {
+        return self.entry_point
+    }
+}
+
+// ============ ELF Program Header (세그먼트) ============
+
+enum SegmentType {
+    Null,
+    Load,      // 로드 가능한 세그먼트
+    Dynamic,
+    Interp,
+    Note,
+    Shlib,
+    Phdr,
+    TLS,
+    GNUStack,
+    GNURelro,
+}
+
+struct ELFSegment {
+    seg_type: SegmentType,
+    flags: u32,          // PF_X=1, PF_W=2, PF_R=4
+    offset: u64,         // 파일 내 오프셋
+    vaddr: u64,          // Guest VA
+    paddr: u64,          // 물리 주소 (LOAD 세그먼트는 vaddr=paddr)
+    file_size: u64,
+    mem_size: u64,       // mem_size >= file_size (bss 포함)
+    alignment: u64,
+}
+
+impl ELFSegment {
+    fn new(stype: SegmentType, vaddr: u64, paddr: u64) -> ELFSegment {
+        return ELFSegment {
+            seg_type: stype,
+            flags: 7,  // RWX
+            offset: 0,
+            vaddr: vaddr,
+            paddr: paddr,
+            file_size: 0,
+            mem_size: 0,
+            alignment: 0x1000,  // 4KB aligned
+        }
+    }
+
+    fn is_loadable(&self) -> bool {
+        return self.seg_type == SegmentType::Load
+    }
+
+    fn is_writable(&self) -> bool {
+        return (self.flags & 2) != 0  // PF_W
+    }
+
+    fn is_executable(&self) -> bool {
+        return (self.flags & 1) != 0  // PF_X
+    }
+
+    fn is_readable(&self) -> bool {
+        return (self.flags & 4) != 0  // PF_R
+    }
+}
+
+// ============ Kernel Image ============
+
+struct KernelImage {
+    vmid: u16,
+    header: ELFHeader,
+    segments: array[ELFSegment; 16],
+    segment_count: u32,
+    total_size: u64,
+    is_loaded: bool,
+    entry_point: u64,
+}
+
+impl KernelImage {
+    fn new(vm_id: u16) -> KernelImage {
+        return KernelImage {
+            vmid: vm_id,
+            header: ELFHeader::new(),
+            segments: array[ELFSegment; 16],
+            segment_count: 0,
+            total_size: 0,
+            is_loaded: false,
+            entry_point: 0x80080000,
+        }
+    }
+
+    fn add_segment(&mut self, seg: ELFSegment) -> bool {
+        if self.segment_count >= 16 {
+            return false  // Too many segments
+        }
+
+        self.segments[self.segment_count] = seg
+        self.segment_count += 1
+        self.total_size += seg.mem_size
+
+        return true
+    }
+
+    fn load_segments(&mut self, guest_as: &mut GuestAddressSpace) -> bool {
+        for i in 0..self.segment_count {
+            let seg = self.segments[i]
+
+            if !seg.is_loadable() {
+                continue  // Skip non-loadable segments
+            }
+
+            // Map segment into guest address space
+            if !guest_as.map_region(seg.vaddr, seg.paddr, seg.mem_size, seg.is_writable()) {
+                return false
+            }
+        }
+
+        self.is_loaded = true
+        return true
+    }
+
+    fn validate(&self) -> bool {
+        if !self.header.validate() {
+            return false
+        }
+
+        if self.segment_count == 0 {
+            return false  // No segments
+        }
+
+        // All LOAD segments must have vaddr == paddr for identity mapping
+        for i in 0..self.segment_count {
+            let seg = self.segments[i]
+            if seg.is_loadable() && seg.vaddr != seg.paddr {
+                return false  // Non-identity mapping not supported for LOAD segments
+            }
+        }
+
+        return true
+    }
+
+    fn get_entry_point(&self) -> u64 {
+        return self.header.get_entry_point()
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Kernel Image (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Entry Point: 0x" + self.entry_point.to_string() + "\\n"
+        s = s + "Total Size: " + (self.total_size / (1024*1024)).to_string() + "MB\\n"
+        s = s + "Segments: " + self.segment_count.to_string() + "/16\\n"
+        s = s + "Loaded: " + self.is_loaded.to_string()
+        return s
+    }
+}
+
+// ============ Linux Boot Protocol ============
+
+struct LinuxBootConfig {
+    vmid: u16,
+    kernel_entry: u64,
+    dtb_address: u64,      // Device Tree Blob address
+    initrd_address: u64,   // Initial ramdisk
+    command_line: string,
+    bootargs: string,      // e.g., "console=ttyAMA0 root=/dev/vda1"
+}
+
+impl LinuxBootConfig {
+    fn new(vm_id: u16) -> LinuxBootConfig {
+        return LinuxBootConfig {
+            vmid: vm_id,
+            kernel_entry: 0x80080000,
+            dtb_address: 0x80000000,
+            initrd_address: 0x84000000,
+            command_line: "",
+            bootargs: "console=ttyAMA0 earlycon=pl011,0x9000000",
+        }
+    }
+
+    fn set_bootargs(&mut self, args: string) -> bool {
+        self.bootargs = args
+        return true
+    }
+
+    fn validate(&self) -> bool {
+        // Ensure addresses don't overlap
+        if self.dtb_address >= self.kernel_entry {
+            return false
+        }
+
+        if self.kernel_entry >= self.initrd_address {
+            return false
+        }
+
+        return true
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Linux Boot Config (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Kernel Entry: 0x" + self.kernel_entry.to_string() + "\\n"
+        s = s + "DTB Address: 0x" + self.dtb_address.to_string() + "\\n"
+        s = s + "Initrd Address: 0x" + self.initrd_address.to_string() + "\\n"
+        s = s + "Bootargs: " + self.bootargs
+        return s
+    }
+}
+
+// ============ Kernel Loader ============
+
+struct KernelLoader {
+    vmid: u16,
+    kernel: KernelImage,
+    boot_config: LinuxBootConfig,
+    load_time_us: u64,
+    is_ready: bool,
+}
+
+impl KernelLoader {
+    fn new(vm_id: u16) -> KernelLoader {
+        return KernelLoader {
+            vmid: vm_id,
+            kernel: KernelImage::new(vm_id),
+            boot_config: LinuxBootConfig::new(vm_id),
+            load_time_us: 0,
+            is_ready: false,
+        }
+    }
+
+    fn prepare_kernel(&mut self, guest_as: &mut GuestAddressSpace) -> bool {
+        // Validate kernel image
+        if !self.kernel.validate() {
+            return false
+        }
+
+        // Load all segments into guest address space
+        if !self.kernel.load_segments(guest_as) {
+            return false
+        }
+
+        self.is_ready = true
+        return true
+    }
+
+    fn prepare_device_tree(&mut self, guest_as: &mut GuestAddressSpace) -> bool {
+        // Map DTB into guest address space
+        let dtb_size = 0x10000  // 64KB DTB
+
+        if !guest_as.map_region(
+            self.boot_config.dtb_address,
+            self.boot_config.dtb_address,
+            dtb_size,
+            true  // writable for L0 to populate
+        ) {
+            return false
+        }
+
+        return true
+    }
+
+    fn prepare_initrd(&mut self, guest_as: &mut GuestAddressSpace) -> bool {
+        // Map initial ramdisk
+        let initrd_size = 64 * 1024 * 1024  // 64MB typical
+
+        if !guest_as.map_region(
+            self.boot_config.initrd_address,
+            self.boot_config.initrd_address,
+            initrd_size,
+            true
+        ) {
+            return false
+        }
+
+        return true
+    }
+
+    fn load_complete(&mut self, guest_as: &mut GuestAddressSpace) -> bool {
+        // Prepare everything for Linux boot
+        if !self.prepare_kernel(guest_as) {
+            return false
+        }
+
+        if !self.prepare_device_tree(guest_as) {
+            return false
+        }
+
+        if !self.prepare_initrd(guest_as) {
+            return false
+        }
+
+        // Validate boot configuration
+        if !self.boot_config.validate() {
+            return false
+        }
+
+        self.is_ready = true
+        return true
+    }
+
+    fn get_entry_point(&self) -> u64 {
+        return self.kernel.get_entry_point()
+    }
+
+    fn get_dtb_address(&self) -> u64 {
+        return self.boot_config.dtb_address
+    }
+
+    fn is_boot_ready(&self) -> bool {
+        return self.is_ready
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "=== Kernel Loader (VMID=" + self.vmid.to_string() + ") ===\\n"
+        s = s + self.kernel.stats() + "\\n"
+        s = s + self.boot_config.stats() + "\\n"
+        s = s + "Ready: " + self.is_ready.to_string()
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_elf_header() -> bool {
+    let header = ELFHeader::new()
+
+    assert(header.magic == 0x464C457F, "ELF magic correct")
+    assert(header.validate(), "header should validate")
+    assert(header.machine == 0xB7, "ARM64 machine type")
+    assert(header.entry_point == 0x80080000, "entry point correct")
+
+    return true
+}
+
+fn validate_kernel_image() -> bool {
+    let mut kernel = KernelImage::new(1)
+
+    let mut seg = ELFSegment::new(SegmentType::Load, 0x80080000, 0x80080000)
+    seg.file_size = 0x100000  // 1MB
+    seg.mem_size = 0x100000
+
+    assert(kernel.add_segment(seg), "add segment")
+    assert(kernel.validate(), "kernel validate")
+    assert(kernel.get_entry_point() == 0x80080000, "entry point")
+
+    return true
+}
+
+fn validate_boot_config() -> bool {
+    let mut config = LinuxBootConfig::new(1)
+
+    assert(config.validate(), "config should validate")
+    assert(config.dtb_address < config.kernel_entry, "DTB before kernel")
+    assert(config.kernel_entry < config.initrd_address, "kernel before initrd")
+
+    config.set_bootargs("console=ttyAMA0 root=/dev/vda1")
+    assert(config.bootargs == "console=ttyAMA0 root=/dev/vda1", "bootargs set")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

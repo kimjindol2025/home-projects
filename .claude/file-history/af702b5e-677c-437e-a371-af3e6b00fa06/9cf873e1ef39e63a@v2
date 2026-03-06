@@ -1,0 +1,761 @@
+// FreeLang Native AOT Compiler - Parser Implementation
+// Recursive descent parser for FreeLang syntax
+
+module parser
+
+use token::{Token, TokenType, TokenStream}
+use ast::{
+    Expression, Statement, Program, Type, BinaryOp, UnaryOp, Literal,
+    Parameter, StructField, ImplBlock, FunctionDecl, Box,
+}
+
+// Parser: converts TokenStream to AST
+struct Parser {
+    tokens: TokenStream,
+}
+
+fn Parser::new(tokens: TokenStream) -> Parser {
+    return Parser {
+        tokens: tokens,
+    }
+}
+
+impl Parser {
+    // Main entry point
+    fn parse(&mut self) -> Result<Program, string> {
+        let mut items = []
+
+        while !self.tokens.is_eof() {
+            match self.parse_item() {
+                Ok(item) => items.push(item),
+                Err(msg) => return Err(msg),
+            }
+        }
+
+        return Ok(Program { items: items })
+    }
+
+    fn parse_item(&mut self) -> Result<(Statement | ImplBlock), string> {
+        match self.tokens.peek_type() {
+            TokenType::KW_fn => return self.parse_function(),
+            TokenType::KW_struct => return self.parse_struct(),
+            TokenType::KW_enum => return self.parse_enum(),
+            TokenType::KW_impl => return self.parse_impl(),
+            TokenType::KW_let => return self.parse_var_decl(),
+            TokenType::KW_const => return self.parse_const_decl(),
+            _ => return Err("Unexpected token in top-level"),
+        }
+    }
+
+    // Function parsing: fn name(params) -> type { body }
+    fn parse_function(&mut self) -> Result<Statement, string> {
+        self.consume(TokenType::KW_fn, "Expected 'fn'")?
+
+        let name = match self.parse_identifier() {
+            Ok(n) => n,
+            Err(e) => return Err(e),
+        }
+
+        self.consume(TokenType::LPAREN, "Expected '('")?
+        let params = self.parse_parameters()?
+        self.consume(TokenType::RPAREN, "Expected ')'")?
+
+        self.consume(TokenType::OP_arrow, "Expected '->'")?
+        let return_type = self.parse_type()?
+
+        self.consume(TokenType::LBRACE, "Expected '{'")?
+        let body = self.parse_block()?
+        self.consume(TokenType::RBRACE, "Expected '}'")?
+
+        let func = Statement::FunctionDecl {
+            name: name,
+            params: params,
+            return_type: return_type,
+            body: Box::new(body),
+        }
+
+        return Ok(func)
+    }
+
+    // Struct parsing: struct Name { field: Type, ... }
+    fn parse_struct(&mut self) -> Result<Statement, string> {
+        self.consume(TokenType::KW_struct, "Expected 'struct'")?
+
+        let name = self.parse_identifier()?
+
+        self.consume(TokenType::LBRACE, "Expected '{'")?
+
+        let mut fields = []
+        while self.tokens.peek_type() != TokenType::RBRACE && !self.tokens.is_eof() {
+            let field_name = self.parse_identifier()?
+            self.consume(TokenType::COLON, "Expected ':'")?
+            let field_type = self.parse_type()?
+
+            fields.push(StructField {
+                name: field_name,
+                field_type: field_type,
+            })
+
+            if self.tokens.peek_type() == TokenType::COMMA {
+                self.tokens.advance()
+            } else {
+                break
+            }
+        }
+
+        self.consume(TokenType::RBRACE, "Expected '}'")?
+
+        return Ok(Statement::StructDecl {
+            name: name,
+            fields: fields,
+        })
+    }
+
+    // Enum parsing: enum Name { Variant1, Variant2, ... }
+    fn parse_enum(&mut self) -> Result<Statement, string> {
+        self.consume(TokenType::KW_enum, "Expected 'enum'")?
+
+        let name = self.parse_identifier()?
+
+        self.consume(TokenType::LBRACE, "Expected '{'")?
+
+        let mut variants = []
+        while self.tokens.peek_type() != TokenType::RBRACE && !self.tokens.is_eof() {
+            let variant = self.parse_identifier()?
+            variants.push(variant)
+
+            if self.tokens.peek_type() == TokenType::COMMA {
+                self.tokens.advance()
+            } else {
+                break
+            }
+        }
+
+        self.consume(TokenType::RBRACE, "Expected '}'")?
+
+        return Ok(Statement::EnumDecl {
+            name: name,
+            variants: variants,
+        })
+    }
+
+    // Impl block parsing
+    fn parse_impl(&mut self) -> Result<(Statement | ImplBlock), string> {
+        self.consume(TokenType::KW_impl, "Expected 'impl'")?
+
+        let target = self.parse_identifier()?
+
+        self.consume(TokenType::LBRACE, "Expected '{'")?
+
+        let mut methods = []
+        while self.tokens.peek_type() != TokenType::RBRACE && !self.tokens.is_eof() {
+            if self.tokens.peek_type() == TokenType::KW_fn {
+                // Parse method
+                self.consume(TokenType::KW_fn, "Expected 'fn'")?
+
+                let method_name = self.parse_identifier()?
+                self.consume(TokenType::LPAREN, "Expected '('")?
+                let params = self.parse_parameters()?
+                self.consume(TokenType::RPAREN, "Expected ')'")?
+
+                self.consume(TokenType::OP_arrow, "Expected '->'")?
+                let return_type = self.parse_type()?
+
+                self.consume(TokenType::LBRACE, "Expected '{'")?
+                let body = self.parse_block()?
+                self.consume(TokenType::RBRACE, "Expected '}'")?
+
+                // methods.push(...)
+            }
+        }
+
+        self.consume(TokenType::RBRACE, "Expected '}'")?
+
+        return Ok(ImplBlock {
+            target: target,
+            methods: methods,
+        })
+    }
+
+    // Variable declaration: let name: type = expr;
+    fn parse_var_decl(&mut self) -> Result<Statement, string> {
+        self.consume(TokenType::KW_let, "Expected 'let'")?
+
+        let mutable = if self.tokens.peek_type() == TokenType::KW_mut {
+            self.tokens.advance()
+            true
+        } else {
+            false
+        }
+
+        let name = self.parse_identifier()?
+
+        let var_type = if self.tokens.peek_type() == TokenType::COLON {
+            self.tokens.advance()
+            Some(self.parse_type()?)
+        } else {
+            None
+        }
+
+        let init = if self.tokens.peek_type() == TokenType::OP_assign {
+            self.tokens.advance()
+            Some(self.parse_expression()?)
+        } else {
+            None
+        }
+
+        self.consume(TokenType::SEMICOLON, "Expected ';'")?
+
+        return Ok(Statement::VariableDecl {
+            name: name,
+            mutable: mutable,
+            var_type: var_type,
+            init: init,
+        })
+    }
+
+    // Const declaration
+    fn parse_const_decl(&mut self) -> Result<Statement, string> {
+        self.consume(TokenType::KW_const, "Expected 'const'")?
+
+        let name = self.parse_identifier()?
+
+        self.consume(TokenType::COLON, "Expected ':'")?
+        let const_type = self.parse_type()?
+
+        self.consume(TokenType::OP_assign, "Expected '='")?
+        let init = self.parse_expression()?
+
+        self.consume(TokenType::SEMICOLON, "Expected ';'")?
+
+        return Ok(Statement::VariableDecl {
+            name: name,
+            mutable: false,
+            var_type: Some(const_type),
+            init: Some(init),
+        })
+    }
+
+    // Parse parameters
+    fn parse_parameters(&mut self) -> Result<Parameter[], string> {
+        let mut params = []
+
+        while self.tokens.peek_type() != TokenType::RPAREN && !self.tokens.is_eof() {
+            let mutable = if self.tokens.peek_type() == TokenType::KW_mut {
+                self.tokens.advance()
+                true
+            } else {
+                false
+            }
+
+            let name = self.parse_identifier()?
+            self.consume(TokenType::COLON, "Expected ':'")?
+            let param_type = self.parse_type()?
+
+            params.push(Parameter {
+                name: name,
+                param_type: param_type,
+                mutable: mutable,
+            })
+
+            if self.tokens.peek_type() == TokenType::COMMA {
+                self.tokens.advance()
+            } else {
+                break
+            }
+        }
+
+        return Ok(params)
+    }
+
+    // Type parsing
+    fn parse_type(&mut self) -> Result<Type, string> {
+        let token = self.tokens.peek()
+        self.tokens.advance()
+
+        return match token.type {
+            TokenType::IDENT => {
+                match token.lexeme {
+                    "u8" => Ok(Type::U8),
+                    "u16" => Ok(Type::U16),
+                    "u32" => Ok(Type::U32),
+                    "u64" => Ok(Type::U64),
+                    "i8" => Ok(Type::I8),
+                    "i16" => Ok(Type::I16),
+                    "i32" => Ok(Type::I32),
+                    "i64" => Ok(Type::I64),
+                    "f32" => Ok(Type::F32),
+                    "f64" => Ok(Type::F64),
+                    "bool" => Ok(Type::Bool),
+                    "char" => Ok(Type::Char),
+                    "string" => Ok(Type::String),
+                    "void" => Ok(Type::Void),
+                    name => Ok(Type::Custom(name: name)),
+                }
+            },
+            _ => Err("Expected type"),
+        }
+    }
+
+    // Expression parsing with precedence climbing
+    fn parse_expression(&mut self) -> Result<Expression, string> {
+        return self.parse_or_expr()
+    }
+
+    fn parse_or_expr(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_and_expr()?
+
+        while self.tokens.peek_type() == TokenType::OP_or {
+            self.tokens.advance()
+            let right = self.parse_and_expr()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOp::Or,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_and_expr(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_bitwise_or()?
+
+        while self.tokens.peek_type() == TokenType::OP_and {
+            self.tokens.advance()
+            let right = self.parse_bitwise_or()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOp::And,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_bitwise_or(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_bitwise_xor()?
+
+        while self.tokens.peek_type() == TokenType::OP_or_bit {
+            self.tokens.advance()
+            let right = self.parse_bitwise_xor()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOp::BitOr,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_bitwise_xor(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_bitwise_and()?
+
+        while self.tokens.peek_type() == TokenType::OP_xor {
+            self.tokens.advance()
+            let right = self.parse_bitwise_and()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOp::BitXor,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_bitwise_and(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_equality()?
+
+        while self.tokens.peek_type() == TokenType::OP_and_bit {
+            self.tokens.advance()
+            let right = self.parse_equality()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOp::BitAnd,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_equality(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_comparison()?
+
+        loop {
+            let op = match self.tokens.peek_type() {
+                TokenType::OP_eq => BinaryOp::Equal,
+                TokenType::OP_ne => BinaryOp::NotEqual,
+                _ => break,
+            }
+            self.tokens.advance()
+            let right = self.parse_comparison()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: op,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_shift()?
+
+        loop {
+            let op = match self.tokens.peek_type() {
+                TokenType::OP_lt => BinaryOp::LessThan,
+                TokenType::OP_le => BinaryOp::LessEqual,
+                TokenType::OP_gt => BinaryOp::GreaterThan,
+                TokenType::OP_ge => BinaryOp::GreaterEqual,
+                _ => break,
+            }
+            self.tokens.advance()
+            let right = self.parse_shift()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: op,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_additive()?
+
+        loop {
+            let op = match self.tokens.peek_type() {
+                TokenType::OP_shl => BinaryOp::LeftShift,
+                TokenType::OP_shr => BinaryOp::RightShift,
+                _ => break,
+            }
+            self.tokens.advance()
+            let right = self.parse_additive()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: op,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_additive(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_multiplicative()?
+
+        loop {
+            let op = match self.tokens.peek_type() {
+                TokenType::OP_plus => BinaryOp::Add,
+                TokenType::OP_minus => BinaryOp::Subtract,
+                _ => break,
+            }
+            self.tokens.advance()
+            let right = self.parse_multiplicative()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: op,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Expression, string> {
+        let mut left = self.parse_unary()?
+
+        loop {
+            let op = match self.tokens.peek_type() {
+                TokenType::OP_star => BinaryOp::Multiply,
+                TokenType::OP_slash => BinaryOp::Divide,
+                TokenType::OP_percent => BinaryOp::Modulo,
+                _ => break,
+            }
+            self.tokens.advance()
+            let right = self.parse_unary()?
+            left = Expression::BinaryOp {
+                left: Box::new(left),
+                op: op,
+                right: Box::new(right),
+            }
+        }
+
+        return Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<Expression, string> {
+        match self.tokens.peek_type() {
+            TokenType::OP_minus => {
+                self.tokens.advance()
+                let expr = self.parse_unary()?
+                return Ok(Expression::UnaryOp {
+                    op: UnaryOp::Negate,
+                    expr: Box::new(expr),
+                })
+            },
+            TokenType::OP_not => {
+                self.tokens.advance()
+                let expr = self.parse_unary()?
+                return Ok(Expression::UnaryOp {
+                    op: UnaryOp::Not,
+                    expr: Box::new(expr),
+                })
+            },
+            TokenType::OP_and_bit => {
+                self.tokens.advance()
+                let expr = self.parse_unary()?
+                return Ok(Expression::UnaryOp {
+                    op: UnaryOp::Address,
+                    expr: Box::new(expr),
+                })
+            },
+            TokenType::OP_star => {
+                self.tokens.advance()
+                let expr = self.parse_unary()?
+                return Ok(Expression::UnaryOp {
+                    op: UnaryOp::Dereference,
+                    expr: Box::new(expr),
+                })
+            },
+            _ => return self.parse_postfix(),
+        }
+    }
+
+    fn parse_postfix(&mut self) -> Result<Expression, string> {
+        let mut expr = self.parse_primary()?
+
+        loop {
+            match self.tokens.peek_type() {
+                TokenType::LPAREN => {
+                    self.tokens.advance()
+                    let args = self.parse_arguments()?
+                    self.consume(TokenType::RPAREN, "Expected ')'")?
+                    expr = Expression::Call {
+                        func: Box::new(expr),
+                        args: args,
+                    }
+                },
+                TokenType::OP_dot => {
+                    self.tokens.advance()
+                    let field = self.parse_identifier()?
+                    expr = Expression::FieldAccess {
+                        object: Box::new(expr),
+                        field: field,
+                    }
+                },
+                TokenType::LBRACKET => {
+                    self.tokens.advance()
+                    let index = self.parse_expression()?
+                    self.consume(TokenType::RBRACKET, "Expected ']'")?
+                    expr = Expression::IndexAccess {
+                        object: Box::new(expr),
+                        index: Box::new(index),
+                    }
+                },
+                _ => break,
+            }
+        }
+
+        return Ok(expr)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expression, string> {
+        let token = self.tokens.peek()
+
+        match token.type {
+            TokenType::LIT_int => {
+                self.tokens.advance()
+                // Parse integer value
+                return Ok(Expression::Literal(Literal::Integer(0)))
+            },
+            TokenType::LIT_float => {
+                self.tokens.advance()
+                return Ok(Expression::Literal(Literal::Float(0.0)))
+            },
+            TokenType::LIT_string => {
+                self.tokens.advance()
+                return Ok(Expression::Literal(Literal::String(token.lexeme)))
+            },
+            TokenType::LIT_char => {
+                self.tokens.advance()
+                return Ok(Expression::Literal(Literal::Char('a')))
+            },
+            TokenType::KW_true => {
+                self.tokens.advance()
+                return Ok(Expression::Literal(Literal::Boolean(true)))
+            },
+            TokenType::KW_false => {
+                self.tokens.advance()
+                return Ok(Expression::Literal(Literal::Boolean(false)))
+            },
+            TokenType::KW_null => {
+                self.tokens.advance()
+                return Ok(Expression::Literal(Literal::Null))
+            },
+            TokenType::IDENT => {
+                let name = self.parse_identifier()?
+                return Ok(Expression::Identifier(name))
+            },
+            TokenType::LPAREN => {
+                self.tokens.advance()
+                let expr = self.parse_expression()?
+                self.consume(TokenType::RPAREN, "Expected ')'")?
+                return Ok(expr)
+            },
+            TokenType::LBRACKET => {
+                self.tokens.advance()
+                let elements = self.parse_array_elements()?
+                self.consume(TokenType::RBRACKET, "Expected ']'")?
+                return Ok(Expression::ArrayLiteral(elements))
+            },
+            TokenType::KW_if => {
+                return self.parse_if_expr()
+            },
+            _ => return Err("Unexpected token in expression"),
+        }
+    }
+
+    fn parse_if_expr(&mut self) -> Result<Expression, string> {
+        self.consume(TokenType::KW_if, "Expected 'if'")?
+        let condition = self.parse_expression()?
+        self.consume(TokenType::LBRACE, "Expected '{'")?
+        let then_expr = self.parse_block()?
+        self.consume(TokenType::RBRACE, "Expected '}'")?
+
+        let else_expr = if self.tokens.peek_type() == TokenType::KW_else {
+            self.tokens.advance()
+            self.consume(TokenType::LBRACE, "Expected '{'")?
+            let else_block = self.parse_block()?
+            self.consume(TokenType::RBRACE, "Expected '}'")?
+            Some(Box::new(else_block))
+        } else {
+            None
+        }
+
+        return Ok(Expression::IfExpr {
+            condition: Box::new(condition),
+            then_expr: Box::new(then_expr),
+            else_expr: else_expr,
+        })
+    }
+
+    fn parse_block(&mut self) -> Result<Expression, string> {
+        let mut statements = []
+
+        while self.tokens.peek_type() != TokenType::RBRACE && !self.tokens.is_eof() {
+            let stmt = self.parse_statement()?
+            statements.push(stmt)
+        }
+
+        return Ok(Expression::Block(statements))
+    }
+
+    fn parse_statement(&mut self) -> Result<Statement, string> {
+        match self.tokens.peek_type() {
+            TokenType::KW_let => self.parse_var_decl(),
+            TokenType::KW_const => self.parse_const_decl(),
+            TokenType::KW_return => {
+                self.tokens.advance()
+                let expr = if self.tokens.peek_type() == TokenType::SEMICOLON {
+                    None
+                } else {
+                    Some(self.parse_expression()?)
+                }
+                self.consume(TokenType::SEMICOLON, "Expected ';'")?
+                Ok(Statement::Return(expr))
+            },
+            TokenType::KW_break => {
+                self.tokens.advance()
+                self.consume(TokenType::SEMICOLON, "Expected ';'")?
+                Ok(Statement::Break)
+            },
+            TokenType::KW_continue => {
+                self.tokens.advance()
+                self.consume(TokenType::SEMICOLON, "Expected ';'")?
+                Ok(Statement::Continue)
+            },
+            _ => {
+                let expr = self.parse_expression()?
+                self.consume(TokenType::SEMICOLON, "Expected ';'")?
+                Ok(Statement::Expression(expr))
+            },
+        }
+    }
+
+    fn parse_arguments(&mut self) -> Result<Expression[], string> {
+        let mut args = []
+
+        while self.tokens.peek_type() != TokenType::RPAREN && !self.tokens.is_eof() {
+            args.push(self.parse_expression()?)
+
+            if self.tokens.peek_type() == TokenType::COMMA {
+                self.tokens.advance()
+            } else {
+                break
+            }
+        }
+
+        return Ok(args)
+    }
+
+    fn parse_array_elements(&mut self) -> Result<Expression[], string> {
+        let mut elements = []
+
+        while self.tokens.peek_type() != TokenType::RBRACKET && !self.tokens.is_eof() {
+            elements.push(self.parse_expression()?)
+
+            if self.tokens.peek_type() == TokenType::COMMA {
+                self.tokens.advance()
+            } else {
+                break
+            }
+        }
+
+        return Ok(elements)
+    }
+
+    fn parse_identifier(&mut self) -> Result<string, string> {
+        if self.tokens.peek_type() != TokenType::IDENT {
+            return Err("Expected identifier")
+        }
+        let name = self.tokens.peek().lexeme
+        self.tokens.advance()
+        return Ok(name)
+    }
+
+    fn consume(&mut self, expected: TokenType, msg: string) -> Result<Token, string> {
+        if self.tokens.peek_type() != expected {
+            return Err(msg)
+        }
+        return Ok(self.tokens.advance())
+    }
+}
+
+// Result type
+enum Result<T, E> {
+    Ok(value: T),
+    Err(error: E),
+}
+
+impl Result<T, E> {
+    fn is_ok(&self) -> bool {
+        return match self {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn unwrap(&self) -> T {
+        return match self {
+            Ok(v) => v,
+            Err(_) => panic("Result unwrap failed"),
+        }
+    }
+}

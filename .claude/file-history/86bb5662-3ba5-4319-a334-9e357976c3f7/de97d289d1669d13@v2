@@ -1,0 +1,424 @@
+/* ============================================================================
+   ARM64 Exception Handler & Syscall Dispatcher
+
+   목적: 예외 벡터 테이블, 시스콜 디스패치 (< 10µs)
+   크기: ~300줄
+   성능: 예외 처리 < 100µs, 시스콜 < 10µs
+
+   설계: freelang-os-kernel의 interrupt.fl 패턴 재사용
+   - 16개 예외 벡터 (EL1 현재, EL0 하위)
+   - 8개 시스콜 (SVC)
+   - 예외 프레임 스택 저장
+============================================================================ */
+
+// ============================================================================
+// 1. 예외 타입 정의
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ExceptionType {
+    // EL1 현재 (Kernel)
+    SyncEl1 = 0,        // 동기 예외 (Page Fault, Abort 등)
+    IrqEl1 = 1,         // IRQ (외부 인터럽트)
+    FiqEl1 = 2,         // FIQ (fast interrupt)
+    ErrorEl1 = 3,       // SError (System Error)
+
+    // EL0 하위 (User)
+    SyncEl0 = 4,        // 동기 예외 from EL0
+    IrqEl0 = 5,         // IRQ from EL0
+    FiqEl0 = 6,         // FIQ from EL0
+    ErrorEl0 = 7,       // SError from EL0
+
+    // 특수
+    Unknown = 255,
+}
+
+impl ExceptionType {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => ExceptionType::SyncEl1,
+            1 => ExceptionType::IrqEl1,
+            2 => ExceptionType::FiqEl1,
+            3 => ExceptionType::ErrorEl1,
+            4 => ExceptionType::SyncEl0,
+            5 => ExceptionType::IrqEl0,
+            6 => ExceptionType::FiqEl0,
+            7 => ExceptionType::ErrorEl0,
+            _ => ExceptionType::Unknown,
+        }
+    }
+
+    pub fn to_u8(&self) -> u8 {
+        *self as u8
+    }
+
+    pub fn is_kernel(&self) -> bool {
+        matches!(self, ExceptionType::SyncEl1 | ExceptionType::IrqEl1 | ExceptionType::FiqEl1 | ExceptionType::ErrorEl1)
+    }
+}
+
+// ============================================================================
+// 2. 시스콜 번호 정의
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SyscallNumber {
+    SysWrite = 0,       // UART 출력
+    SysRead = 1,        // UART 입력
+    SysAlloc = 2,       // 메모리 할당
+    SysFree = 3,        // 메모리 해제
+    SysFork = 4,        // 프로세스 생성
+    SysExit = 5,        // 프로세스 종료
+    SysLcdDraw = 6,     // LCD 픽셀 그리기
+    SysLcdFlush = 7,    // LCD 버퍼 플러시
+}
+
+impl SyscallNumber {
+    pub fn from_u64(val: u64) -> Self {
+        match val {
+            0 => SyscallNumber::SysWrite,
+            1 => SyscallNumber::SysRead,
+            2 => SyscallNumber::SysAlloc,
+            3 => SyscallNumber::SysFree,
+            4 => SyscallNumber::SysFork,
+            5 => SyscallNumber::SysExit,
+            6 => SyscallNumber::SysLcdDraw,
+            7 => SyscallNumber::SysLcdFlush,
+            _ => SyscallNumber::SysWrite,
+        }
+    }
+
+    pub fn to_u64(&self) -> u64 {
+        *self as u64
+    }
+}
+
+// ============================================================================
+// 3. 예외 프레임 (레지스터 스냅샷)
+// ============================================================================
+
+pub struct ExceptionFrame {
+    pub exc_type: ExceptionType,
+
+    // 예외 정보 레지스터
+    pub esr_el1: u64,           // Exception Syndrome Register
+    pub far_el1: u64,           // Fault Address Register
+    pub elr_el1: u64,           // Exception Link Register (복귀 주소)
+
+    // 범용 레지스터 (인자 용도)
+    pub x0: u64,
+    pub x1: u64,
+    pub x2: u64,
+    pub x3: u64,
+    pub x4: u64,
+    pub x5: u64,
+    pub x6: u64,
+    pub x7: u64,
+
+    pub sp: u64,                // 스택 포인터
+    pub spsr_el1: u64,          // 저장된 상태 레지스터
+
+    pub timestamp_ns: u64,      // 예외 시간
+}
+
+impl ExceptionFrame {
+    pub fn new() -> Self {
+        ExceptionFrame {
+            exc_type: ExceptionType::Unknown,
+            esr_el1: 0,
+            far_el1: 0,
+            elr_el1: 0,
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x6: 0,
+            x7: 0,
+            sp: 0,
+            spsr_el1: 0,
+            timestamp_ns: 0,
+        }
+    }
+
+    pub fn extract_syscall_nr(&self) -> u64 {
+        // X8 레지스터에 시스콜 번호 저장됨
+        // 여기서는 x0으로 대체 (시뮬레이션)
+        self.x0
+    }
+
+    pub fn extract_abort_reason(&self) -> u64 {
+        // ESR_EL1의 Exception Class 필드 추출
+        (self.esr_el1 >> 26) & 0x3F
+    }
+}
+
+impl Clone for ExceptionFrame {
+    fn clone(&self) -> Self {
+        ExceptionFrame {
+            exc_type: self.exc_type,
+            esr_el1: self.esr_el1,
+            far_el1: self.far_el1,
+            elr_el1: self.elr_el1,
+            x0: self.x0,
+            x1: self.x1,
+            x2: self.x2,
+            x3: self.x3,
+            x4: self.x4,
+            x5: self.x5,
+            x6: self.x6,
+            x7: self.x7,
+            sp: self.sp,
+            spsr_el1: self.spsr_el1,
+            timestamp_ns: self.timestamp_ns,
+        }
+    }
+}
+
+// ============================================================================
+// 4. 예외 핸들러
+// ============================================================================
+
+pub struct ExceptionHandler {
+    pub total_exceptions: u64,
+    pub sync_count: u64,
+    pub irq_count: u64,
+    pub fiq_count: u64,
+    pub error_count: u64,
+    pub svc_count: u64,
+    pub last_exception_ns: u64,
+}
+
+impl ExceptionHandler {
+    pub fn new() -> Self {
+        ExceptionHandler {
+            total_exceptions: 0,
+            sync_count: 0,
+            irq_count: 0,
+            fiq_count: 0,
+            error_count: 0,
+            svc_count: 0,
+            last_exception_ns: 0,
+        }
+    }
+
+    /// 일반 예외 디스패처
+    pub fn dispatch_exception(&mut self, frame: &ExceptionFrame) -> u64 {
+        self.total_exceptions += 1;
+        self.last_exception_ns = frame.timestamp_ns;
+
+        match frame.exc_type {
+            ExceptionType::SyncEl1 | ExceptionType::SyncEl0 => {
+                self.sync_count += 1;
+                self.handle_sync_exception(frame)
+            },
+            ExceptionType::IrqEl1 | ExceptionType::IrqEl0 => {
+                self.irq_count += 1;
+                self.handle_irq_exception(frame)
+            },
+            ExceptionType::FiqEl1 | ExceptionType::FiqEl0 => {
+                self.fiq_count += 1;
+                self.handle_fiq_exception(frame)
+            },
+            ExceptionType::ErrorEl1 | ExceptionType::ErrorEl0 => {
+                self.error_count += 1;
+                self.handle_serror_exception(frame)
+            },
+            ExceptionType::Unknown => {
+                0  // Unknown exception
+            },
+        }
+    }
+
+    /// 동기 예외 처리
+    fn handle_sync_exception(&mut self, frame: &ExceptionFrame) -> u64 {
+        // SVC (시스콜) 인지 Page Fault 인지 구분
+        let esr_class = frame.extract_abort_reason();
+
+        if esr_class == 0x15 {  // SVC from EL0 or EL1
+            self.handle_syscall(frame)
+        } else {
+            // Page Fault 등 다른 동기 예외
+            0
+        }
+    }
+
+    /// 시스콜 핸들러 (SVC 디스패치)
+    pub fn handle_syscall(&mut self, frame: &ExceptionFrame) -> u64 {
+        self.svc_count += 1;
+
+        let syscall_nr = frame.extract_syscall_nr();
+        let svc = SyscallNumber::from_u64(syscall_nr);
+
+        match svc {
+            SyscallNumber::SysWrite => {
+                // X0: FD, X1: buf, X2: count
+                frame.x2  // 반환: 쓴 바이트
+            },
+            SyscallNumber::SysRead => {
+                // X0: FD, X1: buf, X2: count
+                frame.x2  // 반환: 읽은 바이트
+            },
+            SyscallNumber::SysAlloc => {
+                // X0: size -> 반환: pointer
+                0x1000  // 4KB 할당 시뮬레이션
+            },
+            SyscallNumber::SysFree => {
+                // X0: pointer -> 반환: status
+                0  // 성공
+            },
+            SyscallNumber::SysFork => {
+                // 반환: 자식 PID (부모) / 0 (자식)
+                0
+            },
+            SyscallNumber::SysExit => {
+                // X0: status
+                0
+            },
+            SyscallNumber::SysLcdDraw => {
+                // X0: x, X1: y, X2: color -> 반환: status
+                0
+            },
+            SyscallNumber::SysLcdFlush => {
+                // 반환: 플러시 시간 (µs)
+                1  // 1µs
+            },
+        }
+    }
+
+    /// IRQ 처리 (dummy)
+    fn handle_irq_exception(&self, _frame: &ExceptionFrame) -> u64 {
+        0
+    }
+
+    /// FIQ 처리 (dummy)
+    fn handle_fiq_exception(&self, _frame: &ExceptionFrame) -> u64 {
+        0
+    }
+
+    /// SError 처리 (dummy)
+    fn handle_serror_exception(&self, _frame: &ExceptionFrame) -> u64 {
+        0
+    }
+
+    pub fn stats(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.total_exceptions,
+            self.sync_count,
+            self.irq_count,
+            self.fiq_count,
+            self.error_count,
+            self.svc_count,
+        )
+    }
+}
+
+// ============================================================================
+// 5. 벡터 테이블 관리
+// ============================================================================
+
+pub struct VectorTable {
+    pub base_addr: u64,             // VBAR_EL1 값
+    pub entries: [u64; 16],         // 각 벡터의 핸들러 주소
+    pub entry_size: u32,            // 128 bytes per entry
+}
+
+impl VectorTable {
+    pub fn new(base_addr: u64) -> Self {
+        VectorTable {
+            base_addr,
+            entries: [0u64; 16],
+            entry_size: 128,
+        }
+    }
+
+    pub fn set_handler(&mut self, exc_type: ExceptionType, handler_addr: u64) -> bool {
+        let idx = exc_type.to_u8() as usize;
+        if idx < 16 {
+            self.entries[idx] = handler_addr;
+            return true;
+        }
+        false
+    }
+
+    pub fn get_handler(&self, exc_type: ExceptionType) -> Option<u64> {
+        let idx = exc_type.to_u8() as usize;
+        if idx < 16 && self.entries[idx] > 0 {
+            Some(self.entries[idx])
+        } else {
+            None
+        }
+    }
+
+    pub fn validate(&self) -> bool {
+        self.base_addr > 0 &&
+        self.entry_size == 128 &&
+        self.entries.iter().all(|&e| e > 0)
+    }
+}
+
+// ============================================================================
+// 6. 검증 함수
+// ============================================================================
+
+pub fn validate_exception_type(exc_type: ExceptionType) -> bool {
+    exc_type != ExceptionType::Unknown
+}
+
+pub fn validate_syscall_number(nr: u64) -> bool {
+    nr < 8
+}
+
+pub fn validate_exception_latency(latency_ns: u64) -> bool {
+    latency_ns < 100_000  // < 100µs
+}
+
+pub fn validate_syscall_latency(latency_ns: u64) -> bool {
+    latency_ns < 10_000   // < 10µs
+}
+
+pub fn validate_exception_frame(frame: &ExceptionFrame) -> bool {
+    frame.exc_type != ExceptionType::Unknown &&
+    frame.elr_el1 > 0
+}
+
+// ============================================================================
+// 7. 클론 구현
+// ============================================================================
+
+impl Clone for ExceptionType {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Clone for SyscallNumber {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Clone for ExceptionHandler {
+    fn clone(&self) -> Self {
+        ExceptionHandler {
+            total_exceptions: self.total_exceptions,
+            sync_count: self.sync_count,
+            irq_count: self.irq_count,
+            fiq_count: self.fiq_count,
+            error_count: self.error_count,
+            svc_count: self.svc_count,
+            last_exception_ns: self.last_exception_ns,
+        }
+    }
+}
+
+impl Clone for VectorTable {
+    fn clone(&self) -> Self {
+        VectorTable {
+            base_addr: self.base_addr,
+            entries: self.entries,
+            entry_size: self.entry_size,
+        }
+    }
+}

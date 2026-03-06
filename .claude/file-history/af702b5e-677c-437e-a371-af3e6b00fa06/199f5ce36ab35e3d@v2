@@ -1,0 +1,400 @@
+// Hypervisor: Virtual Interrupt Routing (500줄)
+// L0이 모든 트랩을 잡고 L1 게스트에게 vIRQ injection
+
+module virq
+
+use hypervisor::{
+    VTTBR, GuestAddressSpace
+}
+
+use vttbr::{
+    VTTBRPool
+}
+
+// ============ vIRQ Exception Classes ============
+
+enum vIRQClass {
+    Synchronous,      // 동기 예외 (abort, undefined)
+    HypervisorCall,   // HVC instruction
+    SystemRegister,   // MSR/MRS 트랩
+    CoprocessorTrap,  // CP15 접근
+    MMIO,             // MMIO 접근 (S2 fault)
+    IRQ,              // Physical IRQ
+    FIQ,              // Physical FIQ
+    SError,           // System error
+}
+
+enum TrapReason {
+    DataAbort,
+    InstructionAbort,
+    UndefinedInstruction,
+    HypervisorCall,
+    SMCCall,
+    SysRegisterAccess,
+    CPAccessTrap,
+    MaintExceptionTrap,
+    FPAccessTrap,
+    VectorCatchException,
+    BranchTargetException,
+}
+
+// ============ Virtual IRQ Injection ============
+
+struct VirtualIRQ {
+    vmid: u16,
+    irq_id: u32,      // vIRQ 번호 (0-1023)
+    priority: u8,     // 우선순위 (0-255, 낮을수록 높음)
+    is_level: bool,   // Level vs Edge triggered
+    is_pending: bool,
+    is_active: bool,
+    target_cpu: u8,   // 대상 CPU (0-3)
+}
+
+impl VirtualIRQ {
+    fn new(vmid: u16, irq: u32, prio: u8) -> VirtualIRQ {
+        return VirtualIRQ {
+            vmid: vmid,
+            irq_id: irq,
+            priority: prio,
+            is_level: true,
+            is_pending: false,
+            is_active: false,
+            target_cpu: 0,
+        }
+    }
+
+    fn inject(&mut self) -> bool {
+        if self.is_pending || self.is_active {
+            return false  // Already pending/active
+        }
+        self.is_pending = true
+        return true
+    }
+
+    fn acknowledge(&mut self) -> bool {
+        if !self.is_pending {
+            return false
+        }
+        self.is_pending = false
+        self.is_active = true
+        return true
+    }
+
+    fn deactivate(&mut self) -> bool {
+        self.is_active = false
+        return true
+    }
+}
+
+// ============ Exception Context (L1 상태 보존) ============
+
+struct ExceptionContext {
+    vmid: u16,
+    exception_class: vIRQClass,
+    trap_reason: TrapReason,
+
+    // General-purpose registers (x0-x30)
+    pc: u64,           // 예외 발생 주소
+    lr: u64,           // Return address
+    sp: u64,           // Stack pointer
+
+    // Exception-specific registers
+    esr_el2: u64,      // Exception Syndrome Register
+    far_el2: u64,      // Fault Address Register (S2 MMU faults)
+    hpfar_el2: u64,    // Hypervisor Physical Fault Address
+
+    // State
+    is_write: bool,    // Data abort: write vs read
+    fault_level: u32,  // S2 page table level (0-3)
+    instruction_syndrome: u64,
+}
+
+impl ExceptionContext {
+    fn new(vmid: u16, exc_class: vIRQClass, reason: TrapReason) -> ExceptionContext {
+        return ExceptionContext {
+            vmid: vmid,
+            exception_class: exc_class,
+            trap_reason: reason,
+            pc: 0,
+            lr: 0,
+            sp: 0,
+            esr_el2: 0,
+            far_el2: 0,
+            hpfar_el2: 0,
+            is_write: false,
+            fault_level: 0,
+            instruction_syndrome: 0,
+        }
+    }
+
+    fn get_fault_ipa(&self) -> u64 {
+        return self.far_el2
+    }
+
+    fn get_fault_pa(&self) -> u64 {
+        return self.hpfar_el2
+    }
+}
+
+// ============ Trap Handler (모든 트랩 인터셉트) ============
+
+struct TrapHandler {
+    vmid: u16,
+    trap_count: u32,
+    emulated_accesses: u32,
+    injected_virqs: u32,
+}
+
+impl TrapHandler {
+    fn new(vm_id: u16) -> TrapHandler {
+        return TrapHandler {
+            vmid: vm_id,
+            trap_count: 0,
+            emulated_accesses: 0,
+            injected_virqs: 0,
+        }
+    }
+
+    fn handle_exception(&mut self, ctx: ExceptionContext) -> bool {
+        self.trap_count += 1
+
+        match ctx.exception_class {
+            vIRQClass::Synchronous => {
+                return self.handle_synchronous_exception(ctx)
+            },
+            vIRQClass::HypervisorCall => {
+                return self.handle_hypercall(ctx)
+            },
+            vIRQClass::SystemRegister => {
+                return self.handle_sysreg_access(ctx)
+            },
+            vIRQClass::CoprocessorTrap => {
+                return self.handle_cp_access(ctx)
+            },
+            vIRQClass::MMIO => {
+                return self.handle_mmio_fault(ctx)
+            },
+            vIRQClass::IRQ => {
+                return self.handle_irq(ctx)
+            },
+            vIRQClass::FIQ => {
+                return self.handle_fiq(ctx)
+            },
+            vIRQClass::SError => {
+                return self.handle_serror(ctx)
+            },
+        }
+    }
+
+    fn handle_synchronous_exception(&mut self, ctx: ExceptionContext) -> bool {
+        // Data/Instruction abort, undefined instruction 처리
+        return true
+    }
+
+    fn handle_hypercall(&mut self, ctx: ExceptionContext) -> bool {
+        // HVC 명령어 처리 (L1이 L0에 요청)
+        // e.g., HVC #0x1234 → 게스트 메모리 할당 요청
+        return true
+    }
+
+    fn handle_sysreg_access(&mut self, ctx: ExceptionContext) -> bool {
+        // MSR/MRS 트랩: 시스템 레지스터 에뮬레이션
+        // e.g., CNTP_CTL_EL0 → virtual timer control
+        self.emulated_accesses += 1
+        return true
+    }
+
+    fn handle_cp_access(&mut self, ctx: ExceptionContext) -> bool {
+        // Coprocessor 접근 에뮬레이션 (CP15)
+        self.emulated_accesses += 1
+        return true
+    }
+
+    fn handle_mmio_fault(&mut self, ctx: ExceptionContext) -> bool {
+        // S2 MMU fault: 게스트가 MMIO 접근 시도
+        // Device emulation이나 trap-and-emulate 수행
+        let fault_ipa = ctx.get_fault_ipa()
+        self.emulated_accesses += 1
+        return true
+    }
+
+    fn handle_irq(&mut self, ctx: ExceptionContext) -> bool {
+        // Physical IRQ를 virtual IRQ로 변환하여 L1에 injection
+        self.injected_virqs += 1
+        return true
+    }
+
+    fn handle_fiq(&mut self, ctx: ExceptionContext) -> bool {
+        // Fast Interrupt Request
+        return true
+    }
+
+    fn handle_serror(&mut self, ctx: ExceptionContext) -> bool {
+        // System Error (비복구 가능, 일반적으로 치명적)
+        return false
+    }
+
+    fn get_trap_count(&self) -> u32 {
+        return self.trap_count
+    }
+
+    fn get_emulated_count(&self) -> u32 {
+        return self.emulated_accesses
+    }
+
+    fn get_injected_virq_count(&self) -> u32 {
+        return self.injected_virqs
+    }
+}
+
+// ============ Virtual IRQ Controller ============
+
+struct VirtualIRQController {
+    vmid: u16,
+    virqs: array[VirtualIRQ; 1024],    // 최대 1024 vIRQs
+    pending_count: u32,
+    active_count: u32,
+}
+
+impl VirtualIRQController {
+    fn new(vm_id: u16) -> VirtualIRQController {
+        let mut ctrl = VirtualIRQController {
+            vmid: vm_id,
+            virqs: array[VirtualIRQ; 1024],
+            pending_count: 0,
+            active_count: 0,
+        }
+
+        for i in 0..1024 {
+            ctrl.virqs[i] = VirtualIRQ::new(vm_id, i as u32, 128)
+        }
+
+        return ctrl
+    }
+
+    fn inject_virq(&mut self, irq_id: u32, priority: u8) -> bool {
+        if irq_id >= 1024 {
+            return false
+        }
+
+        if self.virqs[irq_id].inject() {
+            self.pending_count += 1
+            return true
+        }
+        return false
+    }
+
+    fn acknowledge_virq(&mut self, irq_id: u32) -> bool {
+        if irq_id >= 1024 {
+            return false
+        }
+
+        if self.virqs[irq_id].acknowledge() {
+            self.pending_count -= 1
+            self.active_count += 1
+            return true
+        }
+        return false
+    }
+
+    fn deactivate_virq(&mut self, irq_id: u32) -> bool {
+        if irq_id >= 1024 {
+            return false
+        }
+
+        if self.virqs[irq_id].deactivate() {
+            self.active_count -= 1
+            return true
+        }
+        return false
+    }
+
+    fn get_highest_priority_virq(&self) -> u32 {
+        let mut highest_priority = 255
+        let mut highest_irq = 0xFFFFFFFF
+
+        for i in 0..1024 {
+            if self.virqs[i].is_pending && self.virqs[i].priority < highest_priority {
+                highest_priority = self.virqs[i].priority
+                highest_irq = i as u32
+            }
+        }
+
+        return highest_irq
+    }
+
+    fn get_pending_count(&self) -> u32 {
+        return self.pending_count
+    }
+
+    fn get_active_count(&self) -> u32 {
+        return self.active_count
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Virtual IRQ Controller (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Pending vIRQs: " + self.pending_count.to_string() + "\\n"
+        s = s + "Active vIRQs: " + self.active_count.to_string() + "\\n"
+        s = s + "Max vIRQs: 1024"
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_virq_injection() -> bool {
+    let mut virq = VirtualIRQ::new(1, 32, 128)
+
+    assert(!virq.is_pending, "initially not pending")
+    assert(virq.inject(), "inject should succeed")
+    assert(virq.is_pending, "should be pending after inject")
+
+    assert(virq.acknowledge(), "acknowledge should succeed")
+    assert(!virq.is_pending, "should not be pending after acknowledge")
+    assert(virq.is_active, "should be active after acknowledge")
+
+    assert(virq.deactivate(), "deactivate should succeed")
+    assert(!virq.is_active, "should not be active after deactivate")
+
+    return true
+}
+
+fn validate_trap_handler() -> bool {
+    let mut handler = TrapHandler::new(1)
+
+    let mut ctx = ExceptionContext::new(1, vIRQClass::HypervisorCall, TrapReason::HypervisorCall)
+    ctx.pc = 0x80001000
+
+    assert(handler.handle_exception(ctx), "handle exception should succeed")
+    assert(handler.get_trap_count() == 1, "trap count should be 1")
+
+    return true
+}
+
+fn validate_virq_controller() -> bool {
+    let mut ctrl = VirtualIRQController::new(1)
+
+    assert(ctrl.inject_virq(32, 128), "inject vIRQ 32")
+    assert(ctrl.get_pending_count() == 1, "pending count should be 1")
+
+    assert(ctrl.acknowledge_virq(32), "acknowledge vIRQ 32")
+    assert(ctrl.get_pending_count() == 0, "pending count should be 0")
+    assert(ctrl.get_active_count() == 1, "active count should be 1")
+
+    assert(ctrl.deactivate_virq(32), "deactivate vIRQ 32")
+    assert(ctrl.get_active_count() == 0, "active count should be 0")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

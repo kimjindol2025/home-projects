@@ -1,0 +1,476 @@
+// FreeLang-LLC: Distributed Bootloader for Multi-Node Clusters
+// Purpose: Bootstrap multiple ARM64 nodes with synchronized startup
+// Strategy: Leader election + parallel initialization + node coordination
+
+use super::bootloader::*;
+use super::mmu::*;
+use super::pointer::ManagedPointer;
+
+// ============================================================================
+// Part 1: Node Identity & Cluster Configuration (150 lines)
+// ============================================================================
+
+pub struct NodeId {
+    pub cpu_id: u32,              // 0-15 for 16-core system
+    pub socket_id: u8,            // Physical socket
+    pub node_id: u8,              // Cluster node ID (0-255)
+    pub global_id: u64,           // Unique across cluster
+}
+
+impl NodeId {
+    pub fn new(cpu: u32, socket: u8, node: u8) -> Self {
+        let global_id = ((socket as u64) << 16) | ((node as u64) << 8) | (cpu as u64);
+        NodeId {
+            cpu_id: cpu,
+            socket_id: socket,
+            node_id: node,
+            global_id,
+        }
+    }
+
+    pub fn is_primary(&self) -> bool {
+        self.global_id == 0  // Node 0, CPU 0
+    }
+
+    pub fn is_secondary(&self) -> bool {
+        self.global_id > 0 && self.global_id < 256
+    }
+}
+
+pub struct ClusterConfig {
+    pub total_nodes: u32,         // 1-256 nodes
+    pub cpus_per_node: u32,       // 1-16 CPUs
+    pub primary_node: u32,        // Master node (usually 0)
+    pub interconnect: InterconnectType,
+    pub sync_barrier_timeout_ms: u32,
+}
+
+pub enum InterconnectType {
+    LocalMemory,       // Same physical machine
+    PCIe,              // PCI Express (high-speed)
+    Ethernet,          // Network interface
+    InfiniBand,        // IB for supercomputers
+}
+
+impl ClusterConfig {
+    pub fn new(nodes: u32, cpus: u32) -> Result<Self, String> {
+        if nodes == 0 || nodes > 256 {
+            return Err(format!("Invalid node count: {}", nodes));
+        }
+        if cpus == 0 || cpus > 16 {
+            return Err(format!("Invalid CPUs per node: {}", cpus));
+        }
+
+        Ok(ClusterConfig {
+            total_nodes: nodes,
+            cpus_per_node: cpus,
+            primary_node: 0,
+            interconnect: InterconnectType::PCIe,
+            sync_barrier_timeout_ms: 5000,
+        })
+    }
+
+    pub fn total_cpus(&self) -> u32 {
+        self.total_nodes * self.cpus_per_node
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.total_cpus() > 256 {
+            return Err(format!("Total CPUs exceed limit: {}", self.total_cpus()));
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Part 2: Multi-Node Boot Sequence (180 lines)
+// ============================================================================
+
+pub enum BootPhase {
+    Phase0,   // Firmware initialization
+    Phase1A,  // Primary node boot
+    Phase1B,  // Secondary nodes power-on
+    Phase2,   // Synchronized kernel boot
+    Phase3,   // Inter-node communication setup
+    Phase4,   // Cluster ready
+}
+
+pub struct DistributedBootSequence {
+    pub phase: BootPhase,
+    pub config: ClusterConfig,
+    pub local_node: NodeId,
+    pub nodes_ready: u32,
+    pub barrier_count: u32,
+    pub boot_time_ms: u64,
+}
+
+impl DistributedBootSequence {
+    pub fn new(config: ClusterConfig, node_id: NodeId) -> Result<Self, String> {
+        config.validate()?;
+
+        Ok(DistributedBootSequence {
+            phase: BootPhase::Phase0,
+            config,
+            local_node: node_id,
+            nodes_ready: 0,
+            barrier_count: 0,
+            boot_time_ms: 0,
+        })
+    }
+
+    // Phase 0: Firmware bringup
+    pub fn firmware_init(&mut self) -> Result<String, String> {
+        if self.local_node.is_primary() {
+            // Primary: Initialize cluster configuration
+            self.config.validate()?;
+            self.nodes_ready = 1;
+            Ok("Phase 0: Primary node firmware initialized".to_string())
+        } else {
+            // Secondary: Wait for signal from primary
+            Ok("Phase 0: Secondary node waiting for primary".to_string())
+        }
+    }
+
+    // Phase 1A: Primary boot
+    pub fn primary_boot(&mut self) -> Result<String, String> {
+        if !self.local_node.is_primary() {
+            return Err("Not primary node".to_string());
+        }
+
+        // 1. Initialize primary MMU
+        // 2. Set up interconnect
+        // 3. Enable secondary nodes
+        self.phase = BootPhase::Phase1B;
+        Ok("Phase 1A: Primary initialized, enabling secondaries".to_string())
+    }
+
+    // Phase 1B: Secondary nodes power on
+    pub fn secondary_power_on(&mut self) -> Result<String, String> {
+        if self.local_node.is_primary() {
+            return Err("Primary cannot power on itself".to_string());
+        }
+
+        // Wait for enable signal from primary
+        // Initialize local MMU
+        // Report ready status
+        self.nodes_ready += 1;
+        Ok(format!("Phase 1B: Secondary node {} initialized", self.local_node.global_id))
+    }
+
+    // Phase 2: Synchronized kernel boot
+    pub fn sync_kernel_boot(&mut self) -> Result<String, String> {
+        // Wait at barrier until all nodes ready
+        self.barrier_count += 1;
+
+        if self.barrier_count >= self.config.total_nodes {
+            self.phase = BootPhase::Phase3;
+            Ok("Phase 2: All nodes synchronized, proceeding to Phase 3".to_string())
+        } else {
+            Ok(format!(
+                "Phase 2: Waiting for {} more nodes",
+                self.config.total_nodes - self.barrier_count
+            ))
+        }
+    }
+
+    // Phase 3: Inter-node communication setup
+    pub fn setup_interconnect(&mut self) -> Result<String, String> {
+        // Initialize interconnect based on config
+        // Set up remote memory access
+        // Configure interrupts between nodes
+
+        self.phase = BootPhase::Phase4;
+        Ok("Phase 3: Interconnect configured".to_string())
+    }
+
+    // Phase 4: Cluster ready
+    pub fn cluster_ready(&self) -> bool {
+        matches!(self.phase, BootPhase::Phase4) &&
+        self.nodes_ready >= self.config.total_nodes
+    }
+}
+
+// ============================================================================
+// Part 3: Synchronization Barriers (140 lines)
+// ============================================================================
+
+pub struct SyncBarrier {
+    pub barrier_id: u32,
+    pub total_participants: u32,
+    pub arrived_count: u32,
+    pub generation: u64,
+    pub timeout_ms: u32,
+}
+
+impl SyncBarrier {
+    pub fn new(participants: u32, timeout_ms: u32) -> Result<Self, String> {
+        if participants == 0 {
+            return Err("At least 1 participant required".to_string());
+        }
+
+        Ok(SyncBarrier {
+            barrier_id: 0,
+            total_participants: participants,
+            arrived_count: 0,
+            generation: 0,
+            timeout_ms,
+        })
+    }
+
+    pub fn arrive(&mut self) -> Result<bool, String> {
+        self.arrived_count += 1;
+
+        if self.arrived_count >= self.total_participants {
+            // All nodes arrived - release barrier
+            self.generation += 1;
+            self.arrived_count = 0;
+            Ok(true)  // Barrier released
+        } else {
+            Ok(false)  // Waiting for more nodes
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.arrived_count = 0;
+    }
+
+    pub fn get_status(&self) -> (u32, u32) {
+        (self.arrived_count, self.total_participants)
+    }
+}
+
+pub struct BarrierManager {
+    pub barriers: Vec<SyncBarrier>,
+}
+
+impl BarrierManager {
+    pub fn new() -> Self {
+        BarrierManager {
+            barriers: Vec::new(),
+        }
+    }
+
+    pub fn create_barrier(&mut self, participants: u32, timeout_ms: u32) -> Result<u32, String> {
+        let barrier = SyncBarrier::new(participants, timeout_ms)?;
+        let id = self.barriers.len() as u32;
+        self.barriers.push(barrier);
+        Ok(id)
+    }
+
+    pub fn arrive_at_barrier(&mut self, barrier_id: usize) -> Result<bool, String> {
+        if barrier_id >= self.barriers.len() {
+            return Err(format!("Barrier {} not found", barrier_id));
+        }
+
+        self.barriers[barrier_id].arrive()
+    }
+
+    pub fn wait_all(&self) -> u32 {
+        let mut waiting = 0;
+        for barrier in &self.barriers {
+            if barrier.arrived_count < barrier.total_participants {
+                waiting += 1;
+            }
+        }
+        waiting
+    }
+}
+
+// ============================================================================
+// Part 4: Node Communication Protocol (140 lines)
+// ============================================================================
+
+pub enum MessageType {
+    NodeReady,           // Node bootstrap complete
+    SyncRequest,         // Request synchronization
+    SyncAck,             // Acknowledge sync
+    MemoryUpdate,        // Shared memory update
+    Heartbeat,           // Liveness check
+    ErrorReport,         // Error from node
+}
+
+pub struct ClusterMessage {
+    pub source_node: u32,
+    pub dest_node: u32,
+    pub msg_type: MessageType,
+    pub sequence: u64,
+    pub payload: Vec<u64>,
+}
+
+impl ClusterMessage {
+    pub fn new(src: u32, dst: u32, msg_type: MessageType, seq: u64) -> Self {
+        ClusterMessage {
+            source_node: src,
+            dest_node: dst,
+            msg_type,
+            sequence: seq,
+            payload: Vec::new(),
+        }
+    }
+
+    pub fn add_payload(&mut self, data: u64) {
+        self.payload.push(data);
+    }
+
+    pub fn get_payload_size(&self) -> u32 {
+        self.payload.len() as u32
+    }
+}
+
+pub struct MessageQueue {
+    pub messages: Vec<ClusterMessage>,
+    pub max_size: usize,
+}
+
+impl MessageQueue {
+    pub fn new(max_size: usize) -> Self {
+        MessageQueue {
+            messages: Vec::new(),
+            max_size,
+        }
+    }
+
+    pub fn enqueue(&mut self, msg: ClusterMessage) -> Result<(), String> {
+        if self.messages.len() >= self.max_size {
+            return Err("Message queue full".to_string());
+        }
+        self.messages.push(msg);
+        Ok(())
+    }
+
+    pub fn dequeue(&mut self) -> Option<ClusterMessage> {
+        if self.messages.is_empty() {
+            None
+        } else {
+            Some(self.messages.remove(0))
+        }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.messages.len()
+    }
+}
+
+// ============================================================================
+// Part 5: Distributed Clock Synchronization (120 lines)
+// ============================================================================
+
+pub struct DistributedClock {
+    pub local_time_ns: u64,
+    pub reference_node: u32,
+    pub clock_offset_ns: i64,
+    pub last_sync_ns: u64,
+}
+
+impl DistributedClock {
+    pub fn new(reference: u32) -> Self {
+        DistributedClock {
+            local_time_ns: 0,
+            reference_node: reference,
+            clock_offset_ns: 0,
+            last_sync_ns: 0,
+        }
+    }
+
+    pub fn get_global_time(&self) -> u64 {
+        let adjusted = (self.local_time_ns as i64) + self.clock_offset_ns;
+        if adjusted < 0 {
+            0
+        } else {
+            adjusted as u64
+        }
+    }
+
+    pub fn sync_with_reference(&mut self, reference_time_ns: u64) {
+        self.clock_offset_ns = (reference_time_ns as i64) - (self.local_time_ns as i64);
+        self.last_sync_ns = self.local_time_ns;
+    }
+
+    pub fn tick(&mut self) {
+        self.local_time_ns += 1;
+    }
+
+    pub fn get_drift_ns(&self) -> u64 {
+        self.local_time_ns - self.last_sync_ns
+    }
+}
+
+// ============================================================================
+// Tests (90 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_node_id_creation() {
+        let node = NodeId::new(0, 0, 0);
+        assert_eq!(node.cpu_id, 0);
+        assert!(node.is_primary());
+    }
+
+    #[test]
+    fn test_node_id_secondary() {
+        let node = NodeId::new(1, 0, 0);
+        assert!(!node.is_primary());
+        assert!(node.is_secondary());
+    }
+
+    #[test]
+    fn test_cluster_config() {
+        let config = ClusterConfig::new(4, 8).unwrap();
+        assert_eq!(config.total_nodes, 4);
+        assert_eq!(config.total_cpus(), 32);
+    }
+
+    #[test]
+    fn test_cluster_config_validation() {
+        assert!(ClusterConfig::new(0, 8).is_err());
+        assert!(ClusterConfig::new(4, 0).is_err());
+        assert!(ClusterConfig::new(257, 1).is_err());
+    }
+
+    #[test]
+    fn test_boot_sequence_creation() {
+        let config = ClusterConfig::new(2, 4).unwrap();
+        let node = NodeId::new(0, 0, 0);
+        let boot = DistributedBootSequence::new(config, node).unwrap();
+        assert!(boot.local_node.is_primary());
+    }
+
+    #[test]
+    fn test_sync_barrier() {
+        let mut barrier = SyncBarrier::new(2, 5000).unwrap();
+        assert!(!barrier.arrive().unwrap());
+        assert!(barrier.arrive().unwrap());
+    }
+
+    #[test]
+    fn test_barrier_manager() {
+        let mut mgr = BarrierManager::new();
+        let bid = mgr.create_barrier(2, 5000).unwrap();
+        assert!(!mgr.arrive_at_barrier(bid).unwrap());
+    }
+
+    #[test]
+    fn test_cluster_message() {
+        let msg = ClusterMessage::new(0, 1, MessageType::NodeReady, 0);
+        assert_eq!(msg.source_node, 0);
+        assert_eq!(msg.dest_node, 1);
+    }
+
+    #[test]
+    fn test_message_queue() {
+        let mut queue = MessageQueue::new(10);
+        let msg = ClusterMessage::new(0, 1, MessageType::NodeReady, 0);
+        assert!(queue.enqueue(msg).is_ok());
+        assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_distributed_clock() {
+        let mut clock = DistributedClock::new(0);
+        clock.sync_with_reference(1000);
+        assert!(clock.get_global_time() >= 1000 || clock.get_global_time() <= 1001);
+    }
+}

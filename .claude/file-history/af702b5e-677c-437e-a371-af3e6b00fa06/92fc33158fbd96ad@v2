@@ -1,0 +1,325 @@
+// Phase 11c: Hardware Initialization - x86-64 Bare Metal Setup
+// 250줄: 베어메탈 x86-64 하드웨어 초기화
+
+module hardware_init
+
+// CPU 레지스터 상태
+struct CPUState {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    rsp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+    rflags: u64,
+}
+
+// GDT Entry (Global Descriptor Table)
+struct GDTEntry {
+    limit_low: u16,
+    base_low: u16,
+    base_mid: u8,
+    access: u8,
+    limit_high: u4,
+    flags: u4,
+    base_high: u8,
+}
+
+// IDT Entry (Interrupt Descriptor Table)
+struct IDTEntry {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,
+    type_and_attr: u8,
+    offset_mid: u16,
+    offset_high: u32,
+    reserved: u32,
+}
+
+// Page Table Entry
+struct PageTableEntry {
+    present: bool,        // 비트 0
+    writable: bool,       // 비트 1
+    user: bool,          // 비트 2
+    write_through: bool, // 비트 3
+    cache_disable: bool, // 비트 4
+    accessed: bool,      // 비트 5
+    dirty: bool,         // 비트 6
+    pat: bool,           // 비트 7
+    global: bool,        // 비트 8
+    address: u64,        // 비트 12-51
+}
+
+// Hardware initialization manager
+struct HardwareInit {
+    cpu_state: CPUState,
+    gdt: GDTEntry[],
+    idt: IDTEntry[],
+    page_tables: PageTableEntry[],
+    initialized: bool,
+}
+
+impl HardwareInit {
+    fn new() -> HardwareInit {
+        return HardwareInit {
+            cpu_state: CPUState {
+                rax: 0, rbx: 0, rcx: 0, rdx: 0,
+                rsi: 0, rdi: 0, rbp: 0, rsp: 0x7FFF0,
+                r8: 0, r9: 0, r10: 0, r11: 0,
+                r12: 0, r13: 0, r14: 0, r15: 0,
+                rip: 0x7C00,  // 부팅 로더 주소
+                rflags: 0x202,  // IF=1, Reserved=1
+            },
+            gdt: [],
+            idt: [],
+            page_tables: [],
+            initialized: false,
+        }
+    }
+
+    // CPU 상태 초기화
+    fn init_cpu(&mut self) -> bool {
+        // 스택 포인터 설정
+        self.cpu_state.rsp = 0x9C000
+
+        // rflags 초기화
+        // Bit 1: Reserved (1)
+        // Bit 9: IF (Interrupt Flag) = 1
+        self.cpu_state.rflags = 0x202
+
+        return true
+    }
+
+    // GDT (Global Descriptor Table) 구성
+    fn init_gdt(&mut self) -> bool {
+        // GDT Entry 0: Null descriptor
+        let null_entry = GDTEntry {
+            limit_low: 0,
+            base_low: 0,
+            base_mid: 0,
+            access: 0,
+            limit_high: 0,
+            flags: 0,
+            base_high: 0,
+        }
+        self.gdt.push(null_entry)
+
+        // GDT Entry 1: Kernel code (64-bit)
+        // Access byte: 0x9A (Present=1, DPL=0, Type=10, C=1)
+        let code_entry = GDTEntry {
+            limit_low: 0xFFFF,
+            base_low: 0x0000,
+            base_mid: 0x00,
+            access: 0x9A,  // Present | Type | Conforming
+            limit_high: 0xF,
+            flags: 0xA,    // Granularity | Long mode
+            base_high: 0x00,
+        }
+        self.gdt.push(code_entry)
+
+        // GDT Entry 2: Kernel data (64-bit)
+        // Access byte: 0x92 (Present=1, DPL=0, Type=10, W=1)
+        let data_entry = GDTEntry {
+            limit_low: 0xFFFF,
+            base_low: 0x0000,
+            base_mid: 0x00,
+            access: 0x92,  // Present | Type | Writable
+            limit_high: 0xF,
+            flags: 0xC,    // Granularity | 64-bit
+            base_high: 0x00,
+        }
+        self.gdt.push(data_entry)
+
+        return self.gdt.len() == 3
+    }
+
+    // IDT (Interrupt Descriptor Table) 구성
+    fn init_idt(&mut self) -> bool {
+        // 256개 인터럽트 핸들러
+
+        for i in 0..256 {
+            let handler_addr = 0x8000 + (i as u64 * 16)  // 핸들러 주소
+
+            let entry = IDTEntry {
+                offset_low: (handler_addr & 0xFFFF) as u16,
+                selector: 0x08,  // 커널 코드 세그먼트 (GDT entry 1)
+                ist: 0,          // IST 미사용
+                type_and_attr: 0x8E,  // 64-bit interrupt gate
+                offset_mid: ((handler_addr >> 16) & 0xFFFF) as u16,
+                offset_high: ((handler_addr >> 32) & 0xFFFFFFFF) as u32,
+                reserved: 0,
+            }
+
+            self.idt.push(entry)
+        }
+
+        return self.idt.len() == 256
+    }
+
+    // 페이징 구조 구성 (4-level paging)
+    fn init_paging(&mut self) -> bool {
+        // PML4 (Level 4): 512 entries, 각각 1GB 영역
+        // PDPE (Level 3): 512 entries, 각각 2MB 영역
+        // PDE (Level 2): 512 entries, 각각 4KB 영역
+        // PTE (Level 1): 페이지 테이블
+
+        // 첫 번째 PTE 설정 (물리 주소 0 → 가상 주소 0xFFFFFFFF80000000)
+        for i in 0..512 {
+            let entry = PageTableEntry {
+                present: true,
+                writable: true,
+                user: false,
+                write_through: false,
+                cache_disable: false,
+                accessed: false,
+                dirty: false,
+                pat: false,
+                global: true,
+                address: (i as u64 * 4096),  // 4KB 페이지
+            }
+            self.page_tables.push(entry)
+        }
+
+        return self.page_tables.len() == 512
+    }
+
+    // CR0 레지스터 설정 (paging 활성화)
+    fn setup_cr0(&mut self) -> u64 {
+        // Bit 0: PE (Protection Enable) = 1
+        // Bit 1: MP (Monitor Coprocessor) = 1
+        // Bit 2: EM (Emulation) = 0
+        // Bit 3: TS (Task Switched) = 0
+        // Bit 4: ET (Extension Type) = 1
+        // Bit 31: PG (Paging) = 1
+
+        let cr0: u64 = 0x80000011  // PE | ET | PG | MP
+        return cr0
+    }
+
+    // CR3 레지스터 설정 (페이지 디렉토리 베이스)
+    fn setup_cr3(&self) -> u64 {
+        // CR3은 PML4 (레벨 4 페이지 맵)의 물리 주소
+        let pml4_address: u64 = 0x9000
+
+        return pml4_address
+    }
+
+    // CR4 레지스터 설정 (확장 기능)
+    fn setup_cr4(&mut self) -> u64 {
+        // Bit 5: PAE (Physical Address Extension) = 1
+        // Bit 9: PGE (Page Global Enable) = 1
+        // Bit 18: PCIDE (PCID Enable) = 1
+
+        let cr4: u64 = 0x240020  // PAE | PGE | PCIDE
+        return cr4
+    }
+
+    // MTRR (Memory Type Range Register) 설정
+    fn setup_mtrr(&mut self) -> bool {
+        // MTRRdefType: WB (Write-Back) 기본값
+        // 물리 메모리 영역별 캐시 설정
+
+        return true
+    }
+
+    // 부트스트랩 프로세서 (BSP) 초기화
+    fn init_bsp(&mut self) -> bool {
+        // 1. CPU 상태 초기화
+        if !self.init_cpu() {
+            return false
+        }
+
+        // 2. GDT 로드
+        if !self.init_gdt() {
+            return false
+        }
+
+        // 3. IDT 로드
+        if !self.init_idt() {
+            return false
+        }
+
+        // 4. 페이징 구조 설정
+        if !self.init_paging() {
+            return false
+        }
+
+        // 5. MTRR 설정
+        if !self.setup_mtrr() {
+            return false
+        }
+
+        // 6. CR 레지스터 설정
+        let cr0 = self.setup_cr0()
+        let cr3 = self.setup_cr3()
+        let cr4 = self.setup_cr4()
+
+        // 로드 CR0, CR3, CR4
+        // MOV CR0, RAX
+        // MOV CR3, RAX
+        // MOV CR4, RAX
+
+        self.initialized = true
+        return true
+    }
+
+    // CPU 기능 확인
+    fn get_cpu_capabilities(&self) -> u32 {
+        // CPUID를 통해 CPU 기능 반환
+        // Bit 0: FPU (Floating Point Unit)
+        // Bit 5: MSR (Model-Specific Register)
+        // Bit 25: SSE
+        // Bit 26: SSE2
+
+        return 0x06000001  // FPU | MSR | SSE
+    }
+
+    // 메모리 크기 감지
+    fn detect_memory_size(&self) -> u64 {
+        // E820h BIOS 호출을 통해 메모리 맵 조회
+        // 여기서는 4GB 가정
+
+        return 4 * 1024 * 1024 * 1024  // 4GB
+    }
+
+    // 전체 하드웨어 초기화
+    fn initialize(&mut self) -> bool {
+        return self.init_bsp()
+    }
+
+    // 초기화 상태 확인
+    fn is_initialized(&self) -> bool {
+        return self.initialized &&
+               self.gdt.len() == 3 &&
+               self.idt.len() == 256 &&
+               self.page_tables.len() == 512
+    }
+}
+
+// 벡터 확장 지원 유틸리티
+fn has_sse() -> bool {
+    // CPUID EAX=1, EDX 비트 25 확인
+    return true
+}
+
+fn has_avx() -> bool {
+    // CPUID EAX=1, ECX 비트 28 확인
+    // 및 XGETBV 검증
+    return false  // 많은 QEMU 환경에서 미지원
+}
+
+fn has_avx512() -> bool {
+    // CPUID EAX=7, ECX=0, EBX 비트 16 확인
+    return false
+}

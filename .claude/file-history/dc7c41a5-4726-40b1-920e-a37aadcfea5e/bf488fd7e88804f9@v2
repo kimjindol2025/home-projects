@@ -1,0 +1,368 @@
+// Phase 4: Dynamic Key Generator
+// 인증 결과로부터 동적 암호키 생성
+
+use crate::authentication::*;
+use crate::learning::*;
+use super::crypto_module::*;
+use super::key_derivation::*;
+use super::key_entropy_validator::*;
+use super::template_encryption::*;
+
+/// 동적 키 생성 결과
+#[derive(Clone, Debug)]
+pub struct DynamicKeyResult {
+    pub generation_key: Vec<u8>,              // 생성된 키 (32 bytes)
+    pub key_id: String,                        // 키 식별자
+    pub entropy_bits: f64,                     // 엔트로피 (비트)
+    pub is_valid: bool,                        // 엔트로피 >= 128비트
+    pub timestamp: u64,
+    pub metadata: String,
+}
+
+/// 동적 키 생성 엔진
+#[derive(Clone, Debug)]
+pub struct DynamicKeyGenerator {
+    pub user_id: String,
+    pub master_secret: Vec<u8>,               // 사용자의 고정 비밀 (등록 시 생성)
+}
+
+impl DynamicKeyGenerator {
+    pub fn new(user_id: String) -> Self {
+        // 마스터 시크릿 생성 (user_id 기반)
+        let master_secret = hmac_sha256(user_id.as_bytes(), b"master_secret").bytes.to_vec();
+
+        DynamicKeyGenerator {
+            user_id,
+            master_secret,
+        }
+    }
+
+    /// 인증 성공 시 동적 키 생성
+    pub fn generate_key_on_authentication(
+        &self,
+        auth_decision: &AuthenticationDecision,
+        confidence_score: f64,
+        model_fingerprint: &str,  // 신경망 모델의 해시
+    ) -> Result<DynamicKeyResult, String> {
+        // Step 1: 인증 실패 시 거부
+        if *auth_decision != AuthenticationDecision::Accept {
+            return Err("Authentication failed - cannot generate key".to_string());
+        }
+
+        // Step 2: 신뢰도 검증 (최소 0.5)
+        if confidence_score < 0.5 {
+            return Err("Confidence score too low for key generation".to_string());
+        }
+
+        // Step 3: 키 유도
+        let params = KeyDerivationParams::new();
+        let derived = derive_key_from_biometric(
+            &self.user_id,
+            confidence_score,
+            model_fingerprint,
+            &params,
+        );
+
+        // Step 4: 마스터 시크릿과 결합
+        let combined = [self.master_secret.clone(), derived.key.clone()].concat();
+        let final_key = hmac_sha256(&combined, b"dynamic_key").bytes.to_vec();
+
+        // Step 5: 엔트로피 검증
+        let analysis = analyze_entropy(&final_key);
+
+        // Step 6: 키 ID 생성
+        let key_id_hash = sha256(
+            format!(
+                "{}:{}:{}",
+                self.user_id,
+                (confidence_score * 1_000_000.0) as u64,
+                model_fingerprint
+            )
+            .as_bytes(),
+        );
+        let key_id = key_id_hash.to_hex()[..16].to_string();
+
+        Ok(DynamicKeyResult {
+            generation_key: final_key,
+            key_id,
+            entropy_bits: analysis.entropy_bits,
+            is_valid: analysis.meets_nist_requirement(),
+            timestamp: 0,
+            metadata: format!(
+                "user={}, confidence={:.2}%, entropy={:.1}bits, model={}",
+                self.user_id,
+                confidence_score * 100.0,
+                analysis.entropy_bits,
+                &model_fingerprint[..8.min(model_fingerprint.len())]
+            ),
+        })
+    }
+
+    /// 템플릿 암호화 (생성된 키로)
+    pub fn encrypt_user_template(
+        &self,
+        template: &PlaintextTemplate,
+        auth_decision: &AuthenticationDecision,
+        confidence_score: f64,
+        model_fingerprint: &str,
+    ) -> Result<EncryptedTemplate, String> {
+        // 동적 키 생성
+        let key_result = self.generate_key_on_authentication(auth_decision, confidence_score, model_fingerprint)?;
+
+        if !key_result.is_valid {
+            return Err("Generated key does not meet entropy requirements".to_string());
+        }
+
+        // 템플릿 암호화
+        Ok(encrypt_template(template, &key_result.generation_key))
+    }
+
+    /// 템플릿 복호화 (재인증 후)
+    pub fn decrypt_user_template(
+        &self,
+        encrypted: &EncryptedTemplate,
+        auth_decision: &AuthenticationDecision,
+        confidence_score: f64,
+        model_fingerprint: &str,
+    ) -> Result<PlaintextTemplate, String> {
+        // 동적 키 생성 (동일한 조건)
+        let key_result = self.generate_key_on_authentication(auth_decision, confidence_score, model_fingerprint)?;
+
+        // 템플릿 복호화
+        decrypt_template(encrypted, &key_result.generation_key)
+    }
+
+    /// 여러 하위 키 생성 (다양한 용도)
+    pub fn derive_subkeys_for_purposes(
+        &self,
+        auth_decision: &AuthenticationDecision,
+        confidence_score: f64,
+        model_fingerprint: &str,
+        purposes: &[&str],  // ["encryption", "authentication", "integrity", ...]
+    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let key_result = self.generate_key_on_authentication(auth_decision, confidence_score, model_fingerprint)?;
+
+        let subkeys = derive_multiple_keys(&key_result.generation_key, purposes.len(), 32);
+
+        let result = purposes
+            .iter()
+            .zip(subkeys)
+            .map(|(purpose, key)| (purpose.to_string(), key))
+            .collect();
+
+        Ok(result)
+    }
+
+    /// 무관용 규칙: 동일한 입력 → 동일한 키
+    pub fn verify_key_determinism(
+        &self,
+        auth_decision: &AuthenticationDecision,
+        confidence_score: f64,
+        model_fingerprint: &str,
+    ) -> Result<bool, String> {
+        let key1 = self.generate_key_on_authentication(auth_decision, confidence_score, model_fingerprint)?;
+        let key2 = self.generate_key_on_authentication(auth_decision, confidence_score, model_fingerprint)?;
+
+        Ok(key1.generation_key == key2.generation_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generator_creation() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+        assert_eq!(gen.user_id, "user001");
+        assert_eq!(gen.master_secret.len(), 32);
+    }
+
+    #[test]
+    fn test_key_generation_on_accept() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let result = gen.generate_key_on_authentication(
+            &AuthenticationDecision::Accept,
+            0.95,
+            "model_hash_abc123",
+        );
+
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert_eq!(key.generation_key.len(), 32);
+        assert!(key.is_valid);
+    }
+
+    #[test]
+    fn test_key_generation_on_reject() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let result = gen.generate_key_on_authentication(
+            &AuthenticationDecision::Reject,
+            0.3,
+            "model_hash",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_key_generation_low_confidence() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let result = gen.generate_key_on_authentication(
+            &AuthenticationDecision::Accept,
+            0.4,  // < 0.5
+            "model_hash",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_key_determinism() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let result = gen.verify_key_determinism(
+            &AuthenticationDecision::Accept,
+            0.95,
+            "model_hash_xyz",
+        );
+
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_different_users_different_keys() {
+        let gen1 = DynamicKeyGenerator::new("user001".to_string());
+        let gen2 = DynamicKeyGenerator::new("user002".to_string());
+
+        let key1 = gen1
+            .generate_key_on_authentication(&AuthenticationDecision::Accept, 0.95, "hash")
+            .unwrap();
+        let key2 = gen2
+            .generate_key_on_authentication(&AuthenticationDecision::Accept, 0.95, "hash")
+            .unwrap();
+
+        assert_ne!(key1.generation_key, key2.generation_key);
+    }
+
+    #[test]
+    fn test_different_confidence_different_keys() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let key1 = gen
+            .generate_key_on_authentication(&AuthenticationDecision::Accept, 0.95, "hash")
+            .unwrap();
+        let key2 = gen
+            .generate_key_on_authentication(&AuthenticationDecision::Accept, 0.90, "hash")
+            .unwrap();
+
+        assert_ne!(key1.generation_key, key2.generation_key);
+    }
+
+    #[test]
+    fn test_template_encryption_decryption() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let plaintext = PlaintextTemplate::new(b"neural_network_weights".to_vec());
+
+        let encrypted = gen
+            .encrypt_user_template(
+                &plaintext,
+                &AuthenticationDecision::Accept,
+                0.95,
+                "model_hash",
+            )
+            .unwrap();
+
+        let decrypted = gen
+            .decrypt_user_template(
+                &encrypted,
+                &AuthenticationDecision::Accept,
+                0.95,
+                "model_hash",
+            )
+            .unwrap();
+
+        assert_eq!(decrypted.data, plaintext.data);
+    }
+
+    #[test]
+    fn test_subkey_derivation() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let purposes = vec!["encryption", "authentication", "integrity"];
+        let result = gen.derive_subkeys_for_purposes(
+            &AuthenticationDecision::Accept,
+            0.95,
+            "model_hash",
+            &purposes,
+        );
+
+        assert!(result.is_ok());
+        let subkeys = result.unwrap();
+        assert_eq!(subkeys.len(), 3);
+
+        // 각 키가 고유해야 함
+        for i in 0..subkeys.len() {
+            for j in i + 1..subkeys.len() {
+                assert_ne!(subkeys[i].1, subkeys[j].1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_key_entropy_validation() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let result = gen.generate_key_on_authentication(
+            &AuthenticationDecision::Accept,
+            0.95,
+            "model_hash",
+        );
+
+        assert!(result.is_ok());
+        let key = result.unwrap();
+
+        println!("Generated key entropy: {:.1} bits", key.entropy_bits);
+        assert!(key.entropy_bits >= 128.0);
+        assert!(key.is_valid);
+    }
+
+    #[test]
+    fn test_key_metadata() {
+        let gen = DynamicKeyGenerator::new("user_test".to_string());
+
+        let result = gen.generate_key_on_authentication(
+            &AuthenticationDecision::Accept,
+            0.92,
+            "model_abc",
+        );
+
+        assert!(result.is_ok());
+        let key = result.unwrap();
+
+        println!("Key ID: {}", key.key_id);
+        println!("Metadata: {}", key.metadata);
+
+        assert!(!key.key_id.is_empty());
+        assert!(key.metadata.contains("user_test"));
+        assert!(key.metadata.contains("92"));
+    }
+
+    #[test]
+    fn test_reject_high_risk_authentication() {
+        let gen = DynamicKeyGenerator::new("user001".to_string());
+
+        let result = gen.generate_key_on_authentication(
+            &AuthenticationDecision::RejectHighRisk,
+            0.95,
+            "model_hash",
+        );
+
+        assert!(result.is_err());
+    }
+}

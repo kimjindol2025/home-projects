@@ -1,0 +1,346 @@
+/* ============================================================================
+   Nano Scheduler - Round-Robin with Dynamic Priority
+
+   목적: 협력적 멀티태스킹, 라운드로빈 스케줄링
+   크기: ~350줄
+   성능: 스케줄링 < 100µs, 컨텍스트 스위치 < 10µs
+
+   설계: freelang-os-kernel의 scheduler.fl 패턴 재사용
+   - Ready 큐 (FIFO)
+   - 시간 할당(time slice) 기반
+   - 동적 우선순위 조정
+============================================================================ */
+
+// ============================================================================
+// 1. 스케줄링 정책
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SchedulingPolicy {
+    RoundRobin = 0,      // 시간 할당 기반
+    PriorityBased = 1,   // 우선순위 기반
+    Cooperative = 2,     // 자발적 양보
+}
+
+pub struct SchedulerConfig {
+    pub policy: SchedulingPolicy,
+    pub time_slice_ns: u64,         // 시간 할당 (100ms)
+    pub min_priority: u8,           // 최소 우선순위
+    pub max_priority: u8,           // 최대 우선순위
+}
+
+impl SchedulerConfig {
+    pub fn new() -> Self {
+        SchedulerConfig {
+            policy: SchedulingPolicy::RoundRobin,
+            time_slice_ns: 100_000_000,  // 100ms
+            min_priority: 0,
+            max_priority: 255,
+        }
+    }
+
+    pub fn cooperative() -> Self {
+        SchedulerConfig {
+            policy: SchedulingPolicy::Cooperative,
+            time_slice_ns: 0,  // 무제한
+            min_priority: 0,
+            max_priority: 255,
+        }
+    }
+}
+
+// ============================================================================
+// 2. 스케줄러 상태
+// ============================================================================
+
+pub struct SchedulerState {
+    pub current_tid: u32,           // 현재 실행 중인 TID
+    pub total_scheduled: u32,       // 스케줄된 횟수
+    pub context_switches: u32,      // 컨텍스트 스위치 횟수
+    pub idle_count: u32,            // Idle 실행 횟수
+    pub schedule_time_ns: u64,      // 마지막 스케줄 시간
+}
+
+impl SchedulerState {
+    pub fn new() -> Self {
+        SchedulerState {
+            current_tid: 0,
+            total_scheduled: 0,
+            context_switches: 0,
+            idle_count: 0,
+            schedule_time_ns: 0,
+        }
+    }
+}
+
+// ============================================================================
+// 3. 나노 스케줄러
+// ============================================================================
+
+pub struct NanoScheduler {
+    pub ready_queue: Vec<u32>,      // Ready 태스크 TID 리스트 (FIFO)
+    pub current_tid: u32,           // 현재 실행 중인 TID
+    pub config: SchedulerConfig,
+    pub state: SchedulerState,
+    pub last_scheduled_ns: u64,     // 마지막 스케줄 시간
+}
+
+impl NanoScheduler {
+    pub fn new() -> Self {
+        NanoScheduler {
+            ready_queue: Vec::new(),
+            current_tid: 0,
+            config: SchedulerConfig::new(),
+            state: SchedulerState::new(),
+            last_scheduled_ns: 0,
+        }
+    }
+
+    pub fn with_policy(policy: SchedulingPolicy) -> Self {
+        let mut sched = NanoScheduler::new();
+        sched.config.policy = policy;
+        sched
+    }
+
+    /// 태스크를 Ready 큐에 추가
+    pub fn enqueue_task(&mut self, tid: u32) -> bool {
+        if tid == 0 || tid > 255 {
+            return false;
+        }
+
+        // 중복 방지
+        if !self.ready_queue.contains(&tid) {
+            self.ready_queue.push(tid);
+            return true;
+        }
+
+        false
+    }
+
+    /// Ready 큐에서 다음 태스크 선택 (Round-Robin)
+    pub fn schedule_next(&mut self) -> u32 {
+        self.state.total_scheduled += 1;
+
+        // 현재 태스크가 준비 상태면 큐의 끝으로 이동 (Round-Robin)
+        if self.current_tid > 0 && self.ready_queue.contains(&self.current_tid) {
+            if let Some(pos) = self.ready_queue.iter().position(|&t| t == self.current_tid) {
+                let tid = self.ready_queue.remove(pos);
+                self.ready_queue.push(tid);
+            }
+        }
+
+        // 다음 태스크 선택
+        if let Some(next_tid) = self.ready_queue.first().copied() {
+            if next_tid != self.current_tid {
+                self.state.context_switches += 1;
+                self.current_tid = next_tid;
+            }
+            next_tid
+        } else {
+            // Ready 큐가 비었으면 Idle
+            self.state.idle_count += 1;
+            self.current_tid = 0;
+            0
+        }
+    }
+
+    /// 현재 태스크 양보
+    pub fn yield_current(&mut self) -> u32 {
+        // 현재 태스크를 큐의 끝으로 이동
+        if self.current_tid > 0 {
+            if let Some(pos) = self.ready_queue.iter().position(|&t| t == self.current_tid) {
+                let tid = self.ready_queue.remove(pos);
+                self.ready_queue.push(tid);
+            }
+        }
+
+        self.schedule_next()
+    }
+
+    /// 태스크를 Ready 큐에서 제거 (Blocked/Exit)
+    pub fn remove_task(&mut self, tid: u32) -> bool {
+        if let Some(pos) = self.ready_queue.iter().position(|&t| t == tid) {
+            self.ready_queue.remove(pos);
+
+            // 제거된 태스크가 현재 실행 중이었으면 다음 스케줄
+            if self.current_tid == tid {
+                self.schedule_next();
+            }
+
+            return true;
+        }
+
+        false
+    }
+
+    /// 현재 실행 중인 태스크
+    pub fn current_task(&self) -> u32 {
+        self.current_tid
+    }
+
+    /// Ready 큐 크기
+    pub fn ready_count(&self) -> u32 {
+        self.ready_queue.len() as u32
+    }
+
+    /// 통계
+    pub fn stats(&self) -> (u32, u32, u32, u32, u32) {
+        (
+            self.current_tid,
+            self.ready_queue.len() as u32,
+            self.state.total_scheduled,
+            self.state.context_switches,
+            self.state.idle_count,
+        )
+    }
+}
+
+// ============================================================================
+// 4. 멀티 큐 스케줄러 (우선순위 기반)
+// ============================================================================
+
+pub struct PriorityQueueScheduler {
+    // 우선순위별 Ready 큐 (255개, 0=lowest, 255=highest)
+    pub priority_queues: [Vec<u32>; 256],
+    pub current_tid: u32,
+    pub highest_ready_priority: i32,
+    pub total_scheduled: u32,
+}
+
+impl PriorityQueueScheduler {
+    pub fn new() -> Self {
+        let mut queues: [Vec<u32>; 256] = unsafe { core::mem::zeroed() };
+        for i in 0..256 {
+            queues[i] = Vec::new();
+        }
+
+        PriorityQueueScheduler {
+            priority_queues: queues,
+            current_tid: 0,
+            highest_ready_priority: -1,
+            total_scheduled: 0,
+        }
+    }
+
+    pub fn enqueue_with_priority(&mut self, tid: u32, priority: u8) -> bool {
+        if tid == 0 || tid > 255 {
+            return false;
+        }
+
+        let pri = priority as usize;
+        if pri < 256 && !self.priority_queues[pri].contains(&tid) {
+            self.priority_queues[pri].push(tid);
+
+            if pri as i32 > self.highest_ready_priority {
+                self.highest_ready_priority = pri as i32;
+            }
+
+            return true;
+        }
+
+        false
+    }
+
+    pub fn schedule_next(&mut self) -> u32 {
+        self.total_scheduled += 1;
+
+        // 우선순위가 가장 높은 큐에서 선택
+        if self.highest_ready_priority >= 0 {
+            let pri = self.highest_ready_priority as usize;
+
+            if !self.priority_queues[pri].is_empty() {
+                let next_tid = self.priority_queues[pri].remove(0);
+                self.current_tid = next_tid;
+                return next_tid;
+            }
+        }
+
+        // Ready 큐가 비었으면 다시 스캔
+        for i in (0..256).rev() {
+            if !self.priority_queues[i].is_empty() {
+                self.highest_ready_priority = i as i32;
+                let next_tid = self.priority_queues[i].remove(0);
+                self.current_tid = next_tid;
+                return next_tid;
+            }
+        }
+
+        self.current_tid = 0;
+        0
+    }
+}
+
+// ============================================================================
+// 5. 검증 함수
+// ============================================================================
+
+pub fn validate_scheduler_policy(policy: SchedulingPolicy) -> bool {
+    matches!(
+        policy,
+        SchedulingPolicy::RoundRobin | SchedulingPolicy::PriorityBased | SchedulingPolicy::Cooperative
+    )
+}
+
+pub fn validate_time_slice(ns: u64) -> bool {
+    ns > 0 && ns <= 1_000_000_000  // 1ms ~ 1s
+}
+
+pub fn validate_scheduling_latency(latency_ns: u64) -> bool {
+    latency_ns < 100_000  // < 100µs
+}
+
+pub fn validate_ready_queue_size(size: u32) -> bool {
+    size > 0 && size <= 256
+}
+
+pub fn validate_scheduler_state(
+    current_tid: u32,
+    total_scheduled: u32,
+) -> bool {
+    (current_tid == 0 || current_tid <= 255) && total_scheduled > 0
+}
+
+// ============================================================================
+// 6. 클론 구현
+// ============================================================================
+
+impl Clone for SchedulingPolicy {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Clone for SchedulerConfig {
+    fn clone(&self) -> Self {
+        SchedulerConfig {
+            policy: self.policy,
+            time_slice_ns: self.time_slice_ns,
+            min_priority: self.min_priority,
+            max_priority: self.max_priority,
+        }
+    }
+}
+
+impl Clone for SchedulerState {
+    fn clone(&self) -> Self {
+        SchedulerState {
+            current_tid: self.current_tid,
+            total_scheduled: self.total_scheduled,
+            context_switches: self.context_switches,
+            idle_count: self.idle_count,
+            schedule_time_ns: self.schedule_time_ns,
+        }
+    }
+}
+
+impl Clone for NanoScheduler {
+    fn clone(&self) -> Self {
+        NanoScheduler {
+            ready_queue: self.ready_queue.clone(),
+            current_tid: self.current_tid,
+            config: self.config.clone(),
+            state: self.state.clone(),
+            last_scheduled_ns: self.last_scheduled_ns,
+        }
+    }
+}

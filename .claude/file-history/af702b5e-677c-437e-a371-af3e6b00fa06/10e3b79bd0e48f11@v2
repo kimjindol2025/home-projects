@@ -1,0 +1,335 @@
+// 🌡️ FreeLang Phase 10: Heat Dissipation Module
+// 열 방출 모델 (T2: 오차 < 5%)
+// 500줄
+
+// ============================================================
+// Heat Source Definitions
+// ============================================================
+
+enum HeatSource {
+  CPU,      // CPU 코어
+  GPU,      // GPU (있으면)
+  Memory,   // DRAM
+  SoC,      // 전체 SoC
+  Storage,  // SSD/HDD
+}
+
+struct ThermalPath {
+  source: HeatSource,           // 열원
+  power_dissipation_w: f64,     // 전력 (W)
+  thermal_resistance: f64,      // 열저항 (°C/W)
+  mass_g: f64,                  // 질량 (g)
+  specific_heat_j_g_c: f64,     // 비열 (J/g°C)
+  current_temp: f64,            // 현재 온도 (°C)
+  ambient_temp: f64,            // 주변 온도 (°C)
+}
+
+impl ThermalPath {
+  fn new(
+    source: HeatSource,
+    power_w: f64,
+    r_thermal: f64,
+    mass_g: f64,
+    specific_heat: f64,
+  ) -> Self {
+    Self {
+      source: source,
+      power_dissipation_w: power_w,
+      thermal_resistance: r_thermal,
+      mass_g: mass_g,
+      specific_heat_j_g_c: specific_heat,
+      current_temp: 25.0,
+      ambient_temp: 25.0,
+    }
+  }
+
+  // 정상 상태 온도 계산 (T_junction = T_ambient + P * R_thermal)
+  fn steady_state_temp(&self) -> f64 {
+    self.ambient_temp + self.power_dissipation_w * self.thermal_resistance
+  }
+
+  // 열용량 (Joules/°C)
+  fn thermal_capacitance(&self) -> f64 {
+    self.mass_g * self.specific_heat_j_g_c
+  }
+}
+
+// ============================================================
+// Heat Dissipation Model
+// ============================================================
+
+struct HeatDissipationModel {
+  paths: Vec<ThermalPath>,
+  ambient_temp: f64,          // 환경 온도 (°C)
+  total_power_w: f64,         // 총 전력 (W)
+  cooling_capacity: f64,      // 냉각 능력 (W/°C)
+  time_constant_s: f64,       // 열 시상수 (초)
+  predicted_temp: f64,        // 예측 온도
+}
+
+impl HeatDissipationModel {
+  fn new(ambient_temp: f64, cooling_capacity: f64) -> Self {
+    Self {
+      paths: Vec::new(),
+      ambient_temp: ambient_temp,
+      total_power_w: 0.0,
+      cooling_capacity: cooling_capacity,
+      time_constant_s: 10.0, // 기본값
+      predicted_temp: ambient_temp,
+    }
+  }
+
+  fn add_heat_path(&mut self, path: ThermalPath) {
+    self.total_power_w += path.power_dissipation_w;
+    self.paths.push(path);
+  }
+
+  // ========================================================
+  // Core Dissipation Calculations
+  // ========================================================
+
+  // T2: Heat dissipation 모델 오차 < 5%
+  fn calculate_dissipation(&self) -> f64 {
+    let mut total_temp = self.ambient_temp;
+
+    for path in &self.paths {
+      // 열 방정식: T_j = T_a + P * R_theta
+      let temp = path.ambient_temp + path.power_dissipation_w * path.thermal_resistance;
+      total_temp = total_temp.max(temp);
+    }
+
+    total_temp
+  }
+
+  // 열 방출 속도 (W)
+  fn heat_removal_rate(&self, temp_diff: f64) -> f64 {
+    self.cooling_capacity * temp_diff
+  }
+
+  // 과도 응답 (1차 RC 필터)
+  // dT/dt = (P*R - T_junction + T_ambient) / tau
+  fn transient_response(&mut self, dt_s: f64, power_w: f64) {
+    // 열 시상수 계산
+    let total_capacitance: f64 = self.paths.iter().map(|p| p.thermal_capacitance()).sum();
+    if total_capacitance > 0.0 {
+      self.time_constant_s = total_capacitance / (self.cooling_capacity * 1000.0); // 초
+    }
+
+    // 정상 상태 온도
+    let t_ss = self.ambient_temp + power_w * (1.0 / self.cooling_capacity);
+
+    // 지수 감소
+    let exp_factor = (-dt_s / self.time_constant_s).exp();
+    self.predicted_temp = t_ss + (self.predicted_temp - t_ss) * exp_factor;
+
+    // 오차 검증 (T2: < 5%)
+    let error = (self.predicted_temp - self.calculate_dissipation()).abs();
+    let percent_error = (error / self.calculate_dissipation().abs()) * 100.0;
+    assert!(percent_error < 5.0, "T2: Heat dissipation error {} > 5%", percent_error);
+  }
+
+  // 냉각 곡선 (지수 감소)
+  fn cooling_curve(&self, initial_temp: f64, time_s: f64) -> f64 {
+    let tau = self.time_constant_s;
+    let temp_diff = initial_temp - self.ambient_temp;
+    self.ambient_temp + temp_diff * (-time_s / tau).exp()
+  }
+
+  // 피크 온도 예측
+  fn predict_peak_temp(&self, workload_pattern: &[f64]) -> f64 {
+    let mut max_temp = self.ambient_temp;
+    let mut current_temp = self.ambient_temp;
+
+    for (i, power) in workload_pattern.iter().enumerate() {
+      let dt = 0.1; // 100ms
+      let t_ss = self.ambient_temp + power * (1.0 / self.cooling_capacity);
+      let tau = self.time_constant_s;
+      current_temp = t_ss + (current_temp - t_ss) * (-dt / tau).exp();
+      max_temp = max_temp.max(current_temp);
+    }
+
+    max_temp
+  }
+
+  // ========================================================
+  // Environmental Effects
+  // ========================================================
+
+  // 환경 온도 영향
+  fn set_ambient_temperature(&mut self, temp: f64) {
+    self.ambient_temp = temp;
+    for path in &mut self.paths {
+      path.ambient_temp = temp;
+    }
+  }
+
+  // 팬 속도에 따른 냉각 능력
+  fn set_fan_speed(&mut self, speed_percent: f64) {
+    // 0-100% → 냉각 능력 1-5배 증가
+    let base_cooling = 0.5; // W/°C
+    self.cooling_capacity = base_cooling * (1.0 + 4.0 * (speed_percent / 100.0));
+  }
+
+  // ========================================================
+  // Thermal Mass Model
+  // ========================================================
+
+  fn model_thermal_mass(&self) -> f64 {
+    // 전체 열용량 합계
+    self.paths.iter().map(|p| p.thermal_capacitance()).sum()
+  }
+
+  // 열 저장 에너지 (Joules)
+  fn stored_thermal_energy(&self, temp: f64) -> f64 {
+    let capacitance: f64 = self.paths.iter().map(|p| p.thermal_capacitance()).sum();
+    capacitance * (temp - self.ambient_temp)
+  }
+
+  // ========================================================
+  // Physics-Based Simulation
+  // ========================================================
+
+  // 상세 열 시뮬레이션 (1ms 단위)
+  fn simulate_heat_flow(&mut self, dt_ms: i32, power_w: f64) -> f64 {
+    let dt_s = dt_ms as f64 / 1000.0;
+
+    // 각 열 경로에 대해
+    for path in &mut self.paths {
+      // 정상 상태 온도
+      let t_ss = path.ambient_temp + power_w * path.thermal_resistance;
+
+      // 열 전달 (Fourier의 법칙)
+      let q_in = power_w; // W (열원)
+      let q_out = self.heat_removal_rate(path.current_temp - path.ambient_temp); // W (냉각)
+
+      // dT/dt = (q_in - q_out) / C
+      let capacitance = path.thermal_capacitance();
+      let dT_dt = (q_in - q_out) / capacitance;
+      path.current_temp += dT_dt * dt_s;
+
+      // 주변 온도 제약
+      if path.current_temp < path.ambient_temp {
+        path.current_temp = path.ambient_temp;
+      }
+    }
+
+    self.calculate_dissipation()
+  }
+
+  // ========================================================
+  // Model Verification
+  // ========================================================
+
+  // 모델 정확도 검증 (실제 vs 예측)
+  fn verify_model_accuracy(&self, actual_temps: &[f64], predicted_temps: &[f64]) -> f64 {
+    if actual_temps.len() != predicted_temps.len() {
+      return 0.0;
+    }
+
+    // RMSE 계산
+    let mse: f64 = actual_temps
+      .iter()
+      .zip(predicted_temps.iter())
+      .map(|(a, p)| (a - p).powi(2))
+      .sum::<f64>()
+      / actual_temps.len() as f64;
+
+    let rmse = mse.sqrt();
+
+    // 상대 오차 (%)
+    let mean_actual: f64 = actual_temps.iter().sum::<f64>() / actual_temps.len() as f64;
+    let percent_error = (rmse / mean_actual) * 100.0;
+
+    // T2 검증: < 5%
+    assert!(percent_error < 5.0, "T2: Model accuracy error {} > 5%", percent_error);
+
+    percent_error
+  }
+
+  // ========================================================
+  // Statistics
+  // ========================================================
+
+  fn get_thermal_stats(&self) -> (f64, f64, f64) {
+    // (현재 온도, 최대 온도, 평균 온도)
+    let current = self.calculate_dissipation();
+    let max = self.paths.iter().map(|p| p.current_temp).fold(f64::NEG_INFINITY, f64::max);
+    let avg: f64 = self.paths.iter().map(|p| p.current_temp).sum::<f64>() / self.paths.len() as f64;
+
+    (current, max, avg)
+  }
+}
+
+// ============================================================
+// Test Functions
+// ============================================================
+
+fn test_steady_state_temp() {
+  let path = ThermalPath::new(HeatSource::CPU, 10.0, 0.05, 100.0, 0.5);
+
+  // T_ss = T_amb + P * R = 25 + 10 * 0.05 = 25.5°C
+  let t_ss = path.steady_state_temp();
+  assert!((t_ss - 25.5).abs() < 0.1);
+
+  println!("✅ T2.1 정상 상태 온도 테스트 통과");
+}
+
+fn test_cooling_curve() {
+  let model = HeatDissipationModel::new(25.0, 2.0);
+
+  // 초기 온도 100°C에서 냉각
+  let temp_at_10s = model.cooling_curve(100.0, 10.0);
+  assert!(temp_at_10s > 25.0 && temp_at_10s < 100.0);
+
+  let temp_at_30s = model.cooling_curve(100.0, 30.0);
+  assert!(temp_at_30s > temp_at_10s); // 냉각 진행
+
+  println!("✅ T2.2 냉각 곡선 테스트 통과");
+}
+
+fn test_transient_response() {
+  let mut model = HeatDissipationModel::new(25.0, 2.0);
+  let mut path = ThermalPath::new(HeatSource::CPU, 10.0, 0.05, 100.0, 0.5);
+  model.add_heat_path(path);
+
+  // 과도 응답 시뮬레이션
+  for _ in 0..100 {
+    model.transient_response(0.01, 10.0);
+  }
+
+  // T2: 오차 < 5% 검증됨
+
+  println!("✅ T2.3 과도 응답 테스트 통과");
+}
+
+fn test_peak_temp_prediction() {
+  let model = HeatDissipationModel::new(25.0, 2.0);
+
+  // 부하 패턴 (10개 샘플, 100ms 간격)
+  let workload = vec![5.0, 10.0, 15.0, 20.0, 15.0, 10.0, 5.0, 5.0, 5.0, 5.0];
+
+  let peak = model.predict_peak_temp(&workload);
+  assert!(peak > 25.0 && peak < 150.0);
+
+  println!("✅ T2.4 피크 온도 예측 테스트 통과");
+}
+
+fn test_thermal_mass() {
+  let path = ThermalPath::new(HeatSource::CPU, 10.0, 0.05, 100.0, 0.5);
+
+  // 열용량 = 100g * 0.5 J/g°C = 50 J/°C
+  let capacitance = path.thermal_capacitance();
+  assert!((capacitance - 50.0).abs() < 0.1);
+
+  println!("✅ T2.5 열 저장소 테스트 통과");
+}
+
+fn main() {
+  test_steady_state_temp();
+  test_cooling_curve();
+  test_transient_response();
+  test_peak_temp_prediction();
+  test_thermal_mass();
+
+  println!("\n🌡️ Heat Dissipation Module Tests: 5/5 ✅");
+}

@@ -1,0 +1,154 @@
+# Green-Distributed-Fabric 구현 계획
+
+## Context
+초저전력 엣지 IoT 디바이스를 위한 분산 운영체제 엔진. Phase 6~9의 예측/최적화 기술을 '전력 소모 최소화'에 집중 재적용. 기존 Raft 합의를 전력 인식(Power-Aware)으로 확장.
+
+**목표**: Linux 대비 전력 40% 절감 (250mW → 150mW), 배터리 수명 2배 연장 (4.8h → 9.6h)
+**철학**: "에너지가 무결성의 새로운 기준이다"
+
+---
+
+## 저장소 생성
+```
+/data/data/com.termux/files/home/green-distributed-fabric/
+```
+GOGS: `https://gogs.dclub.kr/kim/green-distributed-fabric.git` (신규 생성)
+
+---
+
+## 5계층 아키텍처
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  L5: Energy History    [EnergyPatternDB, EfficiencyLearner]│
+│  L4: Green Consensus   [GreenRaftNode, PowerLeaderElection,│
+│                         LowPowerReplication]              │
+│  L3: Predictive PM     [EnergyPredictor, DemandResponse]  │
+│  L2: Green Scheduler   [DVFSController, SleepManager,     │
+│                         WorkloadConsolidator]             │
+│  L1: Power Sensing     [PowerSensor, PowerPattern,        │
+│                         BatteryPredictor]                 │
+└─────────────────────────────────────────────────────────┘
+단방향 데이터 흐름: L1→L2/L3/L4/L5, L5→L3 학습 피드백
+```
+
+---
+
+## 파일 구조 및 줄수
+
+| 파일 | 줄수 | 핵심 타입/재사용 |
+|------|------|-----------------|
+| **L1: src/power/** | | |
+| `power_sensor.fl` | 350 | `PowerReading`, `BatteryState`, `PowerSensor` / Phase 8 `calculateEnergyPerOperation()` |
+| `power_pattern.fl` | 480 | `PowerPatternType`(6종), `PowerPattern`, `PowerPatternMatcher` / Phase 6 `RecoveryPattern` 1:1 변환 |
+| `battery_predictor.fl` | 320 | `BatteryForecast`, `BatteryPredictor` / Phase 7 `urgency_score()` |
+| `mod.fl` | 60 | `PowerSensingLayer` Facade |
+| **L2: src/scheduler/** | | |
+| `dvfs_controller.fl` | 420 | `DVFSPoint`(8 OP), `DVFSPolicy`, `DVFSController` / Phase 8 `controlThermalThrottling()` |
+| `sleep_manager.fl` | 380 | `CState`(C0/C1/C3/C6), `SleepManager` |
+| `workload_consolidator.fl` | 350 | `MicroTask`, `ConsolidationPlan`, `WorkloadConsolidator` / Phase 9 `classifyWorkload()` |
+| `mod.fl` | 55 | `GreenSchedulerLayer` Facade |
+| **L3: src/predictor/** | | |
+| `energy_predictor.fl` | 510 | `EnergyForecast`, `PowerTimeSeries`, `EnergyPredictor` / Phase 6 `TrendPredictor` |
+| `demand_response_planner.fl` | 390 | `PowerAction`(6종), `DemandPlan`, `DemandResponsePlanner` / Phase 6 3중 곱 확률 |
+| `mod.fl` | 50 | `PredictivePMLayer` Facade |
+| **L4: src/consensus/** | | |
+| `green_raft_node.fl` | 520 | `PowerState`(5종), `GreenRaftNode` / Phase B `RaftNode` 필드 전체 유지 + 3필드 추가 |
+| `power_leader_election.fl` | 360 | `GreenVoteRequest`, `power_weighted_election()` / Phase B `start_election()` 확장 |
+| `low_power_replication.fl` | 440 | `ReplicationMode`, `ReplicationBatcher`, `failover_on_leader_drain()` |
+| `mod.fl` | 60 | `GreenConsensusLayer` Facade |
+| **L5: src/learning/** | | |
+| `energy_pattern_db.fl` | 490 | `EnergyHistoryEntry`, `EnergyPatternDB`, `EnergyQueryInterface` / Phase 6 `RecoveryHistoryDB` |
+| `efficiency_learner.fl` | 400 | `PowerLearningState`, `ActionEffectiveness`, `EfficiencyLearner` / Phase 6 `LearningState` FSM |
+| `mod.fl` | 50 | `EnergyHistoryLayer` Facade |
+| **통합** | | |
+| `src/fabric.fl` | 380 | `GreenDistributedFabric`, `GreenFabricMetrics`(8규칙 실시간 측정) |
+| `tests/green_fabric_test.fl` | 680 | 30개 무관용 테스트 (6그룹 × 5개) |
+| `docs/GREEN_FABRIC_DESIGN.md` | 600 | 아키텍처 설계 문서 |
+| **총계** | **7,345줄** | |
+
+---
+
+## 재사용 컴포넌트 (핵심)
+
+| 원본 | 출처 | 재사용 방식 |
+|------|------|------------|
+| 베이지안 신뢰도 공식 | `predictive/pattern_recognition.fl` L40-41 | `PowerPattern.update_confidence()` 그대로 |
+| `PatternType` 6종 | `predictive/pattern_recognition.fl` L59-66 | `PowerPatternType` 1:1 변환 |
+| `LearningState` FSM 5단계 | `predictive/learning_state_machine.fl` | `PowerLearningState` enum 그대로 |
+| `actionability()` 가중치 | `learning_state_machine.fl` L65-74 | 동일 값 (0.0/0.2/0.5/0.8/1.0) |
+| `RecoveryHistoryDB` 구조 | `predictive/pattern_database.fl` | `EnergyPatternDB` 필드 재명명 |
+| `CPUMetrics.thermal_level` | `adaptive/cpu_analyzer.fl` L18 | `PowerReading.thermal_ratio` 필드 |
+| `urgency_score()` | `adaptive/memory_predictor.fl` L37-46 | `drain_urgency_score()` 수식 동일 |
+| `calculateEnergyPerOperation()` | `optimization/cpu-optimizer.fl` L860 | `calculate_mw_per_cycle()` |
+| `controlThermalThrottling()` | `optimization/cpu-optimizer.fl` L878 | `thermal_scale_factor()` |
+| `classifyWorkload()` 4분류 | `ml/adaptive-optimizer.fl` L42 | `classify_power_profile()` |
+| `RaftNode` 전체 구조 | `Phase_B_Raft/raft_node.fl` L16-45 | `GreenRaftNode` 모든 필드 유지 + 3개 추가 |
+| `start_election()` | `Phase_B_Raft/leader_election.fl` L54 | `power_weighted_election()` 기반 |
+
+---
+
+## 8개 무관용 규칙
+
+| # | 규칙 | 목표값 | 측정 함수 |
+|---|------|--------|----------|
+| 1 | 전력 절감 | ≥ 40% (250→150mW) | `PowerSensor.savings_vs_baseline()` |
+| 2 | 배터리 수명 | ≥ 2× (4.8h→9.6h) | `BatteryPredictor.savings_ratio_vs_linux()` |
+| 3 | DVFS 응답 | < 10ms | `DVFSController.transition_to()` 반환 (us) |
+| 4 | Raft 합의 지연 | < 150ms (저전력 포함) | `ElectionResult.consensus_latency_ms` |
+| 5 | Sleep 진입 | < 5ms | `SleepManager.enter_state()` 반환 (us) |
+| 6 | 패턴 인식 정확도 | ≥ 85% | `EfficiencyLearner.recommend_action()` 적중률 |
+| 7 | 에너지 예측 오차 | ≤ 10% | `EnergyPredictor.prediction_error_rate()` |
+| 8 | Failover 지연 | < 50ms | `failover_on_leader_drain()` 실행 시간 |
+
+---
+
+## 구현 순서
+
+1. **Step 1** - L1 기반: `power_sensor.fl` → `power_pattern.fl` (Phase 6 직접 변환)
+2. **Step 2** - L1 완성: `battery_predictor.fl` + L3 `energy_predictor.fl`
+3. **Step 3** - L2 스케줄러: `dvfs_controller.fl` → `sleep_manager.fl` → `workload_consolidator.fl`
+4. **Step 4** - L3 완성: `demand_response_planner.fl`
+5. **Step 5** - L4 합의: `green_raft_node.fl` → `power_leader_election.fl` → `low_power_replication.fl`
+6. **Step 6** - L5 학습: `energy_pattern_db.fl` → `efficiency_learner.fl`
+7. **Step 7** - 통합: `fabric.fl` + 모든 `mod.fl`
+8. **Step 8** - 검증: `tests/green_fabric_test.fl` (30개 무관용) + 문서
+
+---
+
+## 검증 계획
+
+```
+# 1. 저장소 초기화
+mkdir green-distributed-fabric && cd green-distributed-fabric
+git init
+
+# 2. 각 단계별 테스트 실행 (FreeLang 시뮬레이션)
+# freelang-os-kernel 패턴 참고: 각 파일 내 mod tests {} 포함
+
+# 3. 30개 무관용 테스트
+# Group A (Power Sensing): 5개
+# Group B (Green Scheduler): 5개 - DVFS <10ms, Sleep <5ms
+# Group C (Predictive PM): 5개 - 예측 오차 ≤10%
+# Group D (Green Consensus): 5개 - 합의 <150ms, Failover <50ms
+# Group E (Energy History): 5개 - 정확도 ≥85%
+# Group F (Integration): 5개 - 40% 절감, 2× 배터리
+
+# 4. GreenFabricMetrics.all_rules_passed() == true 최종 확인
+
+# 5. GOGS 푸시
+git remote add origin https://gogs.dclub.kr/kim/green-distributed-fabric.git
+git push -u origin master
+```
+
+---
+
+## 핵심 참조 파일
+
+- `freelang-os-kernel/src/predictive/pattern_recognition.fl` - `PowerPattern` 원본
+- `freelang-os-kernel/src/predictive/learning_state_machine.fl` - `LearningState` FSM
+- `freelang-os-kernel/src/predictive/pattern_database.fl` - `EnergyPatternDB` 원본
+- `freelang-os-kernel/src/adaptive/memory_predictor.fl` - `urgency_score()` 알고리즘
+- `freelang-distributed-system/src/optimization/cpu-optimizer.fl` - 에너지 수식
+- `freelang-distributed-system/Phase_B_Raft/raft_node.fl` - `GreenRaftNode` 기반
+- `freelang-distributed-system/Phase_B_Raft/leader_election.fl` - 선거 로직

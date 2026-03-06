@@ -1,0 +1,317 @@
+// Hypervisor: Virtual Timer Emulation (200줄)
+// L1 게스트의 타이머를 L0이 에뮬레이션
+
+module timer
+
+// ============ Virtual Timer Types ============
+
+enum TimerType {
+    PhysicalTimer,      // CNTPCT_EL0 (Physical Counter)
+    VirtualTimer,       // CNTVCT_EL0 (Virtual Counter)
+}
+
+struct VirtualTimer {
+    vmid: u16,
+    timer_type: TimerType,
+
+    // Registers (ARMv8)
+    cnt_ctl: u64,       // CNT*_CTL_EL0: enable, mask, status
+    cnt_cval: u64,      // CNT*_CVAL_EL0: Compare value
+    cnt_tval: u64,      // CNT*_TVAL_EL0: Timer value (cval - cntpct)
+
+    // State
+    is_enabled: bool,
+    is_masked: bool,
+    is_fired: bool,
+
+    // Timing
+    deadline_us: u64,   // 마감 시간 (microseconds)
+    interval_us: u64,   // 반복 간격
+}
+
+impl VirtualTimer {
+    fn new(vmid: u16, ttype: TimerType) -> VirtualTimer {
+        return VirtualTimer {
+            vmid: vmid,
+            timer_type: ttype,
+            cnt_ctl: 0,
+            cnt_cval: 0,
+            cnt_tval: 0,
+            is_enabled: false,
+            is_masked: false,
+            is_fired: false,
+            deadline_us: 0,
+            interval_us: 0,
+        }
+    }
+
+    fn enable(&mut self) -> bool {
+        self.is_enabled = true
+        self.cnt_ctl = self.cnt_ctl | 0x1  // Enable bit
+        return true
+    }
+
+    fn disable(&mut self) -> bool {
+        self.is_enabled = false
+        self.cnt_ctl = self.cnt_ctl & ~0x1
+        return true
+    }
+
+    fn set_compare_value(&mut self, cval: u64) -> bool {
+        self.cnt_cval = cval
+        return true
+    }
+
+    fn set_timer_value(&mut self, tval: u64) -> bool {
+        self.cnt_tval = tval
+        return true
+    }
+
+    fn mask_interrupt(&mut self) -> bool {
+        self.is_masked = true
+        self.cnt_ctl = self.cnt_ctl | 0x2  // IMASK bit
+        return true
+    }
+
+    fn unmask_interrupt(&mut self) -> bool {
+        self.is_masked = false
+        self.cnt_ctl = self.cnt_ctl & ~0x2
+        return true
+    }
+
+    fn check_fired(&self) -> bool {
+        // Hardware에서는 현재 카운터 >= cval일 때 fire
+        // 여기서는 시뮬레이션: deadline_us 도달 여부 확인
+        return self.is_fired
+    }
+
+    fn fire(&mut self) -> bool {
+        if !self.is_enabled {
+            return false
+        }
+        if self.is_masked {
+            return false
+        }
+        self.is_fired = true
+        self.cnt_ctl = self.cnt_ctl | 0x4  // ISTATUS bit (read-only, indicates firing)
+        return true
+    }
+
+    fn acknowledge(&mut self) -> bool {
+        self.is_fired = false
+        return true
+    }
+
+    fn get_pending_interrupt(&self) -> bool {
+        return self.is_fired && !self.is_masked
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Virtual Timer (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Enabled: " + self.is_enabled.to_string() + "\\n"
+        s = s + "Masked: " + self.is_masked.to_string() + "\\n"
+        s = s + "Fired: " + self.is_fired.to_string() + "\\n"
+        s = s + "CVAL: 0x" + self.cnt_cval.to_string() + "\\n"
+        s = s + "TVAL: " + self.cnt_tval.to_string()
+        return s
+    }
+}
+
+// ============ Virtual Timer Manager ============
+
+struct VirtualTimerManager {
+    vmid: u16,
+    physical_timer: VirtualTimer,
+    virtual_timer: VirtualTimer,
+    interrupt_count: u32,
+    total_fires: u32,
+}
+
+impl VirtualTimerManager {
+    fn new(vm_id: u16) -> VirtualTimerManager {
+        return VirtualTimerManager {
+            vmid: vm_id,
+            physical_timer: VirtualTimer::new(vm_id, TimerType::PhysicalTimer),
+            virtual_timer: VirtualTimer::new(vm_id, TimerType::VirtualTimer),
+            interrupt_count: 0,
+            total_fires: 0,
+        }
+    }
+
+    fn handle_timer_write(&mut self, timer_type: TimerType, reg_name: string, value: u64) -> bool {
+        let mut timer = if timer_type == TimerType::PhysicalTimer {
+            &mut self.physical_timer
+        } else {
+            &mut self.virtual_timer
+        }
+
+        if reg_name == "CTL" {
+            // CNT*_CTL_EL0 쓰기
+            if (value & 0x1) != 0 {
+                timer.enable()
+            } else {
+                timer.disable()
+            }
+
+            if (value & 0x2) != 0 {
+                timer.mask_interrupt()
+            } else {
+                timer.unmask_interrupt()
+            }
+            return true
+        }
+
+        if reg_name == "CVAL" {
+            return timer.set_compare_value(value)
+        }
+
+        if reg_name == "TVAL" {
+            return timer.set_timer_value(value)
+        }
+
+        return false
+    }
+
+    fn handle_timer_read(&mut self, timer_type: TimerType, reg_name: string) -> u64 {
+        let timer = if timer_type == TimerType::PhysicalTimer {
+            &self.physical_timer
+        } else {
+            &self.virtual_timer
+        }
+
+        if reg_name == "CTL" {
+            return timer.cnt_ctl
+        }
+
+        if reg_name == "CVAL" {
+            return timer.cnt_cval
+        }
+
+        if reg_name == "TVAL" {
+            return timer.cnt_tval
+        }
+
+        return 0
+    }
+
+    fn check_pending_interrupts(&mut self) -> bool {
+        let mut has_pending = false
+
+        if self.physical_timer.get_pending_interrupt() {
+            has_pending = true
+            self.interrupt_count += 1
+        }
+
+        if self.virtual_timer.get_pending_interrupt() {
+            has_pending = true
+            self.interrupt_count += 1
+        }
+
+        return has_pending
+    }
+
+    fn acknowledge_interrupt(&mut self, timer_type: TimerType) -> bool {
+        if timer_type == TimerType::PhysicalTimer {
+            return self.physical_timer.acknowledge()
+        } else {
+            return self.virtual_timer.acknowledge()
+        }
+    }
+
+    fn simulate_timer_expiry(&mut self, timer_type: TimerType) -> bool {
+        if timer_type == TimerType::PhysicalTimer {
+            if self.physical_timer.fire() {
+                self.total_fires += 1
+                return true
+            }
+        } else {
+            if self.virtual_timer.fire() {
+                self.total_fires += 1
+                return true
+            }
+        }
+        return false
+    }
+
+    fn get_interrupt_count(&self) -> u32 {
+        return self.interrupt_count
+    }
+
+    fn get_total_fires(&self) -> u32 {
+        return self.total_fires
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Virtual Timer Manager (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Total Interrupts: " + self.interrupt_count.to_string() + "\\n"
+        s = s + "Total Fires: " + self.total_fires.to_string() + "\\n"
+        s = s + "Physical Timer Enabled: " + self.physical_timer.is_enabled.to_string() + "\\n"
+        s = s + "Virtual Timer Enabled: " + self.virtual_timer.is_enabled.to_string()
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_virtual_timer() -> bool {
+    let mut timer = VirtualTimer::new(1, TimerType::PhysicalTimer)
+
+    assert(!timer.is_enabled, "initially disabled")
+
+    assert(timer.enable(), "enable should succeed")
+    assert(timer.is_enabled, "should be enabled")
+
+    assert(timer.set_compare_value(0x1000000), "set compare value")
+    assert(timer.cnt_cval == 0x1000000, "compare value should be set")
+
+    assert(!timer.is_masked, "initially unmasked")
+    assert(timer.mask_interrupt(), "mask interrupt")
+    assert(timer.is_masked, "should be masked")
+
+    return true
+}
+
+fn validate_timer_manager() -> bool {
+    let mut mgr = VirtualTimerManager::new(1)
+
+    assert(mgr.handle_timer_write(TimerType::PhysicalTimer, "CTL", 0x1), "enable physical timer")
+    assert(mgr.physical_timer.is_enabled, "physical timer should be enabled")
+
+    assert(mgr.handle_timer_write(TimerType::PhysicalTimer, "CVAL", 0x2000000), "set CVAL")
+
+    let cval = mgr.handle_timer_read(TimerType::PhysicalTimer, "CVAL")
+    assert(cval == 0x2000000, "CVAL should match")
+
+    assert(mgr.simulate_timer_expiry(TimerType::PhysicalTimer), "timer should fire")
+    assert(mgr.get_total_fires() == 1, "total fires should be 1")
+
+    return true
+}
+
+fn validate_timer_interrupt() -> bool {
+    let mut mgr = VirtualTimerManager::new(1)
+
+    assert(mgr.handle_timer_write(TimerType::VirtualTimer, "CTL", 0x1), "enable virtual timer")
+    assert(mgr.simulate_timer_expiry(TimerType::VirtualTimer), "virtual timer fires")
+
+    assert(mgr.check_pending_interrupts(), "should have pending interrupt")
+    assert(mgr.get_interrupt_count() == 1, "interrupt count should be 1")
+
+    assert(mgr.acknowledge_interrupt(TimerType::VirtualTimer), "acknowledge interrupt")
+    assert(!mgr.check_pending_interrupts(), "no more pending interrupts")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

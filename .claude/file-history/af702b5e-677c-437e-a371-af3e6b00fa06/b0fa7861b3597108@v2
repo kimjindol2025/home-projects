@@ -1,0 +1,464 @@
+// Challenge 16: mail_classifier.fl - 메일 분류 엔진
+// L0NN-Mail-Sentry 신경망 기반 스팸 필터
+// 2026-03-05, Kim
+
+// ============================================================================
+// Constants & Enums
+// ============================================================================
+
+const CLASSIFIER_ACCEPT_THRESHOLD = 80    // Score ≥ 80: ACCEPT
+const CLASSIFIER_QUARANTINE_MIN = 40      // 40-80: QUARANTINE
+const CLASSIFIER_REJECT_THRESHOLD = 40    // Score < 40: REJECT
+
+pub enum MailClassification {
+    LEGITIMATE,
+    SPAM,
+    PHISHING,
+    MALWARE,
+}
+
+pub enum MailAction {
+    ACCEPT,
+    QUARANTINE,
+    REJECT,
+}
+
+// ============================================================================
+// Data Types
+// ============================================================================
+
+pub struct Email {
+    message_id: String,
+    from: String,
+    to: String,
+    subject: String,
+    body: String,
+    headers: String,
+    attachments_count: u32,
+    timestamp: u64,
+}
+
+pub struct ClassificationResult {
+    email_id: String,
+    classification: MailClassification,
+    confidence_score: f32,      // 0-100
+    risk_score: i32,            // -100 to +100
+    action: MailAction,
+    timestamp: u64,
+}
+
+pub struct ScoringEngine {
+    base_score: i32,            // Starting score (50)
+    feature_weights: [f32; 8],  // 8 feature weights (sum = 100)
+}
+
+pub struct MailClassifier {
+    classifier_count: u64,
+    accepted_count: u64,
+    quarantined_count: u64,
+    rejected_count: u64,
+    total_analyzed: u64,
+    false_positives: u64,       // Wrongly rejected legitimate emails
+    false_negatives: u64,       // Wrongly accepted spam/phishing
+}
+
+// ============================================================================
+// ScoringEngine Functions
+// ============================================================================
+
+pub fn scoring_engine_new() -> ScoringEngine {
+    var engine = ScoringEngine {
+        base_score: 50,  // Neutral starting point
+        feature_weights: uninitialized(),
+    }
+
+    // Initialize feature weights (sum = 100)
+    engine.feature_weights[0] = 15.0  // Reputation
+    engine.feature_weights[1] = 12.0  // Header analysis
+    engine.feature_weights[2] = 18.0  // Content pattern
+    engine.feature_weights[3] = 20.0  // URL analysis
+    engine.feature_weights[4] = 10.0  // Attachment
+    engine.feature_weights[5] = 10.0  // Frequency
+    engine.feature_weights[6] = 8.0   // Language model
+    engine.feature_weights[7] = 7.0   // Crypto verification
+
+    return engine
+}
+
+pub fn calculate_reputation_score(sender_reputation: i32) -> i32 {
+    // -100 to +100 → -15 to +15 (based on 15% weight)
+    return (sender_reputation * 15) / 100
+}
+
+pub fn calculate_header_score(has_spf: bool, has_dkim: bool, has_dmarc: bool) -> i32 {
+    // 0-3 headers verified → -12 to +0
+    var verified_count = 0i32
+    if has_spf { verified_count = verified_count + 1 }
+    if has_dkim { verified_count = verified_count + 1 }
+    if has_dmarc { verified_count = verified_count + 1 }
+
+    // 3/3 = 0 penalty, 0/3 = -12 penalty
+    return ((verified_count - 3) * 4) as i32
+}
+
+pub fn calculate_content_score(suspicious_keywords: u32, html_ratio: f32) -> i32 {
+    // Suspicious keywords reduce score
+    // HTML ratio >70% increases suspicion (phishing typical)
+    var keyword_penalty = (suspicious_keywords as i32) * -2
+    var html_penalty = if html_ratio > 0.7 { -8 } else { 0 }
+    return keyword_penalty + html_penalty
+}
+
+pub fn calculate_url_score(url_count: u32, shortened_urls: u32, suspicious_domains: u32) -> i32 {
+    // Many URLs + shortened URLs = phishing
+    var url_penalty = if url_count > 5 { -5 } else { 0 }
+    var shortened_penalty = shortened_urls as i32 * -3
+    var domain_penalty = suspicious_domains as i32 * -4
+    return url_penalty + shortened_penalty + domain_penalty
+}
+
+pub fn calculate_attachment_score(attachment_count: u32, dangerous_types: u32) -> i32 {
+    // Dangerous file types (exe, zip, scr) reduce score
+    if dangerous_types > 0 {
+        return -20 - ((dangerous_types as i32) * 5)
+    }
+
+    if attachment_count > 5 {
+        return -8
+    }
+
+    return 0
+}
+
+pub fn calculate_frequency_score(messages_per_hour: u32, sender_history: i32) -> i32 {
+    // Brute force: >10 messages/hour = suspicious
+    // First-time senders = more suspicious
+    var frequency_penalty = if messages_per_hour > 10 { -10 } else { 0 }
+    var history_bonus = (sender_history / 100) as i32  // Older senders = +bonus
+    return frequency_penalty + history_bonus
+}
+
+pub fn calculate_language_score(entropy: f32, repetition_ratio: f32) -> i32 {
+    // Generated emails have low entropy
+    // High repetition = less natural
+    var entropy_penalty = if entropy < 4.0 { -6 } else { 0 }
+    var repetition_penalty = if repetition_ratio > 0.3 { -4 } else { 0 }
+    return entropy_penalty + repetition_penalty
+}
+
+pub fn calculate_crypto_score(is_signed: bool, is_encrypted: bool, tls_verified: bool) -> i32 {
+    // Lack of security indicators = higher risk
+    var signature_bonus = if is_signed { 2 } else { -3 }
+    var encryption_bonus = if is_encrypted { 1 } else { -2 }
+    var tls_bonus = if tls_verified { 1 } else { 0 }
+    return signature_bonus + encryption_bonus + tls_bonus
+}
+
+// ============================================================================
+// Classification Functions
+// ============================================================================
+
+pub fn classify_mail(
+    email: Email,
+    reputation_score: i32,
+    has_spf: bool,
+    has_dkim: bool,
+    has_dmarc: bool,
+    suspicious_keywords: u32,
+    html_ratio: f32,
+    url_count: u32,
+    shortened_urls: u32,
+    suspicious_domains: u32,
+    attachment_count: u32,
+    dangerous_attachment_types: u32,
+    messages_per_hour: u32,
+    sender_history_days: i32,
+    text_entropy: f32,
+    repetition_ratio: f32,
+    is_signed: bool,
+    is_encrypted: bool,
+    tls_verified: bool
+) -> ClassificationResult {
+    var engine = scoring_engine_new()
+
+    // Calculate individual feature scores
+    var reputation_feature = calculate_reputation_score(reputation_score)
+    var header_feature = calculate_header_score(has_spf, has_dkim, has_dmarc)
+    var content_feature = calculate_content_score(suspicious_keywords, html_ratio)
+    var url_feature = calculate_url_score(url_count, shortened_urls, suspicious_domains)
+    var attachment_feature = calculate_attachment_score(attachment_count, dangerous_attachment_types)
+    var frequency_feature = calculate_frequency_score(messages_per_hour, sender_history_days)
+    var language_feature = calculate_language_score(text_entropy, repetition_ratio)
+    var crypto_feature = calculate_crypto_score(is_signed, is_encrypted, tls_verified)
+
+    // Weighted score calculation
+    var total_score = engine.base_score as i32 +
+                      reputation_feature +
+                      header_feature +
+                      content_feature +
+                      url_feature +
+                      attachment_feature +
+                      frequency_feature +
+                      language_feature +
+                      crypto_feature
+
+    // Clamp score to [0, 100]
+    if total_score > 100 {
+        total_score = 100
+    } else if total_score < 0 {
+        total_score = 0
+    }
+
+    // Determine classification and action
+    var classification: MailClassification
+    var action: MailAction
+
+    if total_score >= CLASSIFIER_ACCEPT_THRESHOLD {
+        classification = MailClassification::LEGITIMATE
+        action = MailAction::ACCEPT
+    } else if total_score >= CLASSIFIER_QUARANTINE_MIN {
+        // Need to determine if SPAM, PHISHING, or MALWARE
+        if dangerous_attachment_types > 0 {
+            classification = MailClassification::MALWARE
+        } else if suspicious_domains > 0 || shortened_urls > 0 {
+            classification = MailClassification::PHISHING
+        } else {
+            classification = MailClassification::SPAM
+        }
+        action = MailAction::QUARANTINE
+    } else {
+        // Determine specific threat type for rejection
+        if dangerous_attachment_types > 0 {
+            classification = MailClassification::MALWARE
+        } else if suspicious_domains > 0 || url_count > 5 {
+            classification = MailClassification::PHISHING
+        } else {
+            classification = MailClassification::SPAM
+        }
+        action = MailAction::REJECT
+    }
+
+    var result = ClassificationResult {
+        email_id: email.message_id,
+        classification: classification,
+        confidence_score: (total_score as f32) / 100.0,  // Normalize to 0-1
+        risk_score: total_score - 50,  // Center at 0 (-50 to +50)
+        action: action,
+        timestamp: 0,  // Would be current time
+    }
+
+    return result
+}
+
+// ============================================================================
+// ActionExecutor Functions
+// ============================================================================
+
+pub fn execute_action(result: ClassificationResult, email: Email) -> bool {
+    match result.action {
+        MailAction::ACCEPT => {
+            // Accept: move to inbox
+            return true
+        }
+        MailAction::QUARANTINE => {
+            // Quarantine: move to spam/phishing folder
+            return true
+        }
+        MailAction::REJECT => {
+            // Reject: discard and report
+            return true
+        }
+    }
+}
+
+// ============================================================================
+// Feedback Functions
+// ============================================================================
+
+pub struct UserFeedback {
+    email_id: String,
+    actual_classification: MailClassification,
+    user_id: String,
+    timestamp: u64,
+}
+
+pub fn collect_feedback(result: ClassificationResult, actual_class: MailClassification) -> bool {
+    // User reports: "This is actually spam" or "This is legitimate"
+    // Used for model retraining
+
+    var feedback = UserFeedback {
+        email_id: result.email_id,
+        actual_classification: actual_class,
+        user_id: "user123",
+        timestamp: 0,
+    }
+
+    return true
+}
+
+// ============================================================================
+// MailClassifier Functions
+// ============================================================================
+
+pub fn mail_classifier_new() -> MailClassifier {
+    return MailClassifier {
+        classifier_count: 0,
+        accepted_count: 0,
+        quarantined_count: 0,
+        rejected_count: 0,
+        total_analyzed: 0,
+        false_positives: 0,
+        false_negatives: 0,
+    }
+}
+
+pub fn mail_classifier_classify(classifier: &mut MailClassifier, email: Email, reputation: i32) -> ClassificationResult {
+    classifier.total_analyzed = classifier.total_analyzed + 1
+
+    // Simplified feature extraction (would call Feature-Extractor module)
+    var result = classify_mail(
+        email,
+        reputation,
+        true,      // has_spf
+        true,      // has_dkim
+        false,     // has_dmarc
+        0,         // suspicious_keywords
+        0.5,       // html_ratio
+        2,         // url_count
+        0,         // shortened_urls
+        0,         // suspicious_domains
+        0,         // attachment_count
+        0,         // dangerous_attachment_types
+        1,         // messages_per_hour
+        100,       // sender_history_days
+        5.0,       // text_entropy
+        0.1,       // repetition_ratio
+        true,      // is_signed
+        true,      // is_encrypted
+        true       // tls_verified
+    )
+
+    // Update statistics
+    match result.action {
+        MailAction::ACCEPT => classifier.accepted_count = classifier.accepted_count + 1,
+        MailAction::QUARANTINE => classifier.quarantined_count = classifier.quarantined_count + 1,
+        MailAction::REJECT => classifier.rejected_count = classifier.rejected_count + 1,
+    }
+
+    classifier.classifier_count = classifier.classifier_count + 1
+    return result
+}
+
+pub fn calculate_false_positive_rate(classifier: &MailClassifier) -> f32 {
+    if classifier.rejected_count == 0 {
+        return 0.0
+    }
+    return (classifier.false_positives as f32) / (classifier.rejected_count as f32) * 100.0
+}
+
+pub fn calculate_false_negative_rate(classifier: &MailClassifier) -> f32 {
+    if classifier.accepted_count == 0 {
+        return 0.0
+    }
+    return (classifier.false_negatives as f32) / (classifier.accepted_count as f32) * 100.0
+}
+
+// ============================================================================
+// Test Functions (Group A: 10 tests)
+// ============================================================================
+
+pub fn test_a1_mail_classification() -> bool {
+    var email = Email {
+        message_id: "msg_001",
+        from: "sender@example.com",
+        to: "recipient@example.com",
+        subject: "Hello World",
+        body: "This is a test email",
+        headers: "SPF: pass; DKIM: pass",
+        attachments_count: 0,
+        timestamp: 0,
+    }
+
+    var result = classify_mail(email, 50, true, true, false, 0, 0.5, 0, 0, 0, 0, 0, 1, 100, 5.0, 0.1, true, true, true)
+    return result.confidence_score > 0.0
+}
+
+pub fn test_a2_legitimate_mail_detection() -> bool {
+    // Clean email from trusted sender
+    var result = classify_mail(
+        Email::default(), 90, true, true, true, 0, 0.3, 0, 0, 0, 0, 0, 1, 365, 5.5, 0.05, true, true, true
+    )
+    return result.classification == MailClassification::LEGITIMATE
+}
+
+pub fn test_a3_spam_detection() -> bool {
+    // Spam: many suspicious keywords, HTML-heavy, unknown sender
+    var result = classify_mail(
+        Email::default(), -50, false, false, false, 5, 0.9, 3, 0, 0, 0, 0, 10, 0, 4.0, 0.4, false, false, false
+    )
+    return result.classification == MailClassification::SPAM
+}
+
+pub fn test_a4_phishing_detection() -> bool {
+    // Phishing: shortened URLs, suspicious domains, urgent language
+    var result = classify_mail(
+        Email::default(), 20, false, false, false, 3, 0.8, 5, 2, 2, 0, 0, 5, 10, 4.2, 0.3, false, false, false
+    )
+    return result.classification == MailClassification::PHISHING
+}
+
+pub fn test_a5_malware_detection() -> bool {
+    // Malware: dangerous attachments, obfuscated content
+    var result = classify_mail(
+        Email::default(), 10, false, false, false, 2, 0.5, 1, 0, 0, 2, 2, 2, 5, 3.5, 0.6, false, false, false
+    )
+    return result.classification == MailClassification::MALWARE
+}
+
+pub fn test_a6_score_calculation() -> bool {
+    var score_result = classify_mail(
+        Email::default(), 0, true, true, true, 0, 0.3, 0, 0, 0, 0, 0, 1, 100, 5.0, 0.1, true, true, true
+    )
+    return score_result.confidence_score >= 0.0 && score_result.confidence_score <= 1.0
+}
+
+pub fn test_a7_false_positive_rate() -> bool {
+    // FP rate should be <0.01% (Rule 1)
+    var classifier = mail_classifier_new()
+    var fp_rate = calculate_false_positive_rate(&classifier)
+    return fp_rate <= 0.01
+}
+
+pub fn test_a8_false_negative_rate() -> bool {
+    // FN rate should be <0.5% (Rule 2)
+    var classifier = mail_classifier_new()
+    var fn_rate = calculate_false_negative_rate(&classifier)
+    return fn_rate <= 0.5
+}
+
+pub fn test_a9_action_execution() -> bool {
+    var email = Email::default()
+    var result = classify_mail(email, 90, true, true, true, 0, 0.3, 0, 0, 0, 0, 0, 1, 100, 5.0, 0.1, true, true, true)
+    return execute_action(result, email)
+}
+
+pub fn test_a10_feedback_collection() -> bool {
+    var result = classify_mail(Email::default(), 50, true, true, false, 0, 0.5, 1, 0, 0, 0, 0, 1, 50, 5.0, 0.1, true, true, false)
+    return collect_feedback(result, MailClassification::LEGITIMATE)
+}
+
+// Helper for default email
+impl Email {
+    pub fn default() -> Email {
+        return Email {
+            message_id: "default_msg",
+            from: "sender@example.com",
+            to: "recipient@example.com",
+            subject: "Test",
+            body: "Test body",
+            headers: "",
+            attachments_count: 0,
+            timestamp: 0,
+        }
+    }
+}

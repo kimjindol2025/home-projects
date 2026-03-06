@@ -1,0 +1,405 @@
+/* ============================================================================
+   ARM64 Memory Initialization & MMU Configuration
+
+   목적: ARM64 MMU, 페이지 테이블, 메모리 레이아웃 초기화
+   크기: ~300줄
+   성능: MMU < 10ms, 페이지 매핑 < 5µs
+============================================================================ */
+
+use crate::boot::arm64_entry::*;
+
+// ============================================================================
+// 1. ARM64 페이지 테이블 엔트리 (PTE)
+// ============================================================================
+
+pub struct Arm64PageTableEntry {
+    pub valid: bool,               // [0]: 유효성 플래그
+    pub table_or_page: bool,       // [1]: 0=Block/Page, 1=Table
+    pub phys_addr: u64,            // [47:12]: 물리 주소
+    pub af: bool,                  // [10]: Access Flag
+    pub sh: u8,                    // [9:8]: Shareability (0=Non, 2=Outer, 3=Inner)
+    pub ap: u8,                    // [7:6]: Access Permission (0=RW, 1=RO, 2=User-RW, 3=User-RO)
+    pub ns: bool,                  // [5]: Non-Secure
+    pub xn: bool,                  // [54]: Execute Never
+}
+
+impl Arm64PageTableEntry {
+    pub fn new() -> Self {
+        Arm64PageTableEntry {
+            valid: false,
+            table_or_page: false,
+            phys_addr: 0,
+            af: false,
+            sh: 0,
+            ap: 0,
+            ns: false,
+            xn: false,
+        }
+    }
+
+    // PTE를 u64 형식으로 인코딩
+    pub fn encode(&self) -> u64 {
+        let mut entry = 0u64;
+
+        if self.valid {
+            entry |= 1 << 0;
+        }
+
+        if self.table_or_page {
+            entry |= 1 << 1;
+        }
+
+        // 물리 주소 [47:12]
+        entry |= (self.phys_addr & 0x0000_FFFF_FFFF_F000) << 0;
+
+        if self.af {
+            entry |= 1 << 10;
+        }
+
+        entry |= ((self.sh as u64) & 0x3) << 8;
+        entry |= ((self.ap as u64) & 0x3) << 6;
+
+        if self.ns {
+            entry |= 1 << 5;
+        }
+
+        if self.xn {
+            entry |= 1 << 54;
+        }
+
+        entry
+    }
+
+    // u64에서 PTE 디코딩
+    pub fn decode(entry: u64) -> Self {
+        Arm64PageTableEntry {
+            valid: (entry & 1) != 0,
+            table_or_page: ((entry >> 1) & 1) != 0,
+            phys_addr: (entry & 0x0000_FFFF_FFFF_F000) as u64,
+            af: ((entry >> 10) & 1) != 0,
+            sh: ((entry >> 8) & 0x3) as u8,
+            ap: ((entry >> 6) & 0x3) as u8,
+            ns: ((entry >> 5) & 1) != 0,
+            xn: ((entry >> 54) & 1) != 0,
+        }
+    }
+}
+
+// ============================================================================
+// 2. ARM64 페이지 테이블 구조 (4-level: L0~L3)
+// ============================================================================
+
+pub struct Arm64PageTable {
+    pub level: u32,                // 0=L0, 1=L1, 2=L2, 3=L3
+    pub entries: [u64; 512],       // 512 엔트리 (각 8 bytes = 4KB 페이지)
+    pub entry_count: u32,
+}
+
+impl Arm64PageTable {
+    pub fn new(level: u32) -> Self {
+        Arm64PageTable {
+            level: level,
+            entries: [0u64; 512],
+            entry_count: 0,
+        }
+    }
+
+    // 엔트리 설정
+    pub fn set_entry(&mut self, index: u32, entry: u64) -> bool {
+        if index >= 512 {
+            return false;
+        }
+        self.entries[index as usize] = entry;
+        self.entry_count += 1;
+        true
+    }
+
+    // 엔트리 조회
+    pub fn get_entry(&self, index: u32) -> Option<u64> {
+        if index >= 512 {
+            None
+        } else {
+            Some(self.entries[index as usize])
+        }
+    }
+
+    // 페이지 테이블 크기 (4KB)
+    pub fn size_bytes() -> u32 {
+        4096
+    }
+}
+
+// ============================================================================
+// 3. ARM64 MMU 상태
+// ============================================================================
+
+pub struct Arm64Mmu {
+    pub ttbr0_el1: u64,            // Translation Table Base Register 0 (User VA)
+    pub ttbr1_el1: u64,            // Translation Table Base Register 1 (Kernel VA)
+    pub tcr_el1: u64,              // Translation Control Register
+    pub sctlr_el1: u64,            // System Control Register (MMU enable bit)
+    pub mair_el1: u64,             // Memory Attribute Indirection Register
+    pub page_tables: Vec<Arm64PageTable>,
+    pub enabled: bool,
+}
+
+impl Arm64Mmu {
+    pub fn new() -> Self {
+        Arm64Mmu {
+            ttbr0_el1: 0,
+            ttbr1_el1: 0,
+            tcr_el1: 0,
+            sctlr_el1: 0,
+            mair_el1: 0,
+            page_tables: Vec::new(),
+            enabled: false,
+        }
+    }
+
+    // MMU 활성화
+    pub fn enable(&mut self) {
+        self.sctlr_el1 |= 1 << 0;  // M bit: MMU enable
+        self.enabled = true;
+    }
+
+    // MMU 비활성화
+    pub fn disable(&mut self) {
+        self.sctlr_el1 &= !(1 << 0);  // M bit clear
+        self.enabled = false;
+    }
+
+    // TLB 플러시
+    pub fn flush_tlb(&mut self) {
+        // 시뮬레이션: TLBI VMALLE1IS (모든 VA 무효화)
+    }
+}
+
+// ============================================================================
+// 4. Nano-Kernel 메모리 레이아웃
+// ============================================================================
+
+pub struct NanoKernelMemoryLayout {
+    pub kernel_start: u64,          // 0xFFFF_0000_0000_0000 (EL1 상위)
+    pub kernel_size: u64,           // 1MB
+    pub stack_start: u64,           // 0xFFFF_0000_0020_0000 (kernel_start + 2MB)
+    pub stack_size: u64,            // 256KB
+    pub heap_start: u64,            // 0xFFFF_0000_0030_0000 (stack_start + 256KB)
+    pub heap_size: u64,             // 768KB
+    pub fb_start: u64,              // 0xFFFF_0000_0100_0000 (framebuffer)
+    pub fb_size: u64,               // 8MB
+}
+
+impl NanoKernelMemoryLayout {
+    pub fn new() -> Self {
+        NanoKernelMemoryLayout {
+            kernel_start: 0xFFFF_0000_0000_0000,
+            kernel_size: 1048576,  // 1MB
+            stack_start: 0xFFFF_0000_0020_0000,
+            stack_size: 262144,    // 256KB
+            heap_start: 0xFFFF_0000_0030_0000,
+            heap_size: 786432,     // 768KB
+            fb_start: 0xFFFF_0000_0100_0000,
+            fb_size: 8388608,      // 8MB
+        }
+    }
+
+    // 주소가 커널 영역 내인지 검증
+    pub fn is_kernel_addr(&self, addr: u64) -> bool {
+        addr >= self.kernel_start && addr < (self.kernel_start + self.kernel_size)
+    }
+
+    // 주소가 스택 영역 내인지 검증
+    pub fn is_stack_addr(&self, addr: u64) -> bool {
+        addr >= self.stack_start && addr < (self.stack_start + self.stack_size)
+    }
+
+    // 주소가 힙 영역 내인지 검증
+    pub fn is_heap_addr(&self, addr: u64) -> bool {
+        addr >= self.heap_start && addr < (self.heap_start + self.heap_size)
+    }
+
+    // 주소가 framebuffer 영역 내인지 검증
+    pub fn is_fb_addr(&self, addr: u64) -> bool {
+        addr >= self.fb_start && addr < (self.fb_start + self.fb_size)
+    }
+}
+
+// ============================================================================
+// 5. 메모리 초기화 함수들
+// ============================================================================
+
+// MMU 초기화
+pub fn init_mmu() -> (NanoKernelMemoryLayout, Arm64Mmu) {
+    let layout = NanoKernelMemoryLayout::new();
+    let mut mmu = Arm64Mmu::new();
+
+    // TCR_EL1 설정 (Translation Control Register)
+    // - T0SZ = 16 (2^48 user space)
+    // - T1SZ = 16 (2^48 kernel space)
+    mmu.tcr_el1 = (16 << 0) | (16 << 16);
+
+    // MAIR_EL1 설정 (Memory Attribute Indirection Register)
+    // - Device memory
+    // - Normal memory
+    mmu.mair_el1 = 0x00FF;
+
+    // TTBR1_EL1 설정 (커널 페이지 테이블 베이스)
+    mmu.ttbr1_el1 = layout.kernel_start;
+
+    // SCTLR_EL1 기본 설정
+    // - M bit (MMU) = 0 (초기에는 비활성)
+    // - C bit (D-cache) = 1
+    // - I bit (I-cache) = 1
+    // - Z bit (branch prediction) = 1
+    mmu.sctlr_el1 = 0x00C50030;
+
+    (layout, mmu)
+}
+
+// 커널 영역 매핑
+pub fn map_kernel_pages(mmu: &mut Arm64Mmu, layout: &NanoKernelMemoryLayout) -> bool {
+    // L0 페이지 테이블 생성
+    let mut l0_table = Arm64PageTable::new(0);
+
+    // L0[511]을 L1 테이블로 설정 (커널 공간)
+    let l1_entry = 0xFFFF_0000_0000_0000 | 0x3;  // valid + table
+    if !l0_table.set_entry(511, l1_entry) {
+        return false;
+    }
+
+    mmu.page_tables.push(l0_table);
+
+    // L1 페이지 테이블 생성
+    let mut l1_table = Arm64PageTable::new(1);
+
+    // L1[0]을 L2 테이블로 설정 (커널 영역)
+    let l2_entry = 0xFFFF_0000_0000_0000 | 0x3;  // valid + table
+    if !l1_table.set_entry(0, l2_entry) {
+        return false;
+    }
+
+    mmu.page_tables.push(l1_table);
+
+    // L2 페이지 테이블 생성
+    let mut l2_table = Arm64PageTable::new(2);
+
+    // L2[0~3]: 커널 영역 (2MB 블록)
+    for i in 0..4 {
+        let phys_addr = (i as u64) * 0x20_0000;
+        let pte = Arm64PageTableEntry {
+            valid: true,
+            table_or_page: false,  // Block
+            phys_addr: phys_addr,
+            af: true,
+            sh: 3,  // Inner shareable
+            ap: 0,  // RW
+            ns: false,
+            xn: false,
+        };
+        if !l2_table.set_entry(i as u32, pte.encode()) {
+            return false;
+        }
+    }
+
+    mmu.page_tables.push(l2_table);
+
+    true
+}
+
+// Framebuffer 매핑
+pub fn map_framebuffer(mmu: &mut Arm64Mmu, layout: &NanoKernelMemoryLayout) -> bool {
+    // 시뮬레이션: Framebuffer를 커널 공간에 매핑
+    // 실제로는 L3 페이지 테이블을 추가하여 4KB 페이지 단위로 매핑
+
+    if !layout.is_fb_addr(layout.fb_start) {
+        return false;
+    }
+
+    // Framebuffer 영역 검증 (< 10MB)
+    if layout.fb_size > 10 * 1024 * 1024 {
+        return false;
+    }
+
+    true
+}
+
+// ============================================================================
+// 6. 검증 함수
+// ============================================================================
+
+// PTE 인코딩/디코딩 일관성 검증
+pub fn validate_pte_encoding() -> bool {
+    let original = Arm64PageTableEntry {
+        valid: true,
+        table_or_page: true,
+        phys_addr: 0x1000,
+        af: true,
+        sh: 3,
+        ap: 0,
+        ns: false,
+        xn: false,
+    };
+
+    let encoded = original.encode();
+    let decoded = Arm64PageTableEntry::decode(encoded);
+
+    if decoded.valid != original.valid {
+        return false;
+    }
+    if decoded.phys_addr != original.phys_addr {
+        return false;
+    }
+
+    true
+}
+
+// MMU 설정 검증
+pub fn validate_mmu_config(mmu: &Arm64Mmu) -> bool {
+    // SCTLR_EL1 기본 비트 검증
+    if (mmu.sctlr_el1 & 0x1) != 0 {
+        // MMU는 초기에 비활성이어야 함
+        return false;
+    }
+
+    // TTBR1_EL1 검증 (0이 아니어야 함)
+    if mmu.ttbr1_el1 == 0 {
+        return false;
+    }
+
+    true
+}
+
+// 메모리 레이아웃 검증
+pub fn validate_memory_layout(layout: &NanoKernelMemoryLayout) -> bool {
+    // 커널 크기 검증 (< 1MB)
+    if layout.kernel_size >= 1048576 {
+        return false;
+    }
+
+    // 영역 겹침 검증
+    let stack_end = layout.stack_start + layout.stack_size;
+    if stack_end > layout.heap_start {
+        return false;  // Stack/Heap 겹침
+    }
+
+    let heap_end = layout.heap_start + layout.heap_size;
+    if heap_end > layout.fb_start {
+        return false;  // Heap/FB 겹침
+    }
+
+    true
+}
+
+// MMU 활성화 검증
+pub fn validate_mmu_enable(mmu: &Arm64Mmu) -> bool {
+    if !mmu.enabled {
+        return false;
+    }
+
+    // M bit 검증
+    if (mmu.sctlr_el1 & 1) == 0 {
+        return false;
+    }
+
+    true
+}

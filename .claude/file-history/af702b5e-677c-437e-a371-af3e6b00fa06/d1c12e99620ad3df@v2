@@ -1,0 +1,359 @@
+// Challenge 15: reputation_manager.fl - 신용도 관리 시스템
+// Sovereign-Naming 발신자 신용도 추적
+// 2026-03-05, Kim
+
+use dht_node::{NodeID}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const REPUTATION_MAX = 100
+const REPUTATION_MIN = -100
+const REPUTATION_INITIAL = 0
+const REPUTATION_DECAY_RATE = 0.95  // Exponential moving average
+const FEEDBACK_WINDOW_SIZE = 100
+const BLACKLIST_SIZE = 10000
+const WHITELIST_SIZE = 5000
+
+// ============================================================================
+// Data Types
+// ============================================================================
+
+pub struct ReputationScore {
+    node_id: NodeID,
+    address: String,
+    score: i32,           // -100 to +100
+    total_interactions: u64,
+    positive_feedback: u64,
+    negative_feedback: u64,
+    last_interaction: u64,
+    decay_factor: f32,    // EMA factor
+}
+
+pub struct FeedbackEntry {
+    source: String,
+    target: String,
+    feedback_type: i32,   // +1 = positive, -1 = negative, 0 = neutral
+    timestamp: u64,
+    reason: String,
+}
+
+pub struct BlacklistEntry {
+    address: String,
+    reason: String,
+    added_at: u64,
+    expires_at: u64,      // 0 = permanent
+}
+
+pub struct WhitelistEntry {
+    address: String,
+    added_at: u64,
+    verified: bool,
+}
+
+pub struct ReputationManager {
+    // Reputation tracking
+    scores: [ReputationScore; 100000],
+    score_count: usize,
+
+    // Feedback history
+    feedback_history: [FeedbackEntry; 100000],
+    feedback_count: usize,
+
+    // Blacklist
+    blacklist: [BlacklistEntry; BLACKLIST_SIZE],
+    blacklist_count: usize,
+
+    // Whitelist
+    whitelist: [WhitelistEntry; WHITELIST_SIZE],
+    whitelist_count: usize,
+
+    // Stats
+    total_feedbacks: u64,
+    decays_applied: u64,
+    blacklists_triggered: u64,
+    avg_score: i32,
+}
+
+// ============================================================================
+// Reputation Calculation
+// ============================================================================
+
+fn calculate_ema_score(old_score: i32, new_feedback: i32, alpha: f32) -> i32 {
+    // EMA = alpha * new_value + (1 - alpha) * old_value
+    var new_val = (alpha * new_feedback as f32) as i32
+    var old_val = ((1.0 - alpha) * old_score as f32) as i32
+    return new_val + old_val
+}
+
+fn calculate_reputation(positive: u64, negative: u64) -> i32 {
+    if positive + negative == 0 {
+        return REPUTATION_INITIAL
+    }
+
+    var total = positive + negative
+    var ratio = (positive * 100) / total  // Percentage
+
+    // Map 0-100% to -100 to +100 scale
+    // 50% = 0 reputation
+    // 100% = +100 reputation
+    // 0% = -100 reputation
+    return ((ratio as i32) * 2) - 100
+}
+
+// ============================================================================
+// ReputationManager Functions
+// ============================================================================
+
+pub fn reputation_manager_new() -> ReputationManager {
+    var manager = ReputationManager {
+        scores: uninitialized(),
+        score_count: 0,
+        feedback_history: uninitialized(),
+        feedback_count: 0,
+        blacklist: uninitialized(),
+        blacklist_count: 0,
+        whitelist: uninitialized(),
+        whitelist_count: 0,
+        total_feedbacks: 0,
+        decays_applied: 0,
+        blacklists_triggered: 0,
+        avg_score: 0,
+    }
+    return manager
+}
+
+pub fn find_score(manager: &ReputationManager, address: String) -> i32 {
+    var i = 0
+    while i < manager.score_count {
+        if manager.scores[i].address == address {
+            return manager.scores[i].score
+        }
+        i = i + 1
+    }
+    return REPUTATION_INITIAL
+}
+
+pub fn add_feedback(manager: &mut ReputationManager, source: String, target: String, feedback: i32, reason: String) {
+    if manager.feedback_count >= 100000 {
+        return  // History full
+    }
+
+    // Record feedback
+    var entry = FeedbackEntry {
+        source: source,
+        target: target,
+        feedback_type: feedback,
+        timestamp: 0,  // Would be current time
+        reason: reason,
+    }
+
+    manager.feedback_history[manager.feedback_count] = entry
+    manager.feedback_count = manager.feedback_count + 1
+    manager.total_feedbacks = manager.total_feedbacks + 1
+
+    // Update reputation score
+    var existing_score = find_score(manager, target)
+    var new_score = calculate_ema_score(existing_score, feedback, 0.3)
+
+    // Clamp to [-100, +100]
+    if new_score > REPUTATION_MAX {
+        new_score = REPUTATION_MAX
+    } else if new_score < REPUTATION_MIN {
+        new_score = REPUTATION_MIN
+    }
+
+    // Find or create score entry
+    var i = 0
+    var found = false
+    while i < manager.score_count {
+        if manager.scores[i].address == target {
+            manager.scores[i].score = new_score
+            manager.scores[i].total_interactions = manager.scores[i].total_interactions + 1
+
+            if feedback > 0 {
+                manager.scores[i].positive_feedback = manager.scores[i].positive_feedback + 1
+            } else if feedback < 0 {
+                manager.scores[i].negative_feedback = manager.scores[i].negative_feedback + 1
+            }
+
+            manager.scores[i].last_interaction = 0  // Would be current time
+            found = true
+            break
+        }
+        i = i + 1
+    }
+
+    if !found && manager.score_count < 100000 {
+        var new_score_entry = ReputationScore {
+            node_id: uninitialized(),  // Would be proper node ID
+            address: target,
+            score: new_score,
+            total_interactions: 1,
+            positive_feedback: if feedback > 0 { 1 } else { 0 },
+            negative_feedback: if feedback < 0 { 1 } else { 0 },
+            last_interaction: 0,
+            decay_factor: 0.95,
+        }
+        manager.scores[manager.score_count] = new_score_entry
+        manager.score_count = manager.score_count + 1
+    }
+}
+
+pub fn apply_reputation_decay(manager: &mut ReputationManager) {
+    var i = 0
+    while i < manager.score_count {
+        var old_score = manager.scores[i].score
+        var decayed = (old_score as f32 * manager.scores[i].decay_factor) as i32
+        manager.scores[i].score = decayed
+        i = i + 1
+    }
+    manager.decays_applied = manager.decays_applied + 1
+}
+
+pub fn is_blacklisted(manager: &ReputationManager, address: String) -> bool {
+    var i = 0
+    while i < manager.blacklist_count {
+        if manager.blacklist[i].address == address {
+            // Check if not expired
+            if manager.blacklist[i].expires_at == 0 {
+                return true  // Permanent
+            }
+            // Would check if expires_at > current_time
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub fn add_to_blacklist(manager: &mut ReputationManager, address: String, reason: String, duration_seconds: u64) {
+    if manager.blacklist_count >= BLACKLIST_SIZE {
+        return
+    }
+
+    var entry = BlacklistEntry {
+        address: address,
+        reason: reason,
+        added_at: 0,  // Would be current time
+        expires_at: duration_seconds,  // Would add to current time
+    }
+
+    manager.blacklist[manager.blacklist_count] = entry
+    manager.blacklist_count = manager.blacklist_count + 1
+    manager.blacklists_triggered = manager.blacklists_triggered + 1
+}
+
+pub fn is_whitelisted(manager: &ReputationManager, address: String) -> bool {
+    var i = 0
+    while i < manager.whitelist_count {
+        if manager.whitelist[i].address == address && manager.whitelist[i].verified {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+pub fn add_to_whitelist(manager: &mut ReputationManager, address: String, verified: bool) {
+    if manager.whitelist_count >= WHITELIST_SIZE {
+        return
+    }
+
+    var entry = WhitelistEntry {
+        address: address,
+        added_at: 0,  // Would be current time
+        verified: verified,
+    }
+
+    manager.whitelist[manager.whitelist_count] = entry
+    manager.whitelist_count = manager.whitelist_count + 1
+}
+
+pub fn calculate_average_reputation(manager: &ReputationManager) -> i32 {
+    if manager.score_count == 0 {
+        return 0
+    }
+
+    var sum = 0i32
+    var i = 0
+    while i < manager.score_count {
+        sum = sum + manager.scores[i].score
+        i = i + 1
+    }
+
+    return sum / (manager.score_count as i32)
+}
+
+// ============================================================================
+// Test Functions (Group C: 5 tests)
+// ============================================================================
+
+pub fn test_c1_reputation_scoring() -> bool {
+    var manager = reputation_manager_new()
+
+    // Add positive feedback
+    add_feedback(&mut manager, "alice@sovereign", "bob@sovereign", 1, "Good behavior")
+    add_feedback(&mut manager, "charlie@sovereign", "bob@sovereign", 1, "Helpful")
+
+    var bob_score = find_score(&manager, "bob@sovereign")
+
+    return bob_score > REPUTATION_INITIAL
+}
+
+pub fn test_c2_blacklist_management() -> bool {
+    var manager = reputation_manager_new()
+
+    // Add to blacklist
+    add_to_blacklist(&mut manager, "spammer@sovereign", "Spam detection", 86400)  // 1 day
+
+    var is_blacklisted = is_blacklisted(&manager, "spammer@sovereign")
+
+    return is_blacklisted && manager.blacklist_count == 1
+}
+
+pub fn test_c3_feedback_loop() -> bool {
+    var manager = reputation_manager_new()
+
+    var initial_feedback_count = manager.feedback_count
+
+    // Add series of feedbacks
+    add_feedback(&mut manager, "user1@sovereign", "user2@sovereign", 1, "Positive")
+    add_feedback(&mut manager, "user1@sovereign", "user2@sovereign", 1, "Positive")
+    add_feedback(&mut manager, "user3@sovereign", "user2@sovereign", -1, "Negative")
+
+    return manager.feedback_count == initial_feedback_count + 3
+}
+
+pub fn test_c4_reputation_decay() -> bool {
+    var manager = reputation_manager_new()
+
+    // Add feedback to establish score
+    add_feedback(&mut manager, "alice@sovereign", "target@sovereign", 1, "Good")
+    var score_before = find_score(&manager, "target@sovereign")
+
+    // Apply decay
+    apply_reputation_decay(&mut manager)
+    var score_after = find_score(&manager, "target@sovereign")
+
+    // Score should decay towards zero (multiply by 0.95)
+    return score_after < score_before || score_after == score_before
+}
+
+pub fn test_c5_distributed_reputation_dht_sync() -> bool {
+    var manager1 = reputation_manager_new()
+    var manager2 = reputation_manager_new()
+
+    // Feedback in manager1
+    add_feedback(&mut manager1, "alice@sovereign", "bob@sovereign", 1, "Good")
+
+    // Would sync to manager2 via DHT
+    // For now, just verify both managers can track separate reputations
+    add_feedback(&mut manager2, "alice@sovereign", "bob@sovereign", 1, "Good")
+
+    var score1 = find_score(&manager1, "bob@sovereign")
+    var score2 = find_score(&manager2, "bob@sovereign")
+
+    return score1 > REPUTATION_INITIAL && score2 > REPUTATION_INITIAL
+}

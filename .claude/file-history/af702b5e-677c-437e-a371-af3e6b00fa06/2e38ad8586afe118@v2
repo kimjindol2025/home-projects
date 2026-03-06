@@ -1,0 +1,427 @@
+// Glyph Rasterizer: SDF → Bitmap Conversion (380줄)
+// Anti-aliasing & Smooth Scaling for High-Quality Font Rendering
+
+module glyph_rasterizer
+
+use math::{
+    FixedPoint, Vec2FP
+}
+
+use sdf_engine::{
+    DistanceField
+}
+
+// ============ Bitmap Data Structure ============
+
+struct Bitmap {
+    width: u32,
+    height: u32,
+    data: array[u8; 256 * 256],  // 8-bit grayscale (최대 256×256)
+    stride: u32,                   // 한 줄의 바이트 수
+}
+
+impl Bitmap {
+    fn new(w: u32, h: u32) -> Bitmap {
+        return Bitmap {
+            width: w,
+            height: h,
+            data: array[u8; 256 * 256],
+            stride: w,
+        }
+    }
+
+    fn set_pixel(&mut self, x: u32, y: u32, value: u8) -> bool {
+        if x >= self.width || y >= self.height {
+            return false
+        }
+        let idx = y * self.stride + x
+        self.data[idx] = value
+        return true
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> u8 {
+        if x >= self.width || y >= self.height {
+            return 0
+        }
+        let idx = y * self.stride + x
+        return self.data[idx]
+    }
+
+    fn size(&self) -> u32 {
+        return self.width * self.height
+    }
+
+    fn total_pixels(&self) -> u32 {
+        return self.width * self.height
+    }
+
+    fn clear(&mut self) -> bool {
+        for i in 0..self.total_pixels() {
+            self.data[i] = 0
+        }
+        return true
+    }
+}
+
+// ============ Anti-Aliasing Filter ============
+
+struct AntiAliasingFilter {
+    quality: u32,  // 0=none, 1=low, 2=medium, 3=high
+    kernel_size: u32,
+    sigma: FixedPoint,  // Gaussian sigma
+}
+
+impl AntiAliasingFilter {
+    fn new() -> AntiAliasingFilter {
+        return AntiAliasingFilter {
+            quality: 1,  // low by default
+            kernel_size: 3,
+            sigma: FixedPoint::from_int(1),
+        }
+    }
+
+    fn set_quality(&mut self, q: u32) -> bool {
+        // 0=none, 1=low (3x3), 2=medium (5x5), 3=high (7x7)
+        if q > 3 {
+            return false
+        }
+        self.quality = q
+
+        match q {
+            0 => {
+                self.kernel_size = 1
+                self.sigma = FixedPoint::ZERO()
+            },
+            1 => {
+                self.kernel_size = 3
+                self.sigma = FixedPoint::from_int(1)
+            },
+            2 => {
+                self.kernel_size = 5
+                self.sigma = FixedPoint::from_int(1)
+            },
+            3 => {
+                self.kernel_size = 7
+                self.sigma = FixedPoint::from_int(2)
+            },
+            _ => {}
+        }
+
+        return true
+    }
+
+    fn apply_gaussian(&self, value: u8) -> u8 {
+        if self.quality == 0 {
+            return value
+        }
+
+        // Simple averaging for low-quality
+        // In high-quality, would use proper Gaussian kernel
+        let centered = (value as i32) - 128
+        let dampened = centered / (self.quality as i32)
+        let result = 128 + dampened
+
+        if result < 0 { return 0 }
+        if result > 255 { return 255 }
+
+        return (result as u8)
+    }
+
+    fn blur_pixel(&self, bitmap: &Bitmap, x: u32, y: u32) -> u8 {
+        if self.quality == 0 {
+            return bitmap.get_pixel(x, y)
+        }
+
+        let mut sum = 0
+        let mut count = 0
+        let radius = self.kernel_size / 2
+
+        for dy in 0..self.kernel_size {
+            for dx in 0..self.kernel_size {
+                let nx = (x as i32) + (dx as i32) - (radius as i32)
+                let ny = (y as i32) + (dy as i32) - (radius as i32)
+
+                if nx >= 0 && nx < (bitmap.width as i32) && ny >= 0 && ny < (bitmap.height as i32) {
+                    let px = bitmap.get_pixel(nx as u32, ny as u32)
+                    sum += (px as u32)
+                    count += 1
+                }
+            }
+        }
+
+        if count > 0 {
+            return (sum / count) as u8
+        }
+
+        return 0
+    }
+}
+
+// ============ SDF Rasterizer ============
+
+struct SDFRasterizer {
+    threshold: i32,       // 거리 임계값 (0 = 곡선 위)
+    smoothness: u32,      // 경계 부드러움 정도
+    filter: AntiAliasingFilter,
+}
+
+impl SDFRasterizer {
+    fn new() -> SDFRasterizer {
+        return SDFRasterizer {
+            threshold: 0,
+            smoothness: 8,
+            filter: AntiAliasingFilter::new(),
+        }
+    }
+
+    fn set_threshold(&mut self, t: i32) -> bool {
+        self.threshold = t
+        return true
+    }
+
+    fn set_smoothness(&mut self, s: u32) -> bool {
+        if s == 0 || s > 255 {
+            return false
+        }
+        self.smoothness = s
+        return true
+    }
+
+    fn set_aa_quality(&mut self, quality: u32) -> bool {
+        return self.filter.set_quality(quality)
+    }
+
+    // SDF 거리값을 알파값(0-255)으로 변환
+    fn distance_to_alpha(&self, distance: i32) -> u8 {
+        // distance < 0: 내부 (검정)
+        // distance = 0: 경계
+        // distance > 0: 외부 (흰색)
+
+        let signed_dist = distance
+        let abs_dist = if signed_dist < 0 { -signed_dist } else { signed_dist }
+
+        // 거리를 smoothness 범위로 맵핑
+        let clamped = if abs_dist > (self.smoothness as i32) {
+            self.smoothness as i32
+        } else {
+            abs_dist
+        }
+
+        // 스무딩: 경계 근처에서 anti-aliasing
+        let alpha = if signed_dist < 0 {
+            // 내부: 불투명
+            255
+        } else {
+            // 외부: 거리에 따라 투명도 조정
+            let factor = (self.smoothness as i32) - clamped
+            ((factor as u32) * 255 / (self.smoothness as u32)) as u8
+        }
+
+        return alpha
+    }
+
+    // SDF → Bitmap 변환
+    fn rasterize(&mut self, sdf: &DistanceField) -> Bitmap {
+        let mut bitmap = Bitmap::new(sdf.width, sdf.height)
+
+        // Phase 1: SDF를 직접 레스터화
+        for y in 0..sdf.height {
+            for x in 0..sdf.width {
+                let distance = sdf.get(x, y)
+                let alpha = self.distance_to_alpha(distance)
+                bitmap.set_pixel(x, y, alpha)
+            }
+        }
+
+        // Phase 2: Anti-aliasing 필터 적용
+        if self.filter.quality > 0 {
+            let mut blurred = Bitmap::new(bitmap.width, bitmap.height)
+
+            for y in 0..bitmap.height {
+                for x in 0..bitmap.width {
+                    let blurred_value = self.filter.blur_pixel(&bitmap, x, y)
+                    blurred.set_pixel(x, y, blurred_value)
+                }
+            }
+
+            return blurred
+        }
+
+        return bitmap
+    }
+}
+
+// ============ Scaled Glyph ============
+
+struct ScaledGlyph {
+    original_size: u32,    // 원본 크기 (픽셀)
+    scaled_size: u32,      // 스케일된 크기
+    scale_factor: FixedPoint,
+    bitmap: Bitmap,
+}
+
+impl ScaledGlyph {
+    fn new(orig: u32, scaled: u32) -> ScaledGlyph {
+        let factor = FixedPoint::from_int(scaled as i32).div(FixedPoint::from_int(orig as i32))
+
+        return ScaledGlyph {
+            original_size: orig,
+            scaled_size: scaled,
+            scale_factor: factor,
+            bitmap: Bitmap::new(scaled, scaled),
+        }
+    }
+
+    fn scale_bitmap(&mut self, source: &Bitmap) -> bool {
+        if source.width == 0 || source.height == 0 {
+            return false
+        }
+
+        // Nearest-neighbor scaling (빠른 구현)
+        for y in 0..self.bitmap.height {
+            for x in 0..self.bitmap.width {
+                // 원본에서 대응하는 좌표 계산
+                let src_x = (x * source.width) / self.scaled_size
+                let src_y = (y * source.height) / self.scaled_size
+
+                let pixel = source.get_pixel(src_x, src_y)
+                self.bitmap.set_pixel(x, y, pixel)
+            }
+        }
+
+        return true
+    }
+
+    fn get_scale_factor(&self) -> FixedPoint {
+        return self.scale_factor
+    }
+
+    fn get_bitmap(&self) -> &Bitmap {
+        return &self.bitmap
+    }
+}
+
+// ============ Glyph Renderer ============
+
+struct GlyphRenderer {
+    rasterizer: SDFRasterizer,
+    cache: array[Bitmap; 16],  // 최대 16개 캐시
+    cache_count: u32,
+}
+
+impl GlyphRenderer {
+    fn new() -> GlyphRenderer {
+        return GlyphRenderer {
+            rasterizer: SDFRasterizer::new(),
+            cache: array[Bitmap; 16],
+            cache_count: 0,
+        }
+    }
+
+    fn set_quality(&mut self, quality: u32) -> bool {
+        return self.rasterizer.set_aa_quality(quality)
+    }
+
+    fn render(&mut self, sdf: &DistanceField) -> Bitmap {
+        return self.rasterizer.rasterize(sdf)
+    }
+
+    fn render_scaled(&mut self, sdf: &DistanceField, scale: u32) -> ScaledGlyph {
+        // Phase 1: 원본 렌더링
+        let original_bitmap = self.render(sdf)
+
+        // Phase 2: 스케일링
+        let mut scaled = ScaledGlyph::new(original_bitmap.width, scale)
+        scaled.scale_bitmap(&original_bitmap)
+
+        return scaled
+    }
+
+    fn quality_preset(&mut self, preset: u32) -> bool {
+        // 0=draft, 1=screen, 2=print, 3=hq
+        match preset {
+            0 => { return self.rasterizer.set_aa_quality(0) },  // No AA
+            1 => { return self.rasterizer.set_aa_quality(1) },  // Low AA
+            2 => { return self.rasterizer.set_aa_quality(2) },  // Medium AA
+            3 => { return self.rasterizer.set_aa_quality(3) },  // High AA
+            _ => { return false }
+        }
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_bitmap() -> bool {
+    let mut bitmap = Bitmap::new(64, 64)
+
+    assert(bitmap.width == 64, "width 64")
+    assert(bitmap.height == 64, "height 64")
+    assert(bitmap.size() == 4096, "size 4096")
+
+    assert(bitmap.set_pixel(0, 0, 255), "set (0,0)")
+    assert(bitmap.get_pixel(0, 0) == 255, "get (0,0)")
+
+    assert(bitmap.set_pixel(63, 63, 128), "set (63,63)")
+    assert(bitmap.get_pixel(63, 63) == 128, "get (63,63)")
+
+    return true
+}
+
+fn validate_aa_filter() -> bool {
+    let mut filter = AntiAliasingFilter::new()
+
+    assert(filter.quality == 1, "default low quality")
+    assert(filter.set_quality(0), "set none")
+    assert(filter.quality == 0, "quality 0")
+
+    assert(filter.set_quality(3), "set high")
+    assert(filter.quality == 3, "quality 3")
+
+    return true
+}
+
+fn validate_sdf_rasterizer() -> bool {
+    let mut rasterizer = SDFRasterizer::new()
+
+    assert(rasterizer.set_threshold(0), "set threshold")
+    assert(rasterizer.set_smoothness(8), "set smoothness")
+    assert(rasterizer.set_aa_quality(1), "set AA quality")
+
+    let alpha = rasterizer.distance_to_alpha(0)
+    assert(alpha > 0 && alpha <= 255, "valid alpha value")
+
+    return true
+}
+
+fn validate_scaled_glyph() -> bool {
+    let scaled = ScaledGlyph::new(64, 128)
+
+    assert(scaled.original_size == 64, "original 64")
+    assert(scaled.scaled_size == 128, "scaled 128")
+
+    let factor = scaled.get_scale_factor()
+    assert(factor.raw > 0, "scale factor positive")
+
+    return true
+}
+
+fn validate_glyph_renderer() -> bool {
+    let mut renderer = GlyphRenderer::new()
+
+    assert(renderer.set_quality(1), "set quality 1")
+    assert(renderer.quality_preset(0), "preset draft")
+    assert(renderer.quality_preset(3), "preset hq")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

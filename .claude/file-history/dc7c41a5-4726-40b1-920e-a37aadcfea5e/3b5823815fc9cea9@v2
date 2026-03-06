@@ -1,0 +1,245 @@
+// Phase 3.1.3 3차 방정식 솔버 - Newton-Raphson 반복법
+// 베지어 곡선에서 점 P에 가장 가까운 위치 t를 찾음
+// 목표: SDF 생성 속도 < 800µs per glyph
+
+use crate::core::fixed_point::*;
+
+pub const NEWTON_ITERATIONS: i32 = 8;       // 최대 반복 횟수
+pub const NEWTON_EPSILON: Fixed16 = 1;      // 수렴 조건: |f'(t)| < epsilon
+pub const NEWTON_MAX_STEP: Fixed16 = 1 << 17;  // 최대 스텝: 2.0
+
+#[derive(Clone, Debug)]
+pub struct Point {
+    pub x: Fixed16,
+    pub y: Fixed16,
+}
+
+impl Point {
+    pub fn new(x: Fixed16, y: Fixed16) -> Self {
+        Point { x, y }
+    }
+
+    // 벡터 뺄셈: self - other
+    pub fn sub(&self, other: &Point) -> Point {
+        Point {
+            x: self.x - other.x,
+            y: self.y - other.y,
+        }
+    }
+
+    // 벡터 더하기: self + other
+    pub fn add(&self, other: &Point) -> Point {
+        Point {
+            x: self.x + other.x,
+            y: self.y + other.y,
+        }
+    }
+
+    // 스칼라 곱셈: self * scalar
+    pub fn scale(&self, scalar: Fixed16) -> Point {
+        Point {
+            x: mul(self.x, scalar),
+            y: mul(self.y, scalar),
+        }
+    }
+
+    // 내적: self · other
+    pub fn dot(&self, other: &Point) -> Fixed16 {
+        mul(self.x, other.x) + mul(self.y, other.y)
+    }
+
+    // 거리 제곱: |self|²
+    pub fn len_squared(&self) -> Fixed16 {
+        mul(self.x, self.x) + mul(self.y, self.y)
+    }
+}
+
+// 3차 베지어 곡선: B(t) = (1-t)³P₀ + 3(1-t)²tP₁ + 3(1-t)t²P₂ + t³P₃
+#[derive(Clone, Debug)]
+pub struct CubicBezier {
+    pub p0: Point,
+    pub p1: Point,
+    pub p2: Point,
+    pub p3: Point,
+}
+
+impl CubicBezier {
+    pub fn new(p0: Point, p1: Point, p2: Point, p3: Point) -> Self {
+        CubicBezier { p0, p1, p2, p3 }
+    }
+
+    // 베지어 곡선 평가: B(t) at t ∈ [0, 1]
+    pub fn eval(&self, t: Fixed16) -> Point {
+        let one = FIXED_ONE;
+        let one_minus_t = one - t;
+
+        // 계수: (1-t)³, 3(1-t)²t, 3(1-t)t², t³
+        let c0 = cube(one_minus_t);
+        let c1 = mul(mul(from_int(3), square(one_minus_t)), t);
+        let c2 = mul(mul(from_int(3), one_minus_t), square(t));
+        let c3 = cube(t);
+
+        let b0 = self.p0.scale(c0);
+        let b1 = self.p1.scale(c1);
+        let b2 = self.p2.scale(c2);
+        let b3 = self.p3.scale(c3);
+
+        b0.add(&b1).add(&b2).add(&b3)
+    }
+
+    // 베지어 곡선 미분: B'(t)
+    // B'(t) = 3(1-t)²(P₁-P₀) + 6(1-t)t(P₂-P₁) + 3t²(P₃-P₂)
+    pub fn eval_derivative(&self, t: Fixed16) -> Point {
+        let one = FIXED_ONE;
+        let one_minus_t = one - t;
+
+        let dp0 = self.p1.sub(&self.p0);  // P₁ - P₀
+        let dp1 = self.p2.sub(&self.p1);  // P₂ - P₁
+        let dp2 = self.p3.sub(&self.p2);  // P₃ - P₂
+
+        // 계수: 3(1-t)², 6(1-t)t, 3t²
+        let c0 = mul(from_int(3), square(one_minus_t));
+        let c1 = mul(from_int(6), mul(one_minus_t, t));
+        let c2 = mul(from_int(3), square(t));
+
+        let d0 = dp0.scale(c0);
+        let d1 = dp1.scale(c1);
+        let d2 = dp2.scale(c2);
+
+        d0.add(&d1).add(&d2)
+    }
+
+    // 점 P에서 곡선까지 거리 최소화하는 t 찾기
+    // 목적: (P - B(t)) · B'(t) = 0를 만족하는 t 탐색
+    // 이는 결국 t에 대한 3차 방정식을 푸는 것
+    pub fn find_closest_t(&self, p: Point) -> Fixed16 {
+        let mut t = FIXED_HALF;  // 초기값: t = 0.5
+
+        for _iter in 0..NEWTON_ITERATIONS {
+            let bt = self.eval(t);
+            let bdt = self.eval_derivative(t);
+
+            // 벡터: P - B(t)
+            let diff = p.sub(&bt);
+
+            // f(t) = (P - B(t)) · B'(t)
+            let f_t = diff.dot(&bdt);
+
+            // f'(t) ≈ -|B'(t)|² - (P - B(t)) · B''(t)
+            // 간단히: f'(t) ≈ -|B'(t)|²
+            let bdt_len_sq = bdt.len_squared();
+
+            if abs(f_t) < NEWTON_EPSILON {
+                break;  // 수렴
+            }
+
+            if bdt_len_sq < NEWTON_EPSILON {
+                break;  // B'(t)이 0에 가까우면 불안정
+            }
+
+            // Newton-Raphson: t_new = t - f(t) / f'(t)
+            let delta = div(f_t, bdt_len_sq);
+            let delta_clamped = if abs(delta) > NEWTON_MAX_STEP {
+                if delta > 0 { NEWTON_MAX_STEP } else { negate(NEWTON_MAX_STEP) }
+            } else {
+                delta
+            };
+
+            t = t - delta_clamped;
+
+            // t을 [0, 1] 범위로 클램프
+            if t < 0 { t = 0; }
+            if t > FIXED_ONE { t = FIXED_ONE; }
+        }
+
+        t
+    }
+}
+
+// 점 P에서 베지어 곡선까지의 최단 거리 계산
+pub fn min_distance(bezier: &CubicBezier, p: Point) -> Fixed16 {
+    let t = bezier.find_closest_t(p);
+    let closest = bezier.eval(t);
+    let diff = p.sub(&closest);
+
+    // 거리 = sqrt(|diff|²)
+    // Fixed-point에서 sqrt를 정확히 계산하기는 복잡하므로,
+    // 거리 제곱값을 반환 (이후 SDF는 부호가 있는 거리이므로 제곱도 가능)
+    diff.len_squared()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_point_operations() {
+        let p1 = Point::new(FIXED_ONE, FIXED_ONE);
+        let p2 = Point::new(FIXED_HALF, FIXED_HALF);
+
+        let sub = p1.sub(&p2);
+        assert_eq!(sub.x, FIXED_HALF);
+        assert_eq!(sub.y, FIXED_HALF);
+    }
+
+    #[test]
+    fn test_bezier_eval_at_zero() {
+        let bezier = CubicBezier::new(
+            Point::new(from_int(0), from_int(0)),
+            Point::new(from_int(1), from_int(1)),
+            Point::new(from_int(2), from_int(0)),
+            Point::new(from_int(3), from_int(1)),
+        );
+
+        let b0 = bezier.eval(0);
+        assert_eq!(b0.x, 0);
+        assert_eq!(b0.y, 0);
+    }
+
+    #[test]
+    fn test_bezier_eval_at_one() {
+        let bezier = CubicBezier::new(
+            Point::new(from_int(0), from_int(0)),
+            Point::new(from_int(1), from_int(1)),
+            Point::new(from_int(2), from_int(0)),
+            Point::new(from_int(3), from_int(1)),
+        );
+
+        let b1 = bezier.eval(FIXED_ONE);
+        assert_eq!(b1.x, from_int(3));
+        assert_eq!(b1.y, from_int(1));
+    }
+
+    #[test]
+    fn test_find_closest_t() {
+        let bezier = CubicBezier::new(
+            Point::new(from_int(0), from_int(0)),
+            Point::new(from_int(1), from_int(2)),
+            Point::new(from_int(2), from_int(2)),
+            Point::new(from_int(3), from_int(0)),
+        );
+
+        let p = Point::new(from_int(1), from_int(1));
+        let t = bezier.find_closest_t(p);
+
+        // t should be in [0, 1]
+        assert!(t >= 0);
+        assert!(t <= FIXED_ONE);
+    }
+
+    #[test]
+    fn test_min_distance() {
+        let bezier = CubicBezier::new(
+            Point::new(from_int(0), from_int(0)),
+            Point::new(from_int(1), from_int(1)),
+            Point::new(from_int(2), from_int(1)),
+            Point::new(from_int(3), from_int(0)),
+        );
+
+        let p = Point::new(from_int(1), from_int(0));
+        let dist_sq = min_distance(&bezier, p);
+
+        // distance squared should be positive (or zero if on curve)
+        assert!(dist_sq >= 0);
+    }
+}

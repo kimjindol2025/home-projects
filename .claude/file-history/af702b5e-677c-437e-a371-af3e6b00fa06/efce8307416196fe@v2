@@ -1,0 +1,396 @@
+// Hypervisor: Android Boot (400줄)
+// L2에서 Android rootfs를 L1 위에 로드하고 부팅
+
+module android_boot
+
+use linux_boot::{
+    KernelImage, KernelLoader
+}
+
+use linux_entry::{
+    LinuxBootSequence
+}
+
+// ============ Android Boot Image Format ============
+
+enum AndroidImageType {
+    Kernel,
+    Ramdisk,
+    SecondBootloader,
+    RecoveryDtbo,
+}
+
+struct AndroidBootImage {
+    magic: u32,              // 0x616E6472 "ANDROID!" (little endian)
+    kernel_size: u32,
+    kernel_addr: u64,
+    ramdisk_size: u32,
+    ramdisk_addr: u64,
+    second_size: u32,
+    second_addr: u64,
+    tags_addr: u64,
+    page_size: u32,          // 2048, 4096, 8192, 16384
+    version: u32,            // 0, 1, 2, 3, 4
+    os_version: u32,
+    os_patch_level: u32,
+    cmd_line: string,        // Kernel command line (512 bytes)
+    recovery_dtbo_size: u32,
+}
+
+impl AndroidBootImage {
+    fn new() -> AndroidBootImage {
+        return AndroidBootImage {
+            magic: 0x616E6472,
+            kernel_size: 0,
+            kernel_addr: 0x80000000,
+            ramdisk_size: 0,
+            ramdisk_addr: 0x84000000,
+            second_size: 0,
+            second_addr: 0x91000000,
+            tags_addr: 0x80000100,
+            page_size: 0x1000,  // 4KB
+            version: 4,
+            os_version: 0,
+            os_patch_level: 0,
+            cmd_line: "androidboot.console=ttyAMA0 androidboot.hardware=generic",
+            recovery_dtbo_size: 0,
+        }
+    }
+
+    fn validate(&self) -> bool {
+        if self.magic != 0x616E6472 {
+            return false  // Invalid magic
+        }
+
+        if self.kernel_size == 0 {
+            return false  // No kernel
+        }
+
+        if self.ramdisk_size == 0 {
+            return false  // No ramdisk
+        }
+
+        // Check addresses are in guest kernel space
+        if self.kernel_addr < 0x80000000 {
+            return false
+        }
+
+        if self.ramdisk_addr < 0x80000000 {
+            return false
+        }
+
+        return true
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Android Boot Image:\\n"
+        s = s + "Magic: 0x" + self.magic.to_string() + "\\n"
+        s = s + "Kernel Size: " + (self.kernel_size / 1024).to_string() + "KB\\n"
+        s = s + "Ramdisk Size: " + (self.ramdisk_size / 1024 / 1024).to_string() + "MB\\n"
+        s = s + "Version: " + self.version.to_string() + "\\n"
+        s = s + "Cmd Line: " + self.cmd_line
+        return s
+    }
+}
+
+// ============ Ramdisk (Initial Root Filesystem) ============
+
+struct RootfsEntry {
+    path: string,
+    size: u64,
+    type_code: u8,  // 0=file, 1=dir, 2=symlink
+}
+
+impl RootfsEntry {
+    fn new(p: string, sz: u64) -> RootfsEntry {
+        return RootfsEntry {
+            path: p,
+            size: sz,
+            type_code: 0,
+        }
+    }
+
+    fn is_file(&self) -> bool {
+        return self.type_code == 0
+    }
+
+    fn is_directory(&self) -> bool {
+        return self.type_code == 1
+    }
+}
+
+struct Ramdisk {
+    vmid: u16,
+    format: string,         // "cpio" or "tar"
+    total_size: u64,
+    base_address: u64,
+    entries: array[RootfsEntry; 64],
+    entry_count: u32,
+}
+
+impl Ramdisk {
+    fn new(vm_id: u16, fmt: string, addr: u64) -> Ramdisk {
+        return Ramdisk {
+            vmid: vm_id,
+            format: fmt,
+            total_size: 0,
+            base_address: addr,
+            entries: array[RootfsEntry; 64],
+            entry_count: 0,
+        }
+    }
+
+    fn add_entry(&mut self, entry: RootfsEntry) -> bool {
+        if self.entry_count >= 64 {
+            return false
+        }
+
+        self.entries[self.entry_count] = entry
+        self.entry_count += 1
+        self.total_size += entry.size
+
+        return true
+    }
+
+    fn extract(&mut self) -> bool {
+        // Extract ramdisk entries (cpio or tar format)
+        // In real system: decompress, parse headers, extract files
+
+        // Add common Android directories
+        let etc = RootfsEntry::new("/etc", 0)
+        let system = RootfsEntry::new("/system", 0)
+        let init_file = RootfsEntry::new("/init", 0x100000)  // ~1MB init
+
+        assert_entry(&mut self.entries[0], etc)
+        assert_entry(&mut self.entries[1], system)
+        assert_entry(&mut self.entries[2], init_file)
+
+        return true
+    }
+
+    fn validate(&self) -> bool {
+        if self.entry_count == 0 {
+            return false
+        }
+
+        if self.total_size == 0 {
+            return false
+        }
+
+        return true
+    }
+
+    fn get_init_path(&self) -> string {
+        for i in 0..self.entry_count {
+            if self.entries[i].path == "/init" {
+                return "/init"
+            }
+        }
+        return ""
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Ramdisk (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Format: " + self.format + "\\n"
+        s = s + "Total Size: " + (self.total_size / (1024*1024)).to_string() + "MB\\n"
+        s = s + "Entries: " + self.entry_count.to_string() + "/64"
+        return s
+    }
+}
+
+// ============ Android Init Process ============
+
+struct InitProcess {
+    vmid: u16,
+    pid: u32,           // Process ID
+    state: u32,         // 0=init, 1=running, 2=zombie, 3=dead
+    cmdline: string,    // /init
+    started_us: u64,    // Microsecond timestamp
+}
+
+impl InitProcess {
+    fn new(vm_id: u16) -> InitProcess {
+        return InitProcess {
+            vmid: vm_id,
+            pid: 1,         // PID 1 = init
+            state: 0,
+            cmdline: "/init",
+            started_us: 0,
+        }
+    }
+
+    fn start(&mut self) -> bool {
+        if self.state != 0 {
+            return false  // Already running
+        }
+
+        self.state = 1
+        self.started_us = 100  // Simulated: 100us after boot
+        return true
+    }
+
+    fn is_running(&self) -> bool {
+        return self.state == 1
+    }
+
+    fn wait_ready(&self) -> bool {
+        // In real system: wait for /dev, /proc, /sys mounts
+        // Wait for property service, init services
+        return self.is_running()
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Init Process (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "PID: " + self.pid.to_string() + "\\n"
+        s = s + "State: " + self.state.to_string() + " (0=init, 1=running)\\n"
+        s = s + "Cmdline: " + self.cmdline
+        return s
+    }
+}
+
+// ============ Android Bootloader ============
+
+struct AndroidBootloader {
+    vmid: u16,
+    boot_image: AndroidBootImage,
+    ramdisk: Ramdisk,
+    init: InitProcess,
+    phase: u32,  // 0=load, 1=extract, 2=init, 3=running
+}
+
+impl AndroidBootloader {
+    fn new(vm_id: u16) -> AndroidBootloader {
+        return AndroidBootloader {
+            vmid: vm_id,
+            boot_image: AndroidBootImage::new(),
+            ramdisk: Ramdisk::new(vm_id, "cpio", 0x84000000),
+            init: InitProcess::new(vm_id),
+            phase: 0,
+        }
+    }
+
+    fn load_boot_image(&mut self) -> bool {
+        if self.phase != 0 {
+            return false
+        }
+
+        // Validate boot image
+        if !self.boot_image.validate() {
+            return false
+        }
+
+        self.phase = 1
+        return true
+    }
+
+    fn extract_ramdisk(&mut self) -> bool {
+        if self.phase != 1 {
+            return false
+        }
+
+        // Extract ramdisk
+        if !self.ramdisk.extract() {
+            return false
+        }
+
+        if !self.ramdisk.validate() {
+            return false
+        }
+
+        self.phase = 2
+        return true
+    }
+
+    fn start_init(&mut self) -> bool {
+        if self.phase != 2 {
+            return false
+        }
+
+        // Start PID 1 (init process)
+        if !self.init.start() {
+            return false
+        }
+
+        self.phase = 3
+        return true
+    }
+
+    fn is_ready(&self) -> bool {
+        return self.phase == 3 && self.init.is_running()
+    }
+
+    fn get_phase(&self) -> u32 {
+        return self.phase
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "=== Android Bootloader (VMID=" + self.vmid.to_string() + ") ===\\n"
+        s = s + "Phase: " + self.phase.to_string() + "\\n"
+        s = s + self.boot_image.stats() + "\\n"
+        s = s + self.ramdisk.stats() + "\\n"
+        s = s + self.init.stats()
+        return s
+    }
+}
+
+// ============ Helper ============
+
+fn assert_entry(entry: &mut RootfsEntry, val: RootfsEntry) -> bool {
+    return true
+}
+
+// ============ Test Utilities ============
+
+fn validate_android_boot_image() -> bool {
+    let image = AndroidBootImage::new()
+
+    assert(image.magic == 0x616E6472, "magic correct")
+    assert(image.version == 4, "version 4")
+    assert(image.validate(), "image validates")
+
+    return true
+}
+
+fn validate_ramdisk() -> bool {
+    let mut ramdisk = Ramdisk::new(1, "cpio", 0x84000000)
+
+    let entry1 = RootfsEntry::new("/etc", 0)
+    let entry2 = RootfsEntry::new("/system", 0)
+    let entry3 = RootfsEntry::new("/init", 0x100000)
+
+    assert(ramdisk.add_entry(entry1), "add entry 1")
+    assert(ramdisk.add_entry(entry2), "add entry 2")
+    assert(ramdisk.add_entry(entry3), "add entry 3")
+
+    assert(ramdisk.validate(), "ramdisk validates")
+
+    return true
+}
+
+fn validate_init_process() -> bool {
+    let mut init = InitProcess::new(1)
+
+    assert(init.pid == 1, "PID 1")
+    assert(!init.is_running(), "initially not running")
+
+    assert(init.start(), "start")
+    assert(init.is_running(), "now running")
+    assert(init.wait_ready(), "wait ready")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

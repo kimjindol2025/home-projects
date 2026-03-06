@@ -1,0 +1,288 @@
+# Project Sovereign-DNS: Challenge 15-17 통합 구현
+
+## Context
+
+기존 DNS(ICANN 중앙화, UDP 도청 취약, 하이재킹 공격)의 3가지 근본 문제를 해결하는
+**탈중앙화·ZKP 인증·L0NN 지능형 라우팅** 기반 주권 DNS 시스템.
+
+**핵심 목표**:
+- Challenge 15: Kademlia DHT 기반 탈중앙 이름 해석 (< 10ms)
+- Challenge 16: ZKP 도메인 소유권 증명 (ZKP 검증 < 1ms)
+- Challenge 17: L0NeuralNet 지능형 경로 최적화 (경로 결정 < 5ms)
+
+**"기록이 증명이다"**: 모든 도메인 등록/해석 → Atomic-Ledger CAS 영구 저장
+
+---
+
+## 저장소 위치
+
+```
+~/freelang-sovereign-dns/
+├── src/
+│   ├── dht/
+│   │   ├── dht_node.fl          (~400줄) - Kademlia NodeId + K-bucket 라우팅 테이블
+│   │   ├── dht_router.fl        (~400줄) - 이터레이티브 룩업 + 병렬 α=3 쿼리
+│   │   └── mod.fl               (~30줄)
+│   ├── registry/
+│   │   ├── dns_record.fl        (~350줄) - DnsRecord + RecordType (A/AAAA/MX/TXT)
+│   │   ├── sovereign_registry.fl (~400줄) - 도메인 등록 + ZKP 소유권 저장
+│   │   └── mod.fl               (~30줄)
+│   ├── security/
+│   │   ├── proof_validator.fl   (~400줄) - Schnorr ZKP 검증 < 1ms
+│   │   ├── domain_session.fl    (~350줄) - HMAC 세션 + 재생 방지 nonce
+│   │   └── mod.fl               (~30줄)
+│   ├── resolver/
+│   │   ├── path_optimizer.fl    (~400줄) - L0NeuralNet 경로 최적화 < 5ms
+│   │   ├── sovereign_resolver.fl (~400줄) - 통합 해석기 + 캐시
+│   │   └── mod.fl               (~30줄)
+│   └── lib.fl                   (~100줄)
+├── tests/
+│   └── sovereign_dns_tests.fl   (~1,800줄) - 48개 무관용 테스트
+└── docs/
+    └── SOVEREIGN_DNS_DESIGN.md
+```
+
+**총 코드: ~3,600줄**
+**총 테스트: 48개 무관용 (A-H 그룹, 각 6개)**
+
+---
+
+## 재사용 자산
+
+| 자산 | 출처 파일 | 재사용 내용 |
+|------|----------|------------|
+| `NanoPagePool` | `freelang-nano-kernel/src/boot/nano_memory.fl` | K-bucket 정적 메모리 풀 |
+| `ZeroCopyRingBuffer` | `freelang-atomic-ledger/src/kernel_io/commit_bus.fl` | DNS 쿼리 큐 O(1) |
+| `SchnorrProof` | `freelang-signal/src/zkp/schnorr_proof.fl` | ZKP 소유권 증명 |
+| `PedersenCommitment` | `freelang-signal/src/zkp/commitment.fl` | 도메인 해시 은닉 |
+| `sha3_256()` | `freelang-signal/src/crypto/sha3_hash.fl` | NodeId 해시 |
+| `L0NeuralNet` | `freelang-signal/src/detection/signal_detector.fl` | 경로 최적화 NN |
+| `NgramAnalyzer` | `freelang-signal/src/detection/signal_detector.fl` | 이상 쿼리 탐지 |
+| `CASCore` | `freelang-atomic-ledger/src/kernel_io/io_layer.fl` | 레코드 불변 저장 |
+| `LedgerHashEngine` | `freelang-atomic-ledger/src/ledger/hash_engine.fl` | 레코드 해시 검증 |
+| `DagNodePool` | `freelang-atomic-ledger/src/dag/dag_store.fl` | 레코드 버전 DAG |
+
+---
+
+## 4개 계층 설계
+
+### Layer 1: DHT Layer (Day 1-2, ~830줄)
+
+**dht_node.fl** (~400줄) — `NanoPagePool` 패턴으로 K-bucket 관리:
+```
+pub struct NodeId { pub bytes: [u8; 20] }  // 160비트 Kademlia ID
+impl NodeId {
+    pub fn xor_distance(&self, other: &NodeId) -> NodeId  // XOR 거리
+    pub fn bucket_index(&self, other: &NodeId) -> u8      // K-bucket 인덱스 (0-159)
+}
+pub struct KBucket {
+    pub nodes: [Option<DhtContact>; 20],   // K=20 노드/버킷
+    pub count: u8,
+    pub last_seen_ns: u64,
+}
+pub struct DhtTable {
+    pub buckets: [KBucket; 160],           // 160개 K-bucket (NanoPagePool 패턴)
+    pub self_id: NodeId,
+    pub total_contacts: u32,
+}
+```
+
+**dht_router.fl** (~400줄) — α=3 병렬 이터레이티브 룩업:
+```
+pub struct DhtRouter {
+    pub table: DhtTable,
+    pub alpha: u8,                         // 병렬 쿼리 수 = 3
+    pub lookup_timeout_ms: u32,            // 10ms (규칙 1)
+    pub total_lookups: u64,
+    pub fast_lookups: u64,                 // < 10ms 카운터
+}
+pub fn find_node(&mut self, target: &NodeId) -> Option<DhtContact>  // < 10ms
+pub fn store_record(&mut self, key: &[u8;20], value: &DnsRecord) -> bool
+pub fn find_value(&mut self, key: &[u8;20]) -> Option<DnsRecord>
+```
+
+**테스트 A1-A6**: NodeId XOR, K-bucket 삽입/퇴출, 이터레이티브 룩업 < 10ms, 팬아웃
+
+---
+
+### Layer 2: Registry Layer (Day 3-4, ~780줄)
+
+**dns_record.fl** (~350줄):
+```
+pub enum RecordType { A, AAAA, MX, TXT, CNAME, NS, SOA }
+pub struct DnsRecord {
+    pub domain: [u8; 253],
+    pub record_type: RecordType,
+    pub value: [u8; 512],
+    pub ttl: u32,
+    pub owner_hash: [u8; 32],             // 소유자 Pedersen commitment
+    pub proof_hash: [u8; 32],             // ZKP 증명 해시
+    pub timestamp: u64,
+    pub signature: [u8; 64],
+}
+```
+
+**sovereign_registry.fl** (~400줄) — `CASCore` 재사용:
+```
+pub struct SovereignRegistry {
+    pub cas: CASCore,                     // Atomic-Ledger CAS 직접 재사용
+    pub records: [Option<DnsRecord>; 4096],
+    pub record_count: u32,
+    pub ownership_map: [Option<[u8;32]>; 4096], // 도메인 → 소유자 해시
+}
+pub fn register_domain(&mut self, record: DnsRecord, proof: &SchnorrProof) -> bool
+pub fn update_record(&mut self, domain: &[u8], proof: &SchnorrProof) -> bool
+pub fn lookup_record(&self, domain: &[u8]) -> Option<DnsRecord>
+```
+
+**테스트 B1-B6**: 도메인 등록, ZKP 소유권, TTL 만료, CAS 저장
+**테스트 C1-C6**: 레코드 타입, 업데이트, 중복 방지, 소유권 이전
+
+---
+
+### Layer 3: Security Layer (Day 5-6, ~780줄)
+
+**proof_validator.fl** (~400줄) — `SchnorrProof` + `sha3_256()` 재사용:
+```
+pub struct DnsProof {
+    pub commitment: [u8; 32],             // PedersenCommitment(domain, rand)
+    pub challenge: [u8; 32],             // Fiat-Shamir 챌린지
+    pub response: [u8; 32],              // Schnorr 응답
+    pub domain_hash: [u8; 32],
+    pub nonce: u64,
+}
+pub struct ProofValidator {
+    pub total_verified: u64,
+    pub fast_verifications: u64,          // < 1ms 카운터
+    pub rejected_count: u64,
+}
+pub fn verify_domain_ownership(proof: &DnsProof) -> bool  // < 1ms (규칙 3)
+pub fn create_domain_proof(domain: &[u8], private_key: &[u8;32]) -> DnsProof
+pub fn detect_hijack_attempt(query: &DnsQuery) -> bool    // NgramAnalyzer 재사용
+```
+
+**domain_session.fl** (~350줄) — 재생공격 방지:
+```
+pub struct DnsSession {
+    pub session_id: u64,
+    pub client_nonce: u64,
+    pub server_nonce: u64,
+    pub hmac_key: [u8; 32],
+    pub expires_ns: u64,
+}
+pub struct SessionManager {
+    pub sessions: [Option<DnsSession>; 1024],
+    pub nonce_cache: [u64; 8192],         // 재생 방지 nonce 캐시 (Atomic-Ledger 패턴)
+    pub hijack_attempts: u64,
+}
+pub fn create_session(&mut self, client_id: u64) -> DnsSession
+pub fn verify_session(&self, session: &DnsSession, nonce: u64) -> bool  // nonce 재사용 거부
+pub fn detect_replay(&self, nonce: u64) -> bool
+```
+
+**테스트 D1-D6**: ZKP 검증 < 1ms, 하이재킹 탐지, nonce 재생공격 방지
+
+---
+
+### Layer 4: Resolver Layer (Day 7-8, ~800줄 + 테스트)
+
+**path_optimizer.fl** (~400줄) — `L0NeuralNet` + `NgramAnalyzer` 재사용:
+```
+// L0NeuralNet 패턴 재사용 (signal_detector.fl에서)
+pub struct DnsPathOptimizer {
+    pub nn_weights: [[f32; 8]; 16],       // 16→8 레이어 (L0NeuralNet 패턴)
+    pub nn_bias: [f32; 8],
+    pub total_decisions: u64,
+    pub fast_decisions: u64,              // < 5ms 카운터
+}
+pub fn optimize_path(&mut self, query: &DnsQuery) -> ResolverPath  // < 5ms (규칙 4)
+// 입력 피처 16개: latency, hop_count, cache_hit, proof_valid, node_trust, ...
+// 출력 8개: path_score (softmax)
+pub fn analyze_query_pattern(&self, domain: &[u8]) -> QueryAnomaly  // NgramAnalyzer
+```
+
+**sovereign_resolver.fl** (~400줄) — 통합 캐시 해석기:
+```
+pub struct SovereignResolver {
+    pub dht: DhtRouter,
+    pub registry: SovereignRegistry,
+    pub validator: ProofValidator,
+    pub optimizer: DnsPathOptimizer,
+    pub cache: [Option<(DnsRecord, u64)>; 4096],  // TTL 기반 캐시
+    pub cache_hits: u64,
+    pub remote_hits: u64,
+}
+pub fn resolve(&mut self, domain: &[u8]) -> Option<DnsRecord>  // 캐시 < 0.1ms, 원격 < 10ms
+pub fn resolve_with_proof(&mut self, domain: &[u8]) -> Option<(DnsRecord, DnsProof)>
+pub fn is_icann_free(&self) -> bool  // 규칙 6: ICANN 의존 0%
+```
+
+**테스트 E1-E6**: 캐시 히트 < 0.1ms, 원격 해석 < 10ms, 경로 최적화
+**테스트 F1-F6**: 도메인 해석, ZKP 포함 해석, 오류 처리
+**테스트 G1-G6**: 처리량, 동시 쿼리, 장애 내성 (50% 노드 손실)
+**테스트 H1-H6 (E2E)**:
+- H1: 도메인 등록 → ZKP 증명 → DHT 저장 → 해석 전체 플로우
+- H2: 하이재킹 100번 시도 → 전부 탐지 + 거부
+- H3: nonce 재생공격 → 100% 차단
+- H4: 1,000 쿼리 배치 처리량 검증
+- H5: 50% 노드 장애 → 해석 가능 (규칙 7)
+- H6: 8개 무관용 규칙 최종 검증
+
+---
+
+## 8개 무관용 규칙
+
+| # | 규칙 | 목표 | 측정 방법 |
+|---|------|------|---------|
+| 1 | **원격 해석 지연** | < 10ms | `DhtRouter.find_value()` 레이턴시 |
+| 2 | **캐시 히트 지연** | < 0.1ms | `SovereignResolver.cache` 룩업 |
+| 3 | **ZKP 검증 지연** | < 1ms | `ProofValidator.verify_domain_ownership()` |
+| 4 | **경로 결정 지연** | < 5ms | `DnsPathOptimizer.optimize_path()` L0NN |
+| 5 | **하이재킹 방어** | 100% | `SessionManager.detect_replay()` + NgramAnalyzer |
+| 6 | **ICANN 의존** | 0% | 외부 DNS 서버 호출 0% |
+| 7 | **장애 내성** | 50% 노드 손실 후 해석 가능 | K=20 K-bucket 복구 |
+| 8 | **레코드 불변성** | 100% CAS | `CASCore` 영구 저장 + 해시 검증 |
+
+---
+
+## 구현 순서
+
+1. **Day 1-2**: `dht/` + 테스트 A1-A6 (NodeId XOR, K-bucket, 이터레이티브 룩업)
+2. **Day 3-4**: `registry/` + 테스트 B1-C6 (도메인 등록, ZKP 소유권, CAS 저장)
+3. **Day 5-6**: `security/` + 테스트 D1-D6 (ZKP 검증 < 1ms, 하이재킹 탐지)
+4. **Day 7-8**: `resolver/` + 테스트 E1-H6 (L0NN 경로, 통합 해석, E2E)
+
+---
+
+## GOGS 저장소
+
+저장소: `freelang-sovereign-dns`
+API 토큰: `ffab4b9176ee59ee8ff729ca8a5225b31064be22`
+리모트: `https://gogs.dclub.kr/kim/freelang-sovereign-dns.git`
+
+**최종 검증 목표**:
+```
+✅ 원격 해석: < 10ms
+✅ 캐시 히트: < 0.1ms
+✅ ZKP 검증: < 1ms
+✅ 경로 결정: < 5ms (L0NN)
+✅ 하이재킹 방어: 100%
+✅ ICANN 의존: 0%
+✅ 장애 내성: 50% 노드 손실 후 작동
+✅ 레코드 불변성: 100% CAS
+```
+
+**핵심 데이터 흐름**:
+```
+[도메인 쿼리]
+    ↓ 캐시 확인 < 0.1ms
+[SovereignResolver.cache] → 히트 → 즉시 반환
+    ↓ 미스
+[DhtRouter.find_value()] → K-bucket 이터레이티브 룩업 < 10ms
+    ↓ ZKP 검증
+[ProofValidator.verify_domain_ownership()] < 1ms
+    ↓ L0NN 경로 최적화
+[DnsPathOptimizer.optimize_path()] < 5ms
+    ↓ 불변 저장
+[CASCore.store_chunk()] → 100% 무결성
+```

@@ -1,0 +1,273 @@
+// Phase 5.2 Day 1-2: OpenTelemetry 분산 추적 프레임워크 (280줄)
+// 마이크로초 정밀도 분산 추적, 8가지 span 추적
+
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug)]
+pub struct TraceId {
+    pub high: u64,
+    pub low: u64,
+}
+
+impl TraceId {
+    pub fn new() -> Self {
+        // 128-bit trace ID 생성
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        TraceId {
+            high: ((now >> 64) as u64) ^ 0x1234567890ABCDEF,
+            low: (now as u64) ^ 0xFEDCBA0987654321,
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{:016x}{:016x}", self.high, self.low)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SpanId {
+    pub id: u64,
+}
+
+impl SpanId {
+    pub fn new() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
+        SpanId {
+            id: now ^ 0xDEADBEEFCAFEBABE,
+        }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{:016x}", self.id)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum SpanStatus {
+    Unset = 0,
+    Ok = 1,
+    Error = 2,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpanEvent {
+    pub name: String,
+    pub timestamp_us: u64,
+    pub attributes: HashMap<String, String>,
+}
+
+impl SpanEvent {
+    pub fn new(name: &str) -> Self {
+        SpanEvent {
+            name: name.to_string(),
+            timestamp_us: get_timestamp_us(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    pub fn add_attribute(&mut self, key: &str, value: &str) {
+        self.attributes.insert(key.to_string(), value.to_string());
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Span {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub name: String,
+    pub start_time_us: u64,
+    pub end_time_us: u64,
+    pub status: SpanStatus,
+    pub events: Vec<SpanEvent>,
+    pub attributes: HashMap<String, String>,
+    pub duration_us: u64,
+}
+
+impl Span {
+    pub fn new(name: &str, trace_id: TraceId, parent_span_id: Option<SpanId>) -> Self {
+        let start_time = get_timestamp_us();
+
+        Span {
+            trace_id,
+            span_id: SpanId::new(),
+            parent_span_id,
+            name: name.to_string(),
+            start_time_us: start_time,
+            end_time_us: start_time,
+            status: SpanStatus::Unset,
+            events: Vec::new(),
+            attributes: HashMap::new(),
+            duration_us: 0,
+        }
+    }
+
+    pub fn add_event(&mut self, event: SpanEvent) {
+        self.events.push(event);
+    }
+
+    pub fn add_attribute(&mut self, key: &str, value: &str) {
+        self.attributes.insert(key.to_string(), value.to_string());
+    }
+
+    pub fn end(&mut self) {
+        self.end_time_us = get_timestamp_us();
+        self.duration_us = self.end_time_us.saturating_sub(self.start_time_us);
+        self.status = SpanStatus::Ok;
+    }
+
+    pub fn end_with_error(&mut self, error_msg: &str) {
+        self.end_time_us = get_timestamp_us();
+        self.duration_us = self.end_time_us.saturating_sub(self.start_time_us);
+        self.status = SpanStatus::Error;
+        self.add_attribute("error.message", error_msg);
+    }
+}
+
+pub struct Tracer {
+    pub current_trace_id: TraceId,
+    pub spans: Vec<Span>,
+    pub active_span_id: Option<SpanId>,
+}
+
+impl Tracer {
+    pub fn new() -> Self {
+        Tracer {
+            current_trace_id: TraceId::new(),
+            spans: Vec::new(),
+            active_span_id: None,
+        }
+    }
+
+    pub fn with_trace_id(trace_id: TraceId) -> Self {
+        Tracer {
+            current_trace_id: trace_id,
+            spans: Vec::new(),
+            active_span_id: None,
+        }
+    }
+
+    pub fn start_span(&mut self, name: &str) -> Span {
+        let span = Span::new(name, self.current_trace_id, self.active_span_id);
+        let span_id = span.span_id;
+        self.spans.push(span.clone());
+        self.active_span_id = Some(span_id);
+        span
+    }
+
+    pub fn end_span(&mut self, span: &mut Span) {
+        span.end();
+
+        // Find and update span in vector
+        for s in &mut self.spans {
+            if s.span_id.id == span.span_id.id {
+                s.end_time_us = span.end_time_us;
+                s.duration_us = span.duration_us;
+                s.status = span.status.clone();
+                break;
+            }
+        }
+    }
+
+    pub fn get_spans(&self) -> &Vec<Span> {
+        &self.spans
+    }
+
+    pub fn get_trace_spans_count(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn get_total_duration_us(&self) -> u64 {
+        if self.spans.is_empty() {
+            return 0;
+        }
+
+        let min_start = self.spans.iter()
+            .map(|s| s.start_time_us)
+            .min()
+            .unwrap_or(0);
+
+        let max_end = self.spans.iter()
+            .map(|s| s.end_time_us)
+            .max()
+            .unwrap_or(0);
+
+        max_end.saturating_sub(min_start)
+    }
+}
+
+pub fn get_timestamp_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_id_generation() {
+        let trace_id = TraceId::new();
+        assert_ne!(trace_id.high, 0);
+        assert_ne!(trace_id.low, 0);
+
+        let trace_str = trace_id.to_string();
+        assert_eq!(trace_str.len(), 32);
+    }
+
+    #[test]
+    fn test_span_id_generation() {
+        let span_id = SpanId::new();
+        assert_ne!(span_id.id, 0);
+
+        let span_str = span_id.to_string();
+        assert_eq!(span_str.len(), 16);
+    }
+
+    #[test]
+    fn test_span_creation_and_timing() {
+        let trace_id = TraceId::new();
+        let mut span = Span::new("test_span", trace_id, None);
+
+        assert_eq!(span.name, "test_span");
+        assert_eq!(span.trace_id.high, trace_id.high);
+        assert_eq!(span.parent_span_id, None);
+
+        span.end();
+        assert!(span.duration_us >= 0);
+    }
+
+    #[test]
+    fn test_span_event_creation() {
+        let mut event = SpanEvent::new("event1");
+        assert_eq!(event.name, "event1");
+
+        event.add_attribute("key1", "value1");
+        assert_eq!(event.attributes.get("key1"), Some(&"value1".to_string()));
+    }
+
+    #[test]
+    fn test_tracer_span_tracking() {
+        let mut tracer = Tracer::new();
+        let mut span1 = tracer.start_span("operation1");
+        let mut span2 = tracer.start_span("operation2");
+
+        span2.end();
+        tracer.end_span(&mut span2);
+        span1.end();
+        tracer.end_span(&mut span1);
+
+        assert_eq!(tracer.get_spans().len(), 2);
+    }
+}

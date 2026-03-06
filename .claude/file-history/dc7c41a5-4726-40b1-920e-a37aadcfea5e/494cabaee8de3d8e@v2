@@ -1,0 +1,428 @@
+// Green-Distributed-Fabric Layer 1: Power Sensing
+// power_pattern.fl - 전력 패턴 인식 및 분석
+// 재사용: Phase 6 RecoveryPattern, PatternType, 베이지안 신뢰도 공식
+
+use super::power_sensor::PowerReading;
+use std::collections::VecDeque;
+
+// ─────────────────────────────────────────────────────────────────
+// PowerPatternType: 전력 패턴 6가지 (Phase 6 변환)
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PowerPatternType {
+    PowerSpike,        // MemoryLeak 대응: 순간 전력 급증
+    IdleWaste,         // IOBottleneck 대응: 아이들 상태 과소비
+    LeakCurrent,       // CacheThreshing 대응: 미세 누설 전류
+    PeriodPeak,        // PeriodicLoad 대응: 주기적 전력 피크
+    ThermalThrottle,   // ThreadContention 대응: 발열 악순환
+    CombinedDrain,     // CombinedPressure 대응: 복합 소비
+}
+
+impl PowerPatternType {
+    pub fn to_string(&self) -> String {
+        match self {
+            PowerPatternType::PowerSpike => "PowerSpike".to_string(),
+            PowerPatternType::IdleWaste => "IdleWaste".to_string(),
+            PowerPatternType::LeakCurrent => "LeakCurrent".to_string(),
+            PowerPatternType::PeriodPeak => "PeriodPeak".to_string(),
+            PowerPatternType::ThermalThrottle => "ThermalThrottle".to_string(),
+            PowerPatternType::CombinedDrain => "CombinedDrain".to_string(),
+        }
+    }
+
+    pub fn severity_weight(&self) -> f64 {
+        // 절감 우선순위 가중치 (0.0-1.0)
+        match self {
+            PowerPatternType::PowerSpike => 0.95,      // 즉시 해결 필요
+            PowerPatternType::ThermalThrottle => 0.90,  // 성능 영향 큼
+            PowerPatternType::CombinedDrain => 0.85,    // 복합 문제
+            PowerPatternType::PeriodPeak => 0.70,       // 예측 가능
+            PowerPatternType::IdleWaste => 0.60,        // 배경 최적화
+            PowerPatternType::LeakCurrent => 0.50,      // 오래되면 누적
+        }
+    }
+
+    pub fn detection_threshold_mw(&self) -> f64 {
+        // 각 패턴별 감지 임계값
+        match self {
+            PowerPatternType::PowerSpike => 300.0,      // 300mW 이상 순간
+            PowerPatternType::IdleWaste => 80.0,        // 아이들에 80mW 이상
+            PowerPatternType::LeakCurrent => 10.0,      // 누설 전류
+            PowerPatternType::PeriodPeak => 200.0,      // 주기적 200mW 이상
+            PowerPatternType::ThermalThrottle => 150.0, // 열 관련 150mW
+            PowerPatternType::CombinedDrain => 250.0,   // 복합 250mW
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PowerPattern: 전력 패턴 (Phase 6 RecoveryPattern 변환)
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct PowerPattern {
+    pub pattern_id: u32,
+    pub pattern_type: PowerPatternType,
+    pub confidence: f64,           // 베이지안 신뢰도 (0.0-1.0)
+    pub timestamp: u64,
+    pub duration_ms: u32,
+    pub avg_consumption_mw: f64,
+    pub peak_consumption_mw: f64,
+    pub savings_achieved_mw: f64,  // 조치로 달성한 절감
+    pub frequency: u32,            // 발생 횟수
+    pub last_occurrence: u64,
+    pub success_rate: f64,         // 조치 성공률
+}
+
+impl PowerPattern {
+    pub fn new(pattern_type: PowerPatternType) -> PowerPattern {
+        PowerPattern {
+            pattern_id: 0,
+            pattern_type,
+            confidence: 0.0,
+            timestamp: 0,
+            duration_ms: 0,
+            avg_consumption_mw: 0.0,
+            peak_consumption_mw: 0.0,
+            savings_achieved_mw: 0.0,
+            frequency: 0,
+            last_occurrence: 0,
+            success_rate: 0.0,
+        }
+    }
+
+    pub fn update_confidence(&mut self, new_evidence: f64) {
+        // Phase 6 베이지안 공식 그대로:
+        // new_conf = (old_conf × N + evidence) / (N + 1)
+        let n = self.frequency as f64;
+        self.confidence = ((self.confidence * n) + new_evidence) / (n + 1.0);
+        self.confidence = self.confidence.min(1.0).max(0.0);
+    }
+
+    pub fn increment_frequency(&mut self, timestamp: u64) {
+        self.frequency += 1;
+        self.last_occurrence = timestamp;
+    }
+
+    pub fn is_reliable(&self) -> bool {
+        // Phase 6 is_reliable() 동일 조건
+        self.confidence > 0.70 && self.success_rate > 0.60 && self.frequency > 2
+    }
+
+    pub fn combined_score(&self) -> f64 {
+        // Phase 6 3중 곱 확률:
+        // confidence × success_rate × frequency_factor
+        let frequency_factor = ((self.frequency as f64) / 10.0).min(1.0);
+        self.confidence * self.success_rate * frequency_factor
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PowerPatternMatcher: 전력 패턴 감지 엔진
+// ─────────────────────────────────────────────────────────────────
+
+pub struct PowerPatternMatcher {
+    window_readings: VecDeque<PowerReading>, // 최근 60초 데이터
+    detected_patterns: Vec<PowerPattern>,
+    detection_interval_ms: u32,              // 기본 1000ms
+    last_detection_us: u64,
+    pattern_counter: u32,
+}
+
+impl PowerPatternMatcher {
+    pub fn new() -> PowerPatternMatcher {
+        PowerPatternMatcher {
+            window_readings: VecDeque::new(),
+            detected_patterns: Vec::new(),
+            detection_interval_ms: 1000,
+            last_detection_us: 0,
+            pattern_counter: 0,
+        }
+    }
+
+    pub fn add_reading(&mut self, reading: PowerReading) {
+        self.window_readings.push_back(reading);
+
+        // 60초 (60,000ms) 윈도우 유지
+        while !self.window_readings.is_empty() {
+            let oldest = self.window_readings.front().unwrap();
+            let window_start = reading.timestamp_us - 60_000_000;
+            if oldest.timestamp_us < window_start {
+                self.window_readings.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn detect_power_spike(&self) -> Option<PowerPattern> {
+        if self.window_readings.len() < 2 {
+            return None;
+        }
+
+        let readings: Vec<&PowerReading> = self.window_readings.iter().collect();
+        let mut max_power = 0.0;
+        let mut min_power = f64::MAX;
+
+        for r in &readings {
+            max_power = max_power.max(r.power_consumption_mw);
+            min_power = min_power.min(r.power_consumption_mw);
+        }
+
+        // 스파이크: 최고 - 최저 > 150mW 이고, 최고 > 300mW
+        if max_power - min_power > 150.0 && max_power > PowerPatternType::PowerSpike.detection_threshold_mw() {
+            let mut pattern = PowerPattern::new(PowerPatternType::PowerSpike);
+            pattern.peak_consumption_mw = max_power;
+            pattern.avg_consumption_mw = min_power;
+            return Some(pattern);
+        }
+
+        None
+    }
+
+    pub fn detect_idle_waste(&self) -> Option<PowerPattern> {
+        // cpu_util < 5% && power > 80mW (시뮬레이션: 모든 레딩이 freq < 400MHz && power > 80)
+        if self.window_readings.len() < 3 {
+            return None;
+        }
+
+        let idle_count = self.window_readings.iter()
+            .filter(|r| r.cpu_frequency_mhz < 400 && r.power_consumption_mw > 80.0)
+            .count();
+
+        if idle_count > self.window_readings.len() / 2 {
+            let avg = self.window_readings.iter()
+                .filter(|r| r.cpu_frequency_mhz < 400)
+                .map(|r| r.power_consumption_mw)
+                .sum::<f64>() / (idle_count as f64);
+
+            let mut pattern = PowerPattern::new(PowerPatternType::IdleWaste);
+            pattern.avg_consumption_mw = avg;
+            return Some(pattern);
+        }
+
+        None
+    }
+
+    pub fn detect_leak_current(&self) -> Option<PowerPattern> {
+        // current_ma > 5 && cpu_util < 1% (freq < 200MHz)
+        if self.window_readings.is_empty() {
+            return None;
+        }
+
+        let leak_count = self.window_readings.iter()
+            .filter(|r| r.cpu_frequency_mhz < 200 && r.current_ma > 5)
+            .count();
+
+        if leak_count > self.window_readings.len() / 3 {
+            let mut pattern = PowerPattern::new(PowerPatternType::LeakCurrent);
+            pattern.avg_consumption_mw = 15.0; // 예상 누설 전류
+            return Some(pattern);
+        }
+
+        None
+    }
+
+    pub fn detect_period_peak(&self) -> Option<PowerPattern> {
+        // 주기성 검출 (간단한 피크 감지)
+        if self.window_readings.len() < 10 {
+            return None;
+        }
+
+        let mut peak_count = 0;
+        for i in 1..self.window_readings.len()-1 {
+            let prev = self.window_readings[i-1].power_consumption_mw;
+            let curr = self.window_readings[i].power_consumption_mw;
+            let next = self.window_readings[i+1].power_consumption_mw;
+
+            if curr > prev && curr > next && curr > 200.0 {
+                peak_count += 1;
+            }
+        }
+
+        // 피크가 4회 이상 = 주기적 패턴
+        if peak_count >= 4 {
+            let mut pattern = PowerPattern::new(PowerPatternType::PeriodPeak);
+            pattern.avg_consumption_mw = 180.0;
+            return Some(pattern);
+        }
+
+        None
+    }
+
+    pub fn detect_thermal_throttle(&self) -> Option<PowerPattern> {
+        // thermal_ratio > 0.85 && frequency 감소 관찰
+        if self.window_readings.len() < 3 {
+            return None;
+        }
+
+        let hot_count = self.window_readings.iter()
+            .filter(|r| r.thermal_ratio > 0.85)
+            .count();
+
+        if hot_count > self.window_readings.len() / 2 {
+            let avg = self.window_readings.iter()
+                .filter(|r| r.thermal_ratio > 0.85)
+                .map(|r| r.power_consumption_mw)
+                .sum::<f64>() / (hot_count as f64);
+
+            let mut pattern = PowerPattern::new(PowerPatternType::ThermalThrottle);
+            pattern.avg_consumption_mw = avg;
+            return Some(pattern);
+        }
+
+        None
+    }
+
+    pub fn detect_combined_drain(&self) -> Option<PowerPattern> {
+        // 3+ 패턴 동시 활성
+        let mut active_patterns = 0;
+        if self.detect_power_spike().is_some() { active_patterns += 1; }
+        if self.detect_idle_waste().is_some() { active_patterns += 1; }
+        if self.detect_thermal_throttle().is_some() { active_patterns += 1; }
+
+        if active_patterns >= 3 {
+            let avg = self.window_readings.iter()
+                .map(|r| r.power_consumption_mw)
+                .sum::<f64>() / (self.window_readings.len() as f64);
+
+            let mut pattern = PowerPattern::new(PowerPatternType::CombinedDrain);
+            pattern.avg_consumption_mw = avg;
+            return Some(pattern);
+        }
+
+        None
+    }
+
+    pub fn run_detection(&mut self) -> Vec<PowerPattern> {
+        let mut detected = Vec::new();
+
+        if let Some(mut p) = self.detect_power_spike() {
+            p.pattern_id = self.pattern_counter;
+            self.pattern_counter += 1;
+            detected.push(p);
+        }
+
+        if let Some(mut p) = self.detect_idle_waste() {
+            p.pattern_id = self.pattern_counter;
+            self.pattern_counter += 1;
+            detected.push(p);
+        }
+
+        if let Some(mut p) = self.detect_leak_current() {
+            p.pattern_id = self.pattern_counter;
+            self.pattern_counter += 1;
+            detected.push(p);
+        }
+
+        if let Some(mut p) = self.detect_period_peak() {
+            p.pattern_id = self.pattern_counter;
+            self.pattern_counter += 1;
+            detected.push(p);
+        }
+
+        if let Some(mut p) = self.detect_thermal_throttle() {
+            p.pattern_id = self.pattern_counter;
+            self.pattern_counter += 1;
+            detected.push(p);
+        }
+
+        if let Some(mut p) = self.detect_combined_drain() {
+            p.pattern_id = self.pattern_counter;
+            self.pattern_counter += 1;
+            detected.push(p);
+        }
+
+        detected
+    }
+
+    pub fn detected_patterns(&self) -> &[PowerPattern] {
+        &self.detected_patterns
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 테스트
+// ─────────────────────────────────────────────────────────────────
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pattern_type_severity() {
+        assert_eq!(PowerPatternType::PowerSpike.severity_weight(), 0.95);
+        assert_eq!(PowerPatternType::LeakCurrent.severity_weight(), 0.50);
+    }
+
+    #[test]
+    fn test_pattern_type_threshold() {
+        assert_eq!(PowerPatternType::PowerSpike.detection_threshold_mw(), 300.0);
+        assert_eq!(PowerPatternType::IdleWaste.detection_threshold_mw(), 80.0);
+    }
+
+    #[test]
+    fn test_power_pattern_confidence_update() {
+        let mut pattern = PowerPattern::new(PowerPatternType::PowerSpike);
+        pattern.confidence = 0.5;
+        pattern.frequency = 5;
+
+        // 베이지안 업데이트
+        pattern.update_confidence(0.8);
+        // (0.5 × 5 + 0.8) / 6 = 3.3 / 6 = 0.55
+        assert!(pattern.confidence > 0.54 && pattern.confidence < 0.56);
+    }
+
+    #[test]
+    fn test_pattern_is_reliable() {
+        let mut pattern = PowerPattern::new(PowerPatternType::PowerSpike);
+        pattern.confidence = 0.75;
+        pattern.success_rate = 0.70;
+        pattern.frequency = 5;
+
+        assert!(pattern.is_reliable());
+    }
+
+    #[test]
+    fn test_pattern_combined_score() {
+        let mut pattern = PowerPattern::new(PowerPatternType::PowerSpike);
+        pattern.confidence = 1.0;
+        pattern.success_rate = 1.0;
+        pattern.frequency = 15;
+
+        let score = pattern.combined_score();
+        // 1.0 × 1.0 × 1.0 = 1.0
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn test_matcher_power_spike_detection() {
+        let mut matcher = PowerPatternMatcher::new();
+
+        // 저 전력 읽음 추가
+        for i in 0..5 {
+            let reading = PowerReading::new(i as u64 * 1_000, 3700, 50, 25.0, 1000);
+            matcher.add_reading(reading);
+        }
+
+        // 스파이크 읽음 추가
+        let spike = PowerReading::new(10_000, 3700, 400, 25.0, 1600);
+        matcher.add_reading(spike);
+
+        let detected = matcher.detect_power_spike();
+        assert!(detected.is_some());
+    }
+
+    #[test]
+    fn test_matcher_idle_waste_detection() {
+        let mut matcher = PowerPatternMatcher::new();
+
+        for i in 0..10 {
+            let reading = PowerReading::new(i as u64 * 1_000, 3700, 150, 25.0, 300);
+            matcher.add_reading(reading);
+        }
+
+        let detected = matcher.detect_idle_waste();
+        assert!(detected.is_some());
+    }
+}

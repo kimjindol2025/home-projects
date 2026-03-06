@@ -1,0 +1,328 @@
+// Challenge 14: mail_structure.fl - 메일 데이터 구조
+// 100% FreeLang 구현
+// 2026-03-05, Kim
+
+module mail_structure
+
+use crypto_primitives::{sha256, AESKey, AESNonce, GCMTag}
+
+// ============================================================================
+// RawMail - 평문 메일
+// ============================================================================
+
+pub type RawMail = {
+    sender: String,
+    recipient: String,
+    subject: String,
+    body: Vec<u8>,
+    timestamp: u64,
+}
+
+pub fn raw_mail_new(
+    sender: String,
+    recipient: String,
+    subject: String,
+    body: Vec<u8>
+) -> RawMail {
+    RawMail {
+        sender,
+        recipient,
+        subject,
+        body,
+        timestamp: now_timestamp(),
+    }
+}
+
+pub fn raw_mail_serialize(mail: &RawMail) -> Vec<u8> {
+    let mut buf = vec![]
+
+    // Sender
+    buf.extend(encode_string(&mail.sender))
+
+    // Recipient
+    buf.extend(encode_string(&mail.recipient))
+
+    // Subject
+    buf.extend(encode_string(&mail.subject))
+
+    // Body
+    buf.extend(encode_length(mail.body.len() as u32))
+    buf.extend_from_slice(&mail.body)
+
+    // Timestamp
+    buf.extend(encode_u64(mail.timestamp))
+
+    buf
+}
+
+pub fn raw_mail_deserialize(data: &[u8]) -> Result<RawMail, String> {
+    let mut pos = 0
+
+    let sender = decode_string(data, &mut pos)?
+    let recipient = decode_string(data, &mut pos)?
+    let subject = decode_string(data, &mut pos)?
+
+    let body_len = decode_length(data, &mut pos)? as usize
+    let body = if pos + body_len <= data.len() {
+        data[pos..pos + body_len].to_vec()
+    } else {
+        return Err("Body overflow".to_string())
+    }
+    pos = pos + body_len
+
+    let timestamp = decode_u64(data, &mut pos)?
+
+    Ok(RawMail {
+        sender,
+        recipient,
+        subject,
+        body,
+        timestamp,
+    })
+}
+
+// ============================================================================
+// EncryptedMail - 암호화된 메일
+// ============================================================================
+
+pub type EncryptedMail = {
+    mail_id: [u8; 32],                  // CAS SHA-256
+    sender_pubkey_id: [u8; 32],        // 발신자 ID
+    recipient_pubkey_id: [u8; 32],     // 수신자 ID
+    nonce: [u8; 12],                   // GCM nonce
+    ciphertext: Vec<u8>,               // 암호문
+    authentication_tag: [u8; 16],      // GCM tag
+    timestamp: u64,                     // 암호화 시간
+}
+
+pub fn encrypted_mail_new(
+    sender_pubkey_id: &[u8; 32],
+    recipient_pubkey_id: &[u8; 32],
+    nonce: &[u8; 12],
+    ciphertext: Vec<u8>,
+    authentication_tag: &[u8; 16]
+) -> EncryptedMail {
+    // Compute CAS hash
+    let mut cas_input = vec![]
+    cas_input.extend_from_slice(&ciphertext)
+    cas_input.extend_from_slice(nonce)
+    cas_input.extend_from_slice(authentication_tag)
+    let mail_id = sha256(&cas_input)
+
+    EncryptedMail {
+        mail_id,
+        sender_pubkey_id: *sender_pubkey_id,
+        recipient_pubkey_id: *recipient_pubkey_id,
+        nonce: *nonce,
+        ciphertext,
+        authentication_tag: *authentication_tag,
+        timestamp: now_timestamp(),
+    }
+}
+
+pub fn encrypted_mail_serialize(mail: &EncryptedMail) -> Vec<u8> {
+    let mut buf = vec![]
+
+    buf.extend_from_slice(&mail.mail_id)
+    buf.extend_from_slice(&mail.sender_pubkey_id)
+    buf.extend_from_slice(&mail.recipient_pubkey_id)
+    buf.extend_from_slice(&mail.nonce)
+
+    buf.extend(encode_length(mail.ciphertext.len() as u32))
+    buf.extend_from_slice(&mail.ciphertext)
+
+    buf.extend_from_slice(&mail.authentication_tag)
+    buf.extend(encode_u64(mail.timestamp))
+
+    buf
+}
+
+pub fn encrypted_mail_deserialize(data: &[u8]) -> Result<EncryptedMail, String> {
+    if data.len() < 32 + 32 + 32 + 12 + 4 + 16 + 8 {
+        return Err("Data too short".to_string())
+    }
+
+    let mut pos = 0
+
+    let mut mail_id = [0u8; 32]
+    mail_id.copy_from_slice(&data[pos..pos+32])
+    pos = pos + 32
+
+    let mut sender_pubkey_id = [0u8; 32]
+    sender_pubkey_id.copy_from_slice(&data[pos..pos+32])
+    pos = pos + 32
+
+    let mut recipient_pubkey_id = [0u8; 32]
+    recipient_pubkey_id.copy_from_slice(&data[pos..pos+32])
+    pos = pos + 32
+
+    let mut nonce = [0u8; 12]
+    nonce.copy_from_slice(&data[pos..pos+12])
+    pos = pos + 12
+
+    let ct_len = decode_length(data, &mut pos)? as usize
+    let ciphertext = data[pos..pos+ct_len].to_vec()
+    pos = pos + ct_len
+
+    let mut authentication_tag = [0u8; 16]
+    authentication_tag.copy_from_slice(&data[pos..pos+16])
+    pos = pos + 16
+
+    let timestamp = decode_u64(data, &mut pos)?
+
+    Ok(EncryptedMail {
+        mail_id,
+        sender_pubkey_id,
+        recipient_pubkey_id,
+        nonce,
+        ciphertext,
+        authentication_tag,
+        timestamp,
+    })
+}
+
+// ============================================================================
+// MailVault - 메일 저장소
+// ============================================================================
+
+pub type MailVault = {
+    owner_id: [u8; 32],
+    encrypted_mails: Vec<[u8; 32]>,
+    master_key: [u8; 32],
+    backup_keys: Vec<[u8; 32]>,
+    key_rotation_at: u64,
+}
+
+pub fn mail_vault_new(owner_id: &[u8; 32], master_key: &[u8; 32]) -> MailVault {
+    let rotation_time = now_timestamp() + 365 * 24 * 3600
+
+    MailVault {
+        owner_id: *owner_id,
+        encrypted_mails: vec![],
+        master_key: *master_key,
+        backup_keys: vec![*master_key, *master_key, *master_key],
+        key_rotation_at: rotation_time,
+    }
+}
+
+pub fn mail_vault_add(vault: &mut MailVault, mail_id: &[u8; 32]) {
+    if !mail_vault_contains(vault, mail_id) {
+        vault.encrypted_mails.push(*mail_id)
+    }
+}
+
+pub fn mail_vault_remove(vault: &mut MailVault, mail_id: &[u8; 32]) {
+    vault.encrypted_mails.retain(|id| id != mail_id)
+}
+
+pub fn mail_vault_contains(vault: &MailVault, mail_id: &[u8; 32]) -> bool {
+    for id in &vault.encrypted_mails {
+        if id == mail_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn mail_vault_count(vault: &MailVault) -> usize {
+    vault.encrypted_mails.len()
+}
+
+pub fn mail_vault_serialize(vault: &MailVault) -> Vec<u8> {
+    let mut buf = vec![]
+
+    buf.extend_from_slice(&vault.owner_id)
+    buf.extend(encode_length(vault.encrypted_mails.len() as u32))
+
+    for mail_id in &vault.encrypted_mails {
+        buf.extend_from_slice(mail_id)
+    }
+
+    buf.extend_from_slice(&vault.master_key)
+    buf.extend(encode_length(vault.backup_keys.len() as u32))
+
+    for backup in &vault.backup_keys {
+        buf.extend_from_slice(backup)
+    }
+
+    buf.extend(encode_u64(vault.key_rotation_at))
+
+    buf
+}
+
+// ============================================================================
+// Serialization Helpers
+// ============================================================================
+
+fn encode_string(s: &String) -> Vec<u8> {
+    let bytes = s.as_bytes()
+    let len = bytes.len() as u32
+    let mut result = encode_length(len)
+    result.extend_from_slice(bytes)
+    result
+}
+
+fn decode_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
+    let len = decode_length(data, pos)? as usize
+    if *pos + len > data.len() {
+        return Err("String overflow".to_string())
+    }
+    let s = String::from_utf8(data[*pos..*pos+len].to_vec())
+        .map_err(|_| "UTF-8 error".to_string())?
+    *pos = *pos + len
+    Ok(s)
+}
+
+fn encode_length(len: u32) -> Vec<u8> {
+    vec![
+        ((len >> 24) & 0xffu32) as u8,
+        ((len >> 16) & 0xffu32) as u8,
+        ((len >> 8) & 0xffu32) as u8,
+        (len & 0xffu32) as u8,
+    ]
+}
+
+fn decode_length(data: &[u8], pos: &mut usize) -> Result<u32, String> {
+    if *pos + 4 > data.len() {
+        return Err("Length overflow".to_string())
+    }
+    let len = ((data[*pos] as u32) << 24) |
+              ((data[*pos+1] as u32) << 16) |
+              ((data[*pos+2] as u32) << 8) |
+              (data[*pos+3] as u32)
+    *pos = *pos + 4
+    Ok(len)
+}
+
+fn encode_u64(val: u64) -> Vec<u8> {
+    vec![
+        ((val >> 56) & 0xffu64) as u8,
+        ((val >> 48) & 0xffu64) as u8,
+        ((val >> 40) & 0xffu64) as u8,
+        ((val >> 32) & 0xffu64) as u8,
+        ((val >> 24) & 0xffu64) as u8,
+        ((val >> 16) & 0xffu64) as u8,
+        ((val >> 8) & 0xffu64) as u8,
+        (val & 0xffu64) as u8,
+    ]
+}
+
+fn decode_u64(data: &[u8], pos: &mut usize) -> Result<u64, String> {
+    if *pos + 8 > data.len() {
+        return Err("U64 overflow".to_string())
+    }
+    let val = ((data[*pos] as u64) << 56) |
+              ((data[*pos+1] as u64) << 48) |
+              ((data[*pos+2] as u64) << 40) |
+              ((data[*pos+3] as u64) << 32) |
+              ((data[*pos+4] as u64) << 24) |
+              ((data[*pos+5] as u64) << 16) |
+              ((data[*pos+6] as u64) << 8) |
+              (data[*pos+7] as u64)
+    *pos = *pos + 8
+    Ok(val)
+}
+
+fn now_timestamp() -> u64 {
+    0u64  // Placeholder - would use system time in production
+}

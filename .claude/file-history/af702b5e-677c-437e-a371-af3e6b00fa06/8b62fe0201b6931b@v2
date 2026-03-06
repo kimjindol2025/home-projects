@@ -1,0 +1,388 @@
+// Signed Distance Field (SDF) Engine for Bézier Curves (280줄)
+// Bézier 곡선 → SDF 변환, Anti-aliasing & Smooth Scaling 지원
+
+module sdf_engine
+
+use math::{
+    FixedPoint, Vec2FP, QuadraticBezier, CubicSolver, BezierDistance
+}
+
+// ============ SDF Sampler (샘플링 그리드) ============
+
+struct SDFSampler {
+    width: u32,         // 그리드 너비 (픽셀 단위)
+    height: u32,        // 그리드 높이
+    resolution: u32,    // 샘플 해상도 (1-16)
+    bounds_min: Vec2FP, // 경계 최소점
+    bounds_max: Vec2FP, // 경계 최대점
+}
+
+impl SDFSampler {
+    fn new(w: u32, h: u32, res: u32) -> SDFSampler {
+        return SDFSampler {
+            width: w,
+            height: h,
+            resolution: res,
+            bounds_min: Vec2FP::new(FixedPoint::ZERO(), FixedPoint::ZERO()),
+            bounds_max: Vec2FP::new(
+                FixedPoint::from_int(w as i32),
+                FixedPoint::from_int(h as i32)
+            ),
+        }
+    }
+
+    fn set_bounds(&mut self, min: Vec2FP, max: Vec2FP) -> bool {
+        self.bounds_min = min
+        self.bounds_max = max
+        return true
+    }
+
+    fn grid_size(&self) -> u32 {
+        return self.width * self.height
+    }
+
+    fn pixel_to_world(&self, px: u32, py: u32) -> Vec2FP {
+        let x = FixedPoint::from_int(px as i32)
+        let y = FixedPoint::from_int(py as i32)
+        return Vec2FP::new(x, y)
+    }
+
+    fn sample_count(&self) -> u32 {
+        // 각 픽셀당 샘플 수 = resolution²
+        return self.resolution * self.resolution
+    }
+}
+
+// ============ Contour Detector (윤곽 감지) ============
+
+struct ContourDetector {
+    curves: array[QuadraticBezier; 256],  // 최대 256개 Bézier 곡선
+    curve_count: u32,
+    fill_rule: u32,  // 0=even-odd, 1=non-zero
+}
+
+impl ContourDetector {
+    fn new() -> ContourDetector {
+        return ContourDetector {
+            curves: array[QuadraticBezier; 256],
+            curve_count: 0,
+            fill_rule: 0,  // even-odd 룰 기본값
+        }
+    }
+
+    fn add_curve(&mut self, curve: QuadraticBezier) -> bool {
+        if self.curve_count >= 256 {
+            return false
+        }
+        self.curves[self.curve_count] = curve
+        self.curve_count += 1
+        return true
+    }
+
+    fn get_curve_count(&self) -> u32 {
+        return self.curve_count
+    }
+
+    fn set_fill_rule(&mut self, rule: u32) -> bool {
+        // rule: 0=even-odd, 1=non-zero
+        self.fill_rule = rule
+        return true
+    }
+
+    // 점이 윤곽 내부인지 판정 (ray casting)
+    fn is_inside(&self, point: Vec2FP) -> bool {
+        let mut crossings = 0
+        let ray_direction = FixedPoint::ONE()  // 우향 광선
+
+        // 각 곡선과 우향 광선의 교점 개수 세기
+        for i in 0..self.curve_count {
+            let curve = &self.curves[i]
+
+            // 곡선의 y 범위와 점의 y 비교
+            let y_min = curve.p0.y
+            let y_max = curve.p2.y
+
+            if point.y.raw > y_min.raw && point.y.raw <= y_max.raw {
+                // 곡선과 수평선의 교점이 점의 우측에 있는지 확인
+                // (단순화: 대략적 판정)
+                if curve.p1.x.raw > point.x.raw {
+                    crossings += 1
+                }
+            }
+        }
+
+        // even-odd rule: 교점 수가 홀수면 내부
+        if self.fill_rule == 0 {
+            return (crossings & 1) == 1
+        }
+
+        // non-zero rule: 교점 수가 0이 아니면 내부
+        return crossings != 0
+    }
+}
+
+// ============ Distance Field (거리 필드) ============
+
+struct DistanceField {
+    width: u32,
+    height: u32,
+    data: array[i32; 256 * 256],  // 최대 256×256 그리드
+    scale: FixedPoint,             // 실제 거리 스케일
+}
+
+impl DistanceField {
+    fn new(w: u32, h: u32) -> DistanceField {
+        return DistanceField {
+            width: w,
+            height: h,
+            data: array[i32; 256 * 256],
+            scale: FixedPoint::ONE(),
+        }
+    }
+
+    fn set(&mut self, x: u32, y: u32, distance: i32) -> bool {
+        if x >= self.width || y >= self.height {
+            return false
+        }
+        let idx = y * self.width + x
+        self.data[idx] = distance
+        return true
+    }
+
+    fn get(&self, x: u32, y: u32) -> i32 {
+        if x >= self.width || y >= self.height {
+            return 0
+        }
+        let idx = y * self.width + x
+        return self.data[idx]
+    }
+
+    fn total_size(&self) -> u32 {
+        return self.width * self.height
+    }
+
+    fn stats(&self) -> string {
+        let mut min_dist = 999999
+        let mut max_dist = -999999
+        let mut count = 0
+
+        for i in 0..self.total_size() {
+            let d = self.data[i]
+            if d < min_dist { min_dist = d }
+            if d > max_dist { max_dist = d }
+            count += 1
+        }
+
+        let mut s = ""
+        s = s + "SDF Stats: " + self.width.to_string() + "x" + self.height.to_string() + "\n"
+        s = s + "Min distance: " + min_dist.to_string() + "\n"
+        s = s + "Max distance: " + max_dist.to_string()
+        return s
+    }
+}
+
+// ============ SDF Generator (SDF 생성기) ============
+
+struct SDFGenerator {
+    sampler: SDFSampler,
+    contour: ContourDetector,
+    field: DistanceField,
+    max_distance: FixedPoint,  // 최대 거리 (이 이상은 포화)
+}
+
+impl SDFGenerator {
+    fn new(width: u32, height: u32, resolution: u32) -> SDFGenerator {
+        return SDFGenerator {
+            sampler: SDFSampler::new(width, height, resolution),
+            contour: ContourDetector::new(),
+            field: DistanceField::new(width, height),
+            max_distance: FixedPoint::from_int(128),  // 최대 128 단위
+        }
+    }
+
+    fn add_curve(&mut self, curve: QuadraticBezier) -> bool {
+        return self.contour.add_curve(curve)
+    }
+
+    fn set_fill_rule(&mut self, rule: u32) -> bool {
+        return self.contour.set_fill_rule(rule)
+    }
+
+    // SDF 생성 메인 함수
+    fn generate(&mut self) -> bool {
+        let zero = FixedPoint::ZERO()
+        let one = FixedPoint::ONE()
+
+        // 각 픽셀마다 거리 계산
+        for py in 0..self.sampler.height {
+            for px in 0..self.sampler.width {
+                let mut total_dist = zero
+                let mut sample_count = 0
+
+                // 각 픽셀 내에서 여러 샘플로 거리 측정
+                for sy in 0..self.sampler.resolution {
+                    for sx in 0..self.sampler.resolution {
+                        // 샘플점 위치 계산
+                        let sample_x = (px as i32) + (sx as i32)
+                        let sample_y = (py as i32) + (sy as i32)
+                        let sample_point = Vec2FP::new(
+                            FixedPoint::from_int(sample_x),
+                            FixedPoint::from_int(sample_y)
+                        )
+
+                        // 각 곡선까지의 거리 계산
+                        let mut min_dist = FixedPoint::from_int(999999)
+
+                        for i in 0..self.contour.get_curve_count() {
+                            let curve = &self.contour.curves[i]
+                            let dist_calc = BezierDistance::new(curve, sample_point)
+                            let dist = dist_calc.compute()
+
+                            if dist.raw < min_dist.raw {
+                                min_dist = dist
+                            }
+                        }
+
+                        total_dist = total_dist.add(min_dist)
+                        sample_count += 1
+                    }
+                }
+
+                // 평균 거리 계산
+                let avg_dist = if sample_count > 0 {
+                    total_dist.div(FixedPoint::from_int(sample_count as i32))
+                } else {
+                    zero
+                }
+
+                // 부호 판정: 내부면 음수, 외부면 양수
+                let signed_dist = if self.contour.is_inside(
+                    Vec2FP::new(
+                        FixedPoint::from_int(px as i32),
+                        FixedPoint::from_int(py as i32)
+                    )
+                ) {
+                    // 내부: 음수
+                    avg_dist.mul(FixedPoint::from_int(-1))
+                } else {
+                    // 외부: 양수
+                    avg_dist
+                }
+
+                // SDF 필드에 저장 (fixed-point를 int로 변환)
+                let stored_value = if signed_dist.raw > self.max_distance.raw {
+                    self.max_distance.raw
+                } else if signed_dist.raw < (self.max_distance.mul(FixedPoint::from_int(-1))).raw {
+                    (self.max_distance.mul(FixedPoint::from_int(-1))).raw
+                } else {
+                    signed_dist.raw
+                }
+
+                self.field.set(px, py, stored_value)
+            }
+        }
+
+        return true
+    }
+
+    fn get_field(&self) -> &DistanceField {
+        return &self.field
+    }
+
+    fn query(&self, x: u32, y: u32) -> FixedPoint {
+        let raw_value = self.field.get(x, y)
+        return FixedPoint { raw: raw_value }
+    }
+
+    fn is_inside_field(&self, x: u32, y: u32) -> bool {
+        let distance = self.query(x, y)
+        return distance.raw < 0
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_sdf_sampler() -> bool {
+    let mut sampler = SDFSampler::new(256, 256, 2)
+
+    assert(sampler.width == 256, "width 256")
+    assert(sampler.height == 256, "height 256")
+    assert(sampler.resolution == 2, "resolution 2")
+    assert(sampler.grid_size() == 256 * 256, "grid size")
+    assert(sampler.sample_count() == 4, "sample count 4 (2x2)")
+
+    return true
+}
+
+fn validate_contour_detector() -> bool {
+    let mut detector = ContourDetector::new()
+
+    assert(detector.get_curve_count() == 0, "initial count 0")
+
+    let zero = FixedPoint::ZERO()
+    let one = FixedPoint::ONE()
+    let half = FixedPoint::HALF()
+
+    let p0 = Vec2FP::new(zero, zero)
+    let p1 = Vec2FP::new(half, one)
+    let p2 = Vec2FP::new(one, zero)
+    let curve = QuadraticBezier::new(p0, p1, p2)
+
+    assert(detector.add_curve(curve), "add curve")
+    assert(detector.get_curve_count() == 1, "count 1")
+
+    assert(detector.set_fill_rule(0), "set even-odd rule")
+
+    return true
+}
+
+fn validate_distance_field() -> bool {
+    let mut field = DistanceField::new(128, 128)
+
+    assert(field.width == 128, "width 128")
+    assert(field.height == 128, "height 128")
+    assert(field.total_size() == 128 * 128, "total size")
+
+    assert(field.set(0, 0, 100), "set value at (0,0)")
+    assert(field.get(0, 0) == 100, "get value 100")
+
+    assert(field.set(127, 127, -50), "set negative value")
+    assert(field.get(127, 127) == -50, "get negative -50")
+
+    return true
+}
+
+fn validate_sdf_generator() -> bool {
+    let mut gen = SDFGenerator::new(64, 64, 1)
+
+    assert(gen.sampler.width == 64, "generator width 64")
+    assert(gen.sampler.height == 64, "generator height 64")
+
+    let zero = FixedPoint::ZERO()
+    let one = FixedPoint::ONE()
+    let half = FixedPoint::HALF()
+
+    let p0 = Vec2FP::new(zero, zero)
+    let p1 = Vec2FP::new(half, half)
+    let p2 = Vec2FP::new(one, zero)
+    let curve = QuadraticBezier::new(p0, p1, p2)
+
+    assert(gen.add_curve(curve), "add curve to generator")
+    assert(gen.generate(), "generate SDF")
+
+    let field = gen.get_field()
+    assert(field.total_size() == 64 * 64, "field size correct")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

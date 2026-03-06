@@ -1,0 +1,336 @@
+/* ============================================================================
+   DVFS Predictor: Dynamic Voltage and Frequency Scaling - Phase 8
+
+   목적: CPU 주파수 예측 및 동적 스케일링 (AI 기반)
+   크기: ~350줄
+   성능: < 5µs per prediction, 예측 오차 < 5%
+============================================================================ */
+
+use crate::l0_engine::L0NeuralNet;
+
+// ============================================================================
+// 1. DVFS 상태 정의
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DVFSState {
+    Min200MHz,      // 최소 전력 (0.8V)
+    Low500MHz,      // 저전력 (0.9V)
+    Mid1GHz,        // 중간 (1.0V)
+    High1_5GHz,     // 고성능 (1.1V)
+    Max2GHz,        // 최대 성능 (1.2V)
+}
+
+impl DVFSState {
+    pub fn to_mhz(&self) -> u32 {
+        match self {
+            DVFSState::Min200MHz => 200,
+            DVFSState::Low500MHz => 500,
+            DVFSState::Mid1GHz => 1000,
+            DVFSState::High1_5GHz => 1500,
+            DVFSState::Max2GHz => 2000,
+        }
+    }
+
+    pub fn to_voltage(&self) -> f32 {
+        match self {
+            DVFSState::Min200MHz => 0.8,
+            DVFSState::Low500MHz => 0.9,
+            DVFSState::Mid1GHz => 1.0,
+            DVFSState::High1_5GHz => 1.1,
+            DVFSState::Max2GHz => 1.2,
+        }
+    }
+
+    pub fn to_power_mw(&self) -> u32 {
+        match self {
+            DVFSState::Min200MHz => 50,
+            DVFSState::Low500MHz => 120,
+            DVFSState::Mid1GHz => 250,
+            DVFSState::High1_5GHz => 450,
+            DVFSState::Max2GHz => 700,
+        }
+    }
+
+    pub fn next_state(&self) -> DVFSState {
+        match self {
+            DVFSState::Min200MHz => DVFSState::Low500MHz,
+            DVFSState::Low500MHz => DVFSState::Mid1GHz,
+            DVFSState::Mid1GHz => DVFSState::High1_5GHz,
+            DVFSState::High1_5GHz => DVFSState::Max2GHz,
+            DVFSState::Max2GHz => DVFSState::Max2GHz,
+        }
+    }
+
+    pub fn prev_state(&self) -> DVFSState {
+        match self {
+            DVFSState::Max2GHz => DVFSState::High1_5GHz,
+            DVFSState::High1_5GHz => DVFSState::Mid1GHz,
+            DVFSState::Mid1GHz => DVFSState::Low500MHz,
+            DVFSState::Low500MHz => DVFSState::Min200MHz,
+            DVFSState::Min200MHz => DVFSState::Min200MHz,
+        }
+    }
+}
+
+// ============================================================================
+// 2. 워크로드 프로필
+// ============================================================================
+
+pub struct WorkloadProfile {
+    pub ipc: f32,                 // Instructions Per Cycle (0.5-4.0)
+    pub cache_miss_rate: f32,     // L3 캐시 미스율 (0.0-1.0)
+    pub branch_mispred: f32,      // 분기 오측 률 (0.0-1.0)
+    pub memory_bandwidth: f32,    // 메모리 대역폭 사용률 (0.0-1.0)
+    pub thermal_headroom: f32,    // 열 마진 (0.0-1.0, 1.0=최대)
+}
+
+impl WorkloadProfile {
+    pub fn new(
+        ipc: f32,
+        cache_miss: f32,
+        branch_pred: f32,
+        mem_bw: f32,
+        thermal: f32,
+    ) -> Self {
+        WorkloadProfile {
+            ipc: ipc.max(0.5).min(4.0),
+            cache_miss_rate: cache_miss.max(0.0).min(1.0),
+            branch_mispred: branch_pred.max(0.0).min(1.0),
+            memory_bandwidth: mem_bw.max(0.0).min(1.0),
+            thermal_headroom: thermal.max(0.0).min(1.0),
+        }
+    }
+
+    /// 프로필 → 신경망 입력 (16차원)
+    pub fn to_feature_vector(&self) -> [f32; 16] {
+        [
+            self.ipc,
+            self.cache_miss_rate,
+            self.branch_mispred,
+            self.memory_bandwidth,
+            self.thermal_headroom,
+            self.ipc * self.cache_miss_rate,
+            self.ipc / (self.branch_mispred + 0.001),
+            self.memory_bandwidth * self.thermal_headroom,
+            (1.0 - self.cache_miss_rate) * self.ipc,
+            self.branch_mispred + self.cache_miss_rate,
+            self.ipc * self.thermal_headroom,
+            self.memory_bandwidth / (self.branch_mispred + 0.001),
+            0.0, 0.0, 0.0, 0.0,  // 패딩
+        ]
+    }
+
+    pub fn validate(&self) -> bool {
+        self.ipc >= 0.5 && self.ipc <= 4.0 &&
+        self.cache_miss_rate >= 0.0 && self.cache_miss_rate <= 1.0 &&
+        self.branch_mispred >= 0.0 && self.branch_mispred <= 1.0 &&
+        self.memory_bandwidth >= 0.0 && self.memory_bandwidth <= 1.0 &&
+        self.thermal_headroom >= 0.0 && self.thermal_headroom <= 1.0
+    }
+}
+
+// ============================================================================
+// 3. DVFS 예측기
+// ============================================================================
+
+pub struct DVFSPredictor {
+    pub model: L0NeuralNet,
+    pub current_state: DVFSState,
+    pub prediction_history: Vec<DVFSState>,
+    pub prediction_accuracy: f32,
+    pub error_rate: f32,
+    pub state_changes: u32,
+    pub predictions_made: u32,
+}
+
+impl DVFSPredictor {
+    pub fn new() -> Self {
+        let mut model = L0NeuralNet::new();
+        model.initialize_random();
+
+        DVFSPredictor {
+            model,
+            current_state: DVFSState::Mid1GHz,
+            prediction_history: Vec::new(),
+            prediction_accuracy: 0.0,
+            error_rate: 0.0,
+            state_changes: 0,
+            predictions_made: 0,
+        }
+    }
+
+    /// 워크로드 프로필에서 최적 주파수 예측
+    pub fn predict_optimal_freq(&mut self, workload: &WorkloadProfile) -> DVFSState {
+        if !workload.validate() {
+            return self.current_state;
+        }
+
+        // 신경망 입력 (16차원)
+        let features = workload.to_feature_vector();
+
+        // L0NN 추론 (8차원 출력 → DVFS 상태)
+        let output = self.model.forward(&features);
+
+        // 출력 해석: max로 상태 결정
+        let mut max_idx = 0usize;
+        let mut max_val = output[0];
+        for i in 1..5 {
+            if output[i] > max_val {
+                max_val = output[i];
+                max_idx = i;
+            }
+        }
+
+        let predicted_state = match max_idx {
+            0 => DVFSState::Min200MHz,
+            1 => DVFSState::Low500MHz,
+            2 => DVFSState::Mid1GHz,
+            3 => DVFSState::High1_5GHz,
+            _ => DVFSState::Max2GHz,
+        };
+
+        // 열 제약 확인
+        let adjusted_state = if workload.thermal_headroom < 0.3 {
+            // 열 위험: 한 단계 낮춤
+            predicted_state.prev_state()
+        } else if workload.thermal_headroom > 0.8 && workload.ipc > 2.0 {
+            // 충분한 열 마진 + 높은 IPC: 한 단계 높임
+            predicted_state.next_state()
+        } else {
+            predicted_state
+        };
+
+        // 상태 변경 추적
+        if adjusted_state as u32 != self.current_state as u32 {
+            self.state_changes += 1;
+        }
+
+        self.current_state = adjusted_state;
+        self.prediction_history.push(adjusted_state);
+        self.predictions_made += 1;
+
+        adjusted_state
+    }
+
+    /// 예측 오차 측정
+    pub fn measure_prediction_error(&mut self, actual_state: DVFSState) -> f32 {
+        let predicted = self.current_state;
+
+        let error = ((predicted as u32) as i32 - (actual_state as u32) as i32).abs() as f32;
+        let max_error = 4.0;  // Min(0) ~ Max(4)
+
+        let error_percent = (error / max_error) * 100.0;
+        self.error_rate = error_percent;
+
+        error_percent
+    }
+
+    /// 예측 정확도 업데이트
+    pub fn update_accuracy(&mut self, correct_predictions: u32) {
+        if self.predictions_made > 0 {
+            self.prediction_accuracy = (correct_predictions as f32 / self.predictions_made as f32) * 100.0;
+        }
+    }
+
+    /// 통계
+    pub fn stats(&self) -> (u32, u32, f32, f32) {
+        (
+            self.predictions_made,
+            self.state_changes,
+            self.prediction_accuracy,
+            self.error_rate,
+        )
+    }
+}
+
+// ============================================================================
+// 4. DVFS 제어 인터페이스
+// ============================================================================
+
+pub struct DVFSController {
+    pub predictor: DVFSPredictor,
+    pub last_applied_state: DVFSState,
+    pub frequency_changes_per_sec: u32,
+    pub max_freq_changes_allowed: u32,  // 안정성 제약
+}
+
+impl DVFSController {
+    pub fn new() -> Self {
+        DVFSController {
+            predictor: DVFSPredictor::new(),
+            last_applied_state: DVFSState::Mid1GHz,
+            frequency_changes_per_sec: 0,
+            max_freq_changes_allowed: 10,  // 초당 최대 10회
+        }
+    }
+
+    /// DVFS 상태 적용 (MMIO 직접 제어)
+    pub fn apply_dvfs(&mut self, state: DVFSState) -> bool {
+        // 변경 빈도 제한 확인
+        if self.frequency_changes_per_sec >= self.max_freq_changes_allowed {
+            return false;
+        }
+
+        // 실제 구현: MMIO 쓰기
+        // *CPU_FREQ_CTRL = state.to_mhz();
+        // *CPU_VOLT_CTRL = state.to_voltage();
+
+        self.last_applied_state = state;
+        self.frequency_changes_per_sec += 1;
+
+        true
+    }
+
+    /// 워크로드 기반 자동 스케일링
+    pub fn auto_scale(&mut self, workload: &WorkloadProfile) -> DVFSState {
+        let predicted = self.predictor.predict_optimal_freq(workload);
+        let _ = self.apply_dvfs(predicted);
+        predicted
+    }
+}
+
+// ============================================================================
+// 5. 검증 함수
+// ============================================================================
+
+pub fn validate_dvfs_state(state: DVFSState) -> bool {
+    matches!(
+        state,
+        DVFSState::Min200MHz
+            | DVFSState::Low500MHz
+            | DVFSState::Mid1GHz
+            | DVFSState::High1_5GHz
+            | DVFSState::Max2GHz
+    )
+}
+
+pub fn validate_workload_profile(profile: &WorkloadProfile) -> bool {
+    profile.validate()
+}
+
+pub fn validate_prediction_error(error: f32) -> bool {
+    // 오차 < 5% (목표)
+    error < 5.0
+}
+
+pub fn validate_frequency_change_rate(changes_per_sec: u32) -> bool {
+    // 초당 < 20회 (안정성)
+    changes_per_sec < 20
+}
+
+// ============================================================================
+// 6. 클론 구현
+// ============================================================================
+
+impl Clone for WorkloadProfile {
+    fn clone(&self) -> Self {
+        WorkloadProfile {
+            ipc: self.ipc,
+            cache_miss_rate: self.cache_miss_rate,
+            branch_mispred: self.branch_mispred,
+            memory_bandwidth: self.memory_bandwidth,
+            thermal_headroom: self.thermal_headroom,
+        }
+    }
+}

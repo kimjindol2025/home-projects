@@ -1,0 +1,417 @@
+// FreeLang-LLC: ARM64 Memory Management Unit (MMU)
+// Purpose: Virtual memory management and page table handling
+// Strategy: 4-level page table hierarchy with 4KB granule
+
+use super::pointer::ManagedPointer;
+use super::bootloader::*;
+
+// ============================================================================
+// Part 1: Page Table Entry (PTE) Structure (140 lines)
+// ============================================================================
+
+pub struct PageTableEntry {
+    pub address: u64,         // Physical page address (bits 47:12)
+    pub valid: bool,          // Valid bit
+    pub is_table: bool,       // Table (0) or Page (1) descriptor
+    pub access_perm: AccessPermission,  // Access permission
+    pub attr_index: u8,       // Memory attribute index
+    pub shareability: Shareability,
+    pub accessed: bool,       // Accessed flag
+    pub dirty: bool,          // Dirty flag
+}
+
+pub enum AccessPermission {
+    PrivRWUserNone,   // EL1 RW, EL0 None
+    PrivRWUserRW,     // EL1 RW, EL0 RW
+    PrivROUserNone,   // EL1 RO, EL0 None
+    PrivROUserRO,     // EL1 RO, EL0 RO
+}
+
+pub enum Shareability {
+    NonShareable,
+    OuterShareable,
+    InnerShareable,
+}
+
+impl PageTableEntry {
+    pub fn new(physical_addr: u64) -> Self {
+        PageTableEntry {
+            address: physical_addr & 0xFFFFFFFFF000,  // Mask to page boundary
+            valid: false,
+            is_table: false,
+            access_perm: AccessPermission::PrivRWUserNone,
+            attr_index: 0,
+            shareability: Shareability::InnerShareable,
+            accessed: false,
+            dirty: false,
+        }
+    }
+
+    pub fn to_arm64_descriptor(&self) -> u64 {
+        let mut descriptor = 0u64;
+
+        // Bit 0: Valid
+        if self.valid {
+            descriptor |= 1;
+        }
+
+        // Bit 1: Type (0=table, 1=page)
+        if self.is_table {
+            descriptor |= 2;
+        }
+
+        // Bits 47:12: Physical address
+        descriptor |= self.address & 0xFFFFFFFFF000;
+
+        // Bits 5:2: Memory attribute index
+        descriptor |= ((self.attr_index as u64) & 0xF) << 2;
+
+        // Bits 7:6: Shareability
+        let share_bits = match self.shareability {
+            Shareability::NonShareable => 0,
+            Shareability::OuterShareable => 2,
+            Shareability::InnerShareable => 3,
+        };
+        descriptor |= share_bits << 8;
+
+        // Bits 9:8: Access permission
+        let ap_bits = match self.access_perm {
+            AccessPermission::PrivRWUserNone => 0,
+            AccessPermission::PrivRWUserRW => 1,
+            AccessPermission::PrivROUserNone => 2,
+            AccessPermission::PrivROUserRO => 3,
+        };
+        descriptor |= ap_bits << 6;
+
+        // Bit 10: Accessed flag
+        if self.accessed {
+            descriptor |= 1 << 10;
+        }
+
+        descriptor
+    }
+
+    pub fn from_arm64_descriptor(desc: u64) -> Self {
+        PageTableEntry {
+            address: desc & 0xFFFFFFFFF000,
+            valid: (desc & 1) != 0,
+            is_table: (desc & 2) != 0,
+            access_perm: AccessPermission::PrivRWUserNone,
+            attr_index: ((desc >> 2) & 0xF) as u8,
+            shareability: Shareability::InnerShareable,
+            accessed: (desc & (1 << 10)) != 0,
+            dirty: false,
+        }
+    }
+}
+
+// ============================================================================
+// Part 2: Page Table Levels (160 lines)
+// ============================================================================
+
+pub struct PageTable {
+    pub level: u32,              // 0 (L0) to 3 (L3)
+    pub entries: Vec<PageTableEntry>,
+    pub physical_address: u64,
+}
+
+impl PageTable {
+    pub fn new(level: u32, physical_addr: u64) -> Result<Self, String> {
+        if level > 3 {
+            return Err(format!("Invalid page table level: {}", level));
+        }
+
+        let mut entries = Vec::new();
+        // 512 entries per page table (4KB / 8 bytes)
+        for _ in 0..512 {
+            entries.push(PageTableEntry::new(0));
+        }
+
+        Ok(PageTable {
+            level,
+            entries,
+            physical_address: physical_addr,
+        })
+    }
+
+    pub fn get_entry(&self, index: usize) -> Result<&PageTableEntry, String> {
+        if index >= 512 {
+            return Err(format!("Index out of range: {}", index));
+        }
+        Ok(&self.entries[index])
+    }
+
+    pub fn set_entry(&mut self, index: usize, entry: PageTableEntry) -> Result<(), String> {
+        if index >= 512 {
+            return Err(format!("Index out of range: {}", index));
+        }
+        self.entries[index] = entry;
+        Ok(())
+    }
+
+    pub fn get_index_for_va(va: u64, level: u32) -> u64 {
+        // Virtual address bit mapping for 4-level page table:
+        // L0: bits [47:39] (9 bits)
+        // L1: bits [38:30] (9 bits)
+        // L2: bits [29:21] (9 bits)
+        // L3: bits [20:12] (9 bits)
+
+        match level {
+            0 => (va >> 39) & 0x1FF,
+            1 => (va >> 30) & 0x1FF,
+            2 => (va >> 21) & 0x1FF,
+            3 => (va >> 12) & 0x1FF,
+            _ => 0,
+        }
+    }
+
+    pub fn is_leaf_level(&self) -> bool {
+        self.level == 3
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+        for entry in &self.entries {
+            let desc = entry.to_arm64_descriptor();
+            data.push((desc & 0xFF) as u8);
+            data.push(((desc >> 8) & 0xFF) as u8);
+            data.push(((desc >> 16) & 0xFF) as u8);
+            data.push(((desc >> 24) & 0xFF) as u8);
+            data.push(((desc >> 32) & 0xFF) as u8);
+            data.push(((desc >> 40) & 0xFF) as u8);
+            data.push(((desc >> 48) & 0xFF) as u8);
+            data.push(((desc >> 56) & 0xFF) as u8);
+        }
+        data
+    }
+}
+
+// ============================================================================
+// Part 3: Virtual Address Translation (150 lines)
+// ============================================================================
+
+pub struct VirtualAddress {
+    pub address: u64,
+    pub is_canonical: bool,
+}
+
+impl VirtualAddress {
+    pub fn new(addr: u64) -> Self {
+        // ARM64: 48-bit virtual address space
+        // Bits [63:48] must be sign-extended
+        let is_canonical = (addr & 0xFFFF000000000000) == 0 ||
+                          (addr & 0xFFFF000000000000) == 0xFFFF000000000000;
+
+        VirtualAddress {
+            address: addr,
+            is_canonical,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.is_canonical {
+            return Err(format!("Non-canonical address: 0x{:x}", self.address));
+        }
+        Ok(())
+    }
+
+    pub fn get_page_offset(&self) -> u64 {
+        self.address & 0xFFF  // Bits [11:0]
+    }
+
+    pub fn get_l3_index(&self) -> u64 {
+        PageTable::get_index_for_va(self.address, 3)
+    }
+
+    pub fn get_l2_index(&self) -> u64 {
+        PageTable::get_index_for_va(self.address, 2)
+    }
+
+    pub fn get_l1_index(&self) -> u64 {
+        PageTable::get_index_for_va(self.address, 1)
+    }
+
+    pub fn get_l0_index(&self) -> u64 {
+        PageTable::get_index_for_va(self.address, 0)
+    }
+}
+
+// ============================================================================
+// Part 4: MMU Management (150 lines)
+// ============================================================================
+
+pub struct MMU {
+    pub l0_table: PageTable,
+    pub is_enabled: bool,
+    pub ttbr0_el1: u64,
+}
+
+impl MMU {
+    pub fn new(ttbr0: u64) -> Result<Self, String> {
+        let l0 = PageTable::new(0, ttbr0)?;
+
+        Ok(MMU {
+            l0_table: l0,
+            is_enabled: false,
+            ttbr0_el1: ttbr0,
+        })
+    }
+
+    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, perm: AccessPermission) -> Result<(), String> {
+        let va = VirtualAddress::new(virtual_addr);
+        va.validate()?;
+
+        // Navigate through page table levels
+        let l0_idx = va.get_l0_index() as usize;
+        let l1_idx = va.get_l1_index() as usize;
+        let l2_idx = va.get_l2_index() as usize;
+        let l3_idx = va.get_l3_index() as usize;
+
+        // For simplicity, assume L1/L2/L3 tables already exist
+        // In real implementation, would allocate missing tables
+
+        // Create L3 entry pointing to physical page
+        let mut pte = PageTableEntry::new(physical_addr);
+        pte.valid = true;
+        pte.is_table = false;  // Page descriptor
+        pte.access_perm = perm;
+        pte.accessed = false;
+        pte.dirty = false;
+
+        // Store entry (would normally write to actual page table in memory)
+        // For now, just track in L0 table
+        let mut l3_entry = PageTableEntry::new(0x81000000 + (l3_idx * 8) as u64);
+        l3_entry.valid = true;
+        l3_entry.is_table = true;  // Table descriptor
+        self.l0_table.set_entry(l0_idx, l3_entry)?;
+
+        Ok(())
+    }
+
+    pub fn unmap_page(&mut self, virtual_addr: u64) -> Result<(), String> {
+        let va = VirtualAddress::new(virtual_addr);
+        va.validate()?;
+
+        let l0_idx = va.get_l0_index() as usize;
+
+        // Invalidate entry
+        let mut entry = PageTableEntry::new(0);
+        entry.valid = false;
+        self.l0_table.set_entry(l0_idx, entry)?;
+
+        // Invalidate TLB entry
+        invalidate_tlb();
+
+        Ok(())
+    }
+
+    pub fn translate_va(&self, virtual_addr: u64) -> Result<u64, String> {
+        let va = VirtualAddress::new(virtual_addr);
+        va.validate()?;
+
+        // Walk page tables L0 → L1 → L2 → L3
+        let l0_idx = va.get_l0_index() as usize;
+
+        if let Ok(l0_entry) = self.l0_table.get_entry(l0_idx) {
+            if !l0_entry.valid {
+                return Err(format!("Page fault for VA 0x{:x}", virtual_addr));
+            }
+
+            // In real implementation, would continue walking L1, L2, L3
+            // For simulation, just return physical address derived from L3 entry
+            let physical_addr = (l0_entry.address & 0xFFFFFFFFF000) | va.get_page_offset();
+            Ok(physical_addr)
+        } else {
+            Err(format!("Page table walk failed for VA 0x{:x}", virtual_addr))
+        }
+    }
+
+    pub fn enable(&mut self) {
+        self.is_enabled = true;
+    }
+
+    pub fn disable(&mut self) {
+        self.is_enabled = false;
+    }
+
+    pub fn is_enabled_flag(&self) -> bool {
+        self.is_enabled
+    }
+}
+
+// ============================================================================
+// Tests (80 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pte_creation() {
+        let pte = PageTableEntry::new(0x80000000);
+        assert_eq!(pte.address, 0x80000000);
+        assert!(!pte.valid);
+    }
+
+    #[test]
+    fn test_pte_to_descriptor() {
+        let mut pte = PageTableEntry::new(0x80001000);
+        pte.valid = true;
+        let desc = pte.to_arm64_descriptor();
+        assert_eq!(desc & 1, 1);  // Valid bit set
+    }
+
+    #[test]
+    fn test_page_table_creation() {
+        let pt = PageTable::new(0, 0x80000000).unwrap();
+        assert_eq!(pt.level, 0);
+        assert_eq!(pt.entries.len(), 512);
+    }
+
+    #[test]
+    fn test_page_table_invalid_level() {
+        assert!(PageTable::new(4, 0x80000000).is_err());
+    }
+
+    #[test]
+    fn test_virtual_address_canonical() {
+        let va = VirtualAddress::new(0x0000000080000000);
+        assert!(va.is_canonical);
+        assert!(va.validate().is_ok());
+    }
+
+    #[test]
+    fn test_virtual_address_non_canonical() {
+        let va = VirtualAddress::new(0x5555555555555555);
+        assert!(!va.is_canonical);
+        assert!(va.validate().is_err());
+    }
+
+    #[test]
+    fn test_va_index_calculation() {
+        let va = VirtualAddress::new(0x0000000080001234);
+        assert_eq!(va.get_page_offset(), 0x234);
+    }
+
+    #[test]
+    fn test_mmu_creation() {
+        let mmu = MMU::new(0x80000000).unwrap();
+        assert!(!mmu.is_enabled_flag());
+    }
+
+    #[test]
+    fn test_mmu_enable_disable() {
+        let mut mmu = MMU::new(0x80000000).unwrap();
+        mmu.enable();
+        assert!(mmu.is_enabled_flag());
+        mmu.disable();
+        assert!(!mmu.is_enabled_flag());
+    }
+
+    #[test]
+    fn test_mmu_map_page() {
+        let mut mmu = MMU::new(0x80000000).unwrap();
+        let result = mmu.map_page(0x80001000, 0x80001000, AccessPermission::PrivRWUserNone);
+        assert!(result.is_ok());
+    }
+}

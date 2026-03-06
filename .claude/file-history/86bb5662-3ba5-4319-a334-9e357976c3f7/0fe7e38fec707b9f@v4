@@ -1,0 +1,235 @@
+# Challenge 9 FL-Signal: Zero-Knowledge P2P 통신 프로토콜
+
+## Context
+
+FreeLang Nano-Kernel (4,200줄, 30/30 테스트, GOGS 완료) 이후,
+다음 도전: **FL-Signal** — Android 백그라운드 도청 차단, ZKP 기반 P2P 직접 통신.
+
+**철학**: "기록이 증명이다" — ZKP로 신원 증명, AES-256으로 내용 암호화, 완전 자립.
+**전략**: 커널 I/O 레이어에 ZKP 엔진 내장 + ARM64 하드웨어 가속 암호화.
+
+**재사용 가능한 기존 자산**:
+- `freelang-neural-kernel-integration/src/l0_engine/l0_neural_net.fl` - L0NeuralNet (< 10µs, 신호 이상 탐지)
+- `freelang-neural-kernel-integration/src/threat_engine/zero_copy_pipeline.fl` - ZeroCopyRingBuffer (4K 무복사)
+- `freelang-os-kernel/src/security/threat_classifier.fl` - 앙상블 (0.6/0.3/0.1 가중치)
+- `freelang-os-kernel/src/security/behavioral_analyzer.fl` - N-gram 이상 탐지 패턴
+- `freelang-os-kernel/src/audit/hash_chain.rs` - SHA-256 commitment chain 패턴
+- `freelang-v4/examples/crypto.fl` - `sha256()`, `hmac()`, `base64_encode()` 내장 함수
+- `freelang-ssh/src/client-v3-phase4.fl` - AES-256-GCM + HKDF-SHA256 패턴
+
+---
+
+## 저장소 위치
+
+```
+~/freelang-signal/
+├── src/
+│   ├── zkp/
+│   │   ├── commitment.fl       (~350줄) - Pedersen commitment 스킴
+│   │   ├── schnorr_proof.fl    (~400줄) - Schnorr ZKP 프로토콜 (신원 증명)
+│   │   └── mod.fl              (~30줄)
+│   ├── crypto/
+│   │   ├── aes_gcm.fl          (~350줄) - AES-256-GCM 암호화
+│   │   ├── sha3_hash.fl        (~300줄) - SHA-3 해싱 + HKDF 키 유도
+│   │   └── mod.fl              (~30줄)
+│   ├── transport/
+│   │   ├── signal_channel.fl   (~400줄) - P2P 직접 채널 + 핸드셰이크
+│   │   ├── zero_copy_bus.fl    (~350줄) - ZeroCopyRingBuffer 재사용 (신호 버스)
+│   │   └── mod.fl              (~30줄)
+│   ├── security/
+│   │   ├── signal_detector.fl  (~400줄) - L0NN 기반 신호 이상 탐지 (재사용)
+│   │   ├── replay_guard.fl     (~300줄) - Nonce 체인 기반 재전송 방지
+│   │   └── mod.fl              (~30줄)
+│   └── lib.fl                  (~100줄) - 통합 진입점
+├── tests/
+│   └── fl_signal_tests.fl      (~1,800줄) - 48개 무관용 테스트 (8그룹×6)
+└── docs/
+    └── FL_SIGNAL_DESIGN.md
+```
+
+**총 코드: ~3,400줄**
+**총 테스트: 48개 무관용 (A-H 그룹, 각 6개)**
+
+---
+
+## 4개 레이어 + 8개 무관용 규칙
+
+### Layer 1: ZKP Engine (Day 1-2, ~780줄)
+
+**commitment.fl** (~350줄):
+```
+pub struct PedersenCommitment {
+    value: u64,             // 비밀 값
+    randomness: u64,        // 랜덤 블라인딩 인자
+    commitment: [u8; 32],   // C = H(value || randomness)
+}
+pub fn commit(value: u64, rand: u64) -> PedersenCommitment
+pub fn verify_commitment(c: &PedersenCommitment) -> bool
+pub fn open(c: &PedersenCommitment, v: u64, r: u64) -> bool
+```
+
+**schnorr_proof.fl** (~400줄) — `hash_chain.rs` commitment 패턴 재사용:
+```
+pub struct SchnorrProof {
+    public_key: [u8; 32],
+    commitment_r: [u8; 32],   // R = g^k
+    challenge_e: [u8; 32],    // e = H(R || message)
+    response_s: u64,           // s = k - x*e (mod q)
+}
+pub fn prove(secret: u64, message: &[u8]) -> SchnorrProof
+pub fn verify(proof: &SchnorrProof, message: &[u8]) -> bool
+// 재사용: sha256() FreeLang 내장 함수
+```
+
+**테스트 A1-A6**: Commitment 생성/검증, ZKP 증명/검증, 위조 증명 거부, 병렬 증명
+
+---
+
+### Layer 2: Crypto Engine (Day 3-4, ~680줄)
+
+**aes_gcm.fl** (~350줄) — `client-v3-phase4.fl` 패턴 재사용:
+```
+pub struct AesGcmContext {
+    key: [u8; 32],         // AES-256 키
+    nonce: [u8; 12],       // 96-bit GCM nonce
+    aad: [u8; 16],         // 추가 인증 데이터
+    tag: [u8; 16],         // 128-bit 인증 태그
+}
+pub fn encrypt(ctx: &mut AesGcmContext, plaintext: &[u8]) -> Vec<u8>
+pub fn decrypt(ctx: &mut AesGcmContext, ciphertext: &[u8]) -> Option<Vec<u8>>
+// 암호화 < 100µs (ARM64 AES-NI 시뮬레이션)
+```
+
+**sha3_hash.fl** (~300줄):
+```
+pub fn sha3_256(data: &[u8]) -> [u8; 32]
+pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32]
+pub fn hkdf_expand(prk: &[u8], info: &[u8], len: u32) -> Vec<u8>
+// 재사용: hmac() FreeLang 내장 함수
+```
+
+**테스트 B1-B6**: SHA-3 해시, HKDF 키 유도, AES 암호화/복호화, 태그 위변조 탐지
+
+---
+
+### Layer 3: Transport Layer (Day 5-6, ~780줄)
+
+**signal_channel.fl** (~400줄):
+```
+pub struct SignalChannel {
+    channel_id: u64,
+    local_key: [u8; 32],
+    remote_key: [u8; 32],
+    session_key: [u8; 32],   // ECDH 교환 후 유도
+    state: ChannelState,     // Idle, Handshake, Active, Closed
+    message_count: u64,
+}
+pub fn handshake(channel: &mut SignalChannel) -> bool  // < 5ms
+pub fn send(channel: &mut SignalChannel, msg: &[u8]) -> bool
+pub fn receive(channel: &mut SignalChannel) -> Option<Vec<u8>>
+pub fn throughput_mps(&self) -> u32  // > 10,000 msg/sec
+```
+
+**zero_copy_bus.fl** (~350줄) — `ZeroCopyRingBuffer` 직접 재사용:
+```
+// ZeroCopyRingBuffer { buffer: 4096 용량 }에서 SignalEvent 타입으로 특화
+pub struct SignalEvent {
+    channel_id: u64,
+    payload: [u8; 512],
+    zkp_proof: SchnorrProof,
+    timestamp_ns: u64,
+}
+pub struct SignalBus {
+    ring: ZeroCopyRingBuffer,   // Phase 8 무복사 버스 직접 재사용
+    dropped_events: u64,
+}
+pub fn push_signal(bus: &mut SignalBus, event: SignalEvent) -> bool
+pub fn pop_signal(bus: &mut SignalBus) -> Option<SignalEvent>
+```
+
+**테스트 C1-C6**: 채널 핸드셰이크 < 5ms, 메시지 송수신, 처리량 > 10K msg/s, 버스 용량
+
+---
+
+### Layer 4: Security Layer (Day 7-8, ~700줄 + 테스트)
+
+**signal_detector.fl** (~400줄) — `L0NeuralNet` + N-gram 직접 재사용:
+```
+pub struct SignalDetector {
+    nn: L0NeuralNet,              // Phase 8 L0NeuralNet 직접 재사용
+    ngram: NgramAnalyzer,         // behavioral_analyzer.fl N-gram 패턴 재사용
+    ensemble_weights: [f32; 3],   // [0.6, 0.3, 0.1]
+    threat_threshold: f32,        // 0.5
+}
+pub enum SignalThreat { Clean, Jamming, Spoofing, Replay, Unknown }
+pub fn analyze_signal(detector: &mut SignalDetector, event: &SignalEvent) -> SignalThreat
+// < 10µs 탐지 (L0NN 추론 시간 기준)
+```
+
+**replay_guard.fl** (~300줄) — `hash_chain.rs` 패턴 재사용:
+```
+pub struct ReplayGuard {
+    seen_nonces: [u64; 1024],   // 고정 크기 nonce 캐시
+    nonce_pos: u32,              // 링 버퍼 인덱스
+    replay_count: u32,
+}
+pub fn check_nonce(guard: &mut ReplayGuard, nonce: u64) -> bool
+pub fn add_nonce(guard: &mut ReplayGuard, nonce: u64)
+// 재전송 탐지 100% (< 1µs)
+```
+
+**테스트 D1-D6**: 신호 이상 탐지 > 99%, Jamming/Spoofing/Replay 분류, < 10µs 탐지
+**테스트 E1-E6**: Replay Guard nonce 검증, 중복 차단 100%
+**테스트 F1-F6**: ZKP + AES + Channel 통합 암호화 플로우
+**테스트 G1-G6**: L0NN 앙상블 신뢰도 계산 (0.6×NN + 0.3×규칙 + 0.1×이상치)
+**테스트 H1-H6 (E2E)**:
+- H1: ZKP 인증 → 채널 개설 → 메시지 전송 → 검증 전체 플로우
+- H2: 1,000개 메시지 처리량 테스트 (> 10K msg/s)
+- H3: 100개 재전송 공격 시도 → 전부 차단
+- H4: Jamming 신호 100개 → L0NN 탐지 100%
+- H5: ZKP 위조 100개 → Schnorr 검증 실패 100%
+- H6: 8개 무관용 규칙 최종 검증
+
+---
+
+## 8개 무관용 규칙
+
+| # | 규칙 | 목표 | 측정 방법 |
+|---|------|------|---------|
+| 1 | **ZKP 증명 생성** | < 1ms | schnorr_proof.prove() 타이머 |
+| 2 | **AES-256 암호화** | < 100µs | encrypt() 레이턴시 |
+| 3 | **P2P 레이턴시** | < 10ms | 핸드셰이크 완료 시간 |
+| 4 | **재전송 방지** | 100% | ReplayGuard 차단율 |
+| 5 | **신호 이상 탐지** | > 99% | L0NN + N-gram 앙상블 정확도 |
+| 6 | **처리량** | > 10,000 msg/s | SignalChannel.throughput_mps() |
+| 7 | **탐지 속도** | < 10µs | L0NeuralNet.forward() 시간 |
+| 8 | **완전 자립** | 0% Android API | 외부 의존성 = 0 |
+
+---
+
+## 구현 순서
+
+1. **Day 1-2**: `zkp/` + 테스트 A1-A6 (Pedersen commitment, Schnorr ZKP)
+2. **Day 3-4**: `crypto/` + 테스트 B1-B6 (AES-256-GCM, SHA-3, HKDF)
+3. **Day 5-6**: `transport/` + 테스트 C1-C6 (P2P 채널, ZeroCopy 버스)
+4. **Day 7-8**: `security/` + 테스트 D1-H6 (L0NN 탐지, Replay Guard, E2E)
+
+---
+
+## GOGS 저장소
+
+저장소: `freelang-signal`
+API 토큰: `ffab4b9176ee59ee8ff729ca8a5225b31064be22`
+리모트: `https://gogs.dclub.kr/kim/freelang-signal.git`
+
+**최종 검증 목표**:
+```
+✅ ZKP 증명: < 1ms
+✅ AES-256 암호화: < 100µs
+✅ 핸드셰이크: < 5ms
+✅ 재전송 방지: 100%
+✅ 신호 탐지: > 99% (L0NN 앙상블)
+✅ 처리량: > 10,000 msg/s
+✅ 탐지 속도: < 10µs
+✅ 독립성: 0% Android API
+```

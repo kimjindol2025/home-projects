@@ -1,0 +1,258 @@
+// Hypervisor: Guest Memory Isolation (200줄)
+
+module guest_memory
+
+use hypervisor::{
+    GuestAddressSpace
+}
+
+// ============ Guest Memory Region ============
+
+struct GuestMemoryRegion {
+    guest_ipa_start: u64,
+    host_pa_start: u64,
+    size: u64,
+    is_writable: bool,
+    is_executable: bool,
+    region_type: string,  // "Code", "Data", "Stack", "IO"
+    protection_level: u32,  // 0-3
+}
+
+impl GuestMemoryRegion {
+    fn new(guest_start: u64, host_start: u64, sz: u64, rtype: string) -> GuestMemoryRegion {
+        return GuestMemoryRegion {
+            guest_ipa_start: guest_start,
+            host_pa_start: host_start,
+            size: sz,
+            is_writable: true,
+            is_executable: false,
+            region_type: rtype,
+            protection_level: 2,  // RW
+        }
+    }
+
+    fn set_protection(&mut self, writable: bool, executable: bool) -> bool {
+        self.is_writable = writable
+        self.is_executable = executable
+
+        if writable && executable {
+            self.protection_level = 3  // RWX (dangerous)
+        } else if writable {
+            self.protection_level = 2  // RW
+        } else if executable {
+            self.protection_level = 1  // RX
+        } else {
+            self.protection_level = 0  // R only
+        }
+
+        return true
+    }
+
+    fn get_size_mb(&self) -> u64 {
+        return self.size / (1024 * 1024)
+    }
+
+    fn contains_address(&self, guest_ipa: u64) -> bool {
+        return guest_ipa >= self.guest_ipa_start && guest_ipa < (self.guest_ipa_start + self.size)
+    }
+}
+
+// ============ Guest Memory Allocator ============
+
+struct GuestMemoryAllocator {
+    vmid: u16,
+    total_allocated: u64,
+    regions: array[GuestMemoryRegion; 16],
+    region_count: u32,
+}
+
+impl GuestMemoryAllocator {
+    fn new(vm_id: u16) -> GuestMemoryAllocator {
+        return GuestMemoryAllocator {
+            vmid: vm_id,
+            total_allocated: 0,
+            regions: array[GuestMemoryRegion; 16],
+            region_count: 0,
+        }
+    }
+
+    fn allocate_region(&mut self, guest_start: u64, host_start: u64, size: u64, rtype: string) -> bool {
+        if self.region_count >= 16 {
+            return false  // Max 16 regions
+        }
+
+        // Check overlap
+        for i in 0..self.region_count {
+            let existing = self.regions[i]
+            if guest_start < (existing.guest_ipa_start + existing.size) &&
+               (guest_start + size) > existing.guest_ipa_start {
+                return false  // Overlap detected
+            }
+        }
+
+        let region = GuestMemoryRegion::new(guest_start, host_start, size, rtype)
+        self.regions[self.region_count] = region
+        self.region_count += 1
+        self.total_allocated += size
+
+        return true
+    }
+
+    fn protect_region(&mut self, guest_start: u64, writable: bool, executable: bool) -> bool {
+        for i in 0..self.region_count {
+            if self.regions[i].guest_ipa_start == guest_start {
+                return self.regions[i].set_protection(writable, executable)
+            }
+        }
+        return false
+    }
+
+    fn get_region(&self, guest_ipa: u64) -> GuestMemoryRegion {
+        for i in 0..self.region_count {
+            if self.regions[i].contains_address(guest_ipa) {
+                return self.regions[i]
+            }
+        }
+        return GuestMemoryRegion::new(0, 0, 0, "None")
+    }
+
+    fn get_total_allocated_mb(&self) -> u64 {
+        return self.total_allocated / (1024 * 1024)
+    }
+
+    fn get_region_count(&self) -> u32 {
+        return self.region_count
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Guest Memory (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Total Allocated: " + self.get_total_allocated_mb().to_string() + "MB\\n"
+        s = s + "Regions: " + self.region_count.to_string() + "/16\\n"
+
+        for i in 0..self.region_count {
+            s = s + self.regions[i].region_type + ": " + self.regions[i].get_size_mb().to_string() + "MB\\n"
+        }
+
+        return s
+    }
+}
+
+// ============ Memory Access Audit ============
+
+struct MemoryAccessAudit {
+    vmid: u16,
+    total_accesses: u32,
+    permitted_accesses: u32,
+    denied_accesses: u32,
+    last_fault_ipa: u64,
+}
+
+impl MemoryAccessAudit {
+    fn new(vm_id: u16) -> MemoryAccessAudit {
+        return MemoryAccessAudit {
+            vmid: vm_id,
+            total_accesses: 0,
+            permitted_accesses: 0,
+            denied_accesses: 0,
+            last_fault_ipa: 0,
+        }
+    }
+
+    fn record_access(&mut self, guest_ipa: u64, is_write: bool, allocator: GuestMemoryAllocator) -> bool {
+        self.total_accesses += 1
+
+        let region = allocator.get_region(guest_ipa)
+
+        if region.size == 0 {
+            // Invalid region
+            self.denied_accesses += 1
+            self.last_fault_ipa = guest_ipa
+            return false
+        }
+
+        if is_write && !region.is_writable {
+            // Write to read-only region
+            self.denied_accesses += 1
+            self.last_fault_ipa = guest_ipa
+            return false
+        }
+
+        self.permitted_accesses += 1
+        return true
+    }
+
+    fn get_access_rate(&self) -> u32 {
+        if self.total_accesses == 0 {
+            return 0
+        }
+        return (self.permitted_accesses * 100) / self.total_accesses
+    }
+
+    fn get_fault_count(&self) -> u32 {
+        return self.denied_accesses
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Memory Access Audit (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Total Accesses: " + self.total_accesses.to_string() + "\\n"
+        s = s + "Permitted: " + self.permitted_accesses.to_string() + "\\n"
+        s = s + "Denied: " + self.denied_accesses.to_string() + "\\n"
+        s = s + "Access Rate: " + self.get_access_rate().to_string() + "%"
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_guest_memory_region() -> bool {
+    let mut region = GuestMemoryRegion::new(0x0, 0x80000000, 0x1000000, "Code")
+
+    assert(region.contains_address(0x500000), "should contain 5MB address")
+    assert(!region.contains_address(0x2000000), "should not contain 32MB address")
+
+    region.set_protection(false, true)  // RX
+    assert(region.is_executable, "should be executable")
+    assert(!region.is_writable, "should not be writable")
+
+    return true
+}
+
+fn validate_guest_memory_allocator() -> bool {
+    let mut alloc = GuestMemoryAllocator::new(1)
+
+    // Allocate regions
+    assert(alloc.allocate_region(0x0, 0x80000000, 0x2000000, "Code"), "allocate Code")
+    assert(alloc.allocate_region(0x2000000, 0x82000000, 0x1000000, "Data"), "allocate Data")
+    assert(alloc.allocate_region(0x3000000, 0x83000000, 0x1000000, "Stack"), "allocate Stack")
+
+    assert(alloc.get_region_count() == 3, "should have 3 regions")
+    assert(alloc.get_total_allocated_mb() == 64, "should have 64MB")
+
+    return true
+}
+
+fn validate_memory_access_audit() -> bool {
+    let mut audit = MemoryAccessAudit::new(1)
+    let mut alloc = GuestMemoryAllocator::new(1)
+
+    alloc.allocate_region(0x0, 0x80000000, 0x1000000, "Data")
+
+    // Valid access
+    assert(audit.record_access(0x500000, false, alloc), "valid read")
+    assert(audit.get_access_rate() == 100, "access rate should be 100%")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

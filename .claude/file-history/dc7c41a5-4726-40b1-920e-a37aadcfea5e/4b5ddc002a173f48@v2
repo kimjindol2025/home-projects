@@ -1,0 +1,414 @@
+# Green-Distributed-Fabric: Ultra-Low-Power Edge OS Kernel
+
+## Executive Summary
+
+Green-Distributed-Fabric is a bare-metal distributed operating system kernel optimized for ultra-low-power edge IoT devices. It reuses predictive, adaptive, and optimization technologies from FreeLang Phase 6-9 to minimize energy consumption while maintaining Raft-based consensus and distributed coordination.
+
+**Philosophy**: "에너지가 무결성의 새로운 기준이다" (Energy is the new standard of integrity)
+
+**Quantitative Goals**:
+- 40% power reduction vs Linux baseline: 250mW → 150mW
+- 2× battery life extension: 4.8h → 9.6h
+- 8 unforgiving rules validated through 30 integration tests
+- 7,345 total lines across 5 layers
+
+---
+
+## 5-Layer Architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  L5: Energy History Layer                                │
+│      [EnergyPatternDB, EfficiencyLearner]                │
+│      • Pattern recognition accuracy ≥85%                 │
+│      • Learning state machine (5-state FSM)              │
+│      • Bayesian confidence updates                       │
+└──────────────────────────────────────────────────────────┘
+                         ↓ Feedback
+┌──────────────────────────────────────────────────────────┐
+│  L4: Green Consensus Layer                               │
+│      [GreenRaftNode, PowerWeightedElection]              │
+│      • Power-aware leader election                       │
+│      • Battery level as selection criterion              │
+│      • Consensus latency <150ms                          │
+└──────────────────────────────────────────────────────────┘
+                         ↑ Replication
+┌──────────────────────────────────────────────────────────┐
+│  L3: Predictive Power Management                         │
+│      [EnergyPredictor, DemandResponsePlanner]            │
+│      • Time-series energy forecasting                    │
+│      • Demand-response decision making                   │
+│      • Prediction error ≤10%                             │
+└──────────────────────────────────────────────────────────┘
+                         ↑ Rules
+┌──────────────────────────────────────────────────────────┐
+│  L2: Green Scheduler                                     │
+│      [DVFSController, SleepManager, WorkloadConsolidator]│
+│      • Dynamic frequency/voltage scaling                 │
+│      • C-state sleep management                          │
+│      • Task consolidation for deep sleep                 │
+└──────────────────────────────────────────────────────────┘
+                         ↑ Policies
+┌──────────────────────────────────────────────────────────┐
+│  L1: Power Sensing                                       │
+│      [PowerSensor, PowerPattern, BatteryPredictor]       │
+│      • Real-time power measurements                      │
+│      • 6 power pattern detection                         │
+│      • Battery drain prediction                          │
+└──────────────────────────────────────────────────────────┘
+
+Data Flow: L1→L2/L3/L4/L5 (unidirectional sensors)
+Feedback Loop: L5→L3 (learned patterns inform predictions)
+```
+
+---
+
+## Layer 1: Power Sensing (1,210 lines)
+
+### Purpose
+Real-time power measurement and battery state tracking, providing foundation data for all upper layers.
+
+### Components
+
+**PowerSensor (350 lines)**
+- `PowerReading`: voltage_mv, current_ma, temperature_c, frequency_mhz, thermal_ratio
+- `BatteryState`: capacity_mah, remaining_mah, level_percent, estimated_life_minutes
+- `thermal_throttle_factor()`: Returns throttle scalar based on thermal_ratio
+  - >0.90: 0.5 (heavy throttle)
+  - 0.80-0.90: 0.8 (light throttle)
+  - <0.80: 1.0 (no throttle)
+- Reuses Phase 8 `controlThermalThrottling()` logic
+
+**PowerPattern (480 lines)**
+- Enum `PowerPatternType` (6 types):
+  1. PowerSpike: Sudden current surge
+  2. IdleWaste: Sustained idle power
+  3. LeakCurrent: Subthreshold leakage
+  4. PeriodPeak: Periodic spikes
+  5. ThermalThrottle: Thermal-induced slowdown
+  6. CombinedDrain: Multiple patterns active
+- Struct `PowerPattern`:
+  - pattern_type, confidence, frequency, severity_level
+  - Bayesian update: `confidence_new = (confidence_old × freq + evidence) / (freq + 1)`
+  - Direct reuse from Phase 6 RecoveryPattern.update_confidence()
+
+**BatteryPredictor (320 lines)**
+- `BatteryForecast`: predicted_empty_minutes, confidence, prediction_method
+- `DrainRateHistory`: Exponential weighted moving average (EWMA)
+- Three prediction methods: linear, weighted_exponential, pattern_aware
+- Reuses Phase 7 `urgency_score()`: drain_urgency = time_factor × confidence
+  - time_factor = 1.0 / (1.0 + minutes/60)
+
+### Unforgiving Rules
+- Rule 1: Power Savings ≥40% (Rule 1)
+- Rule 2: Battery Life ≥2× (Rule 2)
+
+---
+
+## Layer 2: Green Scheduler (1,205 lines)
+
+### Purpose
+Decision-making layer for CPU frequency/voltage, sleep states, and task scheduling to minimize energy consumption.
+
+### Components
+
+**DVFSController (420 lines)**
+- 8 Operating Points: 200/400/600/800/1000/1200/1400/1600 MHz with corresponding voltages
+- `DVFSPolicy`: Battery-aware selection
+  - battery<5%: Emergency (200MHz, 0.6V)
+  - 5%-20%: PowerSave (400MHz, 0.65V)
+  - 20%-80%: Balanced (800MHz, 0.85V)
+  - >80%: Performance (1600MHz, 1.2V)
+  - load>80%: Always Performance
+- `thermal_scale_factor()`: Reuses Phase 8 logic directly
+- Rule 3 (<10ms) enforcement: transition_to() includes 5ms simulated latency
+- Reuses Phase 9 `classifyWorkload()` in `classify_workload_type()` (4 categories)
+
+**SleepManager (380 lines)**
+- 4 C-States:
+  - C0: Active (100% power, 0us latency)
+  - C1: Halt (70% power, 1us exit)
+  - C3: Sleep (20% power, 50us exit, 100us min residency)
+  - C6: DeepSleep (2% power, 500us exit, 1000us min residency)
+- `IdleTimePredictor`: EWMA = 0.7×ewma + 0.3×actual
+- `decide_sleep_state()`: Compares predicted_idle_us against thresholds to select optimal state
+- Rule 5 (<5ms sleep entry) enforcement: enter_state() must complete in <5000us
+
+**WorkloadConsolidator (350 lines)**
+- `MicroTask`: cpu_load, deadline_ms, is_deferrable
+- `ConsolidationPlan`: Groups tasks by deadline within 100ms windows
+- Inserts 50ms sleep periods between windows to enable C6 entry
+- Reuses Phase 9 `classifyWorkload()` pattern:
+  - compute_intensive (>50% load)
+  - latency_critical (deadline<50ms)
+  - deferrable (can shift)
+  - background (<5% load)
+
+### Unforgiving Rules
+- Rule 3: DVFS Response <10ms
+- Rule 5: Sleep Entry <5ms
+
+---
+
+## Layer 3: Predictive Power Management (950 lines)
+
+### Purpose
+Forecast energy demand and recommend proactive power management decisions.
+
+### Components
+
+**EnergyPredictor (510 lines)**
+- `PowerTimeSeries`: linear_regression(), quadratic_regression()
+- Three prediction methods:
+  1. Linear: slope × future_sec + intercept
+  2. Quadratic: a×t² + b×t + c
+  3. Pattern-Aware: Weighted by active patterns' combined_score()
+- `best_forecast()`: Selects method based on R² thresholds
+- Stores EnergyForecast with confidence, growth_rate_mw_per_sec, time_to_budget_limit_sec
+- Rule 7 validation: prediction_error_rate() = |predicted-actual|/actual
+
+**DemandResponsePlanner (390 lines)**
+- 6 PowerActions:
+  1. ReduceDVFS: Step down 2 frequencies
+  2. EnterDeepSleep: Request C6 entry
+  3. DeferWorkload: Move non-critical tasks forward
+  4. ConsolidateTasks: Trigger WorkloadConsolidator
+  5. ActivateEmergencyMode: Disable non-essential features
+  6. ResumeNormal: Return to Balanced policy
+- `evaluate_intervention()`:
+  - Checks urgency_score > threshold
+  - Maps battery level to priority (battery<5%→priority 5, etc.)
+- Rule 8: `failover_on_battery_critical()` returns true if battery < 2%
+
+### Unforgiving Rules
+- Rule 7: Prediction Error ≤10%
+- Rule 8: Failover <50ms (implicit)
+
+---
+
+## Layer 4: Green Consensus (compressed, ~320 lines total)
+
+### Purpose
+Raft-based distributed consensus with power-awareness for cluster coordination.
+
+### Components
+
+**GreenRaftNode**
+- Extends Raft with `power_state`, `battery_level` fields
+- `compute_power_score()`: Returns battery_level (higher battery wins elections)
+- `can_accept_writes()`: Disables writes in Emergency power state
+
+**PowerWeightedElection**
+- `power_weighted_election()`: Selects leader with highest battery level
+- Enforces Rule 4 (<150ms) through election timeout ranges (100-150ms)
+
+**LowPowerReplication**
+- `ReplicationBatcher`: Batches log entries for efficient network use
+- `failover_on_leader_drain()`: Returns true if battery < 2%
+
+### Unforgiving Rules
+- Rule 4: Consensus Latency <150ms
+
+---
+
+## Layer 5: Energy History Learning (compressed, ~280 lines total)
+
+### Purpose
+Learn from past energy optimization outcomes to improve future predictions.
+
+### Components
+
+**EnergyPatternDB**
+- `EnergyHistoryEntry`: id, pattern_type, power_before_mw, power_after_mw, success
+- VecDeque with max_size=1000 (FIFO ring buffer)
+- Query methods: by_pattern_type(), by_success_rate(), by_time_window()
+- Direct reuse from Phase 6 RecoveryHistoryDB structure
+
+**EfficiencyLearner**
+- `PowerLearningState` (5-state FSM):
+  - NoData (frequency=0)
+  - Observing (1-3 observations)
+  - Emerging (4-9 observations)
+  - Established (10-29 observations)
+  - Mature (30+ observations)
+- Bayesian update formula identical to Phase 6 LearningState
+- `advance(success: bool)`: Updates confidence using success evidence (0.8) or failure evidence (0.3)
+- `accuracy()`: Returns (mature_count / total_count).min(0.95)
+- Rule 6 validation: accuracy() ≥ 0.85
+
+### Unforgiving Rules
+- Rule 6: Pattern Accuracy ≥85%
+
+---
+
+## Component Reuse Mapping
+
+| Reused From | Original Location | Reuse Method | Adapted To |
+|---|---|---|---|
+| Bayesian confidence formula | Phase 6 PatternRecognition L40-41 | Direct code copy | PowerPattern.update_confidence() |
+| PatternType enum (6 items) | Phase 6 PatternRecognition L59-66 | 1:1 mapping | PowerPatternType |
+| LearningState FSM (5 states) | Phase 6 LearningStateMachine | Struct rename | PowerLearningState |
+| Actionability weights | Phase 6 LearningStateMachine L65-74 | Same numeric values (0.0/0.2/0.5/0.8/1.0) | is_actionable() states |
+| RecoveryHistoryDB structure | Phase 6 PatternDatabase | Field rename | EnergyPatternDB |
+| urgency_score() algorithm | Phase 7 MemoryPredictor L37-46 | Direct formula | drain_urgency_score() |
+| calculateEnergyPerOperation() | Phase 8 CPUOptimizer L860 | Energy math | calculate_mw_per_cycle() |
+| controlThermalThrottling() | Phase 8 CPUOptimizer L878 | Thermal thresholds | thermal_scale_factor() |
+| classifyWorkload() pattern | Phase 9 AdaptiveOptimizer L42 | 4-class classification | classify_workload_type()/classify_power_profile() |
+| RaftNode structure | Phase B Raft L16-45 | All fields preserved + 3 new | GreenRaftNode |
+| start_election() logic | Phase B LeaderElection L54 | Election timeout range | power_weighted_election() |
+
+---
+
+## 8 Unforgiving Rules
+
+| # | Rule | Target | Validation Function |
+|---|---|---|---|
+| 1 | Power Savings | ≥40% (250→150mW) | verify_rule_1_power_savings() |
+| 2 | Battery Life | ≥2× (4.8h→9.6h) | verify_rule_2_battery_life() |
+| 3 | DVFS Response | <10ms | verify_rule_3_dvfs_response() |
+| 4 | Consensus Latency | <150ms | verify_rule_4_consensus_latency() |
+| 5 | Sleep Entry | <5ms | verify_rule_5_sleep_entry() |
+| 6 | Pattern Accuracy | ≥85% | verify_rule_6_pattern_accuracy() |
+| 7 | Prediction Error | ≤10% | verify_rule_7_prediction_error() |
+| 8 | Failover Latency | <50ms | verify_rule_8_failover_latency() |
+
+---
+
+## Data Flow and Orchestration
+
+### L1 → L2 Path: Power Sensing to Scheduler
+1. PowerSensor.tick() measures voltage, current, temperature
+2. PowerPattern.run_detection() identifies active patterns
+3. BatteryPredictor.best_forecast() projects drain rate
+4. GreenSchedulerLayer receives power state via `tick()`
+5. DVFSController.transition_to() adjusts frequency based on battery + load
+6. SleepManager.decide_sleep_state() selects C-state
+7. WorkloadConsolidator.build_consolidation_plan() groups tasks
+
+### L1 → L3 Path: Power Sensing to Predictor
+1. PowerSensor provides historical power readings
+2. PowerTimeSeries collects data points
+3. EnergyPredictor computes regression curves
+4. DemandResponsePlanner evaluates actions
+5. Recommendations flow back to L2 via PredictivePMLayer.predict()
+
+### L5 ← L3 Feedback: Learning from Outcomes
+1. L4 applies recommended actions
+2. L1 measures actual power after action
+3. EnergyPatternDB records (pattern_type, power_before, power_after, success)
+4. EfficiencyLearner.advance(success) updates confidence
+5. PowerLearningState transitions to higher confidence levels
+
+---
+
+## Testing Strategy: 30 Unforgiving Tests
+
+**Group A (Power Sensing - 5 tests)**
+- Rule 1 baseline detection
+- Rule 1 target met (40% savings)
+- Rule 1 exceeds target (>40%)
+- Rule 2 baseline (no improvement)
+- Rule 2 2× improvement
+
+**Group B (Scheduler - 5 tests)**
+- Rule 3 under limit (<10ms)
+- Rule 3 at boundary (=10ms)
+- Rule 3 exceeds limit (>10ms)
+- Rule 5 under limit (<5ms)
+- Rule 5 exceeds limit (>5ms)
+
+**Group C (Predictor - 5 tests)**
+- Rule 7 at target (=10%)
+- Rule 7 below target (<10%)
+- Rule 7 exceeds target (>10%)
+- Rule 7 high error (>>10%)
+- Rule 7 zero error (perfect)
+
+**Group D (Consensus - 5 tests)**
+- Rule 4 under limit (<150ms)
+- Rule 4 at boundary (=150ms)
+- Rule 4 exceeds limit (>150ms)
+- Rule 8 under limit (<50ms)
+- Rule 8 exceeds limit (>50ms)
+
+**Group E (Learning - 5 tests)**
+- Rule 6 at target (=85%)
+- Rule 6 exceeds target (>85%)
+- Rule 6 below target (<85%)
+- Rule 6 perfect (100%)
+- Rule 6 low (<50%)
+
+**Group F (Integration - 5 tests)**
+- All 8 rules pass simultaneously
+- One rule (Rule 1) fails, others pass
+- Multiple rules fail (4 rules)
+- Fabric tick updates metrics
+- Status summary generation
+
+---
+
+## Key Design Decisions
+
+### 1. Unidirectional Data Flow
+- L1 sensors feed into L2/L3/L4/L5 simultaneously
+- Avoids circular dependencies and deadlocks
+- L5 provides asymmetric feedback to L3 only for learning
+
+### 2. Battery as Primary Metric
+- Battery level is the universal decision criterion
+- DVFS policy, C-state selection, leader election all respect battery
+- Emergency mode activated at battery<5%, failover at battery<2%
+
+### 3. Reuse Philosophy
+- Every component built on proven Phase 6-9 designs
+- Bayesian confidence update identical to Phase 6
+- 5-state FSM copied from Phase 6 LearningStateMachine
+- Thermal throttling logic from Phase 8
+- Workload classification from Phase 9
+
+### 4. Quantitative Validation
+- All 8 rules have precise numeric thresholds
+- No subjective assessments
+- Metrics struct tracks all rule compliance in real-time
+- all_rules_passed() returns boolean for automatic validation
+
+---
+
+## Performance Baseline
+
+| Metric | Target | Expected Achievement |
+|--------|--------|-----|
+| Power Consumption | 150mW | 40% reduction from 250mW baseline |
+| Battery Life | 9.6h | 2× improvement from 4.8h baseline |
+| DVFS Response | <10ms | Frequency stepping with 5ms latency |
+| Consensus | <150ms | Election in 100-150ms range |
+| Sleep Entry | <5ms | C-state entry in <5ms overhead |
+| Pattern Accuracy | ≥85% | Bayesian learning with 30+ samples |
+| Prediction Error | ≤10% | Time-series regression R² >0.95 |
+| Failover | <50ms | Battery drain detection with <50ms threshold |
+
+---
+
+## Future Extensions (Phase 7+)
+
+1. **L6: Distributed Coordination** - Multi-node energy optimization
+2. **L7: ML Adaptation** - Neural networks for pattern classification
+3. **L8: Thermal Management** - Die temperature feedback control
+4. **L9: Real-time Scheduling** - EDF + energy-aware tasks
+
+---
+
+## References
+
+- Phase 6 Predictive Self-Healing: Pattern Recognition, Learning State Machine
+- Phase 7 Adaptive Optimization: Memory Prediction, Urgency Scoring
+- Phase 8 Performance Optimization: CPU Thermal Throttling
+- Phase 9 ML Integration: Workload Classification
+- Phase B Raft Consensus: Node Structure, Election Algorithms
+
+---
+
+**Document Version**: 1.0
+**Last Updated**: 2026-03-04
+**Author**: Claude Code
+**Philosophy**: "에너지가 무결성의 새로운 기준이다" (Energy is the new standard of integrity)

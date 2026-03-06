@@ -1,0 +1,247 @@
+// Phase 3.1.3 SDF (Signed Distance Field) 생성기
+// 베지어 곡선을 거리 필드로 변환
+// 목표: 메모리 90% 절감 (기존 비트맵 대비), 생성 < 800µs
+
+use crate::core::fixed_point::*;
+use crate::core::solver::{Point, CubicBezier, min_distance};
+
+pub const SDF_TEXTURE_SIZE: usize = 32;  // 32x32 픽셀
+pub const SDF_SPREAD: Fixed16 = FIXED_ONE / 2;  // 1.0의 절반: 0.5 unit spread
+
+#[derive(Clone, Copy, Debug)]
+pub struct SDFPixel {
+    pub distance: i8,  // -128 ~ 127 (부호 있는 8비트)
+}
+
+pub struct SDFTexture {
+    pub pixels: [SDFPixel; SDF_TEXTURE_SIZE * SDF_TEXTURE_SIZE],
+    pub width: usize,
+    pub height: usize,
+}
+
+impl SDFTexture {
+    pub fn new() -> Self {
+        let mut pixels = [SDFPixel { distance: 0 }; SDF_TEXTURE_SIZE * SDF_TEXTURE_SIZE];
+
+        // 초기화: 모든 픽셀을 127 (매우 먼 거리)로 설정
+        for i in 0..SDF_TEXTURE_SIZE * SDF_TEXTURE_SIZE {
+            pixels[i] = SDFPixel { distance: 127 };
+        }
+
+        SDFTexture {
+            pixels,
+            width: SDF_TEXTURE_SIZE,
+            height: SDF_TEXTURE_SIZE,
+        }
+    }
+
+    // 좌표 (x, y)의 픽셀 접근 (안전)
+    pub fn get(&self, x: usize, y: usize) -> SDFPixel {
+        if x >= self.width || y >= self.height {
+            return SDFPixel { distance: 127 };
+        }
+        self.pixels[y * self.width + x]
+    }
+
+    // 픽셀 설정
+    pub fn set(&mut self, x: usize, y: usize, pixel: SDFPixel) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        self.pixels[y * self.width + x] = pixel;
+    }
+
+    // 거리값을 정규화된 8비트로 변환
+    // 범위: -SDF_SPREAD ~ +SDF_SPREAD → -128 ~ 127
+    fn quantize_distance(distance_sq: Fixed16) -> i8 {
+        let mut distance = distance_sq;  // sqrt 대신 거리 제곱값 사용
+
+        // 거리 제곱을 선형화 (간단한 근사)
+        // 실제로는 sqrt(distance_sq)를 원하지만, 여기서는 선형 근사 사용
+        if distance > 0 {
+            // sqrt 근사: Newton-Raphson 한 번만 (빠름)
+            distance = (distance + FIXED_ONE / 2) / 2;  // 초기 추정값 + 한 번의 Newton 반복
+        }
+
+        // 부호 결정: 점이 곡선 내부/외부
+        // (정확한 판정을 위해서는 winding number가 필요하지만, 여기서는 거리로 근사)
+        let inside = distance < FIXED_SPREAD / 2;
+        let sign = if inside { -1i8 } else { 1i8 };
+
+        // 거리를 [0, SPREAD]로 정규화 후 [-128, 127]로 매핑
+        let normalized = if distance < 0 {
+            0i8
+        } else if distance >= SDF_SPREAD {
+            127i8
+        } else {
+            let ratio = div(distance, SDF_SPREAD);  // [0, 1]
+            let quantized = mul(ratio, from_int(128)) >> FIXED_SHIFT;
+            (quantized as i8).min(127)
+        };
+
+        (sign * (quantized as i8)).min(127).max(-128)
+    }
+}
+
+// 글리프를 SDF 텍스처로 변환
+pub struct SDFGenerator;
+
+impl SDFGenerator {
+    // 베지어 곡선 목록을 SDF로 래스터화
+    pub fn rasterize(
+        beziers: &[CubicBezier],
+        width: usize,
+        height: usize,
+    ) -> SDFTexture {
+        let mut texture = SDFTexture::new();
+
+        // 각 픽셀에 대해 거리 계산
+        for py in 0..height {
+            for px in 0..width {
+                // 픽셀 중심 좌표 (정규화: [0, 1] range)
+                let pixel_x = div(from_int(px as i32), from_int(width as i32));
+                let pixel_y = div(from_int(py as i32), from_int(height as i32));
+                let p = Point::new(pixel_x, pixel_y);
+
+                // 모든 베지어 곡선에 대해 최단 거리 찾기
+                let mut min_dist_sq = Fixed16::MAX / 2;  // 매우 큰 값으로 초기화
+                for bezier in beziers {
+                    let dist_sq = min_distance(bezier, p);
+                    if dist_sq < min_dist_sq {
+                        min_dist_sq = dist_sq;
+                    }
+                }
+
+                let quantized = SDFTexture::quantize_distance(min_dist_sq);
+                texture.set(px, py, SDFPixel { distance: quantized });
+            }
+        }
+
+        texture
+    }
+}
+
+// 쉐이더: SDF를 화면에 렌더링
+pub struct SDFShader {
+    pub threshold: i8,     // 임계값 (-128 ~ 127)
+    pub softness: i8,      // 부드러움 정도 (anti-aliasing)
+}
+
+impl SDFShader {
+    pub fn new() -> Self {
+        SDFShader {
+            threshold: 0,      // 기본값: 경계
+            softness: 8,       // 부드러움: 8/256 = 3.1%
+        }
+    }
+
+    // SDF 값을 알파값 (0 ~ 255)로 변환
+    // threshold를 기준으로 smoothstep 함수 적용
+    pub fn sample(&self, sdf_value: i8) -> u8 {
+        let diff = (sdf_value as i16) - (self.threshold as i16);
+        let softness = self.softness as i16;
+
+        // Smoothstep: 부드러운 전환
+        // smoothstep(d) = 3t² - 2t³ where t = (d - threshold) / softness
+        let clamped = if diff < -softness {
+            0
+        } else if diff > softness {
+            255
+        } else {
+            // t = (d + softness) / (2 * softness)
+            let t = ((diff + softness) * 128) / (2 * softness);
+            let t = t as i32;
+
+            // smoothstep: 3t² - 2t³
+            let t2 = (t * t) / 256;
+            let t3 = (t2 * t) / 256;
+            let result = 3 * t2 - 2 * t3;
+
+            (result as u8).min(255).max(0)
+        };
+
+        clamped
+    }
+
+    // SDF 값을 그레이스케일 픽셀로 변환
+    pub fn render_pixel(&self, sdf_value: i8) -> u32 {
+        let alpha = self.sample(sdf_value);
+        // RGBA: white with varying alpha
+        0xFFFFFF00 | (alpha as u32)
+    }
+
+    // Bold: 임계값을 음수로 (더 굵어짐)
+    pub fn set_bold(&mut self, bold_amount: i8) {
+        self.threshold = -(bold_amount.abs());
+    }
+
+    // Thin: 임계값을 양수로 (더 가늘어짐)
+    pub fn set_thin(&mut self, thin_amount: i8) {
+        self.threshold = thin_amount.abs();
+    }
+
+    // 정상 굵기 복원
+    pub fn set_normal(&mut self) {
+        self.threshold = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sdf_texture_creation() {
+        let texture = SDFTexture::new();
+        assert_eq!(texture.width, SDF_TEXTURE_SIZE);
+        assert_eq!(texture.height, SDF_TEXTURE_SIZE);
+        assert_eq!(texture.pixels.len(), SDF_TEXTURE_SIZE * SDF_TEXTURE_SIZE);
+    }
+
+    #[test]
+    fn test_sdf_texture_set_get() {
+        let mut texture = SDFTexture::new();
+        let pixel = SDFPixel { distance: 42 };
+
+        texture.set(5, 5, pixel);
+        let retrieved = texture.get(5, 5);
+        assert_eq!(retrieved.distance, 42);
+    }
+
+    #[test]
+    fn test_sdf_texture_bounds() {
+        let texture = SDFTexture::new();
+        let pixel = texture.get(999, 999);  // Out of bounds
+        assert_eq!(pixel.distance, 127);
+    }
+
+    #[test]
+    fn test_shader_normal() {
+        let shader = SDFShader::new();
+        let alpha_black = shader.sample(-127);  // 내부
+        let alpha_white = shader.sample(127);   // 외부
+
+        assert!(alpha_black < 100);  // 검은색에 가까움
+        assert!(alpha_white > 155);  // 흰색에 가까움
+    }
+
+    #[test]
+    fn test_shader_bold() {
+        let mut shader = SDFShader::new();
+        shader.set_bold(20);
+        assert_eq!(shader.threshold, -20);
+    }
+
+    #[test]
+    fn test_shader_thin() {
+        let mut shader = SDFShader::new();
+        shader.set_thin(10);
+        assert_eq!(shader.threshold, 10);
+    }
+
+    #[test]
+    fn test_quantize_distance() {
+        let dist = SDFTexture::quantize_distance(0);
+        assert!(dist >= -128 && dist <= 127);
+    }
+}

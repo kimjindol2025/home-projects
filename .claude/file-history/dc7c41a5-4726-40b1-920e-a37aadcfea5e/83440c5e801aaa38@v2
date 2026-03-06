@@ -1,0 +1,466 @@
+// Green-Distributed-Fabric Phase 2: Cluster Manager
+// Purpose: Multi-node (3-5) coordination and power measurement
+// Strategy: Leader election + power synchronization + global metrics
+
+use super::super::power::*;
+use super::super::scheduler::*;
+use super::super::predictor::*;
+use super::super::consensus::*;
+use super::super::learning::*;
+
+// ============================================================================
+// Part 1: Cluster Configuration & Node Manager (180 lines)
+// ============================================================================
+
+pub struct ClusterConfig {
+    pub node_count: u32,           // 3-5 nodes
+    pub total_cpus: u32,           // CPUs per cluster
+    pub consensus_timeout_ms: u32, // Raft timeout
+    pub sync_interval_ms: u32,     // Power reading sync interval (1000ms)
+    pub measurement_duration_sec: u32,  // Simulation duration
+}
+
+impl ClusterConfig {
+    pub fn new(nodes: u32) -> Result<Self, String> {
+        if nodes < 3 || nodes > 5 {
+            return Err(format!("Node count must be 3-5, got {}", nodes));
+        }
+
+        Ok(ClusterConfig {
+            node_count: nodes,
+            total_cpus: nodes * 4,  // 4 CPUs per node
+            consensus_timeout_ms: 300,
+            sync_interval_ms: 1000,
+            measurement_duration_sec: 60,  // 1-minute simulation
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.node_count < 1 || self.node_count > 5 {
+            return Err(format!("Invalid node count: {}", self.node_count));
+        }
+        if self.sync_interval_ms < 100 || self.sync_interval_ms > 5000 {
+            return Err(format!("Invalid sync interval: {}", self.sync_interval_ms));
+        }
+        Ok(())
+    }
+}
+
+pub struct ClusterNode {
+    pub node_id: u32,
+    pub is_leader: bool,
+    pub power_reading: f64,        // Current power in mW
+    pub last_sync_ms: u64,         // Last power reading sync time
+    pub consensus_term: u32,       // Raft term
+    pub cpu_utilization: f64,      // 0.0-1.0
+    pub memory_usage_mb: u32,
+    pub network_latency_ms: u32,   // To leader
+}
+
+impl ClusterNode {
+    pub fn new(node_id: u32, is_leader: bool) -> Self {
+        ClusterNode {
+            node_id,
+            is_leader,
+            power_reading: 0.0,
+            last_sync_ms: 0,
+            consensus_term: 0,
+            cpu_utilization: 0.0,
+            memory_usage_mb: 0,
+            network_latency_ms: if is_leader { 0 } else { 5 + (node_id as u32) * 3 },
+        }
+    }
+
+    pub fn set_power_reading(&mut self, power_mw: f64) {
+        self.power_reading = power_mw;
+    }
+
+    pub fn set_cpu_utilization(&mut self, util: f64) {
+        self.cpu_utilization = util.min(1.0).max(0.0);
+    }
+
+    pub fn is_responsive(&self, current_time_ms: u64) -> bool {
+        current_time_ms - self.last_sync_ms < 5000  // 5-second timeout
+    }
+}
+
+// ============================================================================
+// Part 2: Cluster Message Protocol (150 lines)
+// ============================================================================
+
+pub enum MessageType {
+    PowerReading,
+    ConsensusVote,
+    Heartbeat,
+    SyncRequest,
+    SyncAck,
+    FailoverNotice,
+}
+
+pub struct ClusterMessage {
+    pub source_node_id: u32,
+    pub dest_node_id: u32,
+    pub msg_type: MessageType,
+    pub timestamp_ms: u64,
+    pub payload: Vec<u64>,
+    pub sequence: u64,
+}
+
+impl ClusterMessage {
+    pub fn new(src: u32, dst: u32, msg_type: MessageType, ts: u64) -> Self {
+        ClusterMessage {
+            source_node_id: src,
+            dest_node_id: dst,
+            msg_type,
+            timestamp_ms: ts,
+            payload: Vec::new(),
+            sequence: 0,
+        }
+    }
+
+    pub fn add_power_reading(&mut self, power_mw: u64) {
+        self.payload.push(power_mw);
+    }
+
+    pub fn size_bytes(&self) -> u32 {
+        (self.payload.len() * 8 + 64) as u32  // Rough estimate
+    }
+}
+
+pub struct MessageQueue {
+    pub messages: Vec<ClusterMessage>,
+    pub max_size: usize,
+    pub total_transmitted: u64,  // For network metrics
+}
+
+impl MessageQueue {
+    pub fn new(max_size: usize) -> Self {
+        MessageQueue {
+            messages: Vec::new(),
+            max_size,
+            total_transmitted: 0,
+        }
+    }
+
+    pub fn enqueue(&mut self, msg: ClusterMessage) -> Result<(), String> {
+        if self.messages.len() >= self.max_size {
+            return Err("Queue full".to_string());
+        }
+        self.messages.push(msg);
+        Ok(())
+    }
+
+    pub fn dequeue(&mut self) -> Option<ClusterMessage> {
+        if self.messages.is_empty() {
+            None
+        } else {
+            Some(self.messages.remove(0))
+        }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn network_bandwidth_mw(&self) -> f64 {
+        (self.total_transmitted as f64) * 0.001  // Rough: 1 byte = 0.001 mW
+    }
+}
+
+// ============================================================================
+// Part 3: Global Cluster Metrics (170 lines)
+// ============================================================================
+
+pub struct GlobalMetrics {
+    pub total_power_mw: f64,
+    pub average_power_per_node: f64,
+    pub min_power_mw: f64,
+    pub max_power_mw: f64,
+    pub power_distribution_stddev: f64,
+    pub consensus_latency_ms: u32,
+    pub failover_count: u32,
+    pub energy_efficiency_score: f64,   // Lower = better
+    pub network_overhead_percent: f64,
+    pub timestamp_ms: u64,
+}
+
+impl GlobalMetrics {
+    pub fn new() -> Self {
+        GlobalMetrics {
+            total_power_mw: 0.0,
+            average_power_per_node: 0.0,
+            min_power_mw: 0.0,
+            max_power_mw: 0.0,
+            power_distribution_stddev: 0.0,
+            consensus_latency_ms: 0,
+            failover_count: 0,
+            energy_efficiency_score: 0.0,
+            network_overhead_percent: 0.0,
+            timestamp_ms: 0,
+        }
+    }
+
+    pub fn calculate_from_nodes(&mut self, nodes: &[ClusterNode]) {
+        if nodes.is_empty() {
+            return;
+        }
+
+        let mut readings = Vec::new();
+        let mut total = 0.0;
+
+        for node in nodes {
+            readings.push(node.power_reading);
+            total += node.power_reading;
+        }
+
+        self.total_power_mw = total;
+        self.average_power_per_node = total / nodes.len() as f64;
+        self.min_power_mw = readings.iter().copied().fold(f64::INFINITY, f64::min);
+        self.max_power_mw = readings.iter().copied().fold(0.0, f64::max);
+
+        // Standard deviation
+        let mean = self.average_power_per_node;
+        let variance = readings.iter()
+            .map(|&r| (r - mean).powi(2))
+            .sum::<f64>() / readings.len() as f64;
+        self.power_distribution_stddev = variance.sqrt();
+
+        // Efficiency: lower stddev = more balanced = better
+        self.energy_efficiency_score = self.power_distribution_stddev;
+    }
+
+    pub fn calculate_power_efficiency(&self) -> f64 {
+        if self.total_power_mw == 0.0 {
+            1000.0  // Worst case
+        } else {
+            self.energy_efficiency_score / self.total_power_mw
+        }
+    }
+
+    pub fn detect_power_imbalance(&self) -> bool {
+        // If max/min ratio > 1.5, there's imbalance
+        if self.min_power_mw > 0.0 {
+            self.max_power_mw / self.min_power_mw > 1.5
+        } else {
+            false
+        }
+    }
+
+    pub fn estimate_battery_lifetime_hours(&self, capacity_mah: u32) -> f64 {
+        if self.average_power_per_node > 0.0 {
+            let capacity_mwh = (capacity_mah as f64) * 3.7 / 1000.0;  // Wh
+            let energy_consumption_mwh = self.average_power_per_node * self.average_power_per_node;
+            capacity_mwh / energy_consumption_mwh
+        } else {
+            f64::INFINITY
+        }
+    }
+}
+
+// ============================================================================
+// Part 4: Cluster Manager (280 lines)
+// ============================================================================
+
+pub struct ClusterManager {
+    pub config: ClusterConfig,
+    pub nodes: Vec<ClusterNode>,
+    pub leader_id: u32,
+    pub consensus_term: u32,
+    pub message_queue: MessageQueue,
+    pub global_metrics: GlobalMetrics,
+    pub measurements: Vec<GlobalMetrics>,  // Historical measurements
+    pub current_time_ms: u64,
+}
+
+impl ClusterManager {
+    pub fn new(config: ClusterConfig) -> Result<Self, String> {
+        config.validate()?;
+
+        let mut nodes = Vec::new();
+        for i in 0..config.node_count {
+            let is_leader = i == 0;  // Node 0 is initial leader
+            nodes.push(ClusterNode::new(i, is_leader));
+        }
+
+        Ok(ClusterManager {
+            config,
+            nodes,
+            leader_id: 0,
+            consensus_term: 0,
+            message_queue: MessageQueue::new(1000),
+            global_metrics: GlobalMetrics::new(),
+            measurements: Vec::new(),
+            current_time_ms: 0,
+        })
+    }
+
+    pub fn add_power_reading(&mut self, node_id: usize, power_mw: f64) -> Result<(), String> {
+        if node_id >= self.nodes.len() {
+            return Err(format!("Node {} not found", node_id));
+        }
+
+        self.nodes[node_id].set_power_reading(power_mw);
+        self.nodes[node_id].last_sync_ms = self.current_time_ms;
+
+        Ok(())
+    }
+
+    pub fn simulate_step(&mut self) -> Result<GlobalMetrics, String> {
+        // Step 1: Collect power readings from all nodes
+        self.global_metrics.calculate_from_nodes(&self.nodes);
+        self.global_metrics.timestamp_ms = self.current_time_ms;
+
+        // Step 2: Check leader heartbeat
+        if !self.is_leader_responsive() {
+            self.trigger_failover()?;
+        }
+
+        // Step 3: Broadcast power readings
+        self.broadcast_power_readings()?;
+
+        // Step 4: Process pending messages
+        self.process_message_queue();
+
+        // Step 5: Record measurement
+        self.measurements.push(self.global_metrics.clone());
+
+        Ok(self.global_metrics.clone())
+    }
+
+    fn is_leader_responsive(&self) -> bool {
+        if (self.leader_id as usize) >= self.nodes.len() {
+            return false;
+        }
+        self.nodes[self.leader_id as usize].is_responsive(self.current_time_ms)
+    }
+
+    fn trigger_failover(&mut self) -> Result<(), String> {
+        // Elect new leader (next responsive node)
+        for i in 0..self.nodes.len() {
+            if i != (self.leader_id as usize) && self.nodes[i].is_responsive(self.current_time_ms) {
+                self.leader_id = i as u32;
+                self.consensus_term += 1;
+                self.global_metrics.failover_count += 1;
+                return Ok(());
+            }
+        }
+        Err("No responsive node for leader election".to_string())
+    }
+
+    fn broadcast_power_readings(&mut self) -> Result<(), String> {
+        let mut msg = ClusterMessage::new(
+            self.leader_id,
+            0xFF,  // Broadcast
+            MessageType::PowerReading,
+            self.current_time_ms
+        );
+
+        for node in &self.nodes {
+            msg.add_power_reading(node.power_reading as u64);
+        }
+
+        self.message_queue.total_transmitted += msg.size_bytes() as u64;
+        Ok(())
+    }
+
+    fn process_message_queue(&mut self) {
+        while let Some(_msg) = self.message_queue.dequeue() {
+            // Process message (simplified)
+        }
+    }
+
+    pub fn advance_time(&mut self, delta_ms: u32) {
+        self.current_time_ms += delta_ms as u64;
+    }
+
+    pub fn get_average_power_mw(&self) -> f64 {
+        self.global_metrics.average_power_per_node
+    }
+
+    pub fn get_power_reduction_percent(&self, baseline_mw: f64) -> f64 {
+        if baseline_mw > 0.0 {
+            ((baseline_mw - self.global_metrics.average_power_per_node) / baseline_mw) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    pub fn consensus_elect_leader(&mut self) -> Result<u32, String> {
+        // Simplified: elect by lowest node ID among responsive
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].is_responsive(self.current_time_ms) {
+                self.leader_id = i as u32;
+                return Ok(i as u32);
+            }
+        }
+        Err("Leader election failed".to_string())
+    }
+
+    pub fn synchronize_clock(&mut self) {
+        // All nodes sync to leader's time
+        if (self.leader_id as usize) < self.nodes.len() {
+            self.nodes[self.leader_id as usize].last_sync_ms = self.current_time_ms;
+        }
+    }
+}
+
+// ============================================================================
+// Tests (40 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cluster_config_creation() {
+        let config = ClusterConfig::new(3).unwrap();
+        assert_eq!(config.node_count, 3);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cluster_config_invalid_nodes() {
+        assert!(ClusterConfig::new(2).is_err());
+        assert!(ClusterConfig::new(6).is_err());
+    }
+
+    #[test]
+    fn test_cluster_manager_creation() {
+        let config = ClusterConfig::new(3).unwrap();
+        let manager = ClusterManager::new(config).unwrap();
+        assert_eq!(manager.nodes.len(), 3);
+        assert_eq!(manager.leader_id, 0);
+    }
+
+    #[test]
+    fn test_add_power_reading() {
+        let config = ClusterConfig::new(3).unwrap();
+        let mut manager = ClusterManager::new(config).unwrap();
+        assert!(manager.add_power_reading(0, 150.0).is_ok());
+        assert_eq!(manager.nodes[0].power_reading, 150.0);
+    }
+
+    #[test]
+    fn test_global_metrics_calculation() {
+        let config = ClusterConfig::new(3).unwrap();
+        let mut manager = ClusterManager::new(config).unwrap();
+        let _ = manager.add_power_reading(0, 150.0);
+        let _ = manager.add_power_reading(1, 160.0);
+        let _ = manager.add_power_reading(2, 140.0);
+
+        manager.global_metrics.calculate_from_nodes(&manager.nodes);
+        assert!(manager.global_metrics.average_power_per_node > 0.0);
+    }
+
+    #[test]
+    fn test_simulate_step() {
+        let config = ClusterConfig::new(3).unwrap();
+        let mut manager = ClusterManager::new(config).unwrap();
+        let _ = manager.add_power_reading(0, 150.0);
+        let _ = manager.add_power_reading(1, 160.0);
+        let _ = manager.add_power_reading(2, 140.0);
+
+        let result = manager.simulate_step();
+        assert!(result.is_ok());
+    }
+}

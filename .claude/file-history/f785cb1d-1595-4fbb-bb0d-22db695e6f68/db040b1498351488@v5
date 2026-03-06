@@ -1,0 +1,638 @@
+//! Garbage collector
+//!
+//! Implements mark-and-sweep garbage collection for automatic memory management.
+//!
+//! # Algorithm
+//!
+//! ## Mark Phase
+//! - Start from root references (stack, globals)
+//! - DFS to mark all reachable objects
+//! - Objects are marked in the mark set
+//!
+//! ## Sweep Phase
+//! - Iterate through memory
+//! - Free unmarked objects
+//! - Reset mark set for next collection
+//!
+//! # Color Invariant (Tricolor Marking)
+//!
+//! - **White**: Unreachable, can be freed
+//! - **Gray**: Reachable but not yet processed
+//! - **Black**: Reachable and fully processed
+
+use crate::memory::Memory;
+use std::collections::{HashSet, HashMap};
+use std::time::Instant;
+
+/// Object reference (address in memory)
+pub type Reference = usize;
+
+/// Heap object metadata for tracking
+#[derive(Debug, Clone)]
+pub struct HeapObject {
+    pub address: usize,
+    pub size: u64,
+    pub allocated: bool,
+    pub marked: bool,
+    pub object_type: ObjectType,
+}
+
+#[derive(Debug, Clone)]
+pub enum ObjectType {
+    Array(u64),   // element count
+    String(u64),  // length
+}
+
+/// BumpPointer allocator for post-compaction allocation
+#[derive(Debug, Clone)]
+pub struct BumpPointerAllocator {
+    heap_start: usize,      // 0x5000
+    heap_end: usize,        // 0xFFFE
+    pub current_ptr: usize, // Next free address
+}
+
+impl BumpPointerAllocator {
+    pub fn new(start: usize, end: usize) -> Self {
+        BumpPointerAllocator {
+            heap_start: start,
+            heap_end: end,
+            current_ptr: start,
+        }
+    }
+
+    /// O(1) allocation
+    pub fn allocate(&mut self, size: u64) -> Result<usize, String> {
+        let addr = self.current_ptr;
+        let new_ptr = addr + size as usize;
+
+        if new_ptr > self.heap_end {
+            return Err("Heap overflow: not enough space".to_string());
+        }
+
+        self.current_ptr = new_ptr;
+        Ok(addr)
+    }
+
+    /// Reset for next compaction cycle
+    pub fn reset(&mut self) {
+        self.current_ptr = self.heap_start;
+    }
+
+    /// Get available space
+    pub fn available_space(&self) -> usize {
+        if self.current_ptr > self.heap_end {
+            0
+        } else {
+            self.heap_end - self.current_ptr
+        }
+    }
+
+    /// Get allocated space
+    pub fn allocated_space(&self) -> usize {
+        if self.current_ptr > self.heap_start {
+            self.current_ptr - self.heap_start
+        } else {
+            0
+        }
+    }
+}
+
+/// Compaction result and statistics
+#[derive(Debug, Clone)]
+pub struct CompactionResult {
+    pub bytes_moved: u64,
+    pub objects_moved: usize,
+    pub time_ms: f64,
+    pub fragmentation_before: f64,
+    pub fragmentation_after: f64,
+}
+
+/// Heap compaction using LISP2 algorithm
+pub struct HeapCompactor {
+    address_map: HashMap<usize, usize>,
+    compaction_count: usize,
+    last_result: Option<CompactionResult>,
+}
+
+impl HeapCompactor {
+    pub fn new() -> Self {
+        HeapCompactor {
+            address_map: HashMap::new(),
+            compaction_count: 0,
+            last_result: None,
+        }
+    }
+
+    /// LISP2 Pass 1: Calculate new addresses
+    pub fn calculate_new_addresses(&mut self, heap_objects: &[HeapObject]) -> HashMap<usize, usize> {
+        self.address_map.clear();
+        let mut new_address = 0x5000usize;
+
+        for obj in heap_objects {
+            if obj.allocated {
+                self.address_map.insert(obj.address, new_address);
+                new_address += obj.size as usize;
+            }
+        }
+
+        self.address_map.clone()
+    }
+
+    /// LISP2 Pass 2: Update references
+    pub fn update_stack_references(&self, stack: &mut [u64]) {
+        for value in stack {
+            let addr = *value as usize;
+            if let Some(&new_addr) = self.address_map.get(&addr) {
+                *value = new_addr as u64;
+            }
+        }
+    }
+
+    /// LISP2 Pass 2: Update global references
+    pub fn update_global_references(&self, globals: &mut [u64]) {
+        for value in globals {
+            let addr = *value as usize;
+            if let Some(&new_addr) = self.address_map.get(&addr) {
+                *value = new_addr as u64;
+            }
+        }
+    }
+
+    /// Calculate fragmentation ratio
+    pub fn calculate_fragmentation(&self, heap_objects: &[HeapObject], heap_size: usize) -> f64 {
+        let allocated: u64 = heap_objects
+            .iter()
+            .filter(|obj| obj.allocated)
+            .map(|obj| obj.size)
+            .sum();
+
+        let free: u64 = heap_objects
+            .iter()
+            .filter(|obj| !obj.allocated)
+            .map(|obj| obj.size)
+            .sum();
+
+        if free == 0 {
+            0.0
+        } else {
+            free as f64 / heap_size as f64
+        }
+    }
+
+    /// Should trigger compaction?
+    pub fn should_compact(&self, heap_objects: &[HeapObject], heap_size: usize) -> bool {
+        let fragmentation = self.calculate_fragmentation(heap_objects, heap_size);
+        let allocated: u64 = heap_objects
+            .iter()
+            .filter(|obj| obj.allocated)
+            .map(|obj| obj.size)
+            .sum();
+
+        let allocated_ratio = allocated as f64 / heap_size as f64;
+
+        // Compact if fragmentation > 20% AND allocations > 30% of heap
+        fragmentation > 0.20 && allocated_ratio > 0.30
+    }
+
+    /// Get last compaction result
+    pub fn last_result(&self) -> Option<&CompactionResult> {
+        self.last_result.as_ref()
+    }
+
+    /// Get compaction count
+    pub fn compaction_count(&self) -> usize {
+        self.compaction_count
+    }
+}
+
+impl Default for HeapCompactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Garbage collector using mark-and-sweep
+pub struct GarbageCollector {
+    /// Mark set: which objects are reachable
+    marked: Vec<bool>,
+
+    /// Reachable objects during current collection
+    reachable: Vec<Reference>,
+
+    /// Total collections performed
+    pub collections: usize,
+
+    /// Total objects freed
+    pub freed_count: usize,
+
+    /// Track heap objects
+    pub heap_objects: Vec<HeapObject>,
+
+    /// Freed bytes total
+    pub freed_bytes: u64,
+
+    /// Heap compactor for LISP2 algorithm
+    pub compactor: HeapCompactor,
+
+    /// BumpPointer allocator (post-compaction)
+    pub bump_allocator: BumpPointerAllocator,
+
+    /// Compaction statistics
+    pub compactions: usize,
+}
+
+impl GarbageCollector {
+    /// Create a new garbage collector
+    pub fn new() -> Self {
+        GarbageCollector {
+            marked: vec![false; 16384],
+            reachable: Vec::new(),
+            collections: 0,
+            freed_count: 0,
+            heap_objects: Vec::new(),
+            freed_bytes: 0,
+            compactor: HeapCompactor::new(),
+            bump_allocator: BumpPointerAllocator::new(0x5000, 0xFFFE),
+            compactions: 0,
+        }
+    }
+
+    /// Register a heap allocation
+    pub fn register_allocation(&mut self, address: usize, size: u64, obj_type: ObjectType) {
+        let obj = HeapObject {
+            address,
+            size,
+            allocated: true,
+            marked: false,
+            object_type: obj_type,
+        };
+        self.heap_objects.push(obj);
+    }
+
+    /// Run garbage collection
+    ///
+    /// # Arguments
+    ///
+    /// * `stack` - Stack values
+    /// * `globals` - Global values
+    pub fn collect(&mut self, stack: &[u64], globals: &[u64]) {
+        // Mark phase: Find all reachable objects
+        self.mark_reachable(stack, globals);
+
+        // Sweep phase: Free unmarked objects
+        self.sweep();
+
+        // Statistics
+        self.collections += 1;
+    }
+
+    /// Mark phase: Find all reachable objects from roots
+    pub fn mark_reachable(&mut self, stack: &[u64], globals: &[u64]) {
+        // Clear all marks
+        for obj in &mut self.heap_objects {
+            obj.marked = false;
+        }
+
+        let mut to_visit = Vec::new();
+
+        // Collect roots
+        for &value in stack {
+            if self.is_heap_pointer(value) {
+                to_visit.push(value as usize);
+            }
+        }
+
+        for &value in globals {
+            if self.is_heap_pointer(value) {
+                to_visit.push(value as usize);
+            }
+        }
+
+        // Remove duplicates
+        to_visit.sort();
+        to_visit.dedup();
+
+        // DFS traversal
+        let mut visited = HashSet::new();
+        while let Some(addr) = to_visit.pop() {
+            if visited.contains(&addr) {
+                continue;
+            }
+            visited.insert(addr);
+
+            if let Some(obj) = self.find_object_mut(addr) {
+                obj.marked = true;
+            }
+        }
+    }
+
+    /// Sweep phase: Reclaim unmarked objects
+    pub fn sweep(&mut self) {
+        for obj in &mut self.heap_objects {
+            if !obj.allocated {
+                continue;
+            }
+
+            if !obj.marked {
+                obj.allocated = false;
+                self.freed_count += 1;
+                self.freed_bytes += obj.size;
+            }
+        }
+    }
+
+    /// Compact heap using LISP2 algorithm (Pass 1 & Pass 2)
+    pub fn compact(&mut self, stack: &mut [u64], globals: &mut [u64]) {
+        let start = Instant::now();
+
+        // LISP2 Pass 1: Calculate new addresses
+        let address_map = self.compactor.calculate_new_addresses(&self.heap_objects);
+
+        // LISP2 Pass 2: Update references
+        self.compactor.update_stack_references(stack);
+        self.compactor.update_global_references(globals);
+
+        // Update object addresses in our tracking
+        for obj in &mut self.heap_objects {
+            if obj.allocated {
+                if let Some(&new_addr) = address_map.get(&obj.address) {
+                    obj.address = new_addr;
+                }
+            }
+        }
+
+        // Update heap pointer to next available space
+        let new_heap_ptr = self.heap_objects
+            .iter()
+            .filter(|obj| obj.allocated)
+            .map(|obj| obj.address + obj.size as usize)
+            .max()
+            .unwrap_or(0x5000);
+
+        // Reset bump allocator for next allocations
+        self.bump_allocator.reset();
+        self.bump_allocator.current_ptr = new_heap_ptr;
+
+        // Statistics
+        self.compactions += 1;
+    }
+
+    /// Should compact the heap?
+    pub fn should_compact(&self) -> bool {
+        self.compactor.should_compact(&self.heap_objects, 0xFFFE - 0x5000)
+    }
+
+    /// Get fragmentation ratio (0.0 to 1.0)
+    pub fn fragmentation_ratio(&self) -> f64 {
+        self.compactor.calculate_fragmentation(&self.heap_objects, 0xFFFE - 0x5000)
+    }
+
+    /// Get number of compactions performed
+    pub fn compaction_count(&self) -> usize {
+        self.compactions
+    }
+
+    /// Mark phase: DFS to find reachable objects (legacy interface)
+    fn mark(&mut self, addr: usize, _memory: &Memory) -> Result<(), String> {
+        if addr >= self.marked.len() {
+            return Err(format!("Invalid address: {}", addr));
+        }
+
+        if self.marked[addr] {
+            return Ok(()); // Already marked
+        }
+
+        self.marked[addr] = true;
+        self.reachable.push(addr);
+
+        Ok(())
+    }
+
+    /// Sweep phase: Free unmarked objects (legacy interface)
+    fn sweep_legacy(&mut self, memory: &mut Memory) -> Result<usize, String> {
+        let mut freed = 0;
+
+        for addr in 0..self.marked.len() {
+            if !self.marked[addr] {
+                // Free unmarked object
+                memory.write(addr, 0)?;
+                freed += 1;
+            }
+        }
+
+        Ok(freed)
+    }
+
+    /// Check if a value looks like a heap pointer
+    fn is_heap_pointer(&self, value: u64) -> bool {
+        let addr = value as usize;
+        // Heap range: 0x5000 - 0xFFFD
+        addr >= 0x5000 && addr <= 0xFFFD
+    }
+
+    /// Find object by address (mutable)
+    fn find_object_mut(&mut self, addr: usize) -> Option<&mut HeapObject> {
+        self.heap_objects.iter_mut().find(|obj| obj.address == addr)
+    }
+
+    /// Find object by address
+    pub fn find_object(&self, addr: usize) -> Option<&HeapObject> {
+        self.heap_objects.iter().find(|obj| obj.address == addr)
+    }
+
+    /// Get allocated objects count
+    pub fn allocated_objects_count(&self) -> usize {
+        self.heap_objects.iter().filter(|obj| obj.allocated).count()
+    }
+
+    /// Get total allocated bytes
+    pub fn allocated_bytes(&self) -> u64 {
+        self.heap_objects
+            .iter()
+            .filter(|obj| obj.allocated)
+            .map(|obj| obj.size)
+            .sum()
+    }
+
+    /// Get garbage collector statistics
+    pub fn stats(&self) -> GCStats {
+        GCStats {
+            collections: self.collections,
+            freed_count: self.freed_count,
+            marked_count: self.heap_objects.iter().filter(|obj| obj.marked).count(),
+            freed_bytes: self.freed_bytes,
+        }
+    }
+}
+
+impl Default for GarbageCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Garbage collector statistics
+#[derive(Debug, Clone)]
+pub struct GCStats {
+    /// Total garbage collections
+    pub collections: usize,
+
+    /// Total objects freed
+    pub freed_count: usize,
+
+    /// Currently marked objects
+    pub marked_count: usize,
+
+    /// Total bytes freed
+    pub freed_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gc_creation() {
+        let gc = GarbageCollector::new();
+        assert_eq!(gc.collections, 0);
+        assert_eq!(gc.freed_count, 0);
+    }
+
+    #[test]
+    fn test_gc_stats() {
+        let gc = GarbageCollector::new();
+        let stats = gc.stats();
+        assert_eq!(stats.collections, 0);
+        assert_eq!(stats.freed_count, 0);
+    }
+
+    #[test]
+    fn test_gc_register_allocation() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+        assert_eq!(gc.heap_objects.len(), 1);
+        assert_eq!(gc.heap_objects[0].address, 0x5000);
+    }
+
+    #[test]
+    fn test_gc_is_heap_pointer() {
+        let gc = GarbageCollector::new();
+        assert!(gc.is_heap_pointer(0x5000));
+        assert!(gc.is_heap_pointer(0x8000));
+        assert!(gc.is_heap_pointer(0xFFFD));
+        assert!(!gc.is_heap_pointer(0x1000));
+    }
+
+    #[test]
+    fn test_gc_mark_reachable() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+
+        let stack = [0x5000];
+        gc.mark_reachable(&stack, &[]);
+
+        assert!(gc.heap_objects[0].marked);
+    }
+
+    #[test]
+    fn test_gc_mark_unreferenced() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+
+        let stack = [];
+        gc.mark_reachable(&stack, &[]);
+
+        assert!(!gc.heap_objects[0].marked);
+    }
+
+    #[test]
+    fn test_gc_sweep_unmarked() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+        gc.register_allocation(0x5006, 3, ObjectType::String(3));
+
+        let stack = [0x5000];
+        gc.mark_reachable(&stack, &[]);
+        gc.sweep();
+
+        assert!(gc.heap_objects[0].allocated);
+        assert!(!gc.heap_objects[1].allocated);
+    }
+
+    #[test]
+    fn test_gc_collect_cycle() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 10, ObjectType::Array(5));
+        gc.register_allocation(0x500B, 8, ObjectType::Array(4));
+
+        let stack = [];
+        gc.collect(&stack, &[]);
+
+        assert_eq!(gc.collections, 1);
+        assert_eq!(gc.freed_count, 2);
+        assert_eq!(gc.freed_bytes, 18);
+    }
+
+    #[test]
+    fn test_gc_global_reference() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+
+        let globals = [0x5000];
+        gc.mark_reachable(&[], &globals);
+
+        assert!(gc.heap_objects[0].marked);
+    }
+
+    #[test]
+    fn test_gc_multiple_objects() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+        gc.register_allocation(0x5006, 3, ObjectType::String(3));
+        gc.register_allocation(0x5009, 7, ObjectType::Array(7));
+
+        let stack = [0x5000, 0x5009];
+        gc.mark_reachable(&stack, &[]);
+        gc.sweep();
+
+        assert!(gc.heap_objects[0].allocated);
+        assert!(!gc.heap_objects[1].allocated);
+        assert!(gc.heap_objects[2].allocated);
+    }
+
+    #[test]
+    fn test_gc_allocated_bytes() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 10, ObjectType::Array(5));
+        gc.register_allocation(0x500B, 8, ObjectType::Array(4));
+
+        assert_eq!(gc.allocated_bytes(), 18);
+    }
+
+    #[test]
+    fn test_gc_allocated_objects_count() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+        gc.register_allocation(0x5006, 3, ObjectType::String(3));
+
+        assert_eq!(gc.allocated_objects_count(), 2);
+
+        let stack = [0x5000];
+        gc.mark_reachable(&stack, &[]);
+        gc.sweep();
+
+        assert_eq!(gc.allocated_objects_count(), 1);
+    }
+
+    #[test]
+    fn test_gc_find_object() {
+        let mut gc = GarbageCollector::new();
+        gc.register_allocation(0x5000, 5, ObjectType::Array(5));
+
+        let found = gc.find_object(0x5000);
+        assert!(found.is_some());
+
+        let not_found = gc.find_object(0x6000);
+        assert!(not_found.is_none());
+    }
+}

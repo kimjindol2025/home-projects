@@ -1,0 +1,499 @@
+// FreeLang-LLC: ManagedPointer Implementation
+// Purpose: Safe low-level memory access (C-pointer power + FreeLang integrity)
+// Philosophy: Direct address control without undefined behavior
+
+// ============================================================================
+// Part 1: ManagedPointer Core Structure (200 lines)
+// ============================================================================
+
+pub struct ManagedPointer {
+    pub address: u64,           // Raw memory address
+    pub size_bytes: u64,        // Valid memory region size
+    pub is_volatile: bool,      // Is this a volatile MMIO region?
+    pub element_type: String,   // Type name for bounds checking ("u32", "u64", etc)
+    pub lifetime_id: u64,       // Unique ID for lifetime tracking
+    pub created_at_ns: u64,     // Creation timestamp (nanoseconds)
+}
+
+impl ManagedPointer {
+    // Constructor: Create a managed pointer from raw address
+    pub fn new(address: u64, size_bytes: u64, element_type: String) -> Self {
+        ManagedPointer {
+            address,
+            size_bytes,
+            is_volatile: false,
+            element_type,
+            lifetime_id: Self::generate_lifetime_id(),
+            created_at_ns: Self::current_ns(),
+        }
+    }
+
+    // Create a volatile MMIO pointer
+    pub fn new_volatile(address: u64, size_bytes: u64, element_type: String) -> Self {
+        let mut ptr = Self::new(address, size_bytes, element_type);
+        ptr.is_volatile = true;
+        ptr
+    }
+
+    // Null pointer (invalid by design)
+    pub fn null() -> Self {
+        ManagedPointer {
+            address: 0,
+            size_bytes: 0,
+            is_volatile: false,
+            element_type: "null".to_string(),
+            lifetime_id: 0,
+            created_at_ns: 0,
+        }
+    }
+
+    // Check if pointer is valid
+    pub fn is_valid(&self) -> bool {
+        self.address != 0 && self.size_bytes > 0 && self.lifetime_id > 0
+    }
+
+    // Check if pointer is null
+    pub fn is_null(&self) -> bool {
+        self.address == 0
+    }
+
+    // Get pointer value (address)
+    pub fn as_u64(&self) -> u64 {
+        self.address
+    }
+
+    // Generate unique lifetime ID
+    fn generate_lifetime_id() -> u64 {
+        // In real implementation, would use atomic counter
+        // For now, use timestamp-based ID
+        Self::current_ns()
+    }
+
+    // Get current time in nanoseconds
+    fn current_ns() -> u64 {
+        // Simulated: In actual implementation, use system clock
+        1000000000u64  // Placeholder: 1 second in ns
+    }
+
+    pub fn lifetime_age_ns(&self) -> u64 {
+        Self::current_ns() - self.created_at_ns
+    }
+}
+
+// ============================================================================
+// Part 2: Bounds Checking (150 lines)
+// ============================================================================
+
+pub struct BoundsCheckResult {
+    pub valid: bool,
+    pub offset: u64,
+    pub reason: String,
+}
+
+impl BoundsCheckResult {
+    pub fn success(offset: u64) -> Self {
+        BoundsCheckResult {
+            valid: true,
+            offset,
+            reason: "OK".to_string(),
+        }
+    }
+
+    pub fn failure(reason: String) -> Self {
+        BoundsCheckResult {
+            valid: false,
+            offset: 0,
+            reason,
+        }
+    }
+}
+
+pub fn calculate_element_size(element_type: &str) -> u64 {
+    match element_type {
+        "u8" | "i8" | "bool" => 1,
+        "u16" | "i16" => 2,
+        "u32" | "i32" | "f32" => 4,
+        "u64" | "i64" | "f64" | "ptr" => 8,
+        "u128" | "i128" => 16,
+        _ => 8,  // Default to 8 bytes
+    }
+}
+
+pub fn check_bounds(ptr: &ManagedPointer, offset: u64) -> BoundsCheckResult {
+    // Rule 1: Pointer must be valid
+    if !ptr.is_valid() {
+        return BoundsCheckResult::failure("Pointer is null or invalid".to_string());
+    }
+
+    // Rule 2: Offset must not exceed size
+    let element_size = calculate_element_size(&ptr.element_type);
+    let required_size = offset + element_size;
+
+    if required_size > ptr.size_bytes {
+        let reason = format!(
+            "Bounds violation: offset {} + element_size {} > size {}",
+            offset, element_size, ptr.size_bytes
+        );
+        return BoundsCheckResult::failure(reason);
+    }
+
+    // Rule 3: Offset must be aligned (4-byte alignment for safety)
+    if offset % 4 != 0 && ptr.element_type != "u8" && ptr.element_type != "i8" {
+        let reason = format!("Unaligned access: offset {} not 4-byte aligned", offset);
+        return BoundsCheckResult::failure(reason);
+    }
+
+    BoundsCheckResult::success(offset)
+}
+
+pub fn check_bounds_read(ptr: &ManagedPointer, offset: u64) -> BoundsCheckResult {
+    check_bounds(ptr, offset)
+}
+
+pub fn check_bounds_write(ptr: &ManagedPointer, offset: u64) -> BoundsCheckResult {
+    check_bounds(ptr, offset)
+}
+
+// ============================================================================
+// Part 3: Memory Operations (200 lines)
+// ============================================================================
+
+pub struct MemoryOperation {
+    pub op_type: String,        // "read", "write", "volatile_read", "volatile_write"
+    pub ptr: ManagedPointer,
+    pub offset: u64,
+    pub value: Option<u64>,     // For writes
+    pub latency_ns: u64,        // Measured access time
+    pub is_volatile: bool,
+}
+
+impl MemoryOperation {
+    pub fn new_read(ptr: ManagedPointer, offset: u64) -> Self {
+        MemoryOperation {
+            op_type: "read".to_string(),
+            ptr: ptr.clone(),
+            offset,
+            value: None,
+            latency_ns: 0,
+            is_volatile: ptr.is_volatile,
+        }
+    }
+
+    pub fn new_write(ptr: ManagedPointer, offset: u64, value: u64) -> Self {
+        MemoryOperation {
+            op_type: "write".to_string(),
+            ptr: ptr.clone(),
+            offset,
+            value: Some(value),
+            latency_ns: 0,
+            is_volatile: ptr.is_volatile,
+        }
+    }
+}
+
+// Safe read operation with bounds checking
+pub fn safe_read(ptr: &ManagedPointer, offset: u64) -> Result<u64, String> {
+    let check = check_bounds_read(ptr, offset);
+    if !check.valid {
+        return Err(check.reason);
+    }
+
+    // Simulate reading from address (in real impl, would use unsafe block)
+    let actual_address = ptr.address + offset;
+    let value = simulate_memory_read(actual_address);
+    Ok(value)
+}
+
+// Safe write operation with bounds checking
+pub fn safe_write(ptr: &ManagedPointer, offset: u64, value: u64) -> Result<(), String> {
+    let check = check_bounds_write(ptr, offset);
+    if !check.valid {
+        return Err(check.reason);
+    }
+
+    // Simulate writing to address (in real impl, would use unsafe block)
+    let actual_address = ptr.address + offset;
+    simulate_memory_write(actual_address, value);
+    Ok(())
+}
+
+// Volatile read (for MMIO): Prevents optimization/reordering
+pub fn volatile_read(ptr: &ManagedPointer, offset: u64) -> Result<u64, String> {
+    if !ptr.is_volatile {
+        return Err("volatile_read on non-volatile pointer".to_string());
+    }
+
+    let check = check_bounds_read(ptr, offset);
+    if !check.valid {
+        return Err(check.reason);
+    }
+
+    // Insert memory barrier before read (simulated)
+    memory_barrier();
+
+    let actual_address = ptr.address + offset;
+    let value = simulate_memory_read(actual_address);
+
+    // Insert memory barrier after read (simulated)
+    memory_barrier();
+
+    Ok(value)
+}
+
+// Volatile write (for MMIO): Prevents optimization/reordering
+pub fn volatile_write(ptr: &ManagedPointer, offset: u64, value: u64) -> Result<(), String> {
+    if !ptr.is_volatile {
+        return Err("volatile_write on non-volatile pointer".to_string());
+    }
+
+    let check = check_bounds_write(ptr, offset);
+    if !check.valid {
+        return Err(check.reason);
+    }
+
+    // Insert memory barrier before write (simulated)
+    memory_barrier();
+
+    let actual_address = ptr.address + offset;
+    simulate_memory_write(actual_address, value);
+
+    // Insert memory barrier after write (simulated)
+    memory_barrier();
+
+    Ok(())
+}
+
+// Simulate memory operations (in real impl, would use unsafe { } blocks)
+fn simulate_memory_read(address: u64) -> u64 {
+    // Placeholder: return pseudo-random value based on address
+    (address * 31 + 17) ^ 0xDEADBEEF
+}
+
+fn simulate_memory_write(address: u64, value: u64) {
+    // Placeholder: just record the operation
+    let _ = (address, value);  // Silence unused warning
+}
+
+// Memory barrier (prevents compiler/CPU reordering)
+fn memory_barrier() {
+    // Placeholder: would be compiler intrinsic
+    // __asm__("mfence");  // x86_64
+    // __asm__("dmb sy");  // ARM64
+}
+
+// ============================================================================
+// Part 4: Pointer Arithmetic (150 lines)
+// ============================================================================
+
+pub fn offset(ptr: &ManagedPointer, byte_offset: u64) -> Result<ManagedPointer, String> {
+    // Check if new address is still within bounds
+    let check = check_bounds(ptr, byte_offset);
+    if !check.valid {
+        return Err(check.reason);
+    }
+
+    // Create new pointer with adjusted address and reduced size
+    Ok(ManagedPointer {
+        address: ptr.address + byte_offset,
+        size_bytes: ptr.size_bytes - byte_offset,
+        is_volatile: ptr.is_volatile,
+        element_type: ptr.element_type.clone(),
+        lifetime_id: ptr.lifetime_id,  // Same lifetime
+        created_at_ns: ptr.created_at_ns,
+    })
+}
+
+pub fn stride(ptr: &ManagedPointer, element_index: u64) -> Result<ManagedPointer, String> {
+    let element_size = calculate_element_size(&ptr.element_type);
+    let byte_offset = element_index * element_size;
+    offset(ptr, byte_offset)
+}
+
+pub fn difference(ptr1: &ManagedPointer, ptr2: &ManagedPointer) -> Result<i64, String> {
+    if ptr1.lifetime_id != ptr2.lifetime_id {
+        return Err("Cannot subtract pointers from different allocations".to_string());
+    }
+
+    let diff = (ptr1.address as i64) - (ptr2.address as i64);
+    Ok(diff)
+}
+
+// ============================================================================
+// Part 5: Lifetime Tracking (100 lines)
+// ============================================================================
+
+pub struct PointerLifetime {
+    pub lifetime_id: u64,
+    pub created_at_ns: u64,
+    pub access_count: u64,
+    pub violation_count: u64,
+}
+
+pub fn track_access(ptr: &mut ManagedPointer) {
+    // Would increment access counter in real impl
+    let _ = ptr;  // Silence unused warning
+}
+
+pub fn track_violation(lifetime: &mut PointerLifetime) {
+    lifetime.violation_count += 1;
+}
+
+pub fn validate_lifetime(ptr: &ManagedPointer, max_age_ns: u64) -> bool {
+    let age = ptr.lifetime_age_ns();
+    age <= max_age_ns
+}
+
+// Clone pointer (creates new instance with same address/size)
+impl Clone for ManagedPointer {
+    fn clone(&self) -> Self {
+        ManagedPointer {
+            address: self.address,
+            size_bytes: self.size_bytes,
+            is_volatile: self.is_volatile,
+            element_type: self.element_type.clone(),
+            lifetime_id: self.lifetime_id,
+            created_at_ns: self.created_at_ns,
+        }
+    }
+}
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_managed_pointer_creation() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        assert!(ptr.is_valid());
+        assert_eq!(ptr.address, 0x1000);
+        assert_eq!(ptr.size_bytes, 256);
+    }
+
+    #[test]
+    fn test_null_pointer() {
+        let ptr = ManagedPointer::null();
+        assert!(!ptr.is_valid());
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn test_bounds_check_valid() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let check = check_bounds(&ptr, 0);
+        assert!(check.valid);
+    }
+
+    #[test]
+    fn test_bounds_check_invalid() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let check = check_bounds(&ptr, 300);
+        assert!(!check.valid);
+    }
+
+    #[test]
+    fn test_volatile_pointer_creation() {
+        let ptr = ManagedPointer::new_volatile(0xDEAD0000, 4096, "u64".to_string());
+        assert!(ptr.is_volatile);
+        assert!(ptr.is_valid());
+    }
+
+    #[test]
+    fn test_safe_read() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let result = safe_read(&ptr, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_safe_write() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let result = safe_write(&ptr, 0, 42);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_element_size_u32() {
+        let size = calculate_element_size("u32");
+        assert_eq!(size, 4);
+    }
+
+    #[test]
+    fn test_element_size_u64() {
+        let size = calculate_element_size("u64");
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn test_pointer_offset() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let offset_ptr = offset(&ptr, 16).unwrap();
+        assert_eq!(offset_ptr.address, 0x1010);
+        assert_eq!(offset_ptr.size_bytes, 240);
+    }
+
+    #[test]
+    fn test_pointer_stride() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let strided = stride(&ptr, 2).unwrap();
+        assert_eq!(strided.address, 0x1008);  // 2 * 4 bytes
+    }
+
+    #[test]
+    fn test_pointer_difference() {
+        let ptr1 = ManagedPointer::new(0x2000, 256, "u32".to_string());
+        let ptr2_result = offset(&ptr1, 32);
+        assert!(ptr2_result.is_ok());
+        let ptr2 = ptr2_result.unwrap();
+        let diff = difference(&ptr2, &ptr1).unwrap();
+        assert_eq!(diff, 32);
+    }
+
+    #[test]
+    fn test_lifetime_validation() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        assert!(validate_lifetime(&ptr, 1000000000));  // Very large age limit
+    }
+
+    #[test]
+    fn test_volatile_read_on_non_volatile() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let result = volatile_read(&ptr, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_volatile_write_on_non_volatile() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        let result = volatile_write(&ptr, 0, 42);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_volatile_read_valid() {
+        let ptr = ManagedPointer::new_volatile(0x1000, 256, "u32".to_string());
+        let result = volatile_read(&ptr, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_volatile_write_valid() {
+        let ptr = ManagedPointer::new_volatile(0x1000, 256, "u32".to_string());
+        let result = volatile_write(&ptr, 0, 42);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bounds_check_alignment() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u32".to_string());
+        // Unaligned offset (not 4-byte aligned) should fail
+        let check = check_bounds(&ptr, 1);
+        assert!(!check.valid);
+    }
+
+    #[test]
+    fn test_bounds_check_u8_no_alignment() {
+        let ptr = ManagedPointer::new(0x1000, 256, "u8".to_string());
+        // u8 should allow unaligned access
+        let check = check_bounds(&ptr, 1);
+        assert!(check.valid);
+    }
+}

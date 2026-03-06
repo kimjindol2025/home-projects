@@ -1,0 +1,393 @@
+// Green-Distributed-Fabric Phase 2 Week 2: Multi-Node Power Scenarios
+// Purpose: Simulate 8+ realistic cluster scenarios and measure power
+// Strategy: Profile-based scenarios with temporal dynamics
+
+// ============================================================================
+// Part 1: Scenario Definitions (200 lines)
+// ============================================================================
+
+pub enum PowerScenario {
+    AllNodesIdle,                // 3-5 × 10mW = 30-50mW (baseline sleep)
+    BalancedLoad,                // 3-5 × 40mW = 120-200mW (all compute)
+    LeaderIntensive,             // 1×200mW + 2-4×30mW = 260-320mW (leader busy)
+    ReplicationBurst,            // Leader 200mW + Replicas 150mW sync (network)
+    FailoverEvent,               // Old leader fails, new one elected
+    NetworkPartition,            // Split brain scenario (isolation)
+    CachedHit,                   // All nodes serve from cache (10mW each)
+    DiskWriteStorm,              // All nodes I/O intensive (150mW each)
+}
+
+pub struct ScenarioConfig {
+    pub scenario: PowerScenario,
+    pub node_count: u32,
+    pub duration_sec: u32,
+    pub baseline_per_node_mw: f64,
+    pub peak_per_node_mw: f64,
+}
+
+impl ScenarioConfig {
+    pub fn new(scenario: PowerScenario, nodes: u32) -> Self {
+        let (baseline, peak) = match scenario {
+            PowerScenario::AllNodesIdle => (10.0, 15.0),
+            PowerScenario::BalancedLoad => (40.0, 80.0),
+            PowerScenario::LeaderIntensive => (80.0, 200.0),  // Leader heavy
+            PowerScenario::ReplicationBurst => (100.0, 200.0),
+            PowerScenario::FailoverEvent => (50.0, 250.0),
+            PowerScenario::NetworkPartition => (60.0, 180.0),
+            PowerScenario::CachedHit => (10.0, 20.0),
+            PowerScenario::DiskWriteStorm => (150.0, 200.0),
+        };
+
+        ScenarioConfig {
+            scenario,
+            node_count: nodes,
+            duration_sec: 60,
+            baseline_per_node_mw: baseline,
+            peak_per_node_mw: peak,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        let scenario_name = match self.scenario {
+            PowerScenario::AllNodesIdle => "AllNodesIdle",
+            PowerScenario::BalancedLoad => "BalancedLoad",
+            PowerScenario::LeaderIntensive => "LeaderIntensive",
+            PowerScenario::ReplicationBurst => "ReplicationBurst",
+            PowerScenario::FailoverEvent => "FailoverEvent",
+            PowerScenario::NetworkPartition => "NetworkPartition",
+            PowerScenario::CachedHit => "CachedHit",
+            PowerScenario::DiskWriteStorm => "DiskWriteStorm",
+        };
+
+        format!(
+            "{}: {} nodes, baseline={:.0}mW/node, peak={:.0}mW/node, duration={}s",
+            scenario_name, self.node_count, self.baseline_per_node_mw, self.peak_per_node_mw, self.duration_sec
+        )
+    }
+
+    pub fn expected_total_power(&self) -> f64 {
+        self.baseline_per_node_mw * self.node_count as f64
+    }
+}
+
+// ============================================================================
+// Part 2: Scenario Simulator (220 lines)
+// ============================================================================
+
+pub struct ScenarioSimulator {
+    pub config: ScenarioConfig,
+    pub elapsed_ms: u32,
+    pub node_powers: Vec<f64>,
+    pub measurements: Vec<f64>,
+    pub consensus_latency_ms: u32,
+    pub failover_occurred: bool,
+}
+
+impl ScenarioSimulator {
+    pub fn new(config: ScenarioConfig) -> Self {
+        let node_count = config.node_count as usize;
+        ScenarioSimulator {
+            config,
+            elapsed_ms: 0,
+            node_powers: vec![config.baseline_per_node_mw; node_count],
+            measurements: Vec::new(),
+            consensus_latency_ms: 0,
+            failover_occurred: false,
+        }
+    }
+
+    pub fn simulate_step(&mut self) -> Result<f64, String> {
+        // Update node powers based on scenario
+        self.update_node_powers();
+
+        // Aggregate power
+        let total_power: f64 = self.node_powers.iter().sum();
+        self.measurements.push(total_power);
+
+        // Check for events (failover, partition recovery, etc.)
+        self.check_events();
+
+        self.elapsed_ms += 100;  // 100ms steps
+
+        if self.elapsed_ms > self.config.duration_sec * 1000 {
+            return Err("Scenario complete".to_string());
+        }
+
+        Ok(total_power)
+    }
+
+    fn update_node_powers(&mut self) {
+        let phase = (self.elapsed_ms as f64) / (self.config.duration_sec as f64 * 1000.0);
+
+        match self.config.scenario {
+            PowerScenario::AllNodesIdle => {
+                // Constant low power
+                for power in &mut self.node_powers {
+                    *power = self.config.baseline_per_node_mw;
+                }
+            }
+
+            PowerScenario::BalancedLoad => {
+                // All nodes working equally
+                for power in &mut self.node_powers {
+                    *power = self.config.baseline_per_node_mw +
+                        (self.config.peak_per_node_mw - self.config.baseline_per_node_mw) *
+                        (phase * std::f64::consts::PI * 2.0).sin().abs();
+                }
+            }
+
+            PowerScenario::LeaderIntensive => {
+                // Leader (node 0) uses more power
+                for (i, power) in self.node_powers.iter_mut().enumerate() {
+                    if i == 0 {
+                        *power = self.config.peak_per_node_mw;  // Leader intensive
+                    } else {
+                        *power = self.config.baseline_per_node_mw;
+                    }
+                }
+            }
+
+            PowerScenario::ReplicationBurst => {
+                // Periodic spikes as replication happens
+                let spike_freq = (phase * 4.0).sin() > 0.0;  // 4 spikes per scenario
+                for power in &mut self.node_powers {
+                    if spike_freq {
+                        *power = self.config.peak_per_node_mw;
+                    } else {
+                        *power = self.config.baseline_per_node_mw;
+                    }
+                }
+            }
+
+            PowerScenario::FailoverEvent => {
+                // High power during failover (election + catch-up)
+                if phase < 0.2 {
+                    // Failover happens in first 20%
+                    for power in &mut self.node_powers {
+                        *power = self.config.peak_per_node_mw;
+                    }
+                    self.failover_occurred = true;
+                } else {
+                    // Return to normal
+                    for power in &mut self.node_powers {
+                        *power = self.config.baseline_per_node_mw;
+                    }
+                }
+            }
+
+            PowerScenario::NetworkPartition => {
+                // Split power as nodes communicate across partition
+                if phase < 0.5 {
+                    // Partition active
+                    for (i, power) in self.node_powers.iter_mut().enumerate() {
+                        if i < self.config.node_count as usize / 2 {
+                            *power = self.config.baseline_per_node_mw + 50.0;
+                        } else {
+                            *power = self.config.baseline_per_node_mw + 30.0;
+                        }
+                    }
+                } else {
+                    // Partition resolved
+                    for power in &mut self.node_powers {
+                        *power = self.config.baseline_per_node_mw;
+                    }
+                }
+            }
+
+            PowerScenario::CachedHit => {
+                // Minimal power from cache serving
+                for power in &mut self.node_powers {
+                    *power = self.config.baseline_per_node_mw;
+                }
+            }
+
+            PowerScenario::DiskWriteStorm => {
+                // All nodes doing I/O
+                for power in &mut self.node_powers {
+                    *power = self.config.peak_per_node_mw;
+                }
+            }
+        }
+    }
+
+    fn check_events(&mut self) {
+        // Simulate consensus reaching (happens periodically)
+        if self.elapsed_ms % 5000 == 0 && self.elapsed_ms > 0 {
+            self.consensus_latency_ms = 50;  // ~50ms consensus round trip
+        }
+    }
+
+    pub fn get_average_power(&self) -> f64 {
+        if self.measurements.is_empty() {
+            return 0.0;
+        }
+        self.measurements.iter().sum::<f64>() / self.measurements.len() as f64
+    }
+
+    pub fn get_peak_power(&self) -> f64 {
+        self.measurements.iter().copied().fold(0.0, f64::max)
+    }
+
+    pub fn get_min_power(&self) -> f64 {
+        self.measurements.iter().copied().fold(f64::INFINITY, f64::min)
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "Scenario {}: avg={:.0}mW, peak={:.0}mW, min={:.0}mW, consensus={}ms, failover={}",
+            self.config.describe(),
+            self.get_average_power(),
+            self.get_peak_power(),
+            self.get_min_power(),
+            self.consensus_latency_ms,
+            if self.failover_occurred { "YES" } else { "NO" }
+        )
+    }
+}
+
+// ============================================================================
+// Part 3: Scenario Results Validation (140 lines)
+// ============================================================================
+
+pub struct ScenarioResults {
+    pub scenario_name: String,
+    pub average_power_mw: f64,
+    pub expected_power_mw: f64,
+    pub accuracy_percent: f64,
+    pub test_passed: bool,
+}
+
+impl ScenarioResults {
+    pub fn new(name: String, avg: f64, expected: f64) -> Self {
+        let accuracy = if expected > 0.0 {
+            ((avg / expected).max(0.5).min(2.0) * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        let test_passed = (avg / expected - 1.0).abs() < 0.3;  // Within 30%
+
+        ScenarioResults {
+            scenario_name: name,
+            average_power_mw: avg,
+            expected_power_mw: expected,
+            accuracy_percent: accuracy,
+            test_passed,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let status = if self.test_passed { "✅ PASS" } else { "❌ FAIL" };
+        format!(
+            "{}: avg={:.0}mW, expected={:.0}mW, accuracy={:.0}%, {}",
+            self.scenario_name, self.average_power_mw, self.expected_power_mw,
+            self.accuracy_percent, status
+        )
+    }
+}
+
+pub struct ScenarioTestSuite {
+    pub results: Vec<ScenarioResults>,
+}
+
+impl ScenarioTestSuite {
+    pub fn new() -> Self {
+        ScenarioTestSuite {
+            results: Vec::new(),
+        }
+    }
+
+    pub fn add_result(&mut self, result: ScenarioResults) {
+        self.results.push(result);
+    }
+
+    pub fn overall_pass_rate(&self) -> f64 {
+        if self.results.is_empty() {
+            return 0.0;
+        }
+        let passed = self.results.iter().filter(|r| r.test_passed).count();
+        (passed as f64) / (self.results.len() as f64)
+    }
+
+    pub fn summary(&self) -> String {
+        let pass_rate = self.overall_pass_rate();
+        format!(
+            "Scenario Test Suite: {}/{} passed ({:.0}% pass rate)",
+            self.results.iter().filter(|r| r.test_passed).count(),
+            self.results.len(),
+            pass_rate * 100.0
+        )
+    }
+}
+
+// ============================================================================
+// Tests (60 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scenario_config_creation() {
+        let config = ScenarioConfig::new(PowerScenario::AllNodesIdle, 3);
+        assert_eq!(config.node_count, 3);
+        assert!(config.baseline_per_node_mw > 0.0);
+    }
+
+    #[test]
+    fn test_scenario_simulator() {
+        let config = ScenarioConfig::new(PowerScenario::BalancedLoad, 3);
+        let mut sim = ScenarioSimulator::new(config);
+
+        for _ in 0..10 {
+            let _ = sim.simulate_step();
+        }
+
+        assert!(!sim.measurements.is_empty());
+        assert!(sim.get_average_power() > 0.0);
+    }
+
+    #[test]
+    fn test_all_scenarios() {
+        let scenarios = vec![
+            PowerScenario::AllNodesIdle,
+            PowerScenario::BalancedLoad,
+            PowerScenario::LeaderIntensive,
+            PowerScenario::ReplicationBurst,
+            PowerScenario::CachedHit,
+            PowerScenario::DiskWriteStorm,
+        ];
+
+        for scenario in scenarios {
+            let config = ScenarioConfig::new(scenario, 3);
+            let mut sim = ScenarioSimulator::new(config);
+
+            for _ in 0..5 {
+                let _ = sim.simulate_step();
+            }
+
+            assert!(sim.get_average_power() >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_failover_event() {
+        let config = ScenarioConfig::new(PowerScenario::FailoverEvent, 3);
+        let mut sim = ScenarioSimulator::new(config);
+
+        while sim.simulate_step().is_ok() {}
+
+        assert!(sim.failover_occurred);
+    }
+
+    #[test]
+    fn test_scenario_results() {
+        let result = ScenarioResults::new(
+            "TestScenario".to_string(),
+            150.0,  // measured
+            150.0   // expected
+        );
+
+        assert!(result.test_passed);
+    }
+}

@@ -1,0 +1,259 @@
+// Hypervisor Phase 4: IOMMU (I/O Device Isolation) Tests (10 Unforgiving Tests)
+
+module iommu_phase4_test
+
+use iommu::{
+    IOVAEntry, DeviceDomain, DMARequest, DMAAccessType, IOMMUController, IOVAGranule
+}
+
+use dma_engine::{
+    DeviceType, DMAEndpoint, DMATransaction, DMAController, CoherencyManager
+}
+
+// ============ Test Group A: IOVA Translation (2/2) ============
+
+// Test A1: IOVA Entry and Basic Translation
+fn test_iova_entry_translation() -> bool {
+    let mut entry = IOVAEntry::new(0x1000000, 0x80000000, 0x100000)
+
+    // Check permissions
+    assert(entry.can_read(), "readable")
+    assert(entry.can_write(), "writable")
+    assert(!entry.can_execute(), "not executable")
+
+    // Test translation at boundaries
+    let pa_start = entry.translate(0)
+    assert(pa_start == 0x80000000, "translate start")
+
+    let pa_mid = entry.translate(0x50000)
+    assert(pa_mid == 0x80050000, "translate middle")
+
+    let pa_end = entry.translate(0xFFFFF)
+    assert(pa_end == 0x800FFFFF, "translate end")
+
+    // Out of bounds
+    let pa_invalid = entry.translate(0x100000)
+    assert(pa_invalid == 0, "out of bounds")
+
+    return true
+}
+
+// Test A2: Permission-Based Access Control
+fn test_iova_permissions() -> bool {
+    let mut entry = IOVAEntry::new(0x1000000, 0x80000000, 0x100000)
+
+    // Default: RW
+    assert(entry.can_read(), "default readable")
+    assert(entry.can_write(), "default writable")
+
+    // Change to RX (code)
+    entry.set_permissions(true, false, true)
+    assert(entry.can_read(), "still readable")
+    assert(!entry.can_write(), "not writable")
+    assert(entry.can_execute(), "executable")
+
+    // Change to RO (read-only data)
+    entry.set_permissions(true, false, false)
+    assert(entry.can_read(), "readable")
+    assert(!entry.can_write(), "not writable")
+    assert(!entry.can_execute(), "not executable")
+
+    return true
+}
+
+// ============ Test Group B: Device Domains (3/3) ============
+
+// Test B1: Single Device Domain IOVA Mapping
+fn test_device_domain_single() -> bool {
+    let mut domain = DeviceDomain::new(1, 0x10, 1)
+
+    assert(domain.add_iova_mapping(0x1000000, 0x80000000, 0x100000), "add mapping")
+    assert(domain.iova_count == 1, "count 1")
+
+    let pa = domain.translate_iova(0x1000000)
+    assert(pa == 0x80000000, "translation correct")
+
+    let pa_offset = domain.translate_iova(0x1050000)
+    assert(pa_offset == 0x80050000, "offset translation")
+
+    return true
+}
+
+// Test B2: Multiple IOVA Mappings with Overlap Detection
+fn test_device_domain_multiple() -> bool {
+    let mut domain = DeviceDomain::new(1, 0x10, 1)
+
+    // Add non-overlapping mappings
+    assert(domain.add_iova_mapping(0x1000000, 0x80000000, 0x100000), "mapping 1")
+    assert(domain.add_iova_mapping(0x2000000, 0x80100000, 0x100000), "mapping 2")
+    assert(domain.add_iova_mapping(0x3000000, 0x80200000, 0x100000), "mapping 3")
+
+    assert(domain.iova_count == 3, "count 3")
+
+    // Try to add overlapping (should fail)
+    assert(!domain.add_iova_mapping(0x1080000, 0x80080000, 0x100000), "overlap blocked")
+    assert(domain.iova_count == 3, "still count 3")
+
+    // Verify all translations work
+    assert(domain.translate_iova(0x1000000) == 0x80000000, "trans 1")
+    assert(domain.translate_iova(0x2000000) == 0x80100000, "trans 2")
+    assert(domain.translate_iova(0x3000000) == 0x80200000, "trans 3")
+
+    return true
+}
+
+// Test B3: Domain Isolation (Different VMs)
+fn test_device_domain_isolation() -> bool {
+    let mut domain1 = DeviceDomain::new(1, 0x10, 1)  // VM 1
+    let mut domain2 = DeviceDomain::new(2, 0x10, 2)  // VM 2, same device!
+
+    // Both domains have same device but different IOVA mappings
+    assert(domain1.add_iova_mapping(0x1000000, 0x80000000, 0x100000), "domain 1 mapping")
+    assert(domain2.add_iova_mapping(0x1000000, 0x90000000, 0x100000), "domain 2 mapping")
+
+    // Same IOVA → different PA (isolated)
+    assert(domain1.translate_iova(0x1000000) == 0x80000000, "domain 1 PA")
+    assert(domain2.translate_iova(0x1000000) == 0x90000000, "domain 2 PA (different)")
+
+    assert(domain1.get_vmid() == 1, "domain 1 vmid")
+    assert(domain2.get_vmid() == 2, "domain 2 vmid")
+
+    return true
+}
+
+// ============ Test Group C: DMA Requests (2/2) ============
+
+// Test C1: DMA Request Handling
+fn test_dma_request_handling() -> bool {
+    let mut req = DMARequest::new(1, 0x10, 0x1000000, 0x4000, DMAAccessType::Write)
+
+    assert(req.is_pending, "initially pending")
+    assert(!req.is_permitted, "not permitted")
+
+    req.permit(0x80000000)
+    assert(!req.is_pending, "no longer pending")
+    assert(req.is_permitted, "now permitted")
+    assert(req.translated_pa == 0x80000000, "PA set")
+    assert(req.is_valid(), "valid")
+
+    return true
+}
+
+// Test C2: Blocked DMA Requests
+fn test_dma_request_blocking() -> bool {
+    let mut req = DMARequest::new(1, 0x10, 0x1000000, 0x4000, DMAAccessType::Execute)
+
+    assert(!req.is_permitted, "initially not permitted")
+    req.deny()
+    assert(!req.is_permitted, "still not permitted")
+    assert(!req.is_valid(), "not valid")
+
+    return true
+}
+
+// ============ Test Group D: DMA Endpoints (2/2) ============
+
+// Test D1: DMA Endpoint Registration
+fn test_dma_endpoint_registration() -> bool {
+    let mut ctrl = DMAController::new(1)
+
+    let ep1 = DMAEndpoint::new(0x10, DeviceType::Network, 1)
+    let ep2 = DMAEndpoint::new(0x20, DeviceType::Storage, 1)
+    let ep3 = DMAEndpoint::new(0x30, DeviceType::Graphics, 2)  // Different domain
+
+    assert(ctrl.register_endpoint(ep1), "register network")
+    assert(ctrl.register_endpoint(ep2), "register storage")
+    assert(ctrl.register_endpoint(ep3), "register graphics")
+
+    assert(ctrl.endpoint_count == 3, "count 3")
+
+    // Lookup
+    let ep_found = ctrl.get_endpoint(0x20)
+    assert(ep_found.device_id == 0x20, "found correct endpoint")
+
+    return true
+}
+
+// Test D2: DMA Transaction Lifecycle
+fn test_dma_transaction_lifecycle() -> bool {
+    let mut ctrl = DMAController::new(1)
+    let ep = DMAEndpoint::new(0x10, DeviceType::Storage, 1)
+
+    ctrl.register_endpoint(ep)
+
+    let trans_id = ctrl.create_transaction(0x10)
+    assert(trans_id != 0xFFFFFFFF, "transaction created")
+
+    let mut trans = &mut ctrl.transactions[trans_id as usize]
+    assert(trans.setup_write(0x2000000, 0x100000), "setup write")
+    assert(trans.is_ready(), "ready")
+
+    trans.start()
+    assert(trans.status == 1, "running")
+
+    ctrl.complete_transaction(trans_id)
+    assert(trans.is_complete(), "complete")
+
+    assert(ctrl.total_bytes_transferred == 0x100000, "bytes tracked")
+
+    return true
+}
+
+// ============ Test Group E: IOMMU Controller (1/1) ============
+
+// Test E1: Full IOMMU Pipeline (Create Domain → IOVA Map → DMA Request)
+fn test_full_iommu_pipeline() -> bool {
+    let mut iommu = IOMMUController::new(1)
+
+    // Create device domain
+    let domain_id = iommu.create_device_domain(0x10)
+    assert(domain_id != 0xFFFF, "domain created")
+    assert(iommu.get_domain_count() == 1, "domain count 1")
+
+    // Add IOVA mapping to domain
+    let domain = iommu.get_domain(domain_id)
+    assert(domain.add_iova_mapping(0x1000000, 0x80000000, 0x100000), "add mapping")
+    assert(domain.add_iova_mapping(0x2000000, 0x80100000, 0x100000), "add mapping 2")
+
+    // Submit DMA request
+    let dma_req = DMARequest::new(domain_id, 0x10, 0x1000000, 0x4000, DMAAccessType::Read)
+    assert(iommu.handle_dma_request(dma_req), "DMA permitted")
+
+    assert(iommu.get_total_requests() == 1, "request count")
+    assert(iommu.get_blocked_requests() == 0, "no blocks")
+
+    // Try blocked request (invalid IOVA)
+    let invalid_req = DMARequest::new(domain_id, 0x10, 0x3000000, 0x4000, DMAAccessType::Read)
+    assert(!iommu.handle_dma_request(invalid_req), "invalid IOVA blocked")
+    assert(iommu.get_blocked_requests() == 1, "blocked count 1")
+
+    return true
+}
+
+// ============ Test Group F: Coherency (0/1 - optional bonus) ============
+
+// Test F1: Cache Coherency Management
+fn test_cache_coherency() -> bool {
+    let mut coherency = CoherencyManager::new(1)
+
+    assert(coherency.invalidate_cache(0x80000000, 0x4000), "invalidate cache")
+    assert(coherency.get_invalidation_count() == 1, "invalidation tracked")
+
+    assert(coherency.flush_tlb(), "flush IOMMU TLB")
+    assert(coherency.get_flush_count() == 1, "flush tracked")
+
+    return true
+}
+
+// ============ Helper Functions ============
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

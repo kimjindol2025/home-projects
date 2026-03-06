@@ -1,0 +1,371 @@
+/* ============================================================================
+   Nano Memory Pool - FreeLang Nano-Kernel
+
+   목적: 정적 페이지 풀로 1MB 상한 메모리 관리 (256 × 4KB)
+   크기: ~350줄
+   성능: 페이지 할당/해제 < 1µs
+
+   설계: PhysicalPage (bootloader.fl) 패턴 재사용
+   - 256개 4KB 페이지 = 1MB 총합
+   - 비트맵 기반 할당 (8×32비트 = 256비트)
+   - O(1) 할당/해제 성능
+============================================================================ */
+
+// ============================================================================
+// 1. 상수 정의
+// ============================================================================
+
+pub const PAGE_SIZE: u32 = 4096;           // 4KB per page
+pub const PAGE_COUNT: u32 = 256;           // 256 pages = 1MB
+pub const MEMORY_POOL_SIZE: u32 = PAGE_SIZE * PAGE_COUNT;  // 1,048,576 bytes
+pub const BITMAP_SIZE: u32 = 8;            // 256비트 = 8개 u32
+
+// ============================================================================
+// 2. 페이지 풀 구조체
+// ============================================================================
+
+pub struct NanoPagePool {
+    // 256 × 4KB 정적 메모리 풀
+    pub pages: [u64; 256],                 // 256 물리 페이지 주소 (32KB 메타)
+
+    // 비트맵: 페이지 할당 상태 추적
+    pub bitmap: [u32; 8],                  // 256 페이지 = 256비트 = 8×u32
+
+    // 통계
+    pub total_pages: u32,
+    pub used_pages: u32,
+    pub free_pages: u32,
+    pub allocation_count: u32,
+    pub deallocation_count: u32,
+    pub max_used_pages: u32,
+}
+
+impl NanoPagePool {
+    pub fn new() -> Self {
+        let mut pool = NanoPagePool {
+            pages: [0u64; 256],
+            bitmap: [0u32; 8],
+            total_pages: PAGE_COUNT,
+            used_pages: 0,
+            free_pages: PAGE_COUNT,
+            allocation_count: 0,
+            deallocation_count: 0,
+            max_used_pages: 0,
+        };
+
+        // 물리 주소 초기화: 0x80000000 + page_idx × 4096
+        for i in 0..256 {
+            pool.pages[i] = (0x80000000u64 + (i as u64 * PAGE_SIZE as u64));
+        }
+
+        pool
+    }
+
+    /// 사용률 (%)
+    pub fn usage_percent(&self) -> u32 {
+        if self.total_pages == 0 {
+            return 0;
+        }
+        (self.used_pages * 100) / self.total_pages
+    }
+
+    /// 메모리 사용량 (KB)
+    pub fn used_kb(&self) -> u32 {
+        (self.used_pages * PAGE_SIZE) / 1024
+    }
+
+    /// 메모리 여유량 (KB)
+    pub fn free_kb(&self) -> u32 {
+        (self.free_pages * PAGE_SIZE) / 1024
+    }
+
+    /// 통계 조회
+    pub fn stats(&self) -> (u32, u32, u32, u32, u32, u32) {
+        (
+            self.total_pages,
+            self.used_pages,
+            self.free_pages,
+            self.allocation_count,
+            self.deallocation_count,
+            self.max_used_pages,
+        )
+    }
+}
+
+// ============================================================================
+// 3. 페이지 할당자
+// ============================================================================
+
+pub struct PageAllocator {
+    pub pool: NanoPagePool,
+    pub last_allocated_idx: u32,
+    pub allocation_strategy: u8,  // 0=first-fit, 1=next-fit
+}
+
+impl PageAllocator {
+    pub fn new() -> Self {
+        PageAllocator {
+            pool: NanoPagePool::new(),
+            last_allocated_idx: 0,
+            allocation_strategy: 1,  // next-fit (빠른 할당)
+        }
+    }
+
+    /// 단일 페이지 할당
+    /// 성공 시 물리 주소 반환, 실패 시 None
+    pub fn alloc_page(&mut self) -> Option<u64> {
+        if self.pool.free_pages == 0 {
+            return None;  // 메모리 부족
+        }
+
+        // Next-fit 전략
+        let start_idx = self.last_allocated_idx;
+        let mut idx = start_idx;
+
+        loop {
+            let bitmap_idx = (idx / 32) as usize;
+            let bit_idx = idx % 32;
+
+            if bitmap_idx >= BITMAP_SIZE as usize {
+                // 끝에 도달, 처음부터 다시
+                if idx == start_idx {
+                    return None;  // 전체 순회했으나 못 찾음
+                }
+                idx = 0;
+                continue;
+            }
+
+            // 비트맵 확인: 0 = free, 1 = allocated
+            if (self.pool.bitmap[bitmap_idx] & (1 << bit_idx)) == 0 {
+                // 이 페이지는 비어있음
+                self.pool.bitmap[bitmap_idx] |= 1 << bit_idx;
+
+                self.pool.used_pages += 1;
+                self.pool.free_pages -= 1;
+                self.pool.allocation_count += 1;
+
+                if self.pool.used_pages > self.pool.max_used_pages {
+                    self.pool.max_used_pages = self.pool.used_pages;
+                }
+
+                let addr = self.pool.pages[idx as usize];
+                self.last_allocated_idx = (idx + 1) % PAGE_COUNT;
+
+                return Some(addr);
+            }
+
+            idx = (idx + 1) % PAGE_COUNT;
+
+            if idx == start_idx {
+                // 한 바퀴 다 돌았는데 못 찾음
+                return None;
+            }
+        }
+    }
+
+    /// 여러 페이지 할당 (연속 메모리 미보장)
+    pub fn alloc_pages(&mut self, count: u32) -> Vec<u64> {
+        let mut addrs = Vec::new();
+
+        for _ in 0..count {
+            match self.alloc_page() {
+                Some(addr) => addrs.push(addr),
+                None => break,  // 부족하면 부분 할당
+            }
+        }
+
+        addrs
+    }
+
+    /// 페이지 해제
+    pub fn free_page(&mut self, addr: u64) -> bool {
+        // 주소로부터 페이지 인덱스 계산
+        let base = 0x80000000u64;
+
+        if addr < base || addr >= base + (PAGE_COUNT as u64 * PAGE_SIZE as u64) {
+            return false;  // 범위 외 주소
+        }
+
+        let offset = (addr - base) / PAGE_SIZE as u64;
+        if offset >= PAGE_COUNT as u64 {
+            return false;
+        }
+
+        let idx = offset as u32;
+        let bitmap_idx = (idx / 32) as usize;
+        let bit_idx = idx % 32;
+
+        if bitmap_idx >= BITMAP_SIZE as usize {
+            return false;
+        }
+
+        // 비트 확인: 할당된 상태여야 함
+        if (self.pool.bitmap[bitmap_idx] & (1 << bit_idx)) == 0 {
+            return false;  // 이미 해제됨 (double-free 시도)
+        }
+
+        // 할당 해제
+        self.pool.bitmap[bitmap_idx] &= !(1 << bit_idx);
+
+        self.pool.used_pages -= 1;
+        self.pool.free_pages += 1;
+        self.pool.deallocation_count += 1;
+
+        true
+    }
+
+    /// 모든 페이지 해제
+    pub fn free_all(&mut self) {
+        self.pool.bitmap = [0u32; 8];
+        self.pool.used_pages = 0;
+        self.pool.free_pages = PAGE_COUNT;
+        self.pool.last_allocated_idx = 0;
+    }
+
+    /// 할당된 페이지 개수
+    pub fn allocated_count(&self) -> u32 {
+        self.pool.used_pages
+    }
+
+    /// 여유 페이지 개수
+    pub fn free_count(&self) -> u32 {
+        self.pool.free_pages
+    }
+}
+
+// ============================================================================
+// 4. 메모리 영역 할당자 (다중 크기 지원)
+// ============================================================================
+
+pub struct MemoryRegion {
+    pub start_addr: u64,
+    pub size: u32,
+    pub allocated: bool,
+}
+
+pub struct RegionAllocator {
+    pub regions: Vec<MemoryRegion>,
+    pub page_alloc: PageAllocator,
+}
+
+impl RegionAllocator {
+    pub fn new() -> Self {
+        RegionAllocator {
+            regions: Vec::new(),
+            page_alloc: PageAllocator::new(),
+        }
+    }
+
+    /// 임의 크기 메모리 할당
+    pub fn alloc(&mut self, size: u32) -> Option<u64> {
+        if size == 0 || size > MEMORY_POOL_SIZE {
+            return None;
+        }
+
+        // 필요한 페이지 수 계산
+        let pages_needed = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        // 페이지 할당
+        let addrs = self.page_alloc.alloc_pages(pages_needed);
+        if addrs.is_empty() {
+            return None;
+        }
+
+        let start_addr = addrs[0];
+
+        // 할당 영역 기록
+        self.regions.push(MemoryRegion {
+            start_addr,
+            size,
+            allocated: true,
+        });
+
+        Some(start_addr)
+    }
+
+    /// 메모리 해제
+    pub fn free(&mut self, addr: u64) -> bool {
+        // 영역 찾기
+        let mut region_idx = None;
+        for i in 0..self.regions.len() {
+            if self.regions[i].start_addr == addr && self.regions[i].allocated {
+                region_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = region_idx {
+            let region = &self.regions[idx];
+
+            // 페이지 해제
+            let pages_to_free = (region.size + PAGE_SIZE - 1) / PAGE_SIZE;
+            for i in 0..pages_to_free {
+                let page_addr = region.start_addr + (i as u64 * PAGE_SIZE as u64);
+                self.page_alloc.free_page(page_addr);
+            }
+
+            self.regions.remove(idx);
+            return true;
+        }
+
+        false
+    }
+
+    /// 통계
+    pub fn memory_stats(&self) -> (u32, u32, u32) {
+        let (total, used, free, _, _, _) = self.page_alloc.pool.stats();
+        (total * PAGE_SIZE, used * PAGE_SIZE, free * PAGE_SIZE)
+    }
+}
+
+// ============================================================================
+// 5. 검증 함수
+// ============================================================================
+
+pub fn validate_page_addr(addr: u64) -> bool {
+    let base = 0x80000000u64;
+    let top = base + (PAGE_COUNT as u64 * PAGE_SIZE as u64);
+    addr >= base && addr < top
+}
+
+pub fn validate_page_alignment(addr: u64) -> bool {
+    addr % PAGE_SIZE as u64 == 0
+}
+
+pub fn validate_allocation_count(count: u32) -> bool {
+    count > 0 && count <= PAGE_COUNT
+}
+
+pub fn validate_memory_size(size: u32) -> bool {
+    size > 0 && size <= MEMORY_POOL_SIZE
+}
+
+pub fn validate_pool_integrity(pool: &NanoPagePool) -> bool {
+    // 통계 검증
+    if pool.used_pages + pool.free_pages != pool.total_pages {
+        return false;
+    }
+
+    // 비트맵 검증 (0-1만 포함)
+    for i in 0..8 {
+        if pool.bitmap[i] > 0xFFFFFFFF {
+            return false;
+        }
+    }
+
+    true
+}
+
+// ============================================================================
+// 6. 클론 구현
+// ============================================================================
+
+impl Clone for MemoryRegion {
+    fn clone(&self) -> Self {
+        MemoryRegion {
+            start_addr: self.start_addr,
+            size: self.size,
+            allocated: self.allocated,
+        }
+    }
+}

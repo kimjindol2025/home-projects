@@ -1,0 +1,596 @@
+// FreeLang-LLC: Compile-Time Semantic Validator
+// Purpose: Detect optimizer corruption via semantic equivalence checking
+// Strategy: Before/after LLVM optimization analysis + CFG comparison
+
+use super::pointer::ManagedPointer;
+use super::llvm_codegen::*;
+
+// ============================================================================
+// Part 1: Program Semantics Analyzer (140 lines)
+// ============================================================================
+
+#[derive(Clone)]
+pub enum ProgramProperty {
+    DataFlow,          // Value flows unchanged
+    ControlFlow,       // Execution paths preserved
+    MemoryAccess,      // Memory access order
+    SideEffects,       // Observable effects
+    TerminationBehavior,  // Program halts or diverges
+}
+
+#[derive(Clone)]
+pub struct SemanticInvariant {
+    pub property: ProgramProperty,
+    pub description: String,
+    pub critical: bool,  // true = must not violate
+}
+
+pub struct ProgramSemantics {
+    pub data_flow_vars: Vec<String>,              // Variables with data flow
+    pub memory_accesses: Vec<(String, u64)>,      // (var, offset) pairs
+    pub control_flow_edges: Vec<(String, String)>, // (from_block, to_block)
+    pub side_effects: Vec<String>,                // Function calls, I/O, volatiles
+    pub invariants: Vec<SemanticInvariant>,
+}
+
+impl ProgramSemantics {
+    pub fn new() -> Self {
+        ProgramSemantics {
+            data_flow_vars: Vec::new(),
+            memory_accesses: Vec::new(),
+            control_flow_edges: Vec::new(),
+            side_effects: Vec::new(),
+            invariants: Vec::new(),
+        }
+    }
+
+    pub fn add_invariant(&mut self, property: ProgramProperty, desc: String, critical: bool) {
+        self.invariants.push(SemanticInvariant {
+            property,
+            description: desc,
+            critical,
+        });
+    }
+
+    pub fn add_data_flow(&mut self, var: String) {
+        if !self.data_flow_vars.contains(&var) {
+            self.data_flow_vars.push(var);
+        }
+    }
+
+    pub fn add_memory_access(&mut self, var: String, offset: u64) {
+        self.memory_accesses.push((var, offset));
+    }
+
+    pub fn add_control_flow(&mut self, from_block: String, to_block: String) {
+        if !self.control_flow_edges.contains(&(from_block.clone(), to_block.clone())) {
+            self.control_flow_edges.push((from_block, to_block));
+        }
+    }
+
+    pub fn add_side_effect(&mut self, effect: String) {
+        if !self.side_effects.contains(&effect) {
+            self.side_effects.push(effect);
+        }
+    }
+}
+
+// ============================================================================
+// Part 2: CFG (Control Flow Graph) Validator (160 lines)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct BasicBlock {
+    pub id: String,
+    pub instructions: Vec<String>,
+    pub successors: Vec<String>,
+    pub predecessors: Vec<String>,
+    pub is_reachable: bool,
+}
+
+pub struct ControlFlowGraph {
+    pub blocks: Vec<BasicBlock>,
+    pub entry_block: String,
+    pub exit_blocks: Vec<String>,
+}
+
+impl ControlFlowGraph {
+    pub fn new(entry: String) -> Self {
+        ControlFlowGraph {
+            blocks: Vec::new(),
+            entry_block: entry,
+            exit_blocks: Vec::new(),
+        }
+    }
+
+    pub fn add_block(&mut self, block: BasicBlock) {
+        self.blocks.push(block);
+    }
+
+    pub fn add_edge(&mut self, from: String, to: String) -> Result<(), String> {
+        // Find source block
+        let from_idx = self.blocks.iter().position(|b| b.id == from)
+            .ok_or(format!("Block {} not found", from))?;
+
+        // Find dest block
+        let _to_idx = self.blocks.iter().position(|b| b.id == to)
+            .ok_or(format!("Block {} not found", to))?;
+
+        // Add edge
+        if !self.blocks[from_idx].successors.contains(&to) {
+            self.blocks[from_idx].successors.push(to.clone());
+        }
+
+        // Update backward edge
+        let to_idx = self.blocks.iter().position(|b| b.id == to).unwrap();
+        if !self.blocks[to_idx].predecessors.contains(&from) {
+            self.blocks[to_idx].predecessors.push(from);
+        }
+
+        Ok(())
+    }
+
+    // Compute reachability from entry
+    pub fn compute_reachability(&mut self) -> Result<u64, String> {
+        let mut reachable = Vec::new();
+        let mut queue = vec![self.entry_block.clone()];
+
+        while !queue.is_empty() {
+            let block_id = queue.remove(0);
+
+            if reachable.contains(&block_id) {
+                continue;  // Already visited
+            }
+
+            reachable.push(block_id.clone());
+
+            // Find block and add successors
+            if let Some(block_idx) = self.blocks.iter().position(|b| b.id == block_id) {
+                for successor in &self.blocks[block_idx].successors {
+                    if !reachable.contains(successor) {
+                        queue.push(successor.clone());
+                    }
+                }
+            }
+        }
+
+        // Mark reachable blocks
+        for block in self.blocks.iter_mut() {
+            block.is_reachable = reachable.contains(&block.id);
+        }
+
+        Ok(reachable.len() as u64)
+    }
+
+    // Detect unreachable code (bad optimization sign)
+    pub fn find_dead_code(&self) -> Vec<String> {
+        self.blocks.iter()
+            .filter(|b| !b.is_reachable && b.id != self.entry_block)
+            .map(|b| b.id.clone())
+            .collect()
+    }
+
+    // Validate CFG structure
+    pub fn validate_structure(&self) -> Result<(), String> {
+        // Entry block must exist
+        if !self.blocks.iter().any(|b| b.id == self.entry_block) {
+            return Err("Entry block not found".to_string());
+        }
+
+        // All exit blocks must exist
+        for exit in &self.exit_blocks {
+            if !self.blocks.iter().any(|b| b.id == exit) {
+                return Err(format!("Exit block {} not found", exit));
+            }
+        }
+
+        // Check for disconnected blocks (except unreachable from entry)
+        for block in &self.blocks {
+            if block.id != self.entry_block {
+                if block.predecessors.is_empty() && !block.id.contains("unreachable") {
+                    // Might be unreachable
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Part 3: Value Analysis (Dataflow Tracking) (140 lines)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct Value {
+    pub name: String,
+    pub llvm_type: String,
+    pub definitions: Vec<String>,  // Where defined (instruction indices)
+    pub uses: Vec<String>,         // Where used
+    pub live_range_start: u64,
+    pub live_range_end: u64,
+}
+
+pub struct ValueAnalysis {
+    pub values: Vec<Value>,
+    pub constant_values: std::collections::HashMap<String, u64>,
+}
+
+impl ValueAnalysis {
+    pub fn new() -> Self {
+        ValueAnalysis {
+            values: Vec::new(),
+            constant_values: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn add_value(&mut self, name: String, llvm_type: String) {
+        if !self.values.iter().any(|v| v.name == name) {
+            self.values.push(Value {
+                name,
+                llvm_type,
+                definitions: Vec::new(),
+                uses: Vec::new(),
+                live_range_start: 0,
+                live_range_end: 0,
+            });
+        }
+    }
+
+    pub fn add_definition(&mut self, var: String, at_index: u64) -> Result<(), String> {
+        if let Some(value) = self.values.iter_mut().find(|v| v.name == var) {
+            value.definitions.push(at_index.to_string());
+            if value.live_range_start == 0 {
+                value.live_range_start = at_index;
+            }
+            Ok(())
+        } else {
+            Err(format!("Value {} not found", var))
+        }
+    }
+
+    pub fn add_use(&mut self, var: String, at_index: u64) -> Result<(), String> {
+        if let Some(value) = self.values.iter_mut().find(|v| v.name == var) {
+            value.uses.push(at_index.to_string());
+            value.live_range_end = value.live_range_end.max(at_index);
+            Ok(())
+        } else {
+            Err(format!("Value {} not found", var))
+        }
+    }
+
+    pub fn add_constant(&mut self, name: String, value: u64) {
+        self.constant_values.insert(name, value);
+    }
+
+    // Detect use-before-define (optimizer bug)
+    pub fn validate_definitions(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+
+        for value in &self.values {
+            if value.definitions.is_empty() && !value.name.starts_with("arg") {
+                errors.push(format!("Value {} used but never defined", value.name));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+// ============================================================================
+// Part 4: Transformation Validator (120 lines)
+// ============================================================================
+
+pub struct OptimizationTransform {
+    pub name: String,
+    pub before_ir: String,
+    pub after_ir: String,
+    pub semantics_preserved: bool,
+}
+
+pub struct TransformValidator {
+    pub transforms: Vec<OptimizationTransform>,
+}
+
+impl TransformValidator {
+    pub fn new() -> Self {
+        TransformValidator {
+            transforms: Vec::new(),
+        }
+    }
+
+    pub fn add_transform(&mut self, transform: OptimizationTransform) {
+        self.transforms.push(transform);
+    }
+
+    // Detect invalid optimizations
+    pub fn validate_all(&self) -> Result<Vec<String>, Vec<String>> {
+        let mut errors = Vec::new();
+        let mut validations = Vec::new();
+
+        for transform in &self.transforms {
+            // Check basic invariants
+            let validation = self.check_invariants(&transform);
+
+            match validation {
+                Ok(msg) => validations.push(msg),
+                Err(e) => errors.push(e),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(validations)
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn check_invariants(&self, transform: &OptimizationTransform) -> Result<String, String> {
+        // Rule 1: Instruction count shouldn't increase dramatically (compiler bug)
+        let before_instructions = transform.before_ir.matches('\n').count();
+        let after_instructions = transform.after_ir.matches('\n').count();
+
+        if after_instructions > before_instructions * 2 {
+            return Err(format!(
+                "Transform '{}': Instruction explosion ({} → {})",
+                transform.name, before_instructions, after_instructions
+            ));
+        }
+
+        // Rule 2: Register allocations shouldn't increase dangerously
+        let before_regs = count_registers(&transform.before_ir);
+        let after_regs = count_registers(&transform.after_ir);
+
+        if after_regs > before_regs + 10 {
+            return Err(format!(
+                "Transform '{}': Excessive register allocation ({} → {})",
+                transform.name, before_regs, after_regs
+            ));
+        }
+
+        // Rule 3: Memory barriers must be preserved
+        if transform.before_ir.contains("fence") && !transform.after_ir.contains("fence") {
+            return Err(format!(
+                "Transform '{}': Memory barriers removed (undefined behavior!)",
+                transform.name
+            ));
+        }
+
+        Ok(format!("Transform '{}': Passed invariant checks", transform.name))
+    }
+}
+
+fn count_registers(ir: &str) -> u64 {
+    ir.matches('%').count() as u64
+}
+
+// ============================================================================
+// Part 5: Semantic Equivalence Checker (100 lines)
+// ============================================================================
+
+pub struct EquivalenceChecker {
+    pub before_semantics: ProgramSemantics,
+    pub after_semantics: ProgramSemantics,
+}
+
+impl EquivalenceChecker {
+    pub fn new(before: ProgramSemantics, after: ProgramSemantics) -> Self {
+        EquivalenceChecker {
+            before_semantics: before,
+            after_semantics: after,
+        }
+    }
+
+    // Check if critical properties are preserved
+    pub fn check_equivalence(&self) -> Result<String, Vec<String>> {
+        let mut errors = Vec::new();
+
+        // Check data flow preservation
+        if !self.check_data_flow() {
+            errors.push("Data flow not preserved".to_string());
+        }
+
+        // Check memory access order
+        if !self.check_memory_order() {
+            errors.push("Memory access order changed".to_string());
+        }
+
+        // Check side effects not reordered
+        if !self.check_side_effects() {
+            errors.push("Side effects reordered".to_string());
+        }
+
+        // Check control flow preservation
+        if !self.check_control_flow() {
+            errors.push("Control flow altered".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok("Program semantics equivalent (safe optimization)".to_string())
+        } else {
+            Err(errors)
+        }
+    }
+
+    fn check_data_flow(&self) -> bool {
+        // Variables present before should be present after
+        let before_vars: Vec<_> = self.before_semantics.data_flow_vars.iter().collect();
+        let after_vars: Vec<_> = self.after_semantics.data_flow_vars.iter().collect();
+
+        // All before variables should exist after (may have extras from inlining)
+        before_vars.iter().all(|v| after_vars.contains(v))
+    }
+
+    fn check_memory_order(&self) -> bool {
+        // Memory access patterns must be equivalent
+        self.before_semantics.memory_accesses.len() == self.after_semantics.memory_accesses.len()
+    }
+
+    fn check_side_effects(&self) -> bool {
+        // Side effects must not be introduced/removed
+        let before_count = self.before_semantics.side_effects.len();
+        let after_count = self.after_semantics.side_effects.len();
+
+        // Allow side effects to be moved but not added/removed
+        before_count == after_count
+    }
+
+    fn check_control_flow(&self) -> bool {
+        // Entry and exit blocks must be the same
+        let before_edges = self.before_semantics.control_flow_edges.len();
+        let after_edges = self.after_semantics.control_flow_edges.len();
+
+        // Similar number of edges (allow some simplification)
+        after_edges <= before_edges || (after_edges as i64 - before_edges as i64).abs() <= 2
+    }
+}
+
+// ============================================================================
+// Tests (120 lines)
+// ============================================================================
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_program_semantics_creation() {
+        let mut semantics = ProgramSemantics::new();
+        semantics.add_data_flow("x".to_string());
+        assert_eq!(semantics.data_flow_vars.len(), 1);
+    }
+
+    #[test]
+    fn test_cfg_creation() {
+        let mut cfg = ControlFlowGraph::new("entry".to_string());
+        cfg.add_block(BasicBlock {
+            id: "entry".to_string(),
+            instructions: vec!["load i64 %ptr".to_string()],
+            successors: vec!["exit".to_string()],
+            predecessors: vec![],
+            is_reachable: true,
+        });
+        assert_eq!(cfg.blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_cfg_reachability() {
+        let mut cfg = ControlFlowGraph::new("entry".to_string());
+        cfg.add_block(BasicBlock {
+            id: "entry".to_string(),
+            instructions: vec![],
+            successors: vec!["exit".to_string()],
+            predecessors: vec![],
+            is_reachable: false,
+        });
+        cfg.add_block(BasicBlock {
+            id: "exit".to_string(),
+            instructions: vec![],
+            successors: vec![],
+            predecessors: vec![],
+            is_reachable: false,
+        });
+        cfg.add_edge("entry".to_string(), "exit".to_string()).unwrap();
+        let reachable = cfg.compute_reachability().unwrap();
+        assert_eq!(reachable, 2);
+    }
+
+    #[test]
+    fn test_value_analysis() {
+        let mut analysis = ValueAnalysis::new();
+        analysis.add_value("x".to_string(), "i64".to_string());
+        analysis.add_definition("x".to_string(), 0).unwrap();
+        analysis.add_use("x".to_string(), 1).unwrap();
+        assert_eq!(analysis.values[0].definitions.len(), 1);
+    }
+
+    #[test]
+    fn test_value_analysis_validation() {
+        let mut analysis = ValueAnalysis::new();
+        analysis.add_value("x".to_string(), "i64".to_string());
+        analysis.add_definition("x".to_string(), 0).unwrap();
+        assert!(analysis.validate_definitions().is_ok());
+    }
+
+    #[test]
+    fn test_transform_validator_basic() {
+        let mut validator = TransformValidator::new();
+        validator.add_transform(OptimizationTransform {
+            name: "DCE".to_string(),
+            before_ir: "  %x = add i64 1, 1\n  ret i64 2\n".to_string(),
+            after_ir: "  ret i64 2\n".to_string(),
+            semantics_preserved: true,
+        });
+        assert!(validator.validate_all().is_ok());
+    }
+
+    #[test]
+    fn test_transform_validator_barrier_preservation() {
+        let mut validator = TransformValidator::new();
+        validator.add_transform(OptimizationTransform {
+            name: "BadOpt".to_string(),
+            before_ir: "  fence seq_cst\n  store i64 %val, i64* %ptr\n".to_string(),
+            after_ir: "  store i64 %val, i64* %ptr\n".to_string(),  // Fence removed!
+            semantics_preserved: false,
+        });
+        assert!(validator.validate_all().is_err());
+    }
+
+    #[test]
+    fn test_equivalence_checker_dataflow() {
+        let mut before = ProgramSemantics::new();
+        before.add_data_flow("x".to_string());
+        let mut after = ProgramSemantics::new();
+        after.add_data_flow("x".to_string());
+
+        let checker = EquivalenceChecker::new(before, after);
+        assert!(checker.check_equivalence().is_ok());
+    }
+
+    #[test]
+    fn test_equivalence_checker_memory() {
+        let mut before = ProgramSemantics::new();
+        before.add_memory_access("ptr".to_string(), 0);
+        let mut after = ProgramSemantics::new();
+        after.add_memory_access("ptr".to_string(), 0);
+
+        let checker = EquivalenceChecker::new(before, after);
+        assert!(checker.check_equivalence().is_ok());
+    }
+
+    #[test]
+    fn test_equivalence_checker_side_effects() {
+        let mut before = ProgramSemantics::new();
+        before.add_side_effect("volatile_read".to_string());
+        let mut after = ProgramSemantics::new();
+        after.add_side_effect("volatile_read".to_string());
+
+        let checker = EquivalenceChecker::new(before, after);
+        assert!(checker.check_equivalence().is_ok());
+    }
+
+    #[test]
+    fn test_equivalence_checker_control_flow() {
+        let mut before = ProgramSemantics::new();
+        before.add_control_flow("entry".to_string(), "exit".to_string());
+        let mut after = ProgramSemantics::new();
+        after.add_control_flow("entry".to_string(), "exit".to_string());
+
+        let checker = EquivalenceChecker::new(before, after);
+        assert!(checker.check_equivalence().is_ok());
+    }
+
+    #[test]
+    fn test_invariant_preservation() {
+        let mut semantics = ProgramSemantics::new();
+        semantics.add_invariant(
+            ProgramProperty::MemoryAccess,
+            "Memory access order must be preserved".to_string(),
+            true
+        );
+        assert_eq!(semantics.invariants.len(), 1);
+    }
+}

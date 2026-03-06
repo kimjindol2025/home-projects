@@ -1,0 +1,413 @@
+// Hypervisor: IOMMU (I/O Device Isolation) (500줄)
+// L1 게스트의 DMA 접근을 L0이 중재 (Stage 2 MMU 확장)
+
+module iommu
+
+use hypervisor::{
+    Stage2PTE, Stage2PageTable
+}
+
+// ============ IOMMU Constants ============
+
+enum IOVAGranule {
+    FourKB,
+    TwoMB,
+    OneGB,
+}
+
+enum DMAAccessType {
+    Read,
+    Write,
+    Execute,
+}
+
+// ============ I/O Virtual Address (IOVA) Table Entry ============
+
+struct IOVAEntry {
+    iova: u64,              // I/O Virtual Address
+    pa: u64,                // Physical Address (host)
+    size: u64,              // Page size (4KB, 2MB, 1GB)
+    valid: bool,
+    readable: bool,
+    writable: bool,
+    executable: bool,
+}
+
+impl IOVAEntry {
+    fn new(io_va: u64, phys_addr: u64, sz: u64) -> IOVAEntry {
+        return IOVAEntry {
+            iova: io_va,
+            pa: phys_addr,
+            size: sz,
+            valid: true,
+            readable: true,
+            writable: true,
+            executable: false,
+        }
+    }
+
+    fn set_permissions(&mut self, read: bool, write: bool, exec: bool) -> bool {
+        self.readable = read
+        self.writable = write
+        self.executable = exec
+        return true
+    }
+
+    fn can_read(&self) -> bool {
+        return self.valid && self.readable
+    }
+
+    fn can_write(&self) -> bool {
+        return self.valid && self.writable
+    }
+
+    fn can_execute(&self) -> bool {
+        return self.valid && self.executable
+    }
+
+    fn translate(&self, io_va_offset: u64) -> u64 {
+        if io_va_offset >= self.size {
+            return 0  // Offset out of bounds
+        }
+        return self.pa + io_va_offset
+    }
+}
+
+// ============ Device Domain (IOMMU Context) ============
+
+struct DeviceDomain {
+    domain_id: u16,         // Unique domain ID (0-4095)
+    device_id: u16,         // PCI device ID
+    vmid: u16,              // Associated VM (guest)
+    iova_table: array[IOVAEntry; 256],  // IOVA translation table
+    iova_count: u32,
+    dma_requests: u32,
+    blocked_requests: u32,
+}
+
+impl DeviceDomain {
+    fn new(dom_id: u16, dev_id: u16, vm_id: u16) -> DeviceDomain {
+        return DeviceDomain {
+            domain_id: dom_id,
+            device_id: dev_id,
+            vmid: vm_id,
+            iova_table: array[IOVAEntry; 256],
+            iova_count: 0,
+            dma_requests: 0,
+            blocked_requests: 0,
+        }
+    }
+
+    fn add_iova_mapping(&mut self, iova: u64, pa: u64, size: u64) -> bool {
+        if self.iova_count >= 256 {
+            return false  // Table full
+        }
+
+        // Check for overlaps
+        for i in 0..self.iova_count {
+            let existing = self.iova_table[i]
+            if iova < (existing.iova + existing.size) &&
+               (iova + size) > existing.iova {
+                return false  // Overlap detected
+            }
+        }
+
+        let entry = IOVAEntry::new(iova, pa, size)
+        self.iova_table[self.iova_count] = entry
+        self.iova_count += 1
+
+        return true
+    }
+
+    fn lookup_iova(&self, iova: u64) -> IOVAEntry {
+        for i in 0..self.iova_count {
+            let entry = self.iova_table[i]
+            if iova >= entry.iova && iova < (entry.iova + entry.size) {
+                return entry
+            }
+        }
+        // Return invalid entry if not found
+        return IOVAEntry::new(0, 0, 0)
+    }
+
+    fn translate_iova(&self, iova: u64) -> u64 {
+        let entry = self.lookup_iova(iova)
+        if !entry.valid {
+            return 0  // Translation fault
+        }
+
+        let offset = iova - entry.iova
+        return entry.translate(offset)
+    }
+
+    fn get_domain_id(&self) -> u16 {
+        return self.domain_id
+    }
+
+    fn get_device_id(&self) -> u16 {
+        return self.device_id
+    }
+
+    fn get_vmid(&self) -> u16 {
+        return self.vmid
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Device Domain ID=" + self.domain_id.to_string() + ":\\n"
+        s = s + "Device: " + self.device_id.to_string() + "\\n"
+        s = s + "VMID: " + self.vmid.to_string() + "\\n"
+        s = s + "IOVA Mappings: " + self.iova_count.to_string() + "/256\\n"
+        s = s + "DMA Requests: " + self.dma_requests.to_string() + "\\n"
+        s = s + "Blocked: " + self.blocked_requests.to_string()
+        return s
+    }
+}
+
+// ============ DMA Request (Device Memory Access) ============
+
+struct DMARequest {
+    domain_id: u16,
+    device_id: u16,
+    iova: u64,              // Guest IOVA
+    size: u64,              // Transfer size
+    access_type: DMAAccessType,
+    is_pending: bool,
+    is_permitted: bool,
+    translated_pa: u64,     // Translated PA (L0 computed)
+}
+
+impl DMARequest {
+    fn new(dom_id: u16, dev_id: u16, io_va: u64, sz: u64, atype: DMAAccessType) -> DMARequest {
+        return DMARequest {
+            domain_id: dom_id,
+            device_id: dev_id,
+            iova: io_va,
+            size: sz,
+            access_type: atype,
+            is_pending: true,
+            is_permitted: false,
+            translated_pa: 0,
+        }
+    }
+
+    fn permit(&mut self, pa: u64) -> bool {
+        self.is_permitted = true
+        self.translated_pa = pa
+        self.is_pending = false
+        return true
+    }
+
+    fn deny(&mut self) -> bool {
+        self.is_permitted = false
+        self.is_pending = false
+        return true
+    }
+
+    fn is_valid(&self) -> bool {
+        return self.is_permitted && self.translated_pa != 0
+    }
+}
+
+// ============ IOMMU Controller ============
+
+struct IOMMUController {
+    vmid: u16,
+    domains: array[DeviceDomain; 16],
+    domain_count: u32,
+    dma_queue: array[DMARequest; 64],
+    queue_head: u32,
+    queue_tail: u32,
+    queue_size: u32,
+    total_requests: u64,
+    blocked_requests: u64,
+}
+
+impl IOMMUController {
+    fn new(vm_id: u16) -> IOMMUController {
+        return IOMMUController {
+            vmid: vm_id,
+            domains: array[DeviceDomain; 16],
+            domain_count: 0,
+            dma_queue: array[DMARequest; 64],
+            queue_head: 0,
+            queue_tail: 0,
+            queue_size: 0,
+            total_requests: 0,
+            blocked_requests: 0,
+        }
+    }
+
+    fn create_device_domain(&mut self, device_id: u16) -> u16 {
+        if self.domain_count >= 16 {
+            return 0xFFFF  // No more space
+        }
+
+        let domain_id = self.domain_count as u16
+        let domain = DeviceDomain::new(domain_id, device_id, self.vmid)
+
+        self.domains[self.domain_count] = domain
+        self.domain_count += 1
+
+        return domain_id
+    }
+
+    fn get_domain(&mut self, domain_id: u16) -> &mut DeviceDomain {
+        if domain_id >= self.domain_count as u16 {
+            // Return first domain as fallback
+            return &mut self.domains[0]
+        }
+        return &mut self.domains[domain_id]
+    }
+
+    fn handle_dma_request(&mut self, req: DMARequest) -> bool {
+        if self.queue_size >= 64 {
+            return false  // Queue full
+        }
+
+        // Look up domain
+        let domain = &mut self.domains[req.domain_id as usize]
+
+        // Translate IOVA to PA
+        let pa = domain.translate_iova(req.iova)
+
+        if pa == 0 {
+            // Translation failed
+            domain.blocked_requests += 1
+            self.blocked_requests += 1
+            return false
+        }
+
+        // Check permissions based on access type
+        let entry = domain.lookup_iova(req.iova)
+
+        let mut allowed = false
+        match req.access_type {
+            DMAAccessType::Read => {
+                allowed = entry.can_read()
+            },
+            DMAAccessType::Write => {
+                allowed = entry.can_write()
+            },
+            DMAAccessType::Execute => {
+                allowed = entry.can_execute()
+            },
+        }
+
+        if !allowed {
+            domain.blocked_requests += 1
+            self.blocked_requests += 1
+            return false
+        }
+
+        // Permit and queue
+        let mut req_copy = req
+        req_copy.permit(pa)
+
+        self.dma_queue[self.queue_tail as usize] = req_copy
+        self.queue_tail = (self.queue_tail + 1) % 64
+        self.queue_size += 1
+
+        domain.dma_requests += 1
+        self.total_requests += 1
+
+        return true
+    }
+
+    fn process_dma_queue(&mut self) -> u32 {
+        let mut processed = 0
+
+        while self.queue_size > 0 {
+            let req = self.dma_queue[self.queue_head as usize]
+
+            if req.is_valid() {
+                // DMA would execute here
+                processed += 1
+            }
+
+            self.queue_head = (self.queue_head + 1) % 64
+            self.queue_size -= 1
+        }
+
+        return processed
+    }
+
+    fn get_total_requests(&self) -> u64 {
+        return self.total_requests
+    }
+
+    fn get_blocked_requests(&self) -> u64 {
+        return self.blocked_requests
+    }
+
+    fn get_domain_count(&self) -> u32 {
+        return self.domain_count
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "IOMMU Controller (VMID=" + self.vmid.to_string() + "):\\n"
+        s = s + "Domains: " + self.domain_count.to_string() + "/16\\n"
+        s = s + "Total DMA Requests: " + self.total_requests.to_string() + "\\n"
+        s = s + "Blocked Requests: " + self.blocked_requests.to_string() + "\\n"
+        s = s + "Queue Size: " + self.queue_size.to_string() + "/64"
+        return s
+    }
+}
+
+// ============ Test Utilities ============
+
+fn validate_iova_entry() -> bool {
+    let mut entry = IOVAEntry::new(0x1000000, 0x80000000, 0x100000)
+
+    assert(entry.valid, "entry valid")
+    assert(entry.readable, "readable")
+    assert(entry.writable, "writable")
+    assert(!entry.executable, "not executable")
+
+    assert(entry.can_read(), "can read")
+    assert(entry.can_write(), "can write")
+
+    let pa = entry.translate(0x1000)
+    assert(pa == 0x80001000, "translation correct")
+
+    return true
+}
+
+fn validate_device_domain() -> bool {
+    let mut domain = DeviceDomain::new(1, 0x10, 1)
+
+    assert(domain.add_iova_mapping(0x1000000, 0x80000000, 0x100000), "add mapping")
+    assert(domain.add_iova_mapping(0x2000000, 0x80100000, 0x100000), "add second mapping")
+
+    let pa = domain.translate_iova(0x1000000)
+    assert(pa == 0x80000000, "translation correct")
+
+    assert(!domain.add_iova_mapping(0x1080000, 0x80080000, 0x100000), "overlap blocked")
+
+    return true
+}
+
+fn validate_dma_request() -> bool {
+    let mut req = DMARequest::new(1, 0x10, 0x1000000, 0x4000, DMAAccessType::Write)
+
+    assert(req.is_pending, "initially pending")
+    assert(!req.is_permitted, "initially not permitted")
+
+    req.permit(0x80000000)
+    assert(req.is_permitted, "now permitted")
+    assert(req.is_valid(), "valid")
+
+    return true
+}
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

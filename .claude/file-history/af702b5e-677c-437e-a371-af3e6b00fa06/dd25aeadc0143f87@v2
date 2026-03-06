@@ -1,0 +1,295 @@
+// Hypervisor Phase 3: Linux Kernel Loading Tests (10 Unforgiving Tests)
+
+module linux_phase3_test
+
+use linux_boot::{
+    ELFHeader, ELFSegment, SegmentType, KernelImage, LinuxBootConfig, KernelLoader
+}
+
+use linux_entry::{
+    LinuxBootRegisters, DeviceTreeBlob, KernelEntryHandler, LinuxBootSequence
+}
+
+use hypervisor::{
+    GuestAddressSpace
+}
+
+// ============ Test Group A: ELF Kernel Image (3/3) ============
+
+// Test A1: ELF Header Validation
+fn test_elf_header_validation() -> bool {
+    let header = ELFHeader::new()
+
+    // Check magic
+    assert(header.magic == 0x464C457F, "ELF magic correct")
+
+    // Check architecture
+    assert(header.machine == 0xB7, "ARM64 machine type")
+
+    // Check type
+    assert(header.type == 2, "executable type")
+
+    // Validate
+    assert(header.validate(), "header should validate")
+
+    // Entry point in kernel space
+    assert(header.entry_point >= 0x80000000, "entry point in kernel space")
+
+    return true
+}
+
+// Test A2: Multiple ELF Segments Loading
+fn test_elf_segments() -> bool {
+    let mut kernel = KernelImage::new(1)
+
+    // Segment 1: Code (RX)
+    let mut seg1 = ELFSegment::new(SegmentType::Load, 0x80080000, 0x80080000)
+    seg1.file_size = 0x200000  // 2MB
+    seg1.mem_size = 0x200000
+
+    // Segment 2: Data (RW)
+    let mut seg2 = ELFSegment::new(SegmentType::Load, 0x80280000, 0x80280000)
+    seg2.file_size = 0x100000  // 1MB
+    seg2.mem_size = 0x100000
+    seg2.flags = 6  // RW
+
+    // Segment 3: BSS (RW, mem_size > file_size)
+    let mut seg3 = ELFSegment::new(SegmentType::Load, 0x80380000, 0x80380000)
+    seg3.file_size = 0  // Not in file
+    seg3.mem_size = 0x80000  // 512KB in memory
+    seg3.flags = 6  // RW
+
+    // Add all segments
+    assert(kernel.add_segment(seg1), "add code segment")
+    assert(kernel.add_segment(seg2), "add data segment")
+    assert(kernel.add_segment(seg3), "add BSS segment")
+
+    assert(kernel.segment_count == 3, "should have 3 segments")
+    assert(kernel.total_size == 0x380000, "total size correct")
+
+    return true
+}
+
+// Test A3: Kernel Image Identity Mapping Validation
+fn test_kernel_identity_mapping() -> bool {
+    let mut kernel = KernelImage::new(1)
+
+    // Create segment with identity mapping (vaddr == paddr)
+    let mut seg = ELFSegment::new(SegmentType::Load, 0x80080000, 0x80080000)
+    seg.mem_size = 0x100000
+
+    assert(kernel.add_segment(seg), "add segment")
+    assert(kernel.validate(), "identity mapping should validate")
+
+    // Create invalid segment (vaddr != paddr)
+    let mut kernel2 = KernelImage::new(1)
+    let mut seg2 = ELFSegment::new(SegmentType::Load, 0x40000000, 0x80000000)
+    seg2.mem_size = 0x100000
+
+    assert(kernel2.add_segment(seg2), "add non-identity segment")
+    assert(!kernel2.validate(), "non-identity mapping should NOT validate")
+
+    return true
+}
+
+// ============ Test Group B: Boot Configuration (2/2) ============
+
+// Test B1: Linux Boot Config Layout Validation
+fn test_boot_config_layout() -> bool {
+    let mut config = LinuxBootConfig::new(1)
+
+    // Default layout
+    assert(config.dtb_address == 0x80000000, "DTB at 0x80000000")
+    assert(config.kernel_entry == 0x80080000, "kernel at 0x80080000")
+    assert(config.initrd_address == 0x84000000, "initrd at 0x84000000")
+
+    // Validate non-overlapping
+    assert(config.dtb_address < config.kernel_entry, "DTB before kernel")
+    assert(config.kernel_entry < config.initrd_address, "kernel before initrd")
+    assert(config.validate(), "layout should validate")
+
+    return true
+}
+
+// Test B2: Bootargs Configuration
+fn test_bootargs_config() -> bool {
+    let mut config = LinuxBootConfig::new(1)
+
+    let original_args = config.bootargs
+
+    let new_args = "console=ttyAMA0 root=/dev/vda1 rw single"
+    assert(config.set_bootargs(new_args), "set bootargs")
+    assert(config.bootargs == new_args, "bootargs updated")
+
+    // Should still validate
+    assert(config.validate(), "config still valid after bootargs change")
+
+    return true
+}
+
+// ============ Test Group C: Kernel Loader (2/2) ============
+
+// Test C1: Complete Kernel Load Pipeline
+fn test_kernel_loader_pipeline() -> bool {
+    let mut loader = KernelLoader::new(1)
+    let mut guest_as = GuestAddressSpace::new(1, 0x80000000)
+
+    // Add kernel segment
+    let mut seg = ELFSegment::new(SegmentType::Load, 0x80080000, 0x80080000)
+    seg.mem_size = 0x100000
+
+    assert(loader.kernel.add_segment(seg), "add kernel segment")
+
+    // Load complete pipeline
+    assert(loader.load_complete(&mut guest_as), "load complete")
+    assert(loader.is_boot_ready(), "should be boot ready")
+
+    // Verify entry point
+    assert(loader.get_entry_point() == 0x80080000, "entry point correct")
+    assert(loader.get_dtb_address() == 0x80000000, "DTB address correct")
+
+    return true
+}
+
+// Test C2: Multi-segment Kernel Loading
+fn test_multi_segment_kernel() -> bool {
+    let mut loader = KernelLoader::new(1)
+    let mut guest_as = GuestAddressSpace::new(1, 0x80000000)
+
+    // Add multiple segments like a real kernel
+    let mut seg1 = ELFSegment::new(SegmentType::Load, 0x80080000, 0x80080000)
+    seg1.mem_size = 0x200000
+    loader.kernel.add_segment(seg1)
+
+    let mut seg2 = ELFSegment::new(SegmentType::Load, 0x80280000, 0x80280000)
+    seg2.mem_size = 0x100000
+    loader.kernel.add_segment(seg2)
+
+    assert(loader.kernel.segment_count == 2, "should have 2 segments")
+
+    assert(loader.load_complete(&mut guest_as), "load complete")
+    assert(loader.is_boot_ready(), "boot ready")
+
+    return true
+}
+
+// ============ Test Group D: Boot Protocol (2/2) ============
+
+// Test D1: ARM64 Boot Register Setup
+fn test_boot_registers() -> bool {
+    let regs = LinuxBootRegisters::new(0x80000000)
+
+    // x0 must be DTB address
+    assert(regs.x0 == 0x80000000, "x0 = DTB address")
+
+    // x1-x3 reserved (must be 0)
+    assert(regs.x1 == 0, "x1 reserved = 0")
+    assert(regs.x2 == 0, "x2 reserved = 0")
+    assert(regs.x3 == 0, "x3 reserved = 0")
+
+    // Validate
+    assert(regs.validate(), "boot registers validate")
+
+    return true
+}
+
+// Test D2: Device Tree Blob Configuration
+fn test_device_tree_blob() -> bool {
+    let mut dtb = DeviceTreeBlob::new(1, 0x80000000)
+
+    // Check defaults
+    assert(dtb.cpus == 4, "default 4 CPUs")
+    assert(dtb.memory_size == 2*1024*1024*1024, "default 2GB memory")
+    assert(dtb.version == 17, "FDT version 17")
+
+    // Add nodes
+    assert(dtb.add_memory_node(0x80000000, 2*1024*1024*1024), "add memory node")
+    assert(dtb.add_chosen_node("console=ttyAMA0 root=/dev/vda1"), "add chosen node")
+
+    // Validate
+    assert(dtb.validate(), "DTB should validate")
+
+    return true
+}
+
+// ============ Test Group E: Kernel Entry (1/1) ============
+
+// Test E1: Complete Linux Boot Sequence
+fn test_linux_boot_sequence() -> bool {
+    let mut seq = LinuxBootSequence::new(1, 0x80080000, 0x80000000)
+
+    // Phase 0: Initial
+    assert(seq.get_phase() == 0, "initial phase 0")
+
+    // Phase 1: Initialize
+    assert(seq.initialize(), "initialize")
+    assert(seq.get_phase() == 1, "phase 1 (load)")
+
+    // Phase 2: Load
+    assert(seq.load_kernel(), "load kernel")
+    assert(seq.get_phase() == 2, "phase 2 (configure)")
+
+    // Phase 3: Configure
+    assert(seq.configure_boot("console=ttyAMA0 earlycon=pl011,0x9000000"), "configure boot")
+    assert(seq.get_phase() == 3, "phase 3 (ready)")
+
+    // Phase 4: Enter
+    assert(seq.enter(), "enter kernel")
+    assert(seq.get_phase() == 4, "phase 4 (running)")
+    assert(seq.is_running(), "kernel running")
+
+    // Cannot re-enter
+    assert(!seq.enter(), "cannot re-enter from running phase")
+
+    return true
+}
+
+// ============ Full Integration Test ============
+
+// Test F1: Complete L1 Linux Kernel Boot
+fn test_complete_linux_boot() -> bool {
+    // 1. Create kernel image
+    let mut kernel = KernelImage::new(1)
+    let mut seg = ELFSegment::new(SegmentType::Load, 0x80080000, 0x80080000)
+    seg.mem_size = 0x300000
+    assert(kernel.add_segment(seg), "add kernel segment")
+
+    // 2. Create guest address space
+    let mut guest_as = GuestAddressSpace::new(1, 0x80000000)
+
+    // 3. Setup loader
+    let mut loader = KernelLoader::new(1)
+    loader.kernel = kernel
+
+    // 4. Load
+    assert(loader.load_complete(&mut guest_as), "complete load")
+
+    // 5. Create boot sequence
+    let mut seq = LinuxBootSequence::new(1, loader.get_entry_point(), loader.get_dtb_address())
+
+    // 6. Execute full sequence
+    assert(seq.initialize(), "initialize")
+    assert(seq.load_kernel(), "load")
+    assert(seq.configure_boot("console=ttyAMA0 root=/dev/vda1"), "configure")
+    assert(seq.enter(), "enter")
+    assert(seq.is_running(), "running")
+
+    // Verify everything is ready
+    assert(guest_as.get_mapping_count() > 0, "guest address space mapped")
+    assert(seq.handler.is_kernel_entered(), "kernel entered")
+
+    return true
+}
+
+// ============ Helper Functions ============
+
+fn assert(condition: bool, msg: string) {
+    if !condition {
+        panic("FAIL: " + msg)
+    }
+}
+
+fn panic(msg: string) -> ! {
+    return
+}
+

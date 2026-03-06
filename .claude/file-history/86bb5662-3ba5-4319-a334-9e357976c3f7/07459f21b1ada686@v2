@@ -1,0 +1,290 @@
+/* ============================================================================
+   Transaction Engine - Atomic-Ledger Layer 2
+
+   목적: 트랜잭션 커밋 + 이중지출 방지 + 잔액 검증
+   특징:
+   - < 1ms 커밋 보장 (규칙 1)
+   - 100% 이중지출 방지 (규칙 3, Nonce 캐시)
+   - 배운 잔액 검증
+   - 거래 거부/수락 추적
+
+   크기: ~400줄
+============================================================================ */
+
+use crate::dag::{DagNode, DagNodePool};
+
+// ============================================================================
+// 1. 트랜잭션 정의
+// ============================================================================
+
+pub struct Transaction {
+    pub tx_id: u64,
+    pub from_account: u64,
+    pub to_account: u64,
+    pub amount: u64,
+    pub nonce: u64,
+    pub data: [u8; 256],
+    pub timestamp: u64,
+}
+
+impl Transaction {
+    pub fn new(
+        tx_id: u64,
+        from_account: u64,
+        to_account: u64,
+        amount: u64,
+        nonce: u64,
+        timestamp: u64,
+    ) -> Self {
+        Transaction {
+            tx_id,
+            from_account,
+            to_account,
+            amount,
+            nonce,
+            data: [0u8; 256],
+            timestamp,
+        }
+    }
+
+    pub fn clone(&self) -> Self {
+        Transaction {
+            tx_id: self.tx_id,
+            from_account: self.from_account,
+            to_account: self.to_account,
+            amount: self.amount,
+            nonce: self.nonce,
+            data: self.data,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+// ============================================================================
+// 2. 트랜잭션 결과
+// ============================================================================
+
+pub enum TxResult {
+    Committed(u64),           // (tx_id)
+    Rejected(u32),            // error_code
+    Duplicate,
+}
+
+// ============================================================================
+// 3. 트랜잭션 엔진
+// ============================================================================
+
+pub struct TxEngine {
+    pub dag_store: DagNodePool,
+
+    // 이중지출 방지: Nonce 캐시 (계정별 마지막 nonce)
+    pub last_nonce: [u64; 8192],      // 계정별 마지막 nonce
+    pub nonce_lock: [bool; 8192],     // nonce 잠금 플래그
+
+    // 잔액 추적 (시뮬레이션: 계정별 잔액)
+    pub balance: [u64; 8192],         // 계정 잔액
+
+    // 통계
+    pub commit_count: u64,
+    pub rejected_count: u64,
+    pub duplicate_count: u64,
+    pub total_tx_volume: u64,
+}
+
+impl TxEngine {
+    pub fn new() -> Self {
+        let mut engine = TxEngine {
+            dag_store: DagNodePool::new(),
+            last_nonce: [0u64; 8192],
+            nonce_lock: [false; 8192],
+            balance: [0u64; 8192],
+            commit_count: 0,
+            rejected_count: 0,
+            duplicate_count: 0,
+            total_tx_volume: 0,
+        };
+
+        // 초기 잔액 설정 (시뮬레이션: 모든 계정 1,000,000 초기 자금)
+        for i in 0..8192 {
+            engine.balance[i] = 1000000u64;
+        }
+
+        engine
+    }
+
+    /// 트랜잭션 커밋 (< 1ms)
+    pub fn commit_tx(&mut self, tx: &Transaction) -> TxResult {
+        // Step 1: 계정 유효성 확인
+        if tx.from_account >= 8192 || tx.to_account >= 8192 {
+            self.rejected_count += 1;
+            return TxResult::Rejected(1);  // Invalid account
+        }
+
+        // Step 2: 이중지출 검사 (O(1) nonce 확인)
+        let from_idx = tx.from_account as usize;
+        if self.last_nonce[from_idx] >= tx.nonce {
+            self.duplicate_count += 1;
+            return TxResult::Duplicate;
+        }
+
+        // Step 3: 잔액 검증
+        if !self.validate_balance(tx.from_account, tx.amount) {
+            self.rejected_count += 1;
+            return TxResult::Rejected(2);  // Insufficient balance
+        }
+
+        // Step 4: nonce 잠금 확인
+        if self.nonce_lock[from_idx] {
+            self.rejected_count += 1;
+            return TxResult::Rejected(3);  // Account locked
+        }
+
+        // Step 5: nonce 업데이트
+        self.nonce_lock[from_idx] = true;  // 임시 잠금
+        self.last_nonce[from_idx] = tx.nonce;
+
+        // Step 6: DAG 노드 생성
+        let dag_node = self.create_dag_node_from_tx(tx);
+
+        // Step 7: 잔액 업데이트
+        let to_idx = tx.to_account as usize;
+        self.balance[from_idx] = self.balance[from_idx].saturating_sub(tx.amount);
+        self.balance[to_idx] = self.balance[to_idx].saturating_add(tx.amount);
+
+        // Step 8: DAG 저장소에 추가
+        let node_id = self.dag_store.add_node(dag_node);
+
+        // Step 9: nonce 잠금 해제
+        self.nonce_lock[from_idx] = false;
+
+        // Step 10: 통계 갱신
+        self.commit_count += 1;
+        self.total_tx_volume += tx.amount;
+
+        match node_id {
+            Some(id) => TxResult::Committed(tx.tx_id),
+            None => {
+                self.rejected_count += 1;
+                TxResult::Rejected(4)  // DAG store full
+            }
+        }
+    }
+
+    /// 이중지출 확인 (O(1))
+    pub fn check_double_spend(&self, account: u64, nonce: u64) -> bool {
+        if account >= 8192 {
+            return true;  // Invalid account
+        }
+
+        let idx = account as usize;
+        self.last_nonce[idx] >= nonce  // True if nonce already seen
+    }
+
+    /// 잔액 검증
+    pub fn validate_balance(&self, account: u64, amount: u64) -> bool {
+        if account >= 8192 {
+            return false;
+        }
+
+        self.balance[account as usize] >= amount
+    }
+
+    /// 계정 잔액 조회
+    pub fn get_balance(&self, account: u64) -> u64 {
+        if account >= 8192 {
+            return 0;
+        }
+
+        self.balance[account as usize]
+    }
+
+    /// Nonce 확인
+    pub fn get_last_nonce(&self, account: u64) -> u64 {
+        if account >= 8192 {
+            return 0;
+        }
+
+        self.last_nonce[account as usize]
+    }
+
+    /// 통계
+    pub fn commitment_rate(&self) -> f32 {
+        let total = self.commit_count + self.rejected_count + self.duplicate_count;
+        if total == 0 {
+            return 0.0;
+        }
+
+        (self.commit_count as f32 / total as f32) * 100.0
+    }
+
+    pub fn rejection_rate(&self) -> f32 {
+        let total = self.commit_count + self.rejected_count + self.duplicate_count;
+        if total == 0 {
+            return 0.0;
+        }
+
+        (self.rejected_count as f32 / total as f32) * 100.0
+    }
+
+    pub fn double_spend_rate(&self) -> f32 {
+        let total = self.commit_count + self.rejected_count + self.duplicate_count;
+        if total == 0 {
+            return 0.0;
+        }
+
+        (self.duplicate_count as f32 / total as f32) * 100.0
+    }
+
+    pub fn avg_tx_amount(&self) -> u64 {
+        if self.commit_count == 0 {
+            return 0;
+        }
+
+        self.total_tx_volume / self.commit_count
+    }
+
+    fn create_dag_node_from_tx(&self, tx: &Transaction) -> DagNode {
+        // 마지막 DAG 노드의 해시를 부모로 설정 (간단화)
+        let parent1 = if self.dag_store.count_active() > 0 {
+            // 마지막 노드를 부모로 (시뮬레이션)
+            [0u8; 32]
+        } else {
+            // 제네시스 노드
+            [0u8; 32]
+        };
+
+        let parent2 = [0u8; 32];
+
+        let mut tx_data = [0u8; 256];
+        // tx 데이터 복사 (단순화)
+        for i in 0..tx.data.len() {
+            if i < 256 {
+                tx_data[i] = tx.data[i];
+            }
+        }
+
+        DagNode::new(
+            tx.tx_id,
+            parent1,
+            parent2,
+            tx_data,
+            tx.amount,
+            tx.nonce,
+            tx.timestamp,
+        )
+    }
+
+    pub fn clone(&self) -> Self {
+        TxEngine {
+            dag_store: self.dag_store.clone(),
+            last_nonce: self.last_nonce,
+            nonce_lock: self.nonce_lock,
+            balance: self.balance,
+            commit_count: self.commit_count,
+            rejected_count: self.rejected_count,
+            duplicate_count: self.duplicate_count,
+            total_tx_volume: self.total_tx_volume,
+        }
+    }
+}
+

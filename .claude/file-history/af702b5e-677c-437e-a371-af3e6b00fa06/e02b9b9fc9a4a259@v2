@@ -1,0 +1,274 @@
+// Phase 1: Interrupt Handling - 16 exception vectors, dispatcher (200줄)
+
+module interrupt
+
+// ============ Exception Types ============
+
+enum ExceptionType {
+    Synchronous,    // Instruction abort, data abort, SVC, etc.
+    IRQ,            // External interrupt request
+    FIQ,            // Fast interrupt request
+    SError,         // System error
+}
+
+// ============ Exception Context ============
+
+struct ExceptionContext {
+    exception_class: u32,   // EC field from ESR_EL1/ESR_EL2
+    instruction_syndrome: u32,  // ISS field
+    far: u64,               // Fault Address Register
+    elr: u64,               // Exception Link Register (return address)
+    spsr: u64,              // Saved Program Status Register
+    x0_x30: array[u64; 31], // General purpose registers
+}
+
+impl ExceptionContext {
+    fn new() -> ExceptionContext {
+        return ExceptionContext {
+            exception_class: 0,
+            instruction_syndrome: 0,
+            far: 0,
+            elr: 0,
+            spsr: 0,
+            x0_x30: array[u64; 31],
+        }
+    }
+
+    fn set_return_address(&mut self, addr: u64) -> bool {
+        self.elr = addr
+        return true
+    }
+
+    fn get_return_address(&self) -> u64 {
+        return self.elr
+    }
+
+    fn set_fault_address(&mut self, addr: u64) -> bool {
+        self.far = addr
+        return true
+    }
+
+    fn get_fault_address(&self) -> u64 {
+        return self.far
+    }
+
+    fn set_register(&mut self, reg_num: u32, value: u64) -> bool {
+        if reg_num >= 31 {
+            return false
+        }
+        self.x0_x30[reg_num] = value
+        return true
+    }
+
+    fn get_register(&self, reg_num: u32) -> u64 {
+        if reg_num >= 31 {
+            return 0
+        }
+        return self.x0_x30[reg_num]
+    }
+}
+
+// ============ Exception Vector Entry ============
+
+struct ExceptionVector {
+    exception_type: ExceptionType,
+    exception_level: u32,  // 0-3
+    vector_offset: u64,    // Offset in vector table
+    handler_addr: u64,     // Address of handler function
+    is_enabled: bool,
+}
+
+impl ExceptionVector {
+    fn new(exc_type: ExceptionType, exc_level: u32) -> ExceptionVector {
+        // ARM64 exception vector table: 16 × 128B entries
+        // L0-L3: [Sync, IRQ, FIQ, SError]
+        let offset = (exc_level * 4 + (match exc_type {
+            ExceptionType::Synchronous => 0,
+            ExceptionType::IRQ => 1,
+            ExceptionType::FIQ => 2,
+            ExceptionType::SError => 3,
+        })) * 128
+
+        return ExceptionVector {
+            exception_type: exc_type,
+            exception_level: exc_level,
+            vector_offset: offset as u64,
+            handler_addr: 0,
+            is_enabled: false,
+        }
+    }
+
+    fn set_handler(&mut self, addr: u64) -> bool {
+        self.handler_addr = addr
+        self.is_enabled = true
+        return true
+    }
+
+    fn get_handler(&self) -> u64 {
+        if self.is_enabled {
+            return self.handler_addr
+        }
+        return 0
+    }
+
+    fn disable(&mut self) -> bool {
+        self.is_enabled = false
+        return true
+    }
+
+    fn get_vector_address(&self) -> u64 {
+        // Base of vector table (typically VBAR_EL1 or VBAR_EL2)
+        let base = 0xFFFF800000000000 as u64  // High address for exception vectors
+        return base + self.vector_offset
+    }
+}
+
+// ============ Interrupt Controller (GIC) ============
+
+struct GICController {
+    base_addr: u64,         // GIC distributor base
+    enabled_interrupts: u32,
+    pending_interrupts: u32,
+    active_interrupts: u32,
+}
+
+impl GICController {
+    fn new(base: u64) -> GICController {
+        return GICController {
+            base_addr: base,
+            enabled_interrupts: 0,
+            pending_interrupts: 0,
+            active_interrupts: 0,
+        }
+    }
+
+    fn enable_interrupt(&mut self, irq_num: u32) -> bool {
+        // Set enable bit for IRQ
+        self.enabled_interrupts |= (1 << (irq_num % 32))
+        return true
+    }
+
+    fn disable_interrupt(&mut self, irq_num: u32) -> bool {
+        // Clear enable bit
+        self.enabled_interrupts &= !(1 << (irq_num % 32))
+        return true
+    }
+
+    fn is_pending(&self, irq_num: u32) -> bool {
+        return (self.pending_interrupts & (1 << (irq_num % 32))) != 0
+    }
+
+    fn acknowledge_interrupt(&mut self, irq_num: u32) -> bool {
+        self.pending_interrupts &= !(1 << (irq_num % 32))
+        self.active_interrupts |= (1 << (irq_num % 32))
+        return true
+    }
+
+    fn complete_interrupt(&mut self, irq_num: u32) -> bool {
+        self.active_interrupts &= !(1 << (irq_num % 32))
+        return true
+    }
+
+    fn get_pending_count(&self) -> u32 {
+        let mut count = 0
+        let mut mask = self.pending_interrupts
+        while mask > 0 {
+            count += 1
+            mask >>= 1
+        }
+        return count
+    }
+}
+
+// ============ Exception Handler ============
+
+struct ExceptionHandler {
+    vectors: array[ExceptionVector; 16],  // 4 levels × 4 types
+    gic: GICController,
+    total_exceptions: u32,
+    total_interrupts: u32,
+}
+
+impl ExceptionHandler {
+    fn new(gic_base: u64) -> ExceptionHandler {
+        let mut handler = ExceptionHandler {
+            vectors: array[ExceptionVector; 16],
+            gic: GICController::new(gic_base),
+            total_exceptions: 0,
+            total_interrupts: 0,
+        }
+
+        // Initialize all 16 exception vectors
+        let mut idx = 0
+        for el in 0..4 {
+            for exc_type in 0..4 {
+                let exc = match exc_type {
+                    0 => ExceptionType::Synchronous,
+                    1 => ExceptionType::IRQ,
+                    2 => ExceptionType::FIQ,
+                    _ => ExceptionType::SError,
+                }
+                handler.vectors[idx] = ExceptionVector::new(exc, el)
+                idx += 1
+            }
+        }
+
+        return handler
+    }
+
+    fn register_handler(&mut self, exc_type: ExceptionType, exc_level: u32, handler_addr: u64) -> bool {
+        if exc_level >= 4 {
+            return false
+        }
+
+        let idx = (exc_level * 4) + (match exc_type {
+            ExceptionType::Synchronous => 0,
+            ExceptionType::IRQ => 1,
+            ExceptionType::FIQ => 2,
+            ExceptionType::SError => 3,
+        })
+
+        self.vectors[idx].set_handler(handler_addr)
+        return true
+    }
+
+    fn dispatch_exception(&mut self, context: ExceptionContext) -> bool {
+        self.total_exceptions += 1
+
+        let exc_level = (context.spsr >> 2) & 0x3  // Extract exception level from SPSR
+        let idx = (exc_level * 4) as usize
+
+        if idx < 16 {
+            let _handler = self.vectors[idx].get_handler()
+            // In real implementation, would call handler via function pointer
+            return true
+        }
+
+        return false
+    }
+
+    fn handle_irq(&mut self) -> bool {
+        self.total_interrupts += 1
+        return true
+    }
+
+    fn get_exception_count(&self) -> u32 {
+        return self.total_exceptions
+    }
+
+    fn get_interrupt_count(&self) -> u32 {
+        return self.total_interrupts
+    }
+
+    fn stats(&self) -> string {
+        let mut s = ""
+        s = s + "Exception Handler Statistics:\\n"
+        s = s + "Total Exceptions: " + self.total_exceptions.to_string() + "\\n"
+        s = s + "Total Interrupts: " + self.total_interrupts.to_string() + "\\n"
+        s = s + "GIC Base: 0x" + self.gic.base_addr.to_string() + "\\n"
+        s = s + "Exception Vectors: 16 (4 levels × 4 types)\\n"
+        s = s + "Vector Table Base: 0xFFFF800000000000"
+        return s
+    }
+}
+

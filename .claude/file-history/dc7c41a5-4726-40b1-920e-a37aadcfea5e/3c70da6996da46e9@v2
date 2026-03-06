@@ -1,0 +1,447 @@
+// Green-Distributed-Fabric Layer 3: Predictive Power Management
+// energy_predictor.fl - 미래 전력 소모 예측
+// 재사용: Phase 6 TrendPredictor (다항식 회귀), Phase 7 urgency_score
+
+use crate::power::{PowerReading, PowerPattern};
+use std::collections::VecDeque;
+
+// ─────────────────────────────────────────────────────────────────
+// EnergyForecast: 에너지 예측 결과
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct EnergyForecast {
+    pub current_power_mw: f64,
+    pub predicted_peak_mw: f64,       // N초 후 최고 소비 예측
+    pub growth_rate_mw_per_sec: f64,  // 소비 증가율 (음수=절감 추세)
+    pub time_to_budget_limit_sec: u32, // 전력 예산 초과 예상 시간
+    pub confidence: f64,              // Phase 6 신뢰도 (0.0-1.0)
+    pub prediction_method: String,    // "Linear" / "Quadratic" / "PatternAware"
+    pub estimated_savings_mw: f64,    // 예방 조치 시 절감 예상량
+}
+
+impl EnergyForecast {
+    pub fn is_budget_exceeded(&self, budget_mw: f64) -> bool {
+        self.predicted_peak_mw > budget_mw
+    }
+
+    pub fn drain_urgency_score(&self) -> f64 {
+        // Phase 7 urgency_score() 동일 알고리즘:
+        // time_factor = 1.0 / (1.0 + time_to_limit_sec / 60.0)
+        // urgency = time_factor × confidence
+        let time_factor = 1.0 / (1.0 + (self.time_to_budget_limit_sec as f64) / 60.0);
+        time_factor * self.confidence
+    }
+
+    pub fn is_40percent_savings_achieved(&self) -> bool {
+        // 무관용 규칙 1: 전력 40% 절감
+        // savings_ratio = estimated_savings / current_power >= 0.40
+        if self.current_power_mw > 0.0 {
+            self.estimated_savings_mw / self.current_power_mw >= 0.40
+        } else {
+            false
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// PowerTimeSeries: 시계열 데이터 및 회귀 분석
+// Phase 6 TrendPredictor 패턴 적용
+// ─────────────────────────────────────────────────────────────────
+
+pub struct PowerTimeSeries {
+    samples: VecDeque<(u64, f64)>,  // (timestamp_ms, power_mw)
+    max_samples: usize,              // 기본 300 (5분 × 1/sec)
+}
+
+impl PowerTimeSeries {
+    pub fn new(max_samples: usize) -> PowerTimeSeries {
+        PowerTimeSeries {
+            samples: VecDeque::new(),
+            max_samples,
+        }
+    }
+
+    pub fn add_sample(&mut self, timestamp_ms: u64, power_mw: f64) {
+        self.samples.push_back((timestamp_ms, power_mw));
+
+        if self.samples.len() > self.max_samples {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn linear_regression(&self) -> (f64, f64) {
+        // (slope, intercept)
+        if self.samples.len() < 2 {
+            return (0.0, 0.0);
+        }
+
+        let n = self.samples.len() as f64;
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        let mut sum_xy = 0.0;
+        let mut sum_x2 = 0.0;
+
+        for (i, (_, y)) in self.samples.iter().enumerate() {
+            let x = i as f64;
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_x2 += x * x;
+        }
+
+        let numerator = n * sum_xy - sum_x * sum_y;
+        let denominator = n * sum_x2 - sum_x * sum_x;
+
+        let slope = if denominator.abs() > 0.0001 {
+            numerator / denominator
+        } else {
+            0.0
+        };
+
+        let intercept = (sum_y - slope * sum_x) / n;
+
+        (slope, intercept)
+    }
+
+    pub fn quadratic_regression(&self) -> (f64, f64, f64) {
+        // (a, b, c) for ax² + bx + c
+        // 간단한 근사: 3개 포인트 기반
+        if self.samples.len() < 3 {
+            return (0.0, 0.0, 0.0);
+        }
+
+        let first = self.samples[0].1;
+        let mid = self.samples[self.samples.len() / 2].1;
+        let last = self.samples[self.samples.len() - 1].1;
+
+        // 포물선 근사 (단순화)
+        let a = ((last + first) / 2.0 - mid) / 4.0; // 곡률
+        let (b, c) = self.linear_regression();
+
+        (a, b, c)
+    }
+
+    pub fn predict_at(&self, future_sec: u32, method: &str) -> f64 {
+        let (slope, intercept) = self.linear_regression();
+        let x = (self.samples.len() + future_sec as usize) as f64;
+
+        match method {
+            "Quadratic" => {
+                let (a, b, c) = self.quadratic_regression();
+                a * x * x + b * x + c
+            }
+            _ => slope * x + intercept,
+        }
+    }
+
+    pub fn r_squared(&self) -> f64 {
+        // 모델 적합도 (R²)
+        if self.samples.len() < 2 {
+            return 0.0;
+        }
+
+        let (slope, intercept) = self.linear_regression();
+
+        // 평균 계산
+        let mean_y = self.samples.iter().map(|(_, y)| y).sum::<f64>() / (self.samples.len() as f64);
+
+        // SS_tot: 총 제곱합
+        let ss_tot = self.samples.iter()
+            .map(|(_, y)| (y - mean_y).powi(2))
+            .sum::<f64>();
+
+        // SS_res: 잔차 제곱합
+        let ss_res = self.samples.iter()
+            .enumerate()
+            .map(|(i, (_, y))| {
+                let x = i as f64;
+                let predicted = slope * x + intercept;
+                (y - predicted).powi(2)
+            })
+            .sum::<f64>();
+
+        if ss_tot.abs() < 0.0001 {
+            return 0.0;
+        }
+
+        1.0 - (ss_res / ss_tot)
+    }
+
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// EnergyPredictor: 전력 예측 엔진
+// ─────────────────────────────────────────────────────────────────
+
+pub struct EnergyPredictor {
+    pub time_series: PowerTimeSeries,
+    pub active_patterns: Vec<PowerPattern>,
+    pub power_budget_mw: f64,         // 목표 전력 예산 (150mW)
+    pub learning_state: String,       // 학습 상태 (Phase 6)
+}
+
+impl EnergyPredictor {
+    pub fn new(budget_mw: f64) -> EnergyPredictor {
+        EnergyPredictor {
+            time_series: PowerTimeSeries::new(300),
+            active_patterns: Vec::new(),
+            power_budget_mw: budget_mw,
+            learning_state: "NoData".to_string(),
+        }
+    }
+
+    pub fn observe(&mut self, reading: &PowerReading, patterns: &[PowerPattern]) {
+        let timestamp_ms = reading.timestamp_us / 1000;
+        self.time_series.add_sample(timestamp_ms, reading.power_consumption_mw);
+        self.active_patterns = patterns.to_vec();
+    }
+
+    pub fn forecast_linear(&self, horizon_sec: u32) -> EnergyForecast {
+        let (slope, _) = self.time_series.linear_regression();
+        let current = self.time_series.samples.back()
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+
+        let predicted_peak = current + (slope * (horizon_sec as f64));
+        let time_to_limit = if slope > 0.0 {
+            ((self.power_budget_mw - current) / slope).max(0.0) as u32
+        } else {
+            u32::MAX
+        };
+
+        EnergyForecast {
+            current_power_mw: current,
+            predicted_peak_mw: predicted_peak.max(current),
+            growth_rate_mw_per_sec: slope,
+            time_to_budget_limit_sec: time_to_limit,
+            confidence: 0.70,
+            prediction_method: "Linear".to_string(),
+            estimated_savings_mw: (self.power_budget_mw - predicted_peak).max(0.0),
+        }
+    }
+
+    pub fn forecast_quadratic(&self, horizon_sec: u32) -> EnergyForecast {
+        let (a, b, c) = self.time_series.quadratic_regression();
+        let current = self.time_series.samples.back()
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+
+        let x = (self.time_series.sample_count() + horizon_sec as usize) as f64;
+        let predicted_peak = a * x * x + b * x + c;
+
+        EnergyForecast {
+            current_power_mw: current,
+            predicted_peak_mw: predicted_peak.max(current),
+            growth_rate_mw_per_sec: b + 2.0 * a * x, // 미분값
+            time_to_budget_limit_sec: 60, // 근사
+            confidence: 0.80,
+            prediction_method: "Quadratic".to_string(),
+            estimated_savings_mw: (self.power_budget_mw - predicted_peak).max(0.0),
+        }
+    }
+
+    pub fn forecast_pattern_aware(&self, horizon_sec: u32) -> EnergyForecast {
+        // 활성 패턴의 combined_score() 가중치 반영
+        let mut total_severity = 0.0;
+        for pattern in &self.active_patterns {
+            total_severity += pattern.combined_score();
+        }
+
+        let (slope, _) = self.time_series.linear_regression();
+        let current = self.time_series.samples.back()
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+
+        let severity_factor = if !self.active_patterns.is_empty() {
+            1.0 + (total_severity / self.active_patterns.len() as f64) * 0.5
+        } else {
+            1.0
+        };
+
+        let adjusted_slope = slope * severity_factor;
+        let predicted_peak = current + (adjusted_slope * (horizon_sec as f64));
+
+        EnergyForecast {
+            current_power_mw: current,
+            predicted_peak_mw: predicted_peak.max(current),
+            growth_rate_mw_per_sec: adjusted_slope,
+            time_to_budget_limit_sec: if adjusted_slope > 0.0 {
+                ((self.power_budget_mw - current) / adjusted_slope).max(0.0) as u32
+            } else {
+                u32::MAX
+            },
+            confidence: 0.85,
+            prediction_method: "PatternAware".to_string(),
+            estimated_savings_mw: (self.power_budget_mw - predicted_peak).max(0.0),
+        }
+    }
+
+    pub fn best_forecast(&self, horizon_sec: u32) -> EnergyForecast {
+        let linear = self.forecast_linear(horizon_sec);
+        let quadratic = self.forecast_quadratic(horizon_sec);
+        let pattern_aware = self.forecast_pattern_aware(horizon_sec);
+
+        // R² 가장 높은 방법 선택
+        let r2 = self.time_series.r_squared();
+
+        if r2 > 0.80 && !self.active_patterns.is_empty() {
+            pattern_aware
+        } else if r2 > 0.60 {
+            quadratic
+        } else {
+            linear
+        }
+    }
+
+    pub fn prediction_error_rate(&self) -> f64 {
+        // 무관용 규칙 7: 예측 오차 ≤ 10%
+        // 간단한 추정: 이전 예측 vs 실제 비교
+        if self.time_series.sample_count() < 5 {
+            return 1.0; // 데이터 부족
+        }
+
+        // 작은 윈도우에서 예측 오차 계산
+        let half = self.time_series.sample_count() / 2;
+        let (slope, intercept) = self.time_series.linear_regression();
+
+        let mut error_sum = 0.0;
+        let mut count = 0;
+
+        for i in half..self.time_series.sample_count() {
+            let (_, actual) = self.time_series.samples[i];
+            let predicted = slope * (i as f64) + intercept;
+            let error = (actual - predicted).abs() / actual.max(1.0);
+            error_sum += error;
+            count += 1;
+        }
+
+        if count > 0 {
+            error_sum / (count as f64)
+        } else {
+            1.0
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 테스트
+// ─────────────────────────────────────────────────────────────────
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_energy_forecast_is_budget_exceeded() {
+        let forecast = EnergyForecast {
+            current_power_mw: 100.0,
+            predicted_peak_mw: 180.0,
+            growth_rate_mw_per_sec: 2.0,
+            time_to_budget_limit_sec: 30,
+            confidence: 0.80,
+            prediction_method: "Linear".to_string(),
+            estimated_savings_mw: 50.0,
+        };
+
+        assert!(forecast.is_budget_exceeded(150.0));
+        assert!(!forecast.is_budget_exceeded(200.0));
+    }
+
+    #[test]
+    fn test_drain_urgency_score() {
+        let forecast = EnergyForecast {
+            current_power_mw: 100.0,
+            predicted_peak_mw: 150.0,
+            growth_rate_mw_per_sec: 1.0,
+            time_to_budget_limit_sec: 60,
+            confidence: 0.80,
+            prediction_method: "Linear".to_string(),
+            estimated_savings_mw: 50.0,
+        };
+
+        let urgency = forecast.drain_urgency_score();
+        // time_factor = 1.0 / (1.0 + 60/60) = 0.5
+        // urgency = 0.5 × 0.80 = 0.40
+        assert!(urgency > 0.39 && urgency < 0.41);
+    }
+
+    #[test]
+    fn test_power_time_series_add_sample() {
+        let mut ts = PowerTimeSeries::new(10);
+        ts.add_sample(1000, 100.0);
+        ts.add_sample(2000, 105.0);
+
+        assert_eq!(ts.sample_count(), 2);
+    }
+
+    #[test]
+    fn test_linear_regression() {
+        let mut ts = PowerTimeSeries::new(10);
+        for i in 0..10 {
+            ts.add_sample((i * 1000) as u64, (100.0 + i as f64 * 10.0));
+        }
+
+        let (slope, _) = ts.linear_regression();
+        assert!(slope > 9.0 && slope < 11.0); // ~10.0
+    }
+
+    #[test]
+    fn test_energy_predictor_forecast_linear() {
+        let mut predictor = EnergyPredictor::new(150.0);
+
+        for i in 0..10 {
+            let reading = PowerReading::new(
+                (i * 1000) as u64,
+                3700,
+                (100 + i) as i32,
+                25.0,
+                1000,
+            );
+            predictor.observe(&reading, &[]);
+        }
+
+        let forecast = predictor.forecast_linear(10);
+        assert_eq!(forecast.prediction_method, "Linear");
+    }
+
+    #[test]
+    fn test_energy_predictor_best_forecast() {
+        let mut predictor = EnergyPredictor::new(150.0);
+
+        for i in 0..30 {
+            let reading = PowerReading::new(
+                (i * 1000) as u64,
+                3700,
+                (100 + i as i32 / 2),
+                25.0,
+                1000,
+            );
+            predictor.observe(&reading, &[]);
+        }
+
+        let forecast = predictor.best_forecast(10);
+        assert!(forecast.confidence >= 0.70);
+    }
+
+    #[test]
+    fn test_prediction_error_rate() {
+        let mut predictor = EnergyPredictor::new(150.0);
+
+        for i in 0..20 {
+            let reading = PowerReading::new(
+                (i * 1000) as u64,
+                3700,
+                100 as i32,
+                25.0,
+                1000,
+            );
+            predictor.observe(&reading, &[]);
+        }
+
+        let error = predictor.prediction_error_rate();
+        assert!(error >= 0.0 && error <= 1.0);
+    }
+}
