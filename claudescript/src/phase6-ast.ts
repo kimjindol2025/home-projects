@@ -16,13 +16,15 @@ export type Expr =
       left: Expr;
       right: Expr;
     }
-  | { type: "Identifier"; name: string };
+  | { type: "Identifier"; name: string }
+  | { type: "Call"; name: string; args: Expr[] };
 
 export type Stmt =
   | { type: "VarDecl"; name: string; init: Expr }
   | { type: "Return"; value: Expr }
   | { type: "If"; cond: Expr; then: Stmt[]; else?: Stmt[] }
-  | { type: "While"; cond: Expr; body: Stmt[] };
+  | { type: "While"; cond: Expr; body: Stmt[] }
+  | { type: "Call"; name: string; args: Expr[] };
 
 export interface Program {
   body: Stmt[];

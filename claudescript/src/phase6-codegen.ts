@@ -89,6 +89,19 @@ export class Phase6CodeGenerator {
         this.instructions[jzIndex].arg = this.instructions.length;
         break;
       }
+
+      case "Call": {
+        // 인자 평가
+        stmt.args.forEach((arg) => this.emitExpr(arg));
+
+        // 인자 개수를 스택에 push
+        this.emit(OpCode.PUSH_CONST, stmt.args.length);
+
+        // 네이티브 함수 호출
+        const fnId = this.getNativeFunctionId(stmt.name);
+        this.emit(OpCode.CALL_NATIVE, fnId);
+        break;
+      }
     }
   }
 
@@ -131,6 +144,36 @@ export class Phase6CodeGenerator {
         }
         break;
       }
+
+      case "Call": {
+        // 인자 평가
+        expr.args.forEach((arg) => this.emitExpr(arg));
+
+        // 인자 개수를 스택에 push
+        this.emit(OpCode.PUSH_CONST, expr.args.length);
+
+        // 네이티브 함수 호출
+        const fnId = this.getNativeFunctionId(expr.name);
+        this.emit(OpCode.CALL_NATIVE, fnId);
+        break;
+      }
     }
+  }
+
+  /**
+   * 함수 이름 → 네이티브 함수 ID 매핑
+   */
+  private getNativeFunctionId(name: string): number {
+    const nativeMap: Record<string, number> = {
+      println: 0,
+      print: 1,
+      length: 2,
+    };
+
+    if (!(name in nativeMap)) {
+      throw new Error(`Unknown native function: ${name}`);
+    }
+
+    return nativeMap[name];
   }
 }

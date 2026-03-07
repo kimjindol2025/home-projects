@@ -1,6 +1,6 @@
 /**
  * FreeLang VM - 최소 실행 엔진
- * 산술 + 변수 + 함수 호출 지원
+ * 산술 + 변수 + 함수 호출 + StdLib 바인딩 지원
  */
 
 import { OpCode } from "./vt-opcodes";
@@ -11,12 +11,17 @@ interface Frame {
   locals: number[];
 }
 
+type NativeFn = (args: number[]) => number | void;
+
 export class FreeLangVM {
   private stack: number[] = [];
   private frames: Frame[] = [];
   private ip = 0;
+  private natives = new Map<number, NativeFn>();
 
-  constructor(private program: Instruction[]) {}
+  constructor(private program: Instruction[]) {
+    this.registerStdlib();
+  }
 
   /**
    * 프로그램 실행
@@ -132,6 +137,27 @@ export class FreeLangVM {
           continue;
         }
 
+        case OpCode.CALL_NATIVE: {
+          const fnId = instr.arg!;
+          const argc = this.stack.pop()!;
+          const args: number[] = [];
+
+          for (let i = 0; i < argc; i++) {
+            args.unshift(this.stack.pop()!);
+          }
+
+          const result = this.natives.get(fnId)!(args);
+
+          if (typeof result === "number") {
+            this.stack.push(result);
+          } else {
+            // undefined 반환값이면 0을 push
+            this.stack.push(0);
+          }
+
+          break;
+        }
+
         case OpCode.RET: {
           const returnValue = this.stack.pop()!;
           const frame = this.frames.pop()!;
@@ -149,6 +175,29 @@ export class FreeLangVM {
 
       this.ip++;
     }
+  }
+
+  /**
+   * StdLib 함수 등록
+   */
+  private registerStdlib() {
+    // ID 0 → println (값 출력 + 개행)
+    this.natives.set(0, (args) => {
+      console.log(args[0]);
+      return 0;
+    });
+
+    // ID 1 → print (값 출력, 개행 없음)
+    this.natives.set(1, (args) => {
+      process.stdout.write(String(args[0]));
+      return 0;
+    });
+
+    // ID 2 → length (배열 길이, 향후 배열 타입 도입 시 확장)
+    this.natives.set(2, (args) => {
+      // 임시: 단순히 첫 인자 반환
+      return args.length;
+    });
   }
 
   /**

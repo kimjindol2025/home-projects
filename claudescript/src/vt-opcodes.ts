@@ -18,6 +18,7 @@ export enum OpCode {
   LT = 11,         // <
   GT = 12,         // >
   CALL = 13,       // 함수 호출
-  RET = 14,        // 함수 반환
-  HALT = 15        // 프로그램 종료
+  CALL_NATIVE = 14, // 네이티브 함수 호출 (stdlib 바인딩)
+  RET = 15,        // 함수 반환
+  HALT = 16        // 프로그램 종료
 }
