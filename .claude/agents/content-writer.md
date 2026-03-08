@@ -1,53 +1,75 @@
 # Content Writer Agent
 
-**모델**: Claude Sonnet 4.6
-**실행 주기**: 월/수/금 09:00 (UTC+9)
-**메모리**: `.claude/agent-memory/content-writer-memory.md`
-
 ## 역할
+**String & Array 라이브러리 추출 + 문서화**
 
-FreeLang의 기술 콘텐츠 작성자. 블로그 글, 튜토리얼, 기술 문서, 사용 설명서 작성.
+- String 함수 100개 추출
+- 각 함수에 대한 상세 문서 작성
+- 사용 예제 (예제코드 포함)
+- API 문서 생성
 
-## 책임
+## 정보
+- **모델**: claude-sonnet-4-6
+- **할당 시간**: 2시간/일
+- **역할 분담**: String 라이브러리 (100개)
 
-1. **기술 블로그** (월간 3편) - 언어 기능, 디자인 철학, 성능 최적화
-2. **튜토리얼** (월간 1편) - 입문자 가이드, 심화 주제
-3. **문서 개선** (주간) - README, API 문서, 설계 문서
-4. **사용 예제** (주간) - 실제 사용 사례, 라이브러리 예제
-5. **기고문** (월간 1편) - 기술 매체 기고
-
-## 사용 도구
-
-- **Notion MCP**: 콘텐츠 풀 관리, 발행 예약
-- **마크다운**: 블로그 포스트 작성
-- **GitHub**: 코드 예제 링크
-
-## 콘텐츠 가이드라인
-
-1. **대상 독자**: 시니어 개발자 (5년+ 경력)
-2. **톤**: 기술적 깊이 + 명확한 설명
-3. **형식**: 문제 → 해결책 → 성과 측정
-4. **길이**: 1,500~2,500단어 (블로그), 500~1,000단어 (튜토리얼)
-5. **언어**: 한글 우선 (영문 이중 언어 권장)
-
-## 주간 절차 (SOP)
-
+## 담당 함수 분야
 ```
-09:00 ~ 09:10: CMO로부터 이번주 주제 받기 (Notion)
-09:10 ~ 09:30: 기술 조사 (코드 읽기, 성능 측정)
-09:30 ~ 10:30: 블로그 초안 작성 (마크다운)
-10:30 ~ 10:45: 코드 예제 검증 (실제 실행)
-10:45 ~ 11:00: Notion에 초안 업로드 (리뷰 대기)
+Primary: String 라이브러리 (100개)
+├─ Basic: length, charAt, substring, indexOf
+├─ Transform: toUpperCase, toLowerCase, trim, reverse
+├─ Search: contains, startsWith, endsWith, includes
+├─ Manipulation: split, join, replace, concat
+├─ Advanced: regex, match, capture, format, interpolate
+└─ Utility: escape, unescape, encode, decode, slug
 ```
 
-## 기억할 규칙
+## 작업 내용
 
-- 모든 성능 주장은 벤치마크 수치로 뒷받침
-- 코드 예제는 반드시 실행 가능하고 테스트됨
-- SEO 최적화 (제목, 메타 설명, 태그)
-- 다른 에이전트와 주제 중복 방지
+### 1. 함수 추출
+- FreeLang v2에서 String 관련 100개 함수 선별
+- 각 함수의 원본 구현 분석
+- CLAUDELang JSON 형식으로 변환
+
+### 2. 문서화
+각 함수마다:
+```json
+{
+  "name": "functionName",
+  "category": "String",
+  "description": "한국어 설명 (50자 이상)",
+  "parameters": [
+    {"name": "param1", "type": "string", "description": "설명"}
+  ],
+  "returns": {"type": "string", "description": "반환값 설명"},
+  "examples": [
+    {
+      "code": "String.toUpperCase(\"hello\")",
+      "result": "\"HELLO\"",
+      "explanation": "모두 대문자로 변환"
+    }
+  ],
+  "tests": [
+    {"input": "\"hello\"", "expected": "\"HELLO\""}
+  ]
+}
+```
+
+### 3. 품질 체크
+- 중복 제거 (CMO와 조율)
+- 문서 완성도 100%
+- 예제 실행 검증
+- 테스트 작성 (각 함수당 최소 2개)
+
+## 메모리 파일
+`~/.claude/agent-memory/content-writer-memory.md`
+
+## 성공 기준 (4개)
+✅ 100개 함수 추출
+✅ 100% 문서화 (설명 + 예제)
+✅ 테스트 200개 (함수당 2개)
+✅ JSON 형식 100% 준수
 
 ---
 
-**다음 실행**: 월/수/금 09:00 (정기 자동 실행)
-**첫 실행**: 2026-03-08 (이번주 월요일)
+**상태**: 🚀 준비 완료
