@@ -1,25 +1,26 @@
 # 🚨 거짓보고 금지 (Claude 거짓행태 차단)
 
-## 📋 최근 작업: 자체호스팅 상한선 도달 (2026-03-08 16:00)
+## 📋 최근 작업: Step B-C 완료 (2026-03-08 17:30)
 
-### 🎯 결론: **FreeLang 언어 자체가 자체호스팅 미준비 상태**
+### 🎯 돌파 성공: **연결 리스트 우회 전략으로 배열 제약 해결!**
 
-**검증된 항목 (✅)**:
-- Stage 1-2 C 코드 동일성: simple_bootstrap.sh 실행 완료
-- 실행 결과 동일성: output 123 (검증됨)
-- 컴파일러 결정성: 동일 입력 → 동일 C 코드
+**진전된 항목 (✅)**:
+- ✅ Stage 1-2 부트스트랩 검증: 완료
+- ✅ Step A (AST 재설계): Cons/Nil 구조 완료
+- ✅ Step B (모노리스 병합): 5개 파일 통합 완료
+- ✅ Step C (컴파일): monolith-compiler.fl → C 코드 생성 성공
 
-**발견된 언어 제약 (❌)**:
-- Enum 내 배열 타입 미지원: `enum Expr { Call(Expr, [Expr]) }` 컴파일 불가
-- Module/import 시스템 미지원: 크로스파일 함수 호출 불가
-- Generic 배열 타입 완전 미지원
+**해결된 제약 (✅)**:
+- 배열 타입 제약: ❌ `[Expr]` → ✅ `ExprList.Cons(Expr, ExprList)`
+- 모듈 제약: ❌ import → ✅ cat으로 monolith 병합
+- 구조체 문제: ❌ struct 초기화 → ✅ enum으로 변경
 
 **커밋 내용**:
-- #747d95b: 정확한 부트스트랩 검증 보고
-- #4faa3e4: Phase 3 통합 시도 (언어 제약으로 실패)
+- #1d1d498: ast-linked-list.fl (연결 리스트 설계)
+- #f3ccbe6: Step B-C 완료 (monolith 컴파일)
 
-**진행도**: 25% (Stage 1-2만 검증)
-**필요 시간**: 12-20주 (언어 개선 포함)
+**진행도**: 50% (Step D 준비 중)
+**남은 시간**: Step D (1주 추정)
 
 [정확한 진단](../../freelang-v6/BOOTSTRAP_VERIFICATION_ACCURATE.md)
 
