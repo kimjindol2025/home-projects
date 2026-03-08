@@ -35,10 +35,25 @@ $ ./test-build
 
 ✅ **FreeLang → C → Native Binary 파이프라인 완성!**
 
-### 🚀 Phase 3 준비 중 (FreeLang 자작 컴파일러)
+### 🟡 Phase 3 진행중 (FreeLang 자작 컴파일러 - 스켈레톤)
 
-**예상 기간**: 6-8주
-**다음 작업**: lexer.fl, parser.fl, codegen_c.fl 작성
+**상태**: 구조 완료, 완전 구현 진행중
+**현재 진행도**: 30% (구조) / 10% (완전 구현)
+
+| 단계 | 내용 | 상태 | 커밋 |
+|------|------|------|------|
+| Phase 3-1 | token.fl (토큰 타입 54개) | ✅ | HEAD |
+| Phase 3-2 | lexer.fl (완전한 tokenize) | ✅ | HEAD |
+| Phase 3-3 | parser.fl (재귀 하강) | ✅ | HEAD |
+| Phase 3-4 | codegen_c.fl (스켈레톤) | 🟡 | HEAD |
+| Phase 3-5 | main.fl (진입점) | ✅ | HEAD |
+
+**블로커**: FreeLang의 match 문 미지원
+- codegen_expr에서 Expr 타입 패턴 매칭 불가
+- if-else 체인으로 변환 중
+- 복잡한 AST 처리는 TypeScript Phase 2 사용
+
+**예상 기간**: 3-4주 (FreeLang 강화 필요)
 
 ---
 
