@@ -1,0 +1,764 @@
+// 🦎 Mini Zig Compiler - Phase 2.3: AstGen
+// src/astgen.zig: AST → ZIR (Untyped Intermediate Representation)
+
+const std = @import("std");
+const Ast = @import("ast.zig");
+const Node = Ast.Node;
+const Zir = @import("zir.zig").Zir;
+
+pub const AstGen = struct {
+    zir: *Zir,
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    function_decls: std.StringHashMap(std.ArrayList(*const Node)),
+
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !AstGen {
+        var zir = try allocator.create(Zir);
+        zir.* = Zir.init(allocator);
+
+        return .{
+            .zir = zir,
+            .allocator = allocator,
+            .source = source,
+            .function_decls = std.StringHashMap(std.ArrayList(*const Node)).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *AstGen) void {
+        self.zir.deinit();
+        self.allocator.destroy(self.zir);
+        var iter = self.function_decls.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.function_decls.deinit();
+    }
+
+    /// 전체 프로그램 생성
+    pub fn genProgram(self: *AstGen, ast: *const Ast) !void {
+        // root 노드의 블록 생성
+        if (ast.root.data == .block) {
+            // 첫 번째 pass: 모든 함수 선언 수집 (오버로드 감지)
+            for (ast.root.data.block) |stmt| {
+                if (stmt.tag == .fn_decl) {
+                    const fn_name = stmt.data.fn_decl.name;
+                    var entry = try self.function_decls.getOrPut(fn_name);
+                    if (entry.value_ptr.* == undefined) {
+                        entry.value_ptr.* = std.ArrayList(*const Node).init(self.allocator);
+                    }
+                    try entry.value_ptr.append(&stmt);
+                }
+            }
+
+            // 두 번째 pass: ZIR 생성
+            var processed_fn_names = std.StringHashMap(bool).init(self.allocator);
+            defer processed_fn_names.deinit();
+
+            for (ast.root.data.block) |stmt| {
+                if (stmt.tag == .fn_decl) {
+                    const fn_name = stmt.data.fn_decl.name;
+                    // 이미 처리한 오버로드 그룹은 건너뛰기
+                    if (processed_fn_names.contains(fn_name)) {
+                        continue;
+                    }
+
+                    const decls = self.function_decls.get(fn_name).?;
+                    if (decls.items.len > 1) {
+                        // 오버로드 그룹: 모든 오버로드 버전 처리
+                        _ = try self.genOverloadGroup(fn_name, decls.items);
+                    } else {
+                        // 일반 함수: 단일 버전
+                        _ = try self.genNode(&stmt);
+                    }
+                    try processed_fn_names.put(fn_name, true);
+                } else {
+                    _ = try self.genNode(&stmt);
+                }
+            }
+        }
+    }
+
+    /// 노드 생성 (재귀)
+    pub fn genNode(self: *AstGen, node: *const Node) !Zir.Ref {
+        return switch (node.tag) {
+            // 선언
+            .fn_decl => self.genFnDecl(node),
+            .const_decl => self.genConstDecl(node),
+            .var_decl => self.genVarDecl(node),
+
+            // Phase 3.2: Union/Enum
+            .union_type => self.genUnionType(node),
+            .enum_type => self.genEnumType(node),
+
+            // Phase 3.3: Comptime Programming
+            .comptime_block_expr => self.genComptimeBlockExpr(node),
+            .const_expr => self.genConstExpr(node),
+
+            // 문장
+            .return_stmt => self.genReturnStmt(node),
+            .block => self.genBlock(node),
+            .if_stmt => self.genIfStmt(node),
+            .while_stmt => self.genWhileStmt(node),
+            .expr_stmt => self.genExprStmt(node),
+
+            // 식
+            .binary_op => self.genBinaryOp(node),
+            .unary_op => self.genUnaryOp(node),
+            .call => self.genCall(node),
+            .integer_literal => self.genIntegerLiteral(node),
+            .float_literal => self.genFloatLiteral(node),
+            .string_literal => self.genStringLiteral(node),
+            .identifier => self.genIdentifier(node),
+            .array_literal => self.genArrayLiteral(node),
+            .index_access => self.genIndexAccess(node),
+            .member_access => self.genMemberAccess(node),
+            .grouped_expr => self.genNode(node.data.expr),
+
+            // Phase 3.5: 배열/슬라이스
+            .type_array => self.genArrayType(node),
+            .type_slice => self.genSliceType(node),
+            .slice_access => self.genSliceAccess(node),
+
+            // 기타
+            .var_assign => self.genVarAssign(node),
+
+            else => error.UnhandledNodeType,
+        };
+    }
+
+    /// 함수 선언 생성
+    fn genFnDecl(self: *AstGen, node: *const Node) !Zir.Ref {
+        const fn_decl = node.data.fn_decl;
+        return try self.genFnDeclBase(fn_decl);
+    }
+
+    /// 상수 선언 생성
+    fn genConstDecl(self: *AstGen, node: *const Node) !Zir.Ref {
+        const const_decl = node.data.const_decl;
+
+        // 값 생성
+        const value_ref = try self.genNode(const_decl.value);
+
+        // 변수 이름 추가
+        const name_index = try self.zir.addString(const_decl.name);
+
+        // store 명령어 생성
+        return try self.zir.addInstruction(.{
+            .store_var = .{
+                .name_index = name_index,
+                .value = value_ref,
+            },
+        });
+    }
+
+    /// 변수 선언 생성
+    fn genVarDecl(self: *AstGen, node: *const Node) !Zir.Ref {
+        const var_decl = node.data.var_decl;
+
+        // 초기값이 있으면 생성
+        var value_ref: Zir.Ref = 0;
+        if (var_decl.initial_value) |init| {
+            value_ref = try self.genNode(init);
+        }
+
+        // 변수 이름 추가
+        const name_index = try self.zir.addString(var_decl.name);
+
+        // store 명령어 생성
+        return try self.zir.addInstruction(.{
+            .store_var = .{
+                .name_index = name_index,
+                .value = value_ref,
+            },
+        });
+    }
+
+    /// return 문 생성
+    fn genReturnStmt(self: *AstGen, node: *const Node) !Zir.Ref {
+        if (node.data.return_expr) |expr| {
+            const value = try self.genNode(expr);
+            return try self.zir.addInstruction(.{ .return_val = value });
+        } else {
+            return try self.zir.addInstruction(.{ .return_val = null });
+        }
+    }
+
+    /// 블록 생성
+    fn genBlock(self: *AstGen, node: *const Node) !Zir.Ref {
+        const block_label: u32 = @intCast(self.zir.instructions.items.len);
+
+        _ = try self.zir.addInstruction(.{
+            .block_begin = .{ .label = block_label },
+        });
+
+        var last_ref: Zir.Ref = 0;
+        for (node.data.block) |stmt| {
+            last_ref = try self.genNode(&stmt);
+        }
+
+        _ = try self.zir.addInstruction(.block_end);
+
+        return last_ref;
+    }
+
+    /// if 문 생성
+    fn genIfStmt(self: *AstGen, node: *const Node) !Zir.Ref {
+        const if_stmt = node.data.if_stmt;
+
+        // 조건 생성
+        const cond_ref = try self.genNode(if_stmt.condition);
+
+        // then 분기 생성
+        const then_ref = try self.genNode(if_stmt.then_branch);
+
+        // else 분기 생성 (있으면)
+        var else_ref: ?Zir.Ref = null;
+        if (if_stmt.else_branch) |else_br| {
+            else_ref = try self.genNode(else_br);
+        }
+
+        return try self.zir.addInstruction(.{
+            .cond_br = .{
+                .cond = cond_ref,
+                .then_block = then_ref,
+                .else_block = else_ref,
+            },
+        });
+    }
+
+    /// while 루프 생성
+    fn genWhileStmt(self: *AstGen, node: *const Node) !Zir.Ref {
+        const while_stmt = node.data.while_stmt;
+
+        const loop_label: u32 = @intCast(self.zir.instructions.items.len);
+
+        _ = try self.zir.addInstruction(.{
+            .loop_begin = .{ .label = loop_label },
+        });
+
+        // 조건 생성
+        const cond_ref = try self.genNode(while_stmt.condition);
+
+        // 본체 생성
+        _ = try self.genNode(while_stmt.body);
+
+        _ = try self.zir.addInstruction(.loop_end);
+
+        return cond_ref;
+    }
+
+    /// 식 문장 생성
+    fn genExprStmt(self: *AstGen, node: *const Node) !Zir.Ref {
+        return self.genNode(node.data.expr);
+    }
+
+    /// 변수 할당 생성
+    fn genVarAssign(self: *AstGen, node: *const Node) !Zir.Ref {
+        const assign = node.data.var_assign;
+
+        // 값 생성
+        const value_ref = try self.genNode(assign.value);
+
+        // 변수 이름 추출
+        if (assign.target.tag == .identifier) {
+            const name = assign.target.data.identifier;
+            const name_index = try self.zir.addString(name);
+
+            return try self.zir.addInstruction(.{
+                .store_var = .{
+                    .name_index = name_index,
+                    .value = value_ref,
+                },
+            });
+        }
+
+        return error.InvalidAssignmentTarget;
+    }
+
+    /// 이진 연산자 생성
+    fn genBinaryOp(self: *AstGen, node: *const Node) !Zir.Ref {
+        const binary_op = node.data.binary_op;
+
+        // 좌측 및 우측 식 생성
+        const lhs = try self.genNode(binary_op.lhs);
+        const rhs = try self.genNode(binary_op.rhs);
+
+        // BinaryOp을 Zir.BinaryOp로 변환
+        const zir_op = astBinaryOpToZirBinaryOp(binary_op.op);
+
+        return try self.zir.addInstruction(.{
+            .binary_op = .{
+                .op = zir_op,
+                .lhs = lhs,
+                .rhs = rhs,
+            },
+        });
+    }
+
+    /// 단항 연산자 생성
+    fn genUnaryOp(self: *AstGen, node: *const Node) !Zir.Ref {
+        const unary_op = node.data.unary_op;
+
+        // 피연산자 생성
+        const operand = try self.genNode(unary_op.operand);
+
+        // UnaryOp를 Zir.UnaryOp로 변환
+        const zir_op = astUnaryOpToZirUnaryOp(unary_op.op);
+
+        return try self.zir.addInstruction(.{
+            .unary_op = .{
+                .op = zir_op,
+                .operand = operand,
+            },
+        });
+    }
+
+    /// 함수 호출 생성
+    fn genCall(self: *AstGen, node: *const Node) !Zir.Ref {
+        const call = node.data.call;
+
+        // 호출 대상 생성
+        const callee = try self.genNode(call.callee);
+
+        // 인자들 생성
+        var args = std.ArrayList(Zir.Ref).init(self.allocator);
+        defer args.deinit();
+
+        for (call.args) |arg| {
+            try args.append(try self.genNode(&arg));
+        }
+
+        return try self.zir.addInstruction(.{
+            .call = .{
+                .callee = callee,
+                .args = try self.allocator.dupe(Zir.Ref, args.items),
+            },
+        });
+    }
+
+    /// 정수 리터럴 생성
+    fn genIntegerLiteral(self: *AstGen, node: *const Node) !Zir.Ref {
+        return try self.zir.addInstruction(.{
+            .load_int = .{ .value = node.data.integer },
+        });
+    }
+
+    /// 부동소수점 리터럴 생성
+    fn genFloatLiteral(self: *AstGen, node: *const Node) !Zir.Ref {
+        return try self.zir.addInstruction(.{
+            .load_float = .{ .value = node.data.float },
+        });
+    }
+
+    /// 문자열 리터럴 생성
+    fn genStringLiteral(self: *AstGen, node: *const Node) !Zir.Ref {
+        const index = try self.zir.addString(node.data.string);
+        return try self.zir.addInstruction(.{
+            .load_string = .{ .index = index },
+        });
+    }
+
+    /// 식별자 생성
+    fn genIdentifier(self: *AstGen, node: *const Node) !Zir.Ref {
+        const name_index = try self.zir.addString(node.data.identifier);
+        return try self.zir.addInstruction(.{
+            .load_var = .{ .name_index = name_index },
+        });
+    }
+
+    /// 배열 리터럴 생성
+    fn genArrayLiteral(self: *AstGen, node: *const Node) !Zir.Ref {
+        var elements = std.ArrayList(Zir.Ref).init(self.allocator);
+        defer elements.deinit();
+
+        for (node.data.array_literal) |elem| {
+            try elements.append(try self.genNode(&elem));
+        }
+
+        return try self.zir.addInstruction(.{
+            .array_literal = .{
+                .elements = try self.allocator.dupe(Zir.Ref, elements.items),
+            },
+        });
+    }
+
+    /// 배열 인덱싱 생성
+    fn genIndexAccess(self: *AstGen, node: *const Node) !Zir.Ref {
+        const index_access = node.data.index_access;
+
+        const array = try self.genNode(index_access.array);
+        const index = try self.genNode(index_access.index);
+
+        return try self.zir.addInstruction(.{
+            .index_access = .{
+                .array = array,
+                .index = index,
+            },
+        });
+    }
+
+    /// 멤버 접근 생성
+    fn genMemberAccess(self: *AstGen, node: *const Node) !Zir.Ref {
+        const member_access = node.data.member_access;
+
+        const object = try self.genNode(member_access.object);
+        const field_index = try self.zir.addString(member_access.field);
+
+        return try self.zir.addInstruction(.{
+            .member_access = .{
+                .object = object,
+                .field_index = field_index,
+            },
+        });
+    }
+};
+
+/// Ast.BinaryOp를 Zir.BinaryOp로 변환
+fn astBinaryOpToZirBinaryOp(op: Ast.BinaryOp) Zir.BinaryOp {
+    return switch (op) {
+        .add => .add,
+        .subtract => .sub,
+        .multiply => .mul,
+        .divide => .div,
+        .modulo => .mod,
+        .equal => .eq,
+        .not_equal => .ne,
+        .less => .lt,
+        .less_equal => .le,
+        .greater => .gt,
+        .greater_equal => .ge,
+        .logical_and => .logical_and,
+        .logical_or => .logical_or,
+        .bitwise_and => .bitwise_and,
+        .bitwise_or => .bitwise_or,
+        .bitwise_xor => .bitwise_xor,
+        .lshift => .lshift,
+        .rshift => .rshift,
+    };
+}
+
+/// Ast.UnaryOp를 Zir.UnaryOp로 변환
+fn astUnaryOpToZirUnaryOp(op: Ast.UnaryOp) Zir.UnaryOp {
+    return switch (op) {
+        .negate => .negate,
+        .not => .not,
+        .bitwise_not => .bitwise_not,
+    };
+}
+
+/// Union 타입 생성 (Phase 3.2)
+fn genUnionType(self: *AstGen, node: *const Node) !Zir.Ref {
+    const union_data = node.data.union_type_data;
+
+    // Union 이름 추가
+    const name_index = try self.zir.addString(union_data.name);
+
+    // 각 필드 생성
+    var field_refs = std.ArrayList(Zir.Ref).init(self.allocator);
+    defer field_refs.deinit();
+
+    for (union_data.fields) |field| {
+        const field_name_index = try self.zir.addString(field.name);
+        const field_type_ref = try self.genNode(field.type_node);
+
+        const field_ref = try self.zir.addInstruction(.{
+            .union_field = .{
+                .field_name_index = field_name_index,
+                .field_type = field_type_ref,
+            },
+        });
+        try field_refs.append(field_ref);
+    }
+
+    // Union begin 명령어 생성
+    const union_begin_ref = try self.zir.addInstruction(.{
+        .union_begin = .{
+            .name_index = name_index,
+            .field_count = @intCast(u32, union_data.fields.len),
+            .is_tagged = union_data.is_tagged,
+        },
+    });
+
+    return union_begin_ref;
+}
+
+/// Enum 타입 생성 (Phase 3.2)
+fn genEnumType(self: *AstGen, node: *const Node) !Zir.Ref {
+    const enum_data = node.data.enum_type_data;
+
+    // Enum 이름 추가
+    const name_index = try self.zir.addString(enum_data.name);
+
+    // 각 값 생성
+    var value_refs = std.ArrayList(Zir.Ref).init(self.allocator);
+    defer value_refs.deinit();
+
+    for (enum_data.fields) |field| {
+        const value_name_index = try self.zir.addString(field.name);
+        const value_ref: ?Zir.Ref = if (field.value != null)
+            try self.genNode(field.value.?)
+        else null;
+
+        const field_ref = try self.zir.addInstruction(.{
+            .enum_value = .{
+                .value_name_index = value_name_index,
+                .value = value_ref,
+            },
+        });
+        try value_refs.append(field_ref);
+    }
+
+    // Enum begin 명령어 생성
+    const enum_begin_ref = try self.zir.addInstruction(.{
+        .enum_begin = .{
+            .name_index = name_index,
+            .value_count = @intCast(u32, enum_data.fields.len),
+            .is_tagged = enum_data.is_tagged,
+        },
+    });
+
+    return enum_begin_ref;
+}
+
+/// Phase 3.3: Comptime 블록 식 생성
+/// comptime { ... }
+fn genComptimeBlockExpr(self: *AstGen, node: *const Node) !Zir.Ref {
+    const body_data = node.data.comptime_block_expr_data;
+
+    // 본체 시작 위치 기록
+    const body_start = @intCast(Zir.Ref, self.zir.instructions.items.len);
+
+    // 본체 문장들 생성
+    for (body_data.body) |stmt| {
+        _ = try self.genNode(&stmt);
+    }
+
+    // 본체 끝 위치 기록
+    const body_end = @intCast(Zir.Ref, self.zir.instructions.items.len - 1);
+
+    // Comptime begin 명령어 생성
+    const comptime_begin_ref = try self.zir.addInstruction(.{
+        .comptime_begin = .{
+            .body_start = body_start,
+            .body_end = body_end,
+        },
+    });
+
+    return comptime_begin_ref;
+}
+
+/// Phase 3.3: 상수 식 생성
+/// const X = VALUE
+fn genConstExpr(self: *AstGen, node: *const Node) !Zir.Ref {
+    const const_data = node.data.const_expr_data;
+
+    // 상수 이름 추가
+    const name_index = try self.zir.addString(const_data.name);
+
+    // 타입 인덱스 (있으면)
+    var type_index: ?u32 = null;
+    if (const_data.type_node) |type_node| {
+        _ = type_node; // 나중에 타입 정보 저장
+        // type_index = try self.zir.addType(type_node);
+    }
+
+    // 값 생성
+    const value_ref = try self.genNode(const_data.value);
+
+    // Const expr 명령어 생성
+    const const_expr_ref = try self.zir.addInstruction(.{
+        .const_expr = .{
+            .name_index = name_index,
+            .type_index = type_index,
+            .value = value_ref,
+        },
+    });
+
+    return const_expr_ref;
+}
+
+/// Phase 3.4: 함수 오버로드 그룹 생성
+/// 같은 이름의 여러 함수 선언을 하나의 overload_group으로 표현
+fn genOverloadGroup(self: *AstGen, fn_name: []const u8, decls: []*const Node) !Zir.Ref {
+    // 함수 이름 추가
+    const name_index = try self.zir.addString(fn_name);
+
+    // 각 오버로드 버전에 대한 함수 시그니처 생성
+    var signatures = std.ArrayList(Zir.FunctionSignature).init(self.allocator);
+    defer signatures.deinit();
+
+    for (decls) |decl| {
+        if (decl.tag != .fn_decl) continue;
+        const fn_decl = decl.data.fn_decl;
+
+        // 파라미터 타입들 수집
+        var param_types = std.ArrayList(Zir.Ref).init(self.allocator);
+        defer param_types.deinit();
+
+        for (fn_decl.params) |param| {
+            // 파라미터 타입을 문자열로 저장 (간단한 구현)
+            // 나중에 actual type resolution으로 개선 가능
+            const type_str = "param_type"; // TODO: 실제 타입 정보 추출
+            _ = type_str;
+            // 일단 dummy ref 추가
+            try param_types.append(0);
+        }
+
+        // 반환 타입 처리
+        const return_type: Zir.Ref = 0; // TODO: 실제 반환 타입 정보 추출
+
+        // fn_begin 명령어 먼저 생성해서 fn_ref 얻기
+        const fn_ref = try self.genFnDeclBase(fn_decl);
+
+        // 함수 시그니처 추가
+        try signatures.append(.{
+            .name_index = name_index,
+            .param_types = try self.allocator.dupe(Zir.Ref, param_types.items),
+            .return_type = return_type,
+            .fn_ref = fn_ref,
+        });
+    }
+
+    // overload_group 명령어 생성
+    const overload_group_ref = try self.zir.addInstruction(.{
+        .overload_group = .{
+            .name_index = name_index,
+            .signatures = try self.allocator.dupe(Zir.FunctionSignature, signatures.items),
+            .default_fn = 0, // 첫 번째 오버로드가 기본값
+        },
+    });
+
+    return overload_group_ref;
+}
+
+/// Phase 3.4 헬퍼: 함수 선언 기본 처리 (fn_begin 생성)
+fn genFnDeclBase(self: *AstGen, fn_decl: Node.FnDecl) !Zir.Ref {
+    // 함수 이름 추가
+    const name_index = try self.zir.addString(fn_decl.name);
+
+    // 파라미터 생성
+    var params = std.ArrayList(Zir.Ref).init(self.allocator);
+    defer params.deinit();
+
+    // Comptime 파라미터 개수 세기
+    var comptime_param_count: u32 = 0;
+    for (fn_decl.params) |param| {
+        if (param.is_comptime) {
+            comptime_param_count += 1;
+        }
+        // 파라미터 이름을 ZIR 문자열로 등록
+        _ = try self.zir.addString(param.name);
+        // 파라미터 ref는 0으로 설정 (나중에 확장)
+        try params.append(0);
+    }
+
+    // Generic 함수인지 확인
+    if (comptime_param_count > 0) {
+        // Generic 함수: generic_fn_begin 사용
+        const fn_begin_ref = try self.zir.addInstruction(.{
+            .generic_fn_begin = .{
+                .name_index = name_index,
+                .comptime_param_count = comptime_param_count,
+                .params = try self.allocator.dupe(Zir.Ref, params.items),
+            },
+        });
+
+        // 함수 본체 생성
+        _ = try self.genNode(fn_decl.body);
+
+        // 함수 끝
+        _ = try self.zir.addInstruction(.fn_end);
+
+        return fn_begin_ref;
+    } else {
+        // 일반 함수: fn_begin 사용
+        const fn_begin_ref = try self.zir.addInstruction(.{
+            .fn_begin = .{
+                .name_index = name_index,
+                .params = try self.allocator.dupe(Zir.Ref, params.items),
+            },
+        });
+
+        // 함수 본체 생성
+        _ = try self.genNode(fn_decl.body);
+
+        // 함수 끝
+        _ = try self.zir.addInstruction(.fn_end);
+
+        return fn_begin_ref;
+    }
+
+    /// Phase 3.5: 배열 타입 생성 ([N]T)
+    fn genArrayType(self: *AstGen, node: *const Node) !Zir.Ref {
+        const array_type = node.data.array_type;
+
+        // 요소 타입 생성
+        const element_type = try self.genNode(array_type.element_type);
+
+        // 배열 크기 계산 (있으면)
+        var size: ?u32 = null;
+        if (array_type.size) |size_node| {
+            // 크기가 상수여야 함
+            if (size_node.tag == .integer_literal) {
+                size = @intCast(size_node.data.integer);
+            } else {
+                return error.ArraySizeMustBeConstant;
+            }
+        }
+
+        // array_type 명령어 생성
+        return try self.zir.addInstruction(.{
+            .array_type = .{
+                .element_type = element_type,
+                .size = size,
+                .is_const = false,
+            },
+        });
+    }
+
+    /// Phase 3.5: 슬라이스 타입 생성 ([]T, []const T)
+    fn genSliceType(self: *AstGen, node: *const Node) !Zir.Ref {
+        const slice_type = node.data.slice_type;
+
+        // 요소 타입 생성
+        const element_type = try self.genNode(slice_type.element_type);
+
+        // array_type 명령어 (size = null이면 슬라이스)
+        return try self.zir.addInstruction(.{
+            .array_type = .{
+                .element_type = element_type,
+                .size = null,  // 슬라이스
+                .is_const = slice_type.is_const,
+            },
+        });
+    }
+
+    /// Phase 3.5: 슬라이싱 생성 (arr[i..j])
+    fn genSliceAccess(self: *AstGen, node: *const Node) !Zir.Ref {
+        const slice_access = node.data.slice_access;
+
+        // 배열 생성
+        const array = try self.genNode(slice_access.array);
+
+        // 시작 인덱스 생성 (있으면)
+        var start: ?Zir.Ref = null;
+        if (slice_access.start) |start_node| {
+            start = try self.genNode(start_node);
+        }
+
+        // 끝 인덱스 생성 (있으면)
+        var end: ?Zir.Ref = null;
+        if (slice_access.end) |end_node| {
+            end = try self.genNode(end_node);
+        }
+
+        // slice_access 명령어 생성
+        return try self.zir.addInstruction(.{
+            .slice_access = .{
+                .array = array,
+                .start = start,
+                .end = end,
+            },
+        });
+    }
+}

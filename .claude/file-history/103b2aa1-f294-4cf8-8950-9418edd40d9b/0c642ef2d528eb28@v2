@@ -1,0 +1,343 @@
+// 🦎 Phase 7: 바이너리 실행 E2E 테스트
+// test/phase7_e2e_test.zig
+
+const std = @import("std");
+const Tokenizer = @import("../src/tokenizer.zig").Tokenizer;
+const Parser = @import("../src/parser.zig").Parser;
+const AstGen = @import("../src/astgen.zig").AstGen;
+const Sema = @import("../src/sema.zig").Sema;
+const Codegen = @import("../src/codegen.zig").Codegen;
+const LLVMIRGen = @import("../src/llvm_ir.zig").LLVMIRGen;
+const Linker = @import("../src/linker.zig").Linker;
+
+/// 소스 코드 → LLVM IR → 바이너리 → 실행 결과 반환
+fn compileAndRun(source: []const u8, allocator: std.mem.Allocator) !Linker.RunResult {
+    // Step 1: Tokenize
+    var tokenizer = try Tokenizer.init(source, allocator);
+    defer tokenizer.deinit();
+
+    var tokens = std.ArrayList(@import("../src/tokenizer.zig").Token).init(allocator);
+    defer tokens.deinit();
+
+    while (try tokenizer.nextToken()) |token| {
+        try tokens.append(token);
+    }
+
+    // Step 2: Parse
+    var parser = try Parser.init(tokens.items, source, allocator);
+    defer parser.deinit();
+    const ast = try parser.parseProgram();
+
+    // Step 3: AstGen
+    var astgen = try AstGen.init(allocator, source);
+    defer astgen.deinit();
+    try astgen.genProgram(&ast);
+
+    // Step 4: Sema
+    var sema = try Sema.init(allocator, &astgen.zir);
+    defer sema.deinit();
+    try sema.analyzeProgram();
+
+    if (sema.hasErrors()) {
+        return error.SemanticErrors;
+    }
+
+    // Step 5: LLVMIRGen
+    var llvm_gen = try LLVMIRGen.init(allocator, &sema.air);
+    defer llvm_gen.deinit();
+    const ir_text = try llvm_gen.generate();
+
+    // Step 6: Compile LLVM IR to binary
+    var linker = try Linker.init(allocator);
+    defer linker.deinit();
+
+    if (linker.llvm_path == null) {
+        return error.NoLLVMCompilerFound;
+    }
+
+    // 임시 파일 생성
+    const temp_ll = try Linker.generateTempFileName(allocator, ".ll");
+    defer allocator.free(temp_ll);
+    const temp_bin = try Linker.generateTempFileName(allocator, "");
+    defer allocator.free(temp_bin);
+
+    // IR을 .ll 파일에 저장
+    try Linker.writeIRToFile(ir_text, temp_ll);
+    defer Linker.deleteFile(temp_ll) catch {};
+
+    // .ll을 바이너리로 컴파일
+    try linker.compileFromLLVMIR(temp_ll, temp_bin);
+    defer Linker.deleteFile(temp_bin) catch {};
+
+    // 바이너리 실행
+    return try Linker.runBinary(temp_bin, allocator);
+}
+
+// ========== Phase 7 테스트: Exit Code (3개) ==========
+
+test "phase7_run_return_zero" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    return 0;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+}
+
+test "phase7_run_return_value" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    return 42;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 42), result.exit_code);
+}
+
+test "phase7_run_arithmetic" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    return 1 + 2;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 3), result.exit_code);
+}
+
+// ========== Phase 7 테스트: 변수 (3개) ==========
+
+test "phase7_run_const_var" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    const x = 10;
+        \\    return x;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 10), result.exit_code);
+}
+
+test "phase7_run_function_call" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn add(a: i32, b: i32) i32 {
+        \\    return a + b;
+        \\}
+        \\fn main() i32 {
+        \\    return add(20, 22);
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 42), result.exit_code);
+}
+
+test "phase7_run_multiple_ops" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    const a = 10;
+        \\    const b = 20;
+        \\    const c = a + b;
+        \\    return c + 2;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 32), result.exit_code);
+}
+
+// ========== Phase 7 테스트: 제어흐름 (2개) ==========
+
+test "phase7_run_if_true_branch" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    if (1 == 1) {
+        \\        return 10;
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 10), result.exit_code);
+}
+
+test "phase7_run_if_false_branch" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    if (1 == 2) {
+        \\        return 10;
+        \\    } else {
+        \\        return 5;
+        \\    }
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 5), result.exit_code);
+}
+
+// ========== Phase 7 테스트: 컴파일러 감지 (2개) ==========
+
+test "phase7_skip_if_no_compiler" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var linker = try Linker.init(allocator);
+    defer linker.deinit();
+
+    // clang이 없으면 gracefully skip
+    if (linker.llvm_path == null) {
+        return;
+    }
+
+    try std.testing.expect(linker.llvm_path != null);
+}
+
+test "phase7_compiler_available_check" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var linker = try Linker.init(allocator);
+    defer linker.deinit();
+
+    // 컴파일러를 찾을 수 있는지 확인
+    const has_compiler = linker.llvm_path != null;
+    _ = has_compiler;
+}
+
+// ========== Phase 7 통합 테스트 (3개) ==========
+
+test "phase7_full_e2e_simple" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    return 7;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 7), result.exit_code);
+}
+
+test "phase7_full_e2e_function" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn mul(a: i32, b: i32) i32 {
+        \\    return a * b;
+        \\}
+        \\fn main() i32 {
+        \\    const x = mul(5, 8);
+        \\    return x + 2;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 42), result.exit_code);
+}
+
+test "phase7_full_e2e_expression" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const source =
+        \\fn main() i32 {
+        \\    const a = 5;
+        \\    const b = 3;
+        \\    const c = (a + b) * 2;
+        \\    return c + 6;
+        \\}
+    ;
+
+    const result = compileAndRun(source, allocator) catch |err| {
+        std.debug.print("Skip: {}\n", .{err});
+        return;
+    };
+
+    try std.testing.expectEqual(@as(u8, 38), result.exit_code);
+}

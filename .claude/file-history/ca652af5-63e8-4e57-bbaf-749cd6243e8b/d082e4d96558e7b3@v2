@@ -1,0 +1,290 @@
+# Phase 5: x86-64 백엔드 구현 계획
+
+## Context
+
+Phase 4.3 (RISC-V Backend) 완료 상태에서 다음 단계로 진행.
+- 기존: `src/riscv_codegen.zig` (411줄, 40개 테스트)
+- 목표: x86-64 백엔드 추가 + RISC-V processInstruction 미구현 부분 완성
+- 결과: 47개 신규 테스트, 전체 87개 테스트
+
+## 아키텍처
+
+```
+AIR
+ ├─ RiscvCodegen  (기존, processInstruction 완성)
+ └─ X86_64Codegen (신규, ~600줄)
+       ↓
+   .asm 파일 (NASM Intel syntax)
+       ↓
+   nasm -f elf64 → ELF 바이너리 (선택)
+```
+
+---
+
+## Step 1: 기본 골격 + 정수 연산 (20개 테스트)
+
+**신규 파일**: `src/x86_64_codegen.zig`
+
+### 레지스터 (Register enum)
+```
+rax=0, rbx=1, rcx=2, rdx=3, rsi=4, rdi=5, rsp=6, rbp=7,
+r8=8,  r9=9,  r10=10, r11=11, r12=12, r13=13, r14=14, r15=15
+```
+할당 우선순위: `r10, r11` → `rax, rcx, rdx, rsi, rdi, r8, r9` → `rbx, r12~r15`
+예약(불할당): `rsp`, `rbp`
+
+### X86_64Codegen 구조체 필드
+```zig
+allocator: Allocator
+output: ArrayList(u8)
+used_regs: [16]bool
+label_counter: u32
+current_frame_size: i64
+```
+
+### emit 함수 목록
+| 함수 | 출력 어셈블리 |
+|------|-------------|
+| `emitMovImm(dst, value)` | `mov rax, 42` |
+| `emitMov(dst, src)` | `mov rax, rbx` |
+| `emitAdd(dst, src)` | `add rax, rbx` |
+| `emitSub(dst, src)` | `sub rax, rbx` |
+| `emitImul(dst, src)` | `imul rax, rbx` |
+| `emitIdivSetup(divisor)` | `cqo` + `idiv rbx` |
+| `emitNeg(dst)` | `neg rax` |
+| `emitCmp(lhs, rhs)` | `cmp rax, rbx` |
+| `emitSete/Setne/Setl/Setle/Setg/Setge` | `sete al` + `movzx rax, al` |
+| `emitRet()` | `ret` |
+
+**주의**: `idiv`는 피제수를 `rdx:rax`에 배치 필수 (`cqo`로 부호확장)
+
+### 처리할 AIR instruction (Step 1)
+```
+.noop         → 무시
+.load_int     → emitMovImm
+.binary_op    → emitAdd/Sub/Imul/IdivSetup/cmp+setX
+.unary_op     → .negate: emitNeg
+```
+
+### 테스트 20개: `test/x86_64_basic_test.zig`
+```
+1.  emit move immediate (mov rax, 42)
+2.  emit move immediate large (mov rax, 100000)
+3.  emit move register (mov rax, rbx)
+4.  emit add (add rax, rbx)
+5.  emit sub (sub rax, rbx)
+6.  emit imul (imul rax, rbx)
+7.  emit idiv setup (cqo + idiv)
+8.  emit neg (neg rax)
+9.  emit cmp (cmp rax, rbx)
+10. emit sete (sete + movzx)
+11. emit setne (setne + movzx)
+12. emit setl (setl + movzx)
+13. emit setle (setle + movzx)
+14. emit setg (setg + movzx)
+15. emit setge (setge + movzx)
+16. emit ret
+17. register allocation (allocReg returns different regs)
+18. register name mapping (rax, rbx, r8...)
+19. output buffer initialization (.section .text)
+20. binary_op eq generates cmp + sete + movzx
+```
+
+---
+
+## Step 2: 함수 + 호출 규약 (14개 테스트)
+
+**파일**: `src/x86_64_codegen.zig` (추가)
+
+### System V AMD64 ABI
+- 인수: `rdi, rsi, rdx, rcx, r8, r9` (6개까지 레지스터)
+- 반환값: `rax`
+- Callee-saved: `rbx, rbp, r12~r15`
+- Caller-saved: `rax, rcx, rdx, rsi, rdi, r8~r11`
+
+### 스택 프레임 구조
+```
+[caller ret addr]  ← call 명령이 push
+[saved rbp]        ← push rbp
+                   ← rbp = rsp
+[rbp-8]  local 1
+[rbp-16] local 2
+...
+                   ← rsp (16바이트 정렬)
+```
+
+**16바이트 정렬**: `frame_size = ((size + 15) / 16) * 16`
+
+### emit 함수 (Step 2)
+| 함수 | 출력 어셈블리 |
+|------|-------------|
+| `emitFunctionPrologue(frame_size)` | `push rbp` + `mov rbp, rsp` + `sub rsp, N` |
+| `emitFunctionEpilogue()` | `add rsp, N` + `pop rbp` + `ret` |
+| `emitMovToMem(offset, base, src)` | `mov QWORD [rbp-8], rdi` |
+| `emitMovFromMem(dst, offset, base)` | `mov rax, QWORD [rbp-8]` |
+| `emitCall(target)` | `call add` |
+| `emitGlobal(name)` | `global add` |
+| `emitFunctionLabel(name)` | `add:` |
+
+### 처리할 AIR instruction (Step 2)
+```
+.function_begin → emitGlobal + emitFunctionLabel + emitFunctionPrologue
+.function_end   → emitFunctionEpilogue
+.call           → 인수 mov + emitCall
+```
+
+### 테스트 14개: `test/x86_64_function_test.zig`
+```
+1.  function prologue (push rbp + mov rbp rsp)
+2.  function prologue sub rsp (32-byte frame)
+3.  function prologue output contains rbp
+4.  function epilogue (pop rbp + ret)
+5.  function epilogue restores rsp
+6.  store to stack (mov QWORD [rbp-8], rdi)
+7.  load from stack (mov rax, QWORD [rbp-8])
+8.  calling convention arg1 in rdi
+9.  calling convention arg2 in rsi
+10. calling convention arg3 in rdx
+11. calling convention return value in rax
+12. frame size tracking
+13. emit call instruction (call add)
+14. global symbol declaration (global add)
+```
+
+---
+
+## Step 3: 제어 흐름 + main.zig 연동 (13개 테스트)
+
+**파일**: `src/x86_64_codegen.zig` (추가) + `src/main.zig` 수정 + `build.zig` 수정
+
+### 분기 명령어
+| 함수 | 출력 어셈블리 | 조건 |
+|------|-------------|------|
+| `emitJmp(label)` | `jmp .L0` | 무조건 |
+| `emitJe(label)` | `je .L0` | ZF=1 |
+| `emitJne(label)` | `jne .L0` | ZF=0 |
+| `emitJl(label)` | `jl .L0` | 부호 less |
+| `emitJle(label)` | `jle .L0` | 부호 less or equal |
+| `emitJg(label)` | `jg .L0` | 부호 greater |
+| `emitJge(label)` | `jge .L0` | 부호 greater or equal |
+| `emitJz(label)` | `jz .L0` | ZF=1 (je 별칭) |
+| `emitJnz(label)` | `jnz .L0` | ZF=0 (jne 별칭) |
+
+### 레이블 생성 (RISC-V와 동일 패턴)
+```zig
+fn newLabel(self: *X86_64Codegen, allocator: Allocator) ![]u8
+// ".L0", ".L1", ... (label_counter 증가)
+
+fn emitLabel(self: *X86_64Codegen, label: []const u8) !void
+// NASM: 첫 열에 "{s}:"
+```
+
+### processInstruction 완성 (Step 3)
+```
+.cond_br → emitTest(cond_reg) + emitJz(else_label) + else 블록
+.br      → emitJmp(label_str)
+.label   → emitLabel(label_str)
+```
+
+### main.zig 수정 (3곳)
+1. `const X86_64Codegen = @import("x86_64_codegen.zig").X86_64Codegen;`
+2. `Args.emit_x86_64: bool = false` 필드 추가
+3. `--emit-x86-64` 플래그 파싱 + 분기 처리
+4. 버전: `v0.5.0 (x86-64 Backend Phase)`
+
+### build.zig 수정
+- `x86_64_codegen_module` 추가
+- `x86_64_basic_test` / `x86_64_function_test` / `x86_64_control_test` 스텝 추가
+- 집계 `test` 스텝에 3개 x86-64 스텝 추가
+
+### 테스트 13개: `test/x86_64_control_test.zig`
+```
+1.  label generation .L0
+2.  label generation increment .L1
+3.  emit label (.L0:)
+4.  multiple labels (.L0 .L1 .L2)
+5.  unconditional jump (jmp .L0)
+6.  conditional jump equal (je .L0)
+7.  conditional jump not equal (jne .L0)
+8.  conditional jump less (jl .L0)
+9.  conditional jump greater equal (jge .L0)
+10. if/else pattern (cmp + je + jmp)
+11. while loop pattern (cmp + jne + jmp)
+12. break pattern (jmp to end label)
+13. nested if/else multiple labels
+```
+
+---
+
+## RISC-V processInstruction 완성 (기존 미구현 보완)
+
+**파일**: `src/riscv_codegen.zig` (processInstruction else 블록 교체)
+
+추가 구현:
+- `.call` → `call target_func`
+- `.cond_br` → `beqz cond_reg, else_label`
+- `.br` → `j label_str`
+- `.label` → `label_str:`
+- `.unary_op .negate` → `sub dst, x0, src`
+- `.unary_op .not` → `seqz dst, src`
+
+---
+
+## 출력 어셈블리 예시 (Intel syntax, NASM)
+
+```asm
+section .text
+global add
+add:
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 32
+    mov     QWORD [rbp-8], rdi    ; a = arg0
+    mov     QWORD [rbp-16], rsi   ; b = arg1
+    mov     rax, QWORD [rbp-8]
+    mov     r10, QWORD [rbp-16]
+    add     rax, r10              ; a + b
+    add     rsp, 32
+    pop     rbp
+    ret
+```
+
+---
+
+## 파일 변경 요약
+
+| 파일 | 상태 | 내용 | 예상 줄수 |
+|------|------|------|---------|
+| `src/x86_64_codegen.zig` | **신규** | x86-64 코드 생성기 | ~600줄 |
+| `src/main.zig` | **수정** | `--emit-x86-64` 플래그 | +30줄 |
+| `build.zig` | **수정** | x86-64 테스트 3개 추가 | +40줄 |
+| `test/x86_64_basic_test.zig` | **신규** | 20개 테스트 | ~230줄 |
+| `test/x86_64_function_test.zig` | **신규** | 14개 테스트 | ~200줄 |
+| `test/x86_64_control_test.zig` | **신규** | 13개 테스트 | ~280줄 |
+| `src/riscv_codegen.zig` | **수정** | processInstruction 완성 | +50줄 |
+
+**신규 테스트**: 47개 (20+14+13)
+**전체 테스트**: 87개 (기존 40 + 신규 47)
+
+---
+
+## 검증 방법
+
+```bash
+# 단계별 테스트
+zig build x86_64_basic_test
+zig build x86_64_function_test
+zig build x86_64_control_test
+
+# 기존 RISC-V 회귀 확인
+zig build riscv_basic_test
+
+# 전체 87개 테스트
+zig build test
+
+# CLI 확인
+./zig-out/bin/zig-compiler --emit-x86-64 test.zig -o test.asm
+
+# NASM 컴파일 (선택)
+nasm -f elf64 test.asm -o test.o && ld test.o -o test
+```

@@ -1,0 +1,393 @@
+# x86-64 AT&T 어셈블리 코드 생성 가이드
+
+## 개요
+
+CAIR를 x86-64 Linux AT&T 문법 어셈블리로 변환합니다.
+GNU `as` (어셈블러)와 `ld` (링커)로 최종 실행 파일을 생성합니다.
+
+---
+
+## System V AMD64 ABI 호출 규약
+
+### 인수 전달
+
+정수/포인터 인수는 레지스터로, 7번째 이후는 스택으로 전달합니다.
+
+| 인수 | 레지스터 |
+|------|----------|
+| 1번째 | `rdi` |
+| 2번째 | `rsi` |
+| 3번째 | `rdx` |
+| 4번째 | `rcx` |
+| 5번째 | `r8` |
+| 6번째 | `r9` |
+| 7번째+ | 스택 (역순 push) |
+
+부동소수 인수는 `xmm0` ~ `xmm7` 레지스터 사용.
+
+### 반환값
+
+| 타입 | 레지스터 |
+|------|----------|
+| 정수 (≤64비트) | `rax` |
+| 정수 (128비트) | `rdx:rax` |
+| 부동소수 | `xmm0` (float/double) |
+
+### 레지스터 사용 규칙
+
+**Caller-saved** (함수 호출 전에 저장):
+- `rax`, `rcx`, `rdx`, `rdi`, `rsi`, `r8` ~ `r11`
+
+**Callee-saved** (함수가 보존):
+- `rbx`, `rbp`, `r12` ~ `r15`
+
+**특수**:
+- `rsp`: 스택 포인터 (함수 호출 시 16바이트 정렬 필수)
+- `rbp`: 베이스 포인터
+
+### 스택 정렬
+
+`call` 명령 직전 `rsp`는 16의 배수여야 합니다.
+
+```
+함수 진입 직후:
+  rsp = base - 8    (call이 rip를 push)
+함수 시작 시:
+  push rbp          (rsp = base - 16, 정렬됨)
+  sub rsp, $N       (N은 16의 배수)
+  → rsp는 16의 배수 (정렬됨)
+```
+
+---
+
+## AT&T 문법
+
+### 기본 형식
+
+```asm
+# 명령 (소스, 대상)
+movl  $42, %eax      # EAX = 42 (32비트)
+addq  %rbx, %rax     # RAX += RBX (64비트)
+
+# 크기 접미사
+b: byte (8비트)
+w: word (16비트)
+l: long (32비트)
+q: quad (64비트)
+
+# 레지스터 접두사: %
+# 리터럴 접두사: $
+# 메모리 주소: (%rax), -8(%rbp), (%rax,%rbx,8)
+```
+
+### 메모리 주소 지정 모드
+
+```asm
+(%rax)              # [rax]
+8(%rax)             # [rax + 8]
+-8(%rbp)            # [rbp - 8]
+(%rax,%rbx,1)       # [rax + rbx]
+(%rax,%rbx,8)       # [rax + rbx*8]
+disp(%base,%index,scale)  # [base + disp + index*scale]
+```
+
+---
+
+## 함수 프롤로그/에필로그
+
+### 프롤로그 (Prologue)
+
+```asm
+func_name:
+    pushq   %rbp                # 이전 rbp 저장
+    movq    %rsp, %rbp          # 새로운 rbp 설정
+    subq    $STACK_SIZE, %rsp   # 로컬 변수 공간 할당 (16바이트 정렬)
+```
+
+**STACK_SIZE 계산**:
+```
+로컬 변수 총 크기를 계산 → 16바이트 정렬
+예: 24바이트 → 32바이트
+```
+
+### 에필로그 (Epilogue)
+
+```asm
+    movq    %rbp, %rsp          # 스택 복원
+    popq    %rbp                # 이전 rbp 복원
+    ret                         # 함수 종료
+```
+
+### 예시
+
+```asm
+# int add(int a, int b) { return a + b; }
+add:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    movl    %edi, -4(%rbp)      # a → [rbp-4]
+    movl    %esi, -8(%rbp)      # b → [rbp-8]
+    movl    -4(%rbp), %eax      # eax = a
+    addl    -8(%rbp), %eax      # eax += b
+    popq    %rbp
+    ret
+```
+
+---
+
+## CIR → AT&T 변환 규칙
+
+### 산술 연산
+
+```c
+// CIR: CIR_BINARY(ADD, ref_a, ref_b)
+addq    -8(%rbp), %rax
+// ref_a의 값은 rax에 로드되어 있다고 가정
+// ref_b를 스택 메모리에서 취하고 rax에 더함
+
+// CIR: CIR_BINARY(SUB, ref_a, ref_b)
+subq    %rbx, %rax
+
+// CIR: CIR_BINARY(MUL, ref_a, ref_b)
+imulq   %rbx, %rax
+
+// CIR: CIR_BINARY(DIV, ref_a, ref_b)
+// rax ÷ rbx → rax
+cqo                 # 부호 확장 rax → rdx:rax
+idivq   %rbx        # rdx:rax ÷ rbx → rax (몫), rdx (나머지)
+
+// CIR: CIR_BINARY(MOD, ref_a, ref_b)
+cqo                 # 부호 확장
+idivq   %rbx        # rdx에 나머지 저장
+movq    %rdx, %rax  # 결과는 rdx
+```
+
+### 비교/분기
+
+```c
+// CIR: CIR_JMP_IF(cond_ref, true_label, false_label)
+cmpq    $0, %rax           # rax와 0 비교
+jne     .L_true_label      # not equal → true
+jmp     .L_false_label     # else → false
+
+// 조건별 분기
+je      .L_label           # == (equal)
+jne     .L_label           # != (not equal)
+jl      .L_label           # < (less)
+jle     .L_label           # ≤ (less or equal)
+jg      .L_label           # > (greater)
+jge     .L_label           # ≥ (greater or equal)
+```
+
+### 함수 호출
+
+```c
+// CIR: CIR_CALL(callee, [arg1, arg2, arg3])
+movl    arg1, %edi         # arg1 → rdi
+movl    arg2, %esi         # arg2 → rsi
+movl    arg3, %edx         # arg3 → rdx
+call    function_name      # 함수 호출 (call이 return address push)
+# 반환값은 rax에
+
+// printf 같은 가변인자 함수
+xorl    %eax, %eax         # xmm 레지스터 개수 = 0 (float args 없음)
+call    printf@PLT         # PLT (Procedure Linkage Table) 호출
+```
+
+### 변수 로드/저장
+
+```c
+// CIR: CIR_LOAD_VAR(x)
+movl    -8(%rbp), %eax     # x → eax
+
+// CIR: CIR_STORE_VAR(x, value_ref)
+movl    %eax, -8(%rbp)     # eax → x
+
+// 전역 변수
+.globl  global_x
+.data
+global_x:
+    .long   0
+
+// C 코드에서
+movl    global_x(%rip), %eax   # RIP-relative 주소지정
+```
+
+### 캐스트
+
+```c
+// int → char (8비트)
+movb    %al, -8(%rbp)      # al (eax의 하위 8비트)
+
+// float → int (xmm 사용, Phase 3에서)
+cvttsd2siq  %xmm0, %rax    # float64 → int64
+
+// int → float
+cvtsi2sdq   %rax, %xmm0    # int64 → float64
+```
+
+---
+
+## 데이터 섹션
+
+### .data (초기화된 데이터)
+
+```asm
+.data
+.globl global_var
+global_var:
+    .long   42          # int
+    .quad   0x1234      # long long
+    .string "hello"     # 문자열 (null-terminated)
+```
+
+### .rodata (읽기 전용 데이터)
+
+```asm
+.rodata
+.LC0:
+    .string "Hello, World!\n"
+```
+
+### .text (코드)
+
+```asm
+.text
+.globl main
+main:
+    ...
+```
+
+### .bss (미초기화 데이터)
+
+```asm
+.bss
+.globl uninitialized
+uninitialized:
+    .space 4            # 4바이트 공간
+```
+
+---
+
+## 포인터 연산 (Phase 3.1)
+
+### 주소 취하기
+
+```c
+// int *p = &x;
+leaq    -8(%rbp), %rax      # p ← &x (효과적 주소)
+movq    %rax, -16(%rbp)     # [rbp-16] = rax (p를 저장)
+```
+
+### 역참조
+
+```c
+// y = *p;
+movq    -16(%rbp), %rax     # rax = p
+movl    (%rax), %ecx        # ecx = *p (메모리 로드)
+movl    %ecx, -24(%rbp)     # y = ecx
+```
+
+### 포인터 산술
+
+```c
+// int *p; p = p + 1;  (포인터 +1 = 크기 4 증가)
+movq    -16(%rbp), %rax     # rax = p
+addq    $4, %rax            # rax += 4
+movq    %rax, -16(%rbp)     # p = rax
+```
+
+---
+
+## 배열 (Phase 3.2)
+
+### 1D 배열 인덱싱
+
+```c
+// int a[10]; y = a[i];
+movl    -4(%rbp), %eax      # eax = i
+movl    -40(%rbp,%rax,4), %ecx  # ecx = a[i] (scale=4, int 크기)
+movl    %ecx, -44(%rbp)     # y = ecx
+```
+
+### 2D 배열 인덱싱
+
+```c
+// int a[3][4]; y = a[i][j];
+// 메모리 레이아웃: a는 3×4 = 12 int
+// a[i][j] = base + (i*4 + j)*4
+movl    i_val, %eax         # eax = i
+imull   $4, %eax            # eax *= 4 (i*4)
+addl    j_val, %eax         # eax += j (i*4 + j)
+movl    -120(%rbp,%rax,4), %ecx  # ecx = a[i][j]
+```
+
+---
+
+## 구조체 (Phase 3.3)
+
+```c
+struct Point { int x; int y; };
+Point p;
+int val = p.x;
+```
+
+```asm
+# struct offset 계산 필요 (x = 0, y = 4)
+movl    -16(%rbp), %eax     # eax = p.x (offset 0)
+movl    %eax, -20(%rbp)     # val = eax
+```
+
+---
+
+## 최종 어셈블리 예시
+
+### Hello World
+
+```c
+#include <stdio.h>
+int main() {
+    printf("Hello, World!\n");
+    return 0;
+}
+```
+
+```asm
+.data
+.LC0:
+    .string "Hello, World!\n"
+
+.text
+.globl main
+main:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    leaq    .LC0(%rip), %rdi    # rdi = format string (RIP-relative)
+    xorl    %eax, %eax          # eax = 0 (xmm count)
+    call    printf@PLT
+    xorl    %eax, %eax          # eax = 0 (return value)
+    popq    %rbp
+    ret
+
+.globl printf
+printf:
+    # 시스템 라이브러리에서 제공
+```
+
+### 컴파일 명령
+
+```bash
+./ccc hello.c -S              # 어셈블리 생성 (hello.s)
+as hello.s -o hello.o         # 어셈블링
+ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 \
+   -lc -o hello hello.o       # 링킹
+./hello                       # 실행
+```
+
+또는:
+
+```bash
+./ccc hello.c -o hello        # 한번에
+./hello
+```
+

@@ -1,0 +1,513 @@
+/// x86-64 Code Generator for Zig Compiler
+/// Converts AIR (Analyzed IR) to x86-64 Assembly (Intel syntax, NASM compatible)
+///
+/// Architecture:
+/// - AIR instructions → x86-64 assembly (.asm file)
+/// - Register allocation: rax-r15 (16 registers)
+/// - Calling convention: System V AMD64 ABI (rdi, rsi, rdx, rcx, r8, r9 for args)
+/// - Output format: NASM Intel syntax (mov rax, rbx)
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+
+// ============================================================================
+// AIR Types (Shared with RISC-V)
+// ============================================================================
+
+pub const Air = struct {
+    ref_type: type,
+    instructions: ArrayList(Instruction),
+};
+
+pub const Instruction = union(enum) {
+    load_int: i64,
+    binary_op: struct {
+        op: BinaryOp,
+        lhs: u32, // ref
+        rhs: u32, // ref
+    },
+    unary_op: struct {
+        op: UnaryOp,
+        operand: u32,
+    },
+    function_begin: struct {
+        name: []const u8,
+        arg_count: u32,
+    },
+    function_end,
+    call: struct {
+        target: []const u8,
+        arg_count: u32,
+    },
+    cond_br: struct {
+        cond: u32,
+        then_label: u32,
+        else_label: u32,
+    },
+    br: u32, // label
+    label: u32,
+    noop,
+};
+
+pub const BinaryOp = enum {
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    eq,
+    ne,
+    lt,
+    le,
+    gt,
+    ge,
+};
+
+pub const UnaryOp = enum {
+    negate,
+    not,
+};
+
+// ============================================================================
+// x86-64 Register Definition
+// ============================================================================
+
+pub const Register = enum(u4) {
+    rax = 0,  // return value, accumulator
+    rcx = 1,  // counter, 4th arg
+    rdx = 2,  // data, 3rd arg
+    rbx = 3,  // base (callee-saved)
+    rsp = 4,  // stack pointer (reserved)
+    rbp = 5,  // frame pointer (reserved)
+    rsi = 6,  // 2nd arg
+    rdi = 7,  // 1st arg
+    r8 = 8,   // 5th arg
+    r9 = 9,   // 6th arg
+    r10 = 10, // caller-saved (temporary)
+    r11 = 11, // caller-saved (temporary)
+    r12 = 12, // callee-saved
+    r13 = 13, // callee-saved
+    r14 = 14, // callee-saved
+    r15 = 15, // callee-saved
+
+    pub fn name(self: Register) []const u8 {
+        return switch (self) {
+            .rax => "rax", .rcx => "rcx", .rdx => "rdx", .rbx => "rbx",
+            .rsp => "rsp", .rbp => "rbp", .rsi => "rsi", .rdi => "rdi",
+            .r8 => "r8",   .r9 => "r9",   .r10 => "r10", .r11 => "r11",
+            .r12 => "r12", .r13 => "r13", .r14 => "r14", .r15 => "r15",
+        };
+    }
+
+    pub fn al(self: Register) []const u8 {
+        return switch (self) {
+            .rax => "al", .rcx => "cl", .rdx => "dl", .rbx => "bl",
+            else => "al", // 나머지는 지원 안 함 (8-bit로 변환 불가)
+        };
+    }
+};
+
+// ============================================================================
+// x86-64 Code Generator
+// ============================================================================
+
+pub const X86_64Codegen = struct {
+    allocator: Allocator,
+    output: ArrayList(u8),
+    used_regs: [16]bool,
+    label_counter: u32,
+    current_frame_size: i64,
+
+    pub fn init(allocator: Allocator) X86_64Codegen {
+        return X86_64Codegen{
+            .allocator = allocator,
+            .output = ArrayList(u8).init(allocator),
+            .used_regs = [_]bool{false} ** 16,
+            .label_counter = 0,
+            .current_frame_size = 0,
+        };
+    }
+
+    pub fn deinit(self: *X86_64Codegen) void {
+        self.output.deinit();
+    }
+
+    // Allocate a free register
+    pub fn allocReg(self: *X86_64Codegen) ?Register {
+        // Prefer temp registers: r10, r11 (caller-saved, general temp)
+        const temp_regs = [_]u4{ 10, 11 };
+        for (temp_regs) |reg_idx| {
+            if (!self.used_regs[reg_idx]) {
+                self.used_regs[reg_idx] = true;
+                return @enumFromInt(reg_idx);
+            }
+        }
+
+        // Then try arg registers: rax, rcx, rdx, rsi, rdi, r8, r9
+        const arg_regs = [_]u4{ 0, 1, 2, 6, 7, 8, 9 };
+        for (arg_regs) |reg_idx| {
+            if (!self.used_regs[reg_idx]) {
+                self.used_regs[reg_idx] = true;
+                return @enumFromInt(reg_idx);
+            }
+        }
+
+        // Finally try saved registers: rbx, r12, r13, r14, r15
+        const saved_regs = [_]u4{ 3, 12, 13, 14, 15 };
+        for (saved_regs) |reg_idx| {
+            if (!self.used_regs[reg_idx]) {
+                self.used_regs[reg_idx] = true;
+                return @enumFromInt(reg_idx);
+            }
+        }
+
+        return null;
+    }
+
+    // Free a register
+    pub fn freeReg(self: *X86_64Codegen, reg: Register) void {
+        self.used_regs[@intFromEnum(reg)] = false;
+    }
+
+    // Emit line to output
+    fn emit(self: *X86_64Codegen, comptime fmt: []const u8, args: anytype) !void {
+        try self.output.writer().print(fmt ++ "\n", args);
+    }
+
+    // Emit raw text
+    fn emitRaw(self: *X86_64Codegen, text: []const u8) !void {
+        try self.output.appendSlice(text);
+        try self.output.append('\n');
+    }
+
+    // === Step 1: Basic Arithmetic Instructions ===
+
+    /// mov dst, imm64  (Move Immediate)
+    /// Note: x86-64 mov cannot directly load 64-bit immediates,
+    /// so we use: mov rax, imm64 (zig/assembler pseudo-op)
+    /// or: movabs rax, 0x123456789abcdef0
+    fn emitMovImm(self: *X86_64Codegen, dst: Register, value: i64) !void {
+        if (value >= -2147483648 and value <= 2147483647) {
+            // Fits in 32-bit signed
+            try self.emit("    mov {s}, {}", .{ dst.name(), value });
+        } else {
+            // Need movabs for 64-bit
+            try self.emit("    movabs {s}, 0x{x}", .{ dst.name(), @as(u64, @bitCast(value)) });
+        }
+    }
+
+    /// mov dst, src  (Move Register)
+    fn emitMov(self: *X86_64Codegen, dst: Register, src: Register) !void {
+        try self.emit("    mov {s}, {s}", .{ dst.name(), src.name() });
+    }
+
+    /// add dst, src  (Addition: dst += src)
+    fn emitAdd(self: *X86_64Codegen, dst: Register, src: Register) !void {
+        try self.emit("    add {s}, {s}", .{ dst.name(), src.name() });
+    }
+
+    /// sub dst, src  (Subtraction: dst -= src)
+    fn emitSub(self: *X86_64Codegen, dst: Register, src: Register) !void {
+        try self.emit("    sub {s}, {s}", .{ dst.name(), src.name() });
+    }
+
+    /// imul dst, src  (Signed Multiplication: dst *= src)
+    fn emitImul(self: *X86_64Codegen, dst: Register, src: Register) !void {
+        try self.emit("    imul {s}, {s}", .{ dst.name(), src.name() });
+    }
+
+    /// idiv src  (Signed Division: rdx:rax / src, result in rax, remainder in rdx)
+    /// Precondition: rax must contain the dividend
+    fn emitIdiv(self: *X86_64Codegen, src: Register) !void {
+        try self.emit("    idiv {s}", .{src.name()});
+    }
+
+    /// cqo  (Sign-extend rax into rdx:rax for 64-bit idiv)
+    fn emitCqo(self: *X86_64Codegen) !void {
+        try self.emitRaw("    cqo");
+    }
+
+    /// neg dst  (Negation: dst = -dst)
+    fn emitNeg(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    neg {s}", .{dst.name()});
+    }
+
+    /// cmp lhs, rhs  (Compare: set flags based on lhs - rhs)
+    fn emitCmp(self: *X86_64Codegen, lhs: Register, rhs: Register) !void {
+        try self.emit("    cmp {s}, {s}", .{ lhs.name(), rhs.name() });
+    }
+
+    /// sete dst  (Set if Equal: dst = (ZF == 1))
+    fn emitSete(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    sete {s}", .{dst.al()});
+    }
+
+    /// setne dst  (Set if Not Equal)
+    fn emitSetne(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    setne {s}", .{dst.al()});
+    }
+
+    /// setl dst  (Set if Less, signed)
+    fn emitSetl(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    setl {s}", .{dst.al()});
+    }
+
+    /// setle dst  (Set if Less or Equal, signed)
+    fn emitSetle(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    setle {s}", .{dst.al()});
+    }
+
+    /// setg dst  (Set if Greater, signed)
+    fn emitSetg(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    setg {s}", .{dst.al()});
+    }
+
+    /// setge dst  (Set if Greater or Equal, signed)
+    fn emitSetge(self: *X86_64Codegen, dst: Register) !void {
+        try self.emit("    setge {s}", .{dst.al()});
+    }
+
+    /// movzx dst, src  (Move with Zero Extension: dst = (u64)src)
+    /// Used after setX to zero-extend 8-bit result to 64-bit
+    fn emitMovzx(self: *X86_64Codegen, dst: Register, src_byte: []const u8) !void {
+        try self.emit("    movzx {s}, {s}", .{ dst.name(), src_byte });
+    }
+
+    /// ret  (Return from function)
+    fn emitRet(self: *X86_64Codegen) !void {
+        try self.emitRaw("    ret");
+    }
+
+    // === Step 2: Function & Stack Management ===
+
+    /// Function prologue (System V AMD64 ABI)
+    /// Preserves rbp and sets up stack frame
+    fn emitFunctionPrologue(self: *X86_64Codegen, frame_size: i64) !void {
+        self.current_frame_size = frame_size;
+        // 16-byte align: frame_size should be multiple of 16
+        const aligned_frame = ((frame_size + 15) / 16) * 16;
+        try self.emitRaw("    push rbp");
+        try self.emitRaw("    mov rbp, rsp");
+        if (aligned_frame > 0) {
+            try self.emit("    sub rsp, {}", .{aligned_frame});
+        }
+    }
+
+    /// Function epilogue
+    fn emitFunctionEpilogue(self: *X86_64Codegen) !void {
+        const aligned_frame = ((self.current_frame_size + 15) / 16) * 16;
+        if (aligned_frame > 0) {
+            try self.emit("    add rsp, {}", .{aligned_frame});
+        }
+        try self.emitRaw("    pop rbp");
+        try self.emitRet();
+    }
+
+    /// Store to memory: mov QWORD [rbp-offset], src
+    fn emitMovToMem(self: *X86_64Codegen, offset: i64, src: Register) !void {
+        try self.emit("    mov QWORD [rbp-{}], {s}", .{ offset, src.name() });
+    }
+
+    /// Load from memory: mov dst, QWORD [rbp-offset]
+    fn emitMovFromMem(self: *X86_64Codegen, dst: Register, offset: i64) !void {
+        try self.emit("    mov {s}, QWORD [rbp-{}]", .{ dst.name(), offset });
+    }
+
+    /// call target  (Function Call)
+    fn emitCall(self: *X86_64Codegen, target: []const u8) !void {
+        try self.emit("    call {s}", .{target});
+    }
+
+    /// .globl name  (Global Symbol Declaration)
+    fn emitGlobal(self: *X86_64Codegen, name: []const u8) !void {
+        try self.emit("global {s}", .{name});
+    }
+
+    /// name:  (Function Label)
+    fn emitFunctionLabel(self: *X86_64Codegen, name: []const u8) !void {
+        try self.emit("{}:", .{name});
+    }
+
+    // === Step 3: Control Flow ===
+
+    /// Generate new label
+    fn newLabel(self: *X86_64Codegen, allocator: Allocator) ![]u8 {
+        defer self.label_counter += 1;
+        return std.fmt.allocPrint(allocator, ".L{}", .{self.label_counter});
+    }
+
+    /// Emit label
+    fn emitLabel(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("{}:", .{label});
+    }
+
+    /// Unconditional jump
+    fn emitJmp(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jmp {}", .{label});
+    }
+
+    /// je label  (Jump if Equal, ZF=1)
+    fn emitJe(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    je {}", .{label});
+    }
+
+    /// jne label  (Jump if Not Equal, ZF=0)
+    fn emitJne(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jne {}", .{label});
+    }
+
+    /// jl label  (Jump if Less, signed: SF != OF)
+    fn emitJl(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jl {}", .{label});
+    }
+
+    /// jle label  (Jump if Less or Equal, signed)
+    fn emitJle(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jle {}", .{label});
+    }
+
+    /// jg label  (Jump if Greater, signed)
+    fn emitJg(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jg {}", .{label});
+    }
+
+    /// jge label  (Jump if Greater or Equal, signed)
+    fn emitJge(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jge {}", .{label});
+    }
+
+    /// jz label  (Jump if Zero, alias for je)
+    fn emitJz(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jz {}", .{label});
+    }
+
+    /// jnz label  (Jump if Not Zero, alias for jne)
+    fn emitJnz(self: *X86_64Codegen, label: []const u8) !void {
+        try self.emit("    jnz {}", .{label});
+    }
+
+    /// test reg, reg  (Test: sets flags based on bitwise AND)
+    fn emitTest(self: *X86_64Codegen, reg: Register) !void {
+        try self.emit("    test {s}, {s}", .{ reg.name(), reg.name() });
+    }
+
+    // === Main Code Generation ===
+
+    pub fn generate(self: *X86_64Codegen, air: Air, output_file: []const u8) !void {
+        try self.emitRaw("section .text");
+
+        // Process AIR instructions
+        for (air.instructions.items) |instr| {
+            try self.processInstruction(instr);
+        }
+
+        // Write output file
+        const file = try std.fs.cwd().createFile(output_file, .{});
+        defer file.close();
+        try file.writeAll(self.output.items);
+    }
+
+    fn processInstruction(self: *X86_64Codegen, instr: Instruction) !void {
+        switch (instr) {
+            .noop => {
+                // No operation
+            },
+            .load_int => |value| {
+                if (self.allocReg()) |reg| {
+                    try self.emitMovImm(reg, value);
+                    defer self.freeReg(reg);
+                }
+            },
+            .binary_op => |binop| {
+                if (self.allocReg()) |dst| {
+                    defer self.freeReg(dst);
+                    if (self.allocReg()) |src| {
+                        defer self.freeReg(src);
+
+                        switch (binop.op) {
+                            .add => try self.emitAdd(dst, src),
+                            .sub => try self.emitSub(dst, src),
+                            .mul => try self.emitImul(dst, src),
+                            .div => {
+                                try self.emitCqo();
+                                try self.emitIdiv(src);
+                            },
+                            .mod => {
+                                try self.emitCqo();
+                                try self.emitIdiv(src);
+                                // Result in rdx, need to move it to dst
+                            },
+                            .eq => {
+                                try self.emitCmp(dst, src);
+                                try self.emitSete(dst);
+                                try self.emitMovzx(dst, dst.al());
+                            },
+                            .ne => {
+                                try self.emitCmp(dst, src);
+                                try self.emitSetne(dst);
+                                try self.emitMovzx(dst, dst.al());
+                            },
+                            .lt => {
+                                try self.emitCmp(dst, src);
+                                try self.emitSetl(dst);
+                                try self.emitMovzx(dst, dst.al());
+                            },
+                            .le => {
+                                try self.emitCmp(dst, src);
+                                try self.emitSetle(dst);
+                                try self.emitMovzx(dst, dst.al());
+                            },
+                            .gt => {
+                                try self.emitCmp(dst, src);
+                                try self.emitSetg(dst);
+                                try self.emitMovzx(dst, dst.al());
+                            },
+                            .ge => {
+                                try self.emitCmp(dst, src);
+                                try self.emitSetge(dst);
+                                try self.emitMovzx(dst, dst.al());
+                            },
+                        }
+                    }
+                }
+            },
+            .unary_op => |uop| {
+                if (self.allocReg()) |dst| {
+                    defer self.freeReg(dst);
+                    switch (uop.op) {
+                        .negate => try self.emitNeg(dst),
+                        .not => {
+                            try self.emitTest(dst);
+                            try self.emitSete(dst);
+                            try self.emitMovzx(dst, dst.al());
+                        },
+                    }
+                }
+            },
+            .function_begin => |func| {
+                try self.emitGlobal(func.name);
+                try self.emitFunctionLabel(func.name);
+                // Calculate frame size (push rbp makes 16-byte offset, so add minimum locals)
+                const frame_size = 32;
+                try self.emitFunctionPrologue(frame_size);
+            },
+            .function_end => {
+                try self.emitFunctionEpilogue();
+            },
+            else => {},
+        }
+    }
+};
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.debug.print("x86-64 Code Generator initialized\n", .{});
+}

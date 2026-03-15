@@ -1,0 +1,197 @@
+# Phase 6: LLVM IR → Native Binary
+
+## Context
+
+Phase 5가 `src/llvm_ir.zig`를 통해 LLVM IR 텍스트를 생성했지만, `main.zig` 파이프라인에 통합되지 않았고
+`emitTryExpr()` 내 Zig 문법 버그(519, 531번 라인: 문자열 `+` 연산 불가)가 존재한다.
+Phase 6는 이 버그를 수정하고, LLVM IR 텍스트를 `.ll` 파일로 저장한 후 `clang`을 호출해
+네이티브 바이너리를 생성하는 완전한 컴파일 경로를 구현한다.
+
+기존 경로: `AIR → Codegen(C) → linker.zig(C→binary)` (유지)
+신규 경로: `AIR → LLVMIRGen(IR text) → .ll 파일 → clang → binary`
+
+---
+
+## 핵심 파일
+
+| 파일 | 역할 | 변경 |
+|------|------|------|
+| `src/llvm_ir.zig` | LLVM IR 생성기 | 버그 수정 (2줄) |
+| `src/linker.zig` | 링커 래퍼 | LLVM IR 컴파일 메서드 추가 |
+| `src/main.zig` | 진입점 | `--emit-llvm`, `--llvm` 플래그 추가 |
+| `test/phase6_linker_test.zig` | Phase 6 테스트 | 신규 (13 tests) |
+| `build.zig` | 빌드 시스템 | phase6 테스트 타겟 추가 |
+
+---
+
+## 2-Step 구현 계획
+
+---
+
+### Step 1: 버그 수정 + linker.zig 확장 + main.zig 통합
+
+#### 1-1. llvm_ir.zig 버그 수정 (2줄)
+
+`emitTryExpr()` 내 Zig 비호환 문자열 `+` 연산 수정:
+
+```zig
+// 기존 (519번 라인 - 컴파일 에러)
+try self.output.appendSlice("  store i32 0, i32* %" + err_var[1..] + "\n");
+// 수정
+try self.output.writer().print("  store i32 0, i32* %{s}\n", .{err_var[1..]});
+
+// 기존 (531번 라인 - 컴파일 에러)
+try self.output.appendSlice("  br i1 " + is_err_temp[1..] + ", label %propagate, label %continue\n");
+// 수정
+try self.output.writer().print("  br i1 %{s}, label %propagate, label %continue\n", .{is_err_temp[1..]});
+```
+
+#### 1-2. linker.zig 확장
+
+기존 `Linker` struct에 필드 추가:
+```zig
+llvm_path: ?[]const u8,  // clang 경로 (없으면 null)
+```
+
+`init()` 수정: `findCCompiler()` 패턴과 동일하게 `findLLVMCompiler()` 추가:
+```zig
+fn findLLVMCompiler(allocator: std.mem.Allocator) ![]const u8 {
+    const compilers = [_][]const u8{ "clang", "cc", "gcc" };
+    // clang은 .ll 파일을 직접 컴파일 가능
+    ...
+}
+```
+
+`Linker` struct에 3개 메서드 추가:
+
+```zig
+// LLVM IR 텍스트를 .ll 파일로 저장 (static 메서드)
+pub fn writeIRToFile(ir_text: []const u8, path: []const u8) !void {
+    const file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    try file.writeAll(ir_text);
+}
+
+// .ll 파일을 clang으로 바이너리 컴파일
+// 호출: clang {ll_file} -o {output}
+pub fn compileFromLLVMIR(self: *Linker, ll_file: []const u8, output: []const u8) !void
+
+// 통합: IR 텍스트 → 임시 .ll → 바이너리 (임시파일 자동 삭제)
+pub fn compileIRText(self: *Linker, ir_text: []const u8, output: []const u8) !void
+```
+
+`deinit()` 수정: `llvm_path` free 추가.
+
+#### 1-3. main.zig 변경
+
+임포트 추가:
+```zig
+const LLVMIRGen = @import("llvm_ir.zig").LLVMIRGen;
+```
+
+새 CLI 플래그 (기존 인수 파싱 블록에 추가):
+```zig
+var emit_llvm_only = false;
+var use_llvm_backend = false;
+// "--emit-llvm" → .ll 파일만 출력 후 종료
+// "--llvm" → LLVM IR 경유 바이너리 컴파일
+```
+
+Step 5/6 사이에 LLVM 경로 분기 삽입:
+```zig
+if (use_llvm_backend or emit_llvm_only) {
+    // Step 5b: LLVMIRGen (AIR → LLVM IR 텍스트)
+    var llvm_gen = try LLVMIRGen.init(allocator, &sema.air);
+    defer llvm_gen.deinit();
+    const ir_text = try llvm_gen.generate();
+
+    const ll_filename = try std.fmt.allocPrint(allocator, "{s}.ll", .{output_file});
+    defer allocator.free(ll_filename);
+    try Linker.writeIRToFile(ir_text, ll_filename);
+
+    if (emit_llvm_only) {
+        std.debug.print("✅ LLVM IR saved: {s}\n", .{ll_filename});
+        return;
+    }
+
+    // Step 6b: clang으로 바이너리 컴파일
+    try linker.compileFromLLVMIR(ll_filename, binary_filename);
+    return;
+}
+```
+
+---
+
+### Step 2: Phase 6 테스트
+
+**`test/phase6_linker_test.zig`** (13 tests):
+
+| 그룹 | 테스트 | 내용 |
+|------|--------|------|
+| A: File I/O (3) | `write_ir_to_file` | IR 텍스트 → .ll 파일 저장 |
+|  | `read_written_ir_file` | 저장된 파일 내용 검증 |
+|  | `ir_file_contains_preamble` | target triple 포함 여부 |
+| B: 헬퍼 함수 (3) | `generate_temp_filename` | generateTempFileName() 고유성 |
+|  | `file_exists_true` | fileExists() - 파일 생성 후 확인 |
+|  | `file_cleanup` | deleteFile() 후 fileExists() false |
+| C: IR 생성 + 저장 (3) | `compile_to_ir_and_write` | 소스 → IR → 파일 통합 |
+|  | `ir_file_has_function_def` | `define` 키워드 포함 확인 |
+|  | `ir_file_has_target_info` | `target datalayout` 포함 확인 |
+| D: 컴파일러 (2) | `find_llvm_compiler_attempt` | Linker.init() 후 llvm_path 확인 |
+|  | `compile_ir_if_available` | clang 있으면 바이너리, 없으면 skip |
+| E: 통합 (2) | `full_pipeline_ir_write` | 전체 파이프라인 → .ll 파일 |
+|  | `full_pipeline_compile` | clang 있으면 바이너리 end-to-end |
+
+**컴파일러 미탑재 환경 처리**:
+```zig
+test "compile_ir_if_available" {
+    var linker = try Linker.init(allocator);
+    defer linker.deinit();
+    if (linker.llvm_path == null) return; // clang 없으면 skip (pass)
+    // clang 있으면 실제 컴파일 검증
+}
+```
+
+**build.zig 추가** (기존 패턴과 동일, 3곳):
+```zig
+const phase6_linker_tests = b.addTest(.{
+    .root_source_file = b.path("test/phase6_linker_test.zig"),
+    .target = target,
+    .optimize = optimize,
+});
+const run_phase6_linker_tests = b.addRunArtifact(phase6_linker_tests);
+test_step.dependOn(&run_phase6_linker_tests.step);
+```
+
+---
+
+## 검증 방법
+
+```bash
+# Phase 6 테스트만 실행
+zig build test --filter "phase6"
+
+# 전체 테스트 (기존 353개 + 신규 13개 = 366개)
+zig build test
+
+# LLVM IR 파일 생성 (--emit-llvm)
+zig build run -- --emit-llvm -o out
+cat out.ll
+
+# LLVM IR → 바이너리 컴파일 (clang 필요)
+zig build run -- --llvm -o out
+./out
+```
+
+---
+
+## 규모
+
+| 파일 | 변경 | 줄수 |
+|------|------|------|
+| `src/llvm_ir.zig` | 버그 수정 | 2줄 변경 |
+| `src/linker.zig` | LLVM 메서드 3개 + 필드 1개 | +60줄 |
+| `src/main.zig` | 플래그 + Step 5b/6b | +35줄 |
+| `test/phase6_linker_test.zig` | 신규 13 tests | +300줄 |
+| `build.zig` | 테스트 타겟 1개 | +12줄 |
+| **합계** | | **~409줄** |

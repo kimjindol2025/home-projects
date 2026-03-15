@@ -1,0 +1,239 @@
+const std = @import("std");
+const fs = std.fs;
+const process = std.process;
+
+/// C 코드를 바이너리로 링크/컴파일하는 래퍼
+pub const Linker = struct {
+    allocator: std.mem.Allocator,
+    cc_path: ?[]const u8,
+
+    pub fn init(allocator: std.mem.Allocator) !Linker {
+        const cc = findCCompiler(allocator) catch null;
+        return Linker{
+            .allocator = allocator,
+            .cc_path = cc,
+        };
+    }
+
+    pub fn deinit(self: *Linker) void {
+        if (self.cc_path) |cc| {
+            self.allocator.free(cc);
+        }
+    }
+
+    /// C 파일을 바이너리로 컴파일
+    /// c_file: 입력 C 파일 경로
+    /// output: 출력 바이너리 파일 경로
+    pub fn compile(self: *Linker, c_file: []const u8, output: []const u8) !void {
+        if (self.cc_path == null) {
+            return error.NoCCompilerFound;
+        }
+
+        const cc = self.cc_path.?;
+        const argv = [_][]const u8{ cc, c_file, "-o", output };
+
+        var child = try std.process.Child.init(&argv, self.allocator);
+        defer child.deinit();
+
+        const term = try child.spawnAndWait();
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    return error.CompilationFailed;
+                }
+            },
+            else => {
+                return error.CompilationTerminatedAbnormally;
+            },
+        }
+    }
+
+    /// C 파일을 객체 파일로 컴파일 (링킹 전)
+    pub fn compileToObject(self: *Linker, c_file: []const u8, output: []const u8) !void {
+        if (self.cc_path == null) {
+            return error.NoCCompilerFound;
+        }
+
+        const cc = self.cc_path.?;
+        const argv = [_][]const u8{ cc, "-c", c_file, "-o", output };
+
+        var child = try std.process.Child.init(&argv, self.allocator);
+        defer child.deinit();
+
+        const term = try child.spawnAndWait();
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    return error.CompilationFailed;
+                }
+            },
+            else => {
+                return error.CompilationTerminatedAbnormally;
+            },
+        }
+    }
+
+    /// 여러 객체 파일을 링크
+    pub fn linkObjects(self: *Linker, objects: []const []const u8, output: []const u8) !void {
+        if (self.cc_path == null) {
+            return error.NoCCompilerFound;
+        }
+
+        const cc = self.cc_path.?;
+        var argv = std.ArrayList([]const u8).init(self.allocator);
+        defer argv.deinit();
+
+        try argv.append(cc);
+        for (objects) |obj| {
+            try argv.append(obj);
+        }
+        try argv.append("-o");
+        try argv.append(output);
+
+        var child = try std.process.Child.init(argv.items, self.allocator);
+        defer child.deinit();
+
+        const term = try child.spawnAndWait();
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    return error.LinkingFailed;
+                }
+            },
+            else => {
+                return error.LinkingTerminatedAbnormally;
+            },
+        }
+    }
+
+    /// 최적화 플래그를 포함하여 컴파일
+    pub fn compileWithOptimization(
+        self: *Linker,
+        c_file: []const u8,
+        output: []const u8,
+        opt_level: u8,
+    ) !void {
+        if (self.cc_path == null) {
+            return error.NoCCompilerFound;
+        }
+
+        const cc = self.cc_path.?;
+        const opt_flag = switch (opt_level) {
+            0 => "-O0",
+            1 => "-O1",
+            2 => "-O2",
+            3 => "-O3",
+            else => "-O2",
+        };
+
+        const argv = [_][]const u8{ cc, opt_flag, c_file, "-o", output };
+
+        var child = try std.process.Child.init(&argv, self.allocator);
+        defer child.deinit();
+
+        const term = try child.spawnAndWait();
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    return error.CompilationFailed;
+                }
+            },
+            else => {
+                return error.CompilationTerminatedAbnormally;
+            },
+        }
+    }
+
+    /// 디버그 심볼을 포함하여 컴파일
+    pub fn compileWithDebugSymbols(self: *Linker, c_file: []const u8, output: []const u8) !void {
+        if (self.cc_path == null) {
+            return error.NoCCompilerFound;
+        }
+
+        const cc = self.cc_path.?;
+        const argv = [_][]const u8{ cc, "-g", c_file, "-o", output };
+
+        var child = try std.process.Child.init(&argv, self.allocator);
+        defer child.deinit();
+
+        const term = try child.spawnAndWait();
+        switch (term) {
+            .Exited => |code| {
+                if (code != 0) {
+                    return error.CompilationFailed;
+                }
+            },
+            else => {
+                return error.CompilationTerminatedAbnormally;
+            },
+        }
+    }
+};
+
+// ========== 헬퍼 함수 ==========
+
+/// C 컴파일러 자동 감지 (gcc, clang, cc 순)
+fn findCCompiler(allocator: std.mem.Allocator) ![]const u8 {
+    const compilers = [_][]const u8{ "gcc", "clang", "cc" };
+
+    for (compilers) |compiler| {
+        const result = try std.process.run(.{
+            .allocator = allocator,
+            .argv = &[_][]const u8{ compiler, "--version" },
+            .capture_stdout = true,
+        });
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        if (result.term.Exited == 0) {
+            return try allocator.dupe(u8, compiler);
+        }
+    }
+
+    return error.NoCCompilerFound;
+}
+
+/// 임시 파일명 생성
+pub fn generateTempFileName(allocator: std.mem.Allocator, suffix: []const u8) ![]const u8 {
+    const timestamp = @as(u64, @bitCast(std.time.nanoTimestamp()));
+    return try std.fmt.allocPrint(allocator, "/tmp/zig_tmp_{}{}", .{ timestamp, suffix });
+}
+
+/// 파일 존재 여부 확인
+pub fn fileExists(path: []const u8) bool {
+    const file = fs.cwd().openFile(path, .{}) catch return false;
+    defer file.close();
+    return true;
+}
+
+/// 파일 크기 조회
+pub fn getFileSize(path: []const u8) !u64 {
+    const file = try fs.cwd().openFile(path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    return stat.size;
+}
+
+/// 파일 삭제
+pub fn deleteFile(path: []const u8) !void {
+    try fs.cwd().deleteFile(path);
+}
+
+/// 파일 복사
+pub fn copyFile(src: []const u8, dest: []const u8, allocator: std.mem.Allocator) !void {
+    const src_file = try fs.cwd().openFile(src, .{});
+    defer src_file.close();
+
+    const dest_file = try fs.cwd().createFile(dest, .{});
+    defer dest_file.close();
+
+    var buffer: [4096]u8 = undefined;
+    while (true) {
+        const bytes_read = try src_file.read(&buffer);
+        if (bytes_read == 0) break;
+        try dest_file.writeAll(buffer[0..bytes_read]);
+    }
+    _ = allocator;
+}

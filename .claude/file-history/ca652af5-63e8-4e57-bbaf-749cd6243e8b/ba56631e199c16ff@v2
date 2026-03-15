@@ -1,0 +1,287 @@
+/// ARM64 (AArch64) Code Generator
+///
+/// Targets: Apple Silicon (arm64), Linux AArch64, other ARM64 systems
+/// Syntax: GNU AS / LLVM AS
+/// ABI: AAPCS64 (ARM 64-bit Calling Convention)
+///
+/// Register Layout:
+/// - x0-x7:    Argument/return registers (caller-saved)
+/// - x8-x15:   Temporary registers (caller-saved)
+/// - x16-x17:  Intra-procedure-call temporary (caller-saved)
+/// - x18:      Platform register (reserved)
+/// - x19-x28:  Callee-saved
+/// - x29:      Frame pointer (fp) - reserved, not allocated
+/// - x30:      Link register (lr) - reserved, not allocated
+/// - sp:       Stack pointer - reserved
+/// - xzr:      Zero register (read-only)
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
+pub const Register = enum(u5) {
+    x0 = 0, x1 = 1, x2 = 2, x3 = 3, x4 = 4, x5 = 5, x6 = 6, x7 = 7,
+    x8 = 8, x9 = 9, x10 = 10, x11 = 11, x12 = 12, x13 = 13, x14 = 14, x15 = 15,
+    x16 = 16, x17 = 17, x18 = 18, x19 = 19, x20 = 20, x21 = 21, x22 = 22, x23 = 23,
+    x24 = 24, x25 = 25, x26 = 26, x27 = 27, x28 = 28, x29 = 29, x30 = 30,
+};
+
+pub const Arm64Codegen = struct {
+    allocator: Allocator,
+    output: std.ArrayList(u8),
+    used_regs: [31]bool,      // x0-x30 (x29, x30 reserved but tracked)
+    label_counter: u32,
+    current_frame_size: i64,
+
+    pub fn init(allocator: Allocator) Arm64Codegen {
+        return Arm64Codegen{
+            .allocator = allocator,
+            .output = std.ArrayList(u8).init(allocator),
+            .used_regs = [_]bool{false} ** 31,
+            .label_counter = 0,
+            .current_frame_size = 0,
+        };
+    }
+
+    pub fn deinit(self: *Arm64Codegen) void {
+        self.output.deinit();
+    }
+
+    /// Get register name (x0, x1, ..., x30)
+    fn getRegisterName(reg: Register) []const u8 {
+        return switch (reg) {
+            .x0 => "x0", .x1 => "x1", .x2 => "x2", .x3 => "x3", .x4 => "x4", .x5 => "x5", .x6 => "x6", .x7 => "x7",
+            .x8 => "x8", .x9 => "x9", .x10 => "x10", .x11 => "x11", .x12 => "x12", .x13 => "x13", .x14 => "x14", .x15 => "x15",
+            .x16 => "x16", .x17 => "x17", .x18 => "x18", .x19 => "x19", .x20 => "x20", .x21 => "x21", .x22 => "x22", .x23 => "x23",
+            .x24 => "x24", .x25 => "x25", .x26 => "x26", .x27 => "x27", .x28 => "x28", .x29 => "x29", .x30 => "x30",
+        };
+    }
+
+    /// Allocate a register for temporary use
+    /// Priority: x8-x15 (caller-saved temps) → x0-x7 (args) → x19-x28 (callee-saved)
+    pub fn allocReg(self: *Arm64Codegen) ?Register {
+        // Temps first: x8-x15
+        for (8..16) |i| {
+            if (!self.used_regs[i]) {
+                self.used_regs[i] = true;
+                return @enumFromInt(@as(u5, @intCast(i)));
+            }
+        }
+        // Args: x0-x7
+        for (0..8) |i| {
+            if (!self.used_regs[i]) {
+                self.used_regs[i] = true;
+                return @enumFromInt(@as(u5, @intCast(i)));
+            }
+        }
+        // Callee-saved: x19-x28
+        for (19..29) |i| {
+            if (!self.used_regs[i]) {
+                self.used_regs[i] = true;
+                return @enumFromInt(@as(u5, @intCast(i)));
+            }
+        }
+        return null; // All registers used
+    }
+
+    /// Free a register
+    pub fn freeReg(self: *Arm64Codegen, reg: Register) void {
+        const idx = @intFromEnum(reg);
+        if (idx < 31) {
+            self.used_regs[idx] = false;
+        }
+    }
+
+    /// Emit raw instruction line
+    fn emit(self: *Arm64Codegen, comptime fmt: []const u8, args: anytype) !void {
+        try self.output.writer().print(fmt ++ "\n", args);
+    }
+
+    // ========================================================================
+    // Step 1: Basic Arithmetic Operations
+    // ========================================================================
+
+    /// movz x0, #42 (or movz + movk for 64-bit immediates)
+    pub fn emitMovImm(self: *Arm64Codegen, dst: Register, value: i64) !void {
+        const uval = @as(u64, @bitCast(value));
+
+        // For small values, just movz
+        if (uval <= 0xFFFF) {
+            try self.emit("    movz {s}, #{x}", .{ getRegisterName(dst), uval });
+        } else if (uval <= 0xFFFFFFFF) {
+            // Two 16-bit chunks
+            const lo = uval & 0xFFFF;
+            const hi = (uval >> 16) & 0xFFFF;
+            try self.emit("    movz {s}, #{x}", .{ getRegisterName(dst), hi });
+            try self.emit("    movk {s}, #{x}, lsl #16", .{ getRegisterName(dst), lo });
+        } else {
+            // Full 64-bit: 4 chunks
+            try self.emit("    movz {s}, #{x}", .{ getRegisterName(dst), (uval >> 48) & 0xFFFF });
+            try self.emit("    movk {s}, #{x}, lsl #32", .{ getRegisterName(dst), (uval >> 32) & 0xFFFF });
+            try self.emit("    movk {s}, #{x}, lsl #16", .{ getRegisterName(dst), (uval >> 16) & 0xFFFF });
+            try self.emit("    movk {s}, #{x}", .{ getRegisterName(dst), uval & 0xFFFF });
+        }
+    }
+
+    /// mov x0, x1 (register move)
+    pub fn emitMov(self: *Arm64Codegen, dst: Register, src: Register) !void {
+        try self.emit("    mov {s}, {s}", .{ getRegisterName(dst), getRegisterName(src) });
+    }
+
+    /// add x0, x1, x2 (3-operand add)
+    pub fn emitAdd(self: *Arm64Codegen, dst: Register, lhs: Register, rhs: Register) !void {
+        try self.emit("    add {s}, {s}, {s}", .{ getRegisterName(dst), getRegisterName(lhs), getRegisterName(rhs) });
+    }
+
+    /// sub x0, x1, x2 (3-operand sub)
+    pub fn emitSub(self: *Arm64Codegen, dst: Register, lhs: Register, rhs: Register) !void {
+        try self.emit("    sub {s}, {s}, {s}", .{ getRegisterName(dst), getRegisterName(lhs), getRegisterName(rhs) });
+    }
+
+    /// mul x0, x1, x2 (3-operand multiply)
+    pub fn emitMul(self: *Arm64Codegen, dst: Register, lhs: Register, rhs: Register) !void {
+        try self.emit("    mul {s}, {s}, {s}", .{ getRegisterName(dst), getRegisterName(lhs), getRegisterName(rhs) });
+    }
+
+    /// sdiv x0, x1, x2 (signed divide)
+    pub fn emitSdiv(self: *Arm64Codegen, dst: Register, lhs: Register, rhs: Register) !void {
+        try self.emit("    sdiv {s}, {s}, {s}", .{ getRegisterName(dst), getRegisterName(lhs), getRegisterName(rhs) });
+    }
+
+    /// msub x0, x1, x2, x3 (dst = x3 - x1*x2, used for modulo: msub result, quot, divisor, dividend)
+    pub fn emitMsub(self: *Arm64Codegen, dst: Register, a: Register, b: Register, c: Register) !void {
+        try self.emit("    msub {s}, {s}, {s}, {s}", .{ getRegisterName(dst), getRegisterName(a), getRegisterName(b), getRegisterName(c) });
+    }
+
+    /// neg x0, x1 (negate: x0 = 0 - x1)
+    pub fn emitNeg(self: *Arm64Codegen, dst: Register, src: Register) !void {
+        try self.emit("    neg {s}, {s}", .{ getRegisterName(dst), getRegisterName(src) });
+    }
+
+    /// cmp x0, x1 (compare)
+    pub fn emitCmp(self: *Arm64Codegen, lhs: Register, rhs: Register) !void {
+        try self.emit("    cmp {s}, {s}", .{ getRegisterName(lhs), getRegisterName(rhs) });
+    }
+
+    /// cset x0, eq/ne/lt/le/gt/ge (conditional set: 1 if true, 0 if false)
+    pub fn emitCset(self: *Arm64Codegen, dst: Register, cond: []const u8) !void {
+        try self.emit("    cset {s}, {s}", .{ getRegisterName(dst), cond });
+    }
+
+    /// ret (return)
+    pub fn emitRet(self: *Arm64Codegen) !void {
+        try self.emit("    ret", .{});
+    }
+
+    // ========================================================================
+    // Step 2: Function Prologue/Epilogue and Stack Access
+    // ========================================================================
+
+    /// stp x29, x30, [sp, #-N]! (save frame pointer and link register, pre-decrement stack)
+    /// mov x29, sp (set frame pointer)
+    pub fn emitFunctionPrologue(self: *Arm64Codegen, frame_size: i64) !void {
+        // Align to 16 bytes (AAPCS64 requirement)
+        const aligned_frame_size = ((frame_size + 15) / 16) * 16;
+        self.current_frame_size = aligned_frame_size;
+
+        try self.emit("    stp x29, x30, [sp, #-{}]!", .{aligned_frame_size});
+        try self.emit("    mov x29, sp", .{});
+    }
+
+    /// ldp x29, x30, [sp], #N (restore frame pointer and link register, post-increment)
+    /// ret (return)
+    pub fn emitFunctionEpilogue(self: *Arm64Codegen) !void {
+        try self.emit("    ldp x29, x30, [sp], #{}", .{self.current_frame_size});
+        try self.emit("    ret", .{});
+    }
+
+    /// str x0, [x29, #-8] (store register to stack)
+    pub fn emitStr(self: *Arm64Codegen, src: Register, offset: i64) !void {
+        try self.emit("    str {s}, [x29, #{}]", .{ getRegisterName(src), offset });
+    }
+
+    /// ldr x0, [x29, #-8] (load register from stack)
+    pub fn emitLdr(self: *Arm64Codegen, dst: Register, offset: i64) !void {
+        try self.emit("    ldr {s}, [x29, #{}]", .{ getRegisterName(dst), offset });
+    }
+
+    /// bl function_name (branch with link - function call)
+    pub fn emitBl(self: *Arm64Codegen, target: []const u8) !void {
+        try self.emit("    bl {s}", .{target});
+    }
+
+    /// .global symbol_name (declare global function)
+    pub fn emitGlobal(self: *Arm64Codegen, name: []const u8) !void {
+        try self.emit(".global {s}", .{name});
+    }
+
+    /// symbol_name: (function label)
+    pub fn emitFunctionLabel(self: *Arm64Codegen, name: []const u8) !void {
+        try self.emit("{s}:", .{name});
+    }
+
+    // ========================================================================
+    // Step 3: Control Flow
+    // ========================================================================
+
+    /// Generate unique label (.L0, .L1, etc.)
+    pub fn newLabel(self: *Arm64Codegen, allocator: Allocator) ![]u8 {
+        const label = try std.fmt.allocPrint(allocator, ".L{}", .{self.label_counter});
+        self.label_counter += 1;
+        return label;
+    }
+
+    /// .L0: (emit label)
+    pub fn emitLabel(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("{s}:", .{label});
+    }
+
+    /// b .L0 (unconditional branch)
+    pub fn emitB(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b {s}", .{label});
+    }
+
+    /// b.eq .L0 (branch if equal)
+    pub fn emitBEq(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b.eq {s}", .{label});
+    }
+
+    /// b.ne .L0 (branch if not equal)
+    pub fn emitBNe(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b.ne {s}", .{label});
+    }
+
+    /// b.lt .L0 (branch if signed less than)
+    pub fn emitBLt(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b.lt {s}", .{label});
+    }
+
+    /// b.le .L0 (branch if signed less than or equal)
+    pub fn emitBLe(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b.le {s}", .{label});
+    }
+
+    /// b.gt .L0 (branch if signed greater than)
+    pub fn emitBGt(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b.gt {s}", .{label});
+    }
+
+    /// b.ge .L0 (branch if signed greater than or equal)
+    pub fn emitBGe(self: *Arm64Codegen, label: []const u8) !void {
+        try self.emit("    b.ge {s}", .{label});
+    }
+
+    /// cbz x0, .L0 (compare with zero and branch if zero)
+    pub fn emitCbz(self: *Arm64Codegen, reg: Register, label: []const u8) !void {
+        try self.emit("    cbz {s}, {s}", .{ getRegisterName(reg), label });
+    }
+
+    /// cbnz x0, .L0 (compare with zero and branch if not zero)
+    pub fn emitCbnz(self: *Arm64Codegen, reg: Register, label: []const u8) !void {
+        try self.emit("    cbnz {s}, {s}", .{ getRegisterName(reg), label });
+    }
+
+    /// test x0 (cmp x0, #0 - for condition checking)
+    pub fn emitTest(self: *Arm64Codegen, reg: Register) !void {
+        try self.emit("    cmp {s}, #0", .{getRegisterName(reg)});
+    }
+};

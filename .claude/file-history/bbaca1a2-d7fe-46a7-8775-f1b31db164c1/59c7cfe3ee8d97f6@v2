@@ -1,0 +1,984 @@
+// 🦎 Mini Zig Compiler - Phase 2.2: Parser
+// src/parser.zig: Recursive Descent Parser (Token → AST)
+
+const std = @import("std");
+const Token = @import("tokenizer.zig").Token;
+const Ast = @import("ast.zig");
+const Node = Ast.Node;
+
+pub const Parser = struct {
+    tokens: []const Token,
+    source: []const u8,
+    current: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(tokens: []const Token, source: []const u8, allocator: std.mem.Allocator) Parser {
+        return .{
+            .tokens = tokens,
+            .source = source,
+            .current = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Parser) void {
+        _ = self;
+        // Parser는 할당된 메모리 소유하지 않음 (tokens와 source는 외부에서 관리)
+    }
+
+    /// 전체 프로그램 파싱
+    pub fn parseProgram(self: *Parser) !Ast {
+        var declarations = std.ArrayList(Node).init(self.allocator);
+        defer declarations.deinit();
+
+        while (!self.isAtEnd()) {
+            const decl = try self.parseDeclaration();
+            try declarations.append(decl);
+        }
+
+        const root = Node{
+            .tag = .root,
+            .loc = .{
+                .line = 1,
+                .column = 1,
+                .start = 0,
+                .end = self.source.len,
+            },
+            .data = .{ .block = declarations.items },
+        };
+
+        return Ast{
+            .root = root,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// 선언 파싱 (함수, 변수, 상수)
+    fn parseDeclaration(self: *Parser) !Node {
+        if (self.match(.fn_)) {
+            return self.parseFnDecl();
+        }
+
+        if (self.match(.const_)) {
+            return self.parseConstDecl();
+        }
+
+        if (self.match(.var_)) {
+            return self.parseVarDecl();
+        }
+
+        return self.parseStatement();
+    }
+
+    /// 함수 선언 파싱
+    /// fn name(param1: type1, param2: type2) -> return_type { body }
+    fn parseFnDecl(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        const name_token = self.consume(.identifier, "Expected function name")?;
+        const name = name_token.lexeme(self.source);
+
+        self.consume(.lparen, "Expected '(' after function name")?;
+
+        // 파라미터 파싱
+        var params = std.ArrayList(Ast.Param).init(self.allocator);
+        defer params.deinit();
+
+        if (!self.check(.rparen)) {
+            while (true) {
+                // comptime 키워드 확인 (Generic 파라미터)
+                var is_comptime = false;
+                if (self.match(.comptime_)) {
+                    is_comptime = true;
+                }
+
+                const param_name_token = self.consume(.identifier, "Expected parameter name")?;
+                const param_name = param_name_token.lexeme(self.source);
+
+                self.consume(.colon, "Expected ':' after parameter name")?;
+
+                const param_type = try self.parseType();
+
+                try params.append(.{
+                    .name = param_name,
+                    .type_node = param_type,
+                    .is_comptime = is_comptime,
+                });
+
+                if (!self.match(.comma)) {
+                    break;
+                }
+            }
+        }
+
+        self.consume(.rparen, "Expected ')' after parameters")?;
+
+        // 반환 타입 파싱 (선택사항)
+        var return_type: ?*Node = null;
+        if (self.match(.arrow)) {
+            const ret_type = try self.parseType();
+            return_type = try self.allocator.create(Node);
+            return_type.?.* = ret_type;
+        }
+
+        // 함수 본체 파싱
+        self.consume(.lbrace, "Expected '{' for function body")?;
+        const body = try self.parseBlock();
+
+        const fn_decl = try self.allocator.create(Node);
+        fn_decl.* = .{
+            .tag = .fn_decl,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{
+                .fn_decl = .{
+                    .name = name,
+                    .params = try self.allocator.dupe(Ast.Param, params.items),
+                    .return_type = return_type,
+                    .body = try self.allocator.dupe(Node, &.{body}),
+                },
+            },
+        };
+
+        return fn_decl.*;
+    }
+
+    /// 변수 선언 파싱
+    /// var name: type = initial_value;
+    fn parseVarDecl(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        const name_token = self.consume(.identifier, "Expected variable name")?;
+        const name = name_token.lexeme(self.source);
+
+        var type_annotation: ?*Node = null;
+        if (self.match(.colon)) {
+            const type_node = try self.parseType();
+            type_annotation = try self.allocator.create(Node);
+            type_annotation.?.* = type_node;
+        }
+
+        var initial_value: ?*Node = null;
+        if (self.match(.equal)) {
+            const expr = try self.parseExpression();
+            initial_value = try self.allocator.create(Node);
+            initial_value.?.* = expr;
+        }
+
+        self.consume(.semicolon, "Expected ';' after variable declaration")?;
+
+        const var_decl = try self.allocator.create(Node);
+        var_decl.* = .{
+            .tag = .var_decl,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{
+                .var_decl = .{
+                    .name = name,
+                    .type_annotation = type_annotation,
+                    .initial_value = initial_value,
+                },
+            },
+        };
+
+        return var_decl.*;
+    }
+
+    /// 상수 선언 파싱
+    /// const name: type = value;
+    fn parseConstDecl(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        const name_token = self.consume(.identifier, "Expected constant name")?;
+        const name = name_token.lexeme(self.source);
+
+        var type_annotation: ?*Node = null;
+        if (self.match(.colon)) {
+            const type_node = try self.parseType();
+            type_annotation = try self.allocator.create(Node);
+            type_annotation.?.* = type_node;
+        }
+
+        self.consume(.equal, "Expected '=' after constant declaration")?;
+
+        const value = try self.parseExpression();
+        const value_ptr = try self.allocator.create(Node);
+        value_ptr.* = value;
+
+        self.consume(.semicolon, "Expected ';' after constant declaration")?;
+
+        const const_decl = try self.allocator.create(Node);
+        const_decl.* = .{
+            .tag = .const_decl,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{
+                .const_decl = .{
+                    .name = name,
+                    .type_annotation = type_annotation,
+                    .value = value_ptr,
+                },
+            },
+        };
+
+        return const_decl.*;
+    }
+
+    /// 타입 파싱
+    /// i32, f64, *i32, [10]i32, fn(i32, i32) i32
+    fn parseType(self: *Parser) !Node {
+        // 포인터 타입
+        if (self.match(.star)) {
+            const element_type = try self.parseType();
+            const ptr_node = try self.allocator.create(Node);
+            ptr_node.* = element_type;
+
+            return .{
+                .tag = .type_pointer,
+                .loc = .{
+                    .line = 1,
+                    .column = 1,
+                    .start = 0,
+                    .end = 0,
+                },
+                .data = .{ .pointer_type = ptr_node },
+            };
+        }
+
+        // 배열 타입
+        if (self.match(.lbracket)) {
+            var size: ?*Node = null;
+
+            if (!self.check(.rbracket)) {
+                const size_expr = try self.parseExpression();
+                size = try self.allocator.create(Node);
+                size.?.* = size_expr;
+            }
+
+            self.consume(.rbracket, "Expected ']' after array size")?;
+
+            const element_type = try self.parseType();
+            const elem_ptr = try self.allocator.create(Node);
+            elem_ptr.* = element_type;
+
+            return .{
+                .tag = .type_array,
+                .loc = .{
+                    .line = 1,
+                    .column = 1,
+                    .start = 0,
+                    .end = 0,
+                },
+                .data = .{
+                    .array_type = .{
+                        .element_type = elem_ptr,
+                        .size = size,
+                    },
+                },
+            };
+        }
+
+        // 기본 타입 (식별자)
+        const type_token = self.consume(.identifier, "Expected type name")?;
+        const type_name = type_token.lexeme(self.source);
+
+        return .{
+            .tag = .type_primitive,
+            .loc = .{
+                .line = type_token.line,
+                .column = type_token.column,
+                .start = type_token.start,
+                .end = type_token.end,
+            },
+            .data = .{ .type_name = type_name },
+        };
+    }
+
+    /// 문장 파싱
+    fn parseStatement(self: *Parser) !Node {
+        // if 문
+        if (self.match(.if_)) {
+            return self.parseIfStatement();
+        }
+
+        // while 루프
+        if (self.match(.while_)) {
+            return self.parseWhileStatement();
+        }
+
+        // return 문
+        if (self.match(.return_)) {
+            return self.parseReturnStatement();
+        }
+
+        // 블록
+        if (self.check(.lbrace)) {
+            return self.parseBlock();
+        }
+
+        // 식 문장
+        return self.parseExprStatement();
+    }
+
+    /// if 문 파싱
+    /// if (condition) { body } else { else_body }
+    fn parseIfStatement(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        self.consume(.lparen, "Expected '(' after 'if'")?;
+        const condition = try self.parseExpression();
+        const cond_ptr = try self.allocator.create(Node);
+        cond_ptr.* = condition;
+
+        self.consume(.rparen, "Expected ')' after condition")?;
+
+        self.consume(.lbrace, "Expected '{' for if body")?;
+        const then_body = try self.parseBlock();
+        const then_ptr = try self.allocator.create(Node);
+        then_ptr.* = then_body;
+
+        var else_body: ?*Node = null;
+        if (self.match(.else_)) {
+            self.consume(.lbrace, "Expected '{' for else body")?;
+            const else_block = try self.parseBlock();
+            else_body = try self.allocator.create(Node);
+            else_body.?.* = else_block;
+        }
+
+        return .{
+            .tag = .if_stmt,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{
+                .if_stmt = .{
+                    .condition = cond_ptr,
+                    .then_branch = then_ptr,
+                    .else_branch = else_body,
+                },
+            },
+        };
+    }
+
+    /// while 루프 파싱
+    /// while (condition) { body }
+    fn parseWhileStatement(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        self.consume(.lparen, "Expected '(' after 'while'")?;
+        const condition = try self.parseExpression();
+        const cond_ptr = try self.allocator.create(Node);
+        cond_ptr.* = condition;
+
+        self.consume(.rparen, "Expected ')' after condition")?;
+
+        self.consume(.lbrace, "Expected '{' for while body")?;
+        const body = try self.parseBlock();
+        const body_ptr = try self.allocator.create(Node);
+        body_ptr.* = body;
+
+        return .{
+            .tag = .while_stmt,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{
+                .while_stmt = .{
+                    .condition = cond_ptr,
+                    .body = body_ptr,
+                },
+            },
+        };
+    }
+
+    /// return 문 파싱
+    /// return expr;
+    fn parseReturnStatement(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        var return_expr: ?*Node = null;
+
+        if (!self.check(.semicolon)) {
+            const expr = try self.parseExpression();
+            return_expr = try self.allocator.create(Node);
+            return_expr.?.* = expr;
+        }
+
+        self.consume(.semicolon, "Expected ';' after return statement")?;
+
+        return .{
+            .tag = .return_stmt,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{ .return_expr = return_expr },
+        };
+    }
+
+    /// 블록 파싱
+    /// { stmt1; stmt2; ... }
+    fn parseBlock(self: *Parser) !Node {
+        const start_token = self.previous();
+
+        // 아직 { 를 소비하지 않았으면 소비
+        if (start_token.tag != .lbrace) {
+            self.consume(.lbrace, "Expected '{' for block")?;
+        }
+
+        var statements = std.ArrayList(Node).init(self.allocator);
+        defer statements.deinit();
+
+        while (!self.check(.rbrace) and !self.isAtEnd()) {
+            const stmt = try self.parseDeclaration();
+            try statements.append(stmt);
+        }
+
+        self.consume(.rbrace, "Expected '}' to close block")?;
+
+        return .{
+            .tag = .block,
+            .loc = .{
+                .line = start_token.line,
+                .column = start_token.column,
+                .start = start_token.start,
+                .end = self.previous().end,
+            },
+            .data = .{ .block = try self.allocator.dupe(Node, statements.items) },
+        };
+    }
+
+    /// 식 문장 파싱
+    /// expr;
+    fn parseExprStatement(self: *Parser) !Node {
+        const expr = try self.parseExpression();
+
+        self.consume(.semicolon, "Expected ';' after expression")?;
+
+        return .{
+            .tag = .expr_stmt,
+            .loc = expr.loc,
+            .data = .{ .expr = try self.allocator.create(Node) then |ptr| {
+                ptr.* = expr;
+                return ptr;
+            } },
+        };
+    }
+
+    /// 식 파싱 (할당 포함)
+    fn parseExpression(self: *Parser) !Node {
+        return self.parseAssignment();
+    }
+
+    /// 할당 파싱
+    /// target = value
+    fn parseAssignment(self: *Parser) !Node {
+        var expr = try self.parseLogicalOr();
+
+        if (self.match(.equal)) {
+            const value = try self.parseAssignment();
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = value;
+
+            return .{
+                .tag = .var_assign,
+                .loc = expr.loc,
+                .data = .{
+                    .var_assign = .{
+                        .target = lhs,
+                        .value = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 논리 OR 파싱
+    fn parseLogicalOr(self: *Parser) !Node {
+        var expr = try self.parseLogicalAnd();
+
+        while (self.match(.or_)) {
+            const op = self.previous();
+            const right = try self.parseLogicalAnd();
+
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = right;
+
+            expr = .{
+                .tag = .binary_op,
+                .loc = op.loc,
+                .data = .{
+                    .binary_op = .{
+                        .op = .logical_or,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 논리 AND 파싱
+    fn parseLogicalAnd(self: *Parser) !Node {
+        var expr = try self.parseEquality();
+
+        while (self.match(.and_)) {
+            const right = try self.parseEquality();
+
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = right;
+
+            expr = .{
+                .tag = .binary_op,
+                .loc = expr.loc,
+                .data = .{
+                    .binary_op = .{
+                        .op = .logical_and,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 동등성 파싱 (==, !=)
+    fn parseEquality(self: *Parser) !Node {
+        var expr = try self.parseComparison();
+
+        while (true) {
+            const op: Ast.BinaryOp = if (self.match(.equal_equal))
+                .equal
+            else if (self.match(.bang_equal))
+                .not_equal
+            else
+                break;
+
+            const right = try self.parseComparison();
+
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = right;
+
+            expr = .{
+                .tag = .binary_op,
+                .loc = expr.loc,
+                .data = .{
+                    .binary_op = .{
+                        .op = op,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 비교 파싱 (<, <=, >, >=)
+    fn parseComparison(self: *Parser) !Node {
+        var expr = try self.parseAdditive();
+
+        while (true) {
+            const op: Ast.BinaryOp = if (self.match(.less))
+                .less
+            else if (self.match(.less_equal))
+                .less_equal
+            else if (self.match(.greater))
+                .greater
+            else if (self.match(.greater_equal))
+                .greater_equal
+            else
+                break;
+
+            const right = try self.parseAdditive();
+
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = right;
+
+            expr = .{
+                .tag = .binary_op,
+                .loc = expr.loc,
+                .data = .{
+                    .binary_op = .{
+                        .op = op,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 덧셈/뺄셈 파싱
+    fn parseAdditive(self: *Parser) !Node {
+        var expr = try self.parseMultiplicative();
+
+        while (true) {
+            const op: Ast.BinaryOp = if (self.match(.plus))
+                .add
+            else if (self.match(.minus))
+                .subtract
+            else
+                break;
+
+            const right = try self.parseMultiplicative();
+
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = right;
+
+            expr = .{
+                .tag = .binary_op,
+                .loc = expr.loc,
+                .data = .{
+                    .binary_op = .{
+                        .op = op,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 곱셈/나눗셈 파싱
+    fn parseMultiplicative(self: *Parser) !Node {
+        var expr = try self.parseUnary();
+
+        while (true) {
+            const op: Ast.BinaryOp = if (self.match(.star))
+                .multiply
+            else if (self.match(.slash))
+                .divide
+            else if (self.match(.percent))
+                .modulo
+            else
+                break;
+
+            const right = try self.parseUnary();
+
+            const lhs = try self.allocator.create(Node);
+            lhs.* = expr;
+            const rhs = try self.allocator.create(Node);
+            rhs.* = right;
+
+            expr = .{
+                .tag = .binary_op,
+                .loc = expr.loc,
+                .data = .{
+                    .binary_op = .{
+                        .op = op,
+                        .lhs = lhs,
+                        .rhs = rhs,
+                    },
+                },
+            };
+        }
+
+        return expr;
+    }
+
+    /// 단항 연산자 파싱
+    fn parseUnary(self: *Parser) !Node {
+        if (self.match(.minus)) {
+            const op = self.previous();
+            const operand = try self.parseUnary();
+            const op_ptr = try self.allocator.create(Node);
+            op_ptr.* = operand;
+
+            return .{
+                .tag = .unary_op,
+                .loc = op.loc,
+                .data = .{
+                    .unary_op = .{
+                        .op = .negate,
+                        .operand = op_ptr,
+                    },
+                },
+            };
+        }
+
+        if (self.match(.bang)) {
+            const op = self.previous();
+            const operand = try self.parseUnary();
+            const op_ptr = try self.allocator.create(Node);
+            op_ptr.* = operand;
+
+            return .{
+                .tag = .unary_op,
+                .loc = op.loc,
+                .data = .{
+                    .unary_op = .{
+                        .op = .not,
+                        .operand = op_ptr,
+                    },
+                },
+            };
+        }
+
+        return self.parsePostfix();
+    }
+
+    /// 후위 연산자 파싱 (함수 호출, 배열 인덱싱, 멤버 접근)
+    fn parsePostfix(self: *Parser) !Node {
+        var expr = try self.parsePrimary();
+
+        while (true) {
+            // 함수 호출
+            if (self.match(.lparen)) {
+                var args = std.ArrayList(Node).init(self.allocator);
+                defer args.deinit();
+
+                if (!self.check(.rparen)) {
+                    while (true) {
+                        try args.append(try self.parseExpression());
+                        if (!self.match(.comma)) break;
+                    }
+                }
+
+                self.consume(.rparen, "Expected ')' after arguments")?;
+
+                const callee = try self.allocator.create(Node);
+                callee.* = expr;
+
+                expr = .{
+                    .tag = .call,
+                    .loc = expr.loc,
+                    .data = .{
+                        .call = .{
+                            .callee = callee,
+                            .args = try self.allocator.dupe(Node, args.items),
+                        },
+                    },
+                };
+                continue;
+            }
+
+            // 배열 인덱싱
+            if (self.match(.lbracket)) {
+                const index = try self.parseExpression();
+                const idx_ptr = try self.allocator.create(Node);
+                idx_ptr.* = index;
+
+                self.consume(.rbracket, "Expected ']' after array index")?;
+
+                const array = try self.allocator.create(Node);
+                array.* = expr;
+
+                expr = .{
+                    .tag = .index_access,
+                    .loc = expr.loc,
+                    .data = .{
+                        .index_access = .{
+                            .array = array,
+                            .index = idx_ptr,
+                        },
+                    },
+                };
+                continue;
+            }
+
+            // 멤버 접근
+            if (self.match(.dot)) {
+                const field_token = self.consume(.identifier, "Expected field name")?;
+                const field = field_token.lexeme(self.source);
+
+                const obj = try self.allocator.create(Node);
+                obj.* = expr;
+
+                expr = .{
+                    .tag = .member_access,
+                    .loc = expr.loc,
+                    .data = .{
+                        .member_access = .{
+                            .object = obj,
+                            .field = field,
+                        },
+                    },
+                };
+                continue;
+            }
+
+            break;
+        }
+
+        return expr;
+    }
+
+    /// 기본 식 파싱
+    fn parsePrimary(self: *Parser) !Node {
+        // 정수 리터럴
+        if (self.match(.integer)) {
+            const token = self.previous();
+            const text = token.lexeme(self.source);
+            const value = try std.fmt.parseInt(i64, text, 10);
+
+            return .{
+                .tag = .integer_literal,
+                .loc = token.loc,
+                .data = .{ .integer = value },
+            };
+        }
+
+        // 부동소수점 리터럴
+        if (self.match(.float)) {
+            const token = self.previous();
+            const text = token.lexeme(self.source);
+            const value = try std.fmt.parseFloat(f64, text);
+
+            return .{
+                .tag = .float_literal,
+                .loc = token.loc,
+                .data = .{ .float = value },
+            };
+        }
+
+        // 문자열 리터럴
+        if (self.match(.string)) {
+            const token = self.previous();
+            const text = token.lexeme(self.source);
+            // 따옴표 제거
+            const string_value = text[1 .. text.len - 1];
+
+            return .{
+                .tag = .string_literal,
+                .loc = token.loc,
+                .data = .{ .string = string_value },
+            };
+        }
+
+        // 식별자
+        if (self.match(.identifier)) {
+            const token = self.previous();
+            const name = token.lexeme(self.source);
+
+            return .{
+                .tag = .identifier,
+                .loc = token.loc,
+                .data = .{ .identifier = name },
+            };
+        }
+
+        // 괄호로 묶인 식
+        if (self.match(.lparen)) {
+            const expr = try self.parseExpression();
+            self.consume(.rparen, "Expected ')' after expression")?;
+
+            return .{
+                .tag = .grouped_expr,
+                .loc = expr.loc,
+                .data = .{ .expr = try self.allocator.create(Node) then |ptr| {
+                    ptr.* = expr;
+                    return ptr;
+                } },
+            };
+        }
+
+        // 배열 리터럴
+        if (self.match(.lbracket)) {
+            var elements = std.ArrayList(Node).init(self.allocator);
+            defer elements.deinit();
+
+            if (!self.check(.rbracket)) {
+                while (true) {
+                    try elements.append(try self.parseExpression());
+                    if (!self.match(.comma)) break;
+                }
+            }
+
+            self.consume(.rbracket, "Expected ']' after array elements")?;
+
+            return .{
+                .tag = .array_literal,
+                .loc = self.previous().loc,
+                .data = .{ .array_literal = try self.allocator.dupe(Node, elements.items) },
+            };
+        }
+
+        return error.UnexpectedToken;
+    }
+
+    /// 헬퍼 함수들
+    fn match(self: *Parser, tag: Token.Tag) bool {
+        if (self.check(tag)) {
+            self.advance();
+            return true;
+        }
+        return false;
+    }
+
+    fn check(self: *Parser, tag: Token.Tag) bool {
+        if (self.isAtEnd()) return false;
+        return self.peek().tag == tag;
+    }
+
+    fn advance(self: *Parser) Token {
+        if (!self.isAtEnd()) self.current += 1;
+        return self.previous();
+    }
+
+    fn isAtEnd(self: *Parser) bool {
+        return self.peek().tag == .eof;
+    }
+
+    fn peek(self: *Parser) Token {
+        return self.tokens[self.current];
+    }
+
+    fn previous(self: *Parser) Token {
+        return self.tokens[self.current - 1];
+    }
+
+    fn consume(self: *Parser, tag: Token.Tag, message: []const u8) !Token {
+        if (self.check(tag)) {
+            return self.advance();
+        }
+
+        const token = self.peek();
+        std.debug.print("Parse error at line {}, column {}: {s}\n", .{ token.line, token.column, message });
+
+        return error.ParseError;
+    }
+};

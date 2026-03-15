@@ -1,0 +1,242 @@
+# Phase 4.3: RISC-V 백엔드 구현 계획
+
+## Context
+
+현재 상태:
+- Zig 컴파일러 Phase 4.2 (Error Handling Codegen) 완료
+- 파이프라인: Tokenizer → Parser → AstGen → Sema → Codegen(C) → Linker
+- `src/codegen.zig`: AIR → C 코드 생성 (기존)
+- 목표: AIR → RISC-V 어셈블리 생성하는 새 백엔드 추가
+
+## 아키텍처
+
+```
+Air (분석 완료)
+     ↓
+RiscvCodegen   ← 새로 만들 파일
+     ↓
+.s 어셈블리 파일
+     ↓
+(gcc/as → ELF 바이너리, 선택)
+```
+
+## 구현 계획 (3단계)
+
+---
+
+### Step 1: 기본 골격 + 정수 연산
+
+**파일**: `src/riscv_codegen.zig` (신규)
+
+**구현 내용**:
+
+1. **레지스터 정의**
+```
+zero(x0), ra(x1), sp(x2), gp(x3), tp(x4)
+t0-t2(x5-x7), s0-s1(x8-x9)
+a0-a7(x10-x17)  ← 함수 인수/반환값
+s2-s11(x18-x27), t3-t6(x28-x31)
+```
+
+2. **간단한 레지스터 할당기**
+- `used_regs: [32]bool` 배열
+- `allocReg() → Register`
+- `freeReg(reg: Register)`
+- `ref_to_reg: HashMap(Air.Ref, Register)` ← Ref가 어느 레지스터에 있는지
+
+3. **기본 명령어 emit 함수들**
+```zig
+fn emitLi(reg: Register, value: i64)          // li t0, 42
+fn emitMv(dst: Register, src: Register)        // mv a0, t0
+fn emitAdd(dst, lhs, rhs: Register)            // add t0, t1, t2
+fn emitSub(dst, lhs, rhs: Register)            // sub ...
+fn emitMul(dst, lhs, rhs: Register)            // mul ...
+fn emitDiv(dst, lhs, rhs: Register)            // div ...
+fn emitRet()                                   // ret
+```
+
+4. **처리할 AIR 명령어**:
+- `load_int` → `li`
+- `binary_op .add/sub/mul/div/mod` → 산술 명령어
+- `binary_op .eq/ne/lt/le/gt/ge` → `slt`, `seqz`, `snez`
+- `unary_op .negate` → `neg`
+- `noop` → 무시
+
+5. **테스트** (`test/riscv_basic_test.zig`): 15개
+   - 정수 리터럴 생성 확인
+   - 사칙연산 어셈블리 출력 확인
+   - 비교 연산 확인
+
+---
+
+### Step 2: 함수 + 호출 규약
+
+**파일**: `src/riscv_codegen.zig` (추가)
+
+**RISC-V 호출 규약 (ABI)**:
+```
+인수 전달: a0-a7 (최대 8개)
+반환값:    a0
+Callee-saved: s0-s11, sp, ra 보존 필수
+Caller-saved: t0-t6, a0-a7 (자유롭게 사용)
+```
+
+**스택 프레임 구조**:
+```
+high address
+  ┌─────────┐
+  │  (호출자 프레임)  │
+  ├─────────┤ ← old sp
+  │   ra    │  (8 bytes)
+  │   s0    │  (8 bytes, frame pointer)
+  │  locals │  (변수별 8 bytes)
+  └─────────┘ ← new sp = old sp - framesize
+```
+
+**구현 내용**:
+
+1. **함수 프롤로그** (`fn_begin`):
+```asm
+.globl func_name
+func_name:
+    addi sp, sp, -framesize   # 스택 확장
+    sd ra, framesize-8(sp)    # ra 저장
+    sd s0, framesize-16(sp)   # frame pointer 저장
+    addi s0, sp, framesize    # frame pointer 설정
+```
+
+2. **함수 에필로그** (`fn_end`):
+```asm
+    ld ra, framesize-8(sp)    # ra 복원
+    ld s0, framesize-16(sp)   # fp 복원
+    addi sp, sp, framesize    # 스택 복원
+    ret                       # = jalr x0, ra, 0
+```
+
+3. **함수 호출** (`call`):
+```asm
+    mv a0, t0    # 첫 번째 인수
+    mv a1, t1    # 두 번째 인수
+    call target_func
+    mv t_result, a0   # 반환값 저장
+```
+
+4. **변수 load/store**:
+- `store_var` → `sd reg, offset(s0)` (스택에 저장)
+- `load_var` → `ld reg, offset(s0)` (스택에서 로드)
+
+5. **반환** (`return_val`):
+```asm
+    mv a0, result_reg
+    # 에필로그
+    ret
+```
+
+6. **테스트** (`test/riscv_function_test.zig`): 12개
+   - 단순 함수 생성
+   - 인수 전달/반환
+   - 재귀 함수 호출
+
+---
+
+### Step 3: 제어 흐름 + main.zig 연동
+
+**파일**: `src/riscv_codegen.zig`, `src/main.zig`, `build.zig`
+
+**제어 흐름 구현**:
+
+1. **조건 분기** (`cond_br`):
+```asm
+    # if (cond) goto then_label else goto else_label
+    beq cond_reg, zero, else_label
+    # then block
+    j end_label
+else_label:
+    # else block
+end_label:
+```
+
+지원 명령어: `beq`, `bne`, `blt`, `bge`, `bltu`, `bgeu`
+
+2. **루프** (`loop_begin/loop_end`):
+```asm
+loop_start:
+    # 본문
+    j loop_start
+loop_end:
+```
+
+3. **Break/Continue** (`break_loop/continue_loop`):
+```asm
+    j loop_end     # break
+    j loop_start   # continue
+```
+
+4. **레이블 생성**:
+```zig
+var label_counter: u32 = 0;
+fn newLabel() []u8  // ".L0", ".L1", ...
+```
+
+5. **main.zig 연동**:
+- `--emit-riscv` 플래그 추가
+- `RiscvCodegen.init(&air) → generate() → .s 파일 출력`
+
+6. **build.zig 연동**:
+- `riscv_basic_test` 스텝 추가
+- `riscv_function_test` 스텝 추가
+- `riscv_control_test` 스텝 추가
+
+7. **테스트** (`test/riscv_control_test.zig`): 13개
+   - if/else 분기
+   - while 루프
+   - break/continue
+
+---
+
+## 파일 변경 요약
+
+| 파일 | 상태 | 변경 내용 |
+|------|------|-----------|
+| `src/riscv_codegen.zig` | **신규** | ~500줄 RISC-V 코드 생성기 |
+| `src/main.zig` | **수정** | `--emit-riscv` 플래그 추가 |
+| `build.zig` | **수정** | riscv 테스트 3개 추가 |
+| `test/riscv_basic_test.zig` | **신규** | 15개 기본 테스트 |
+| `test/riscv_function_test.zig` | **신규** | 12개 함수 테스트 |
+| `test/riscv_control_test.zig` | **신규** | 13개 제어흐름 테스트 |
+
+## 출력 형식 예시
+
+다음 Zig 코드:
+```zig
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+```
+
+생성될 RISC-V 어셈블리:
+```asm
+    .text
+    .globl add
+add:
+    addi sp, sp, -32
+    sd ra, 24(sp)
+    sd s0, 16(sp)
+    addi s0, sp, 32
+    sd a0, -24(s0)    # a 저장
+    sd a1, -32(s0)    # b 저장
+    ld t0, -24(s0)    # a 로드
+    ld t1, -32(s0)    # b 로드
+    add t2, t0, t1    # a + b
+    mv a0, t2
+    ld ra, 24(sp)
+    ld s0, 16(sp)
+    addi sp, sp, 32
+    ret
+```
+
+## 검증 방법
+
+1. **단위 테스트**: `zig build test` → 3개 riscv 테스트 스텝 PASS
+2. **출력 확인**: `./zig-compiler --emit-riscv test.fl -o test.s` 후 어셈블리 육안 확인
+3. **실행 확인** (선택): `riscv64-linux-gnu-gcc test.s -o test && qemu-riscv64 ./test`

@@ -1,0 +1,517 @@
+# 🦎 Phase 3.6: Defer & Resource Management - 계획서
+
+**날짜**: 2026-03-12 02:30 UTC+9
+**목표**: Defer 문과 리소스 관리 시스템 완전 지원
+**구현 방식**: 3단계 (Parser → AstGen → Sema)
+
+---
+
+## 📋 전체 계획
+
+```
+Phase 3.6: Defer & Resource Management
+├─ Step 1: Parser (Defer 구문 인식)
+│   ├─ defer 문 파싱
+│   ├─ defer expr; 기본 형식
+│   └─ 테스트: 15개+
+│
+├─ Step 2: AstGen (Defer 메타데이터)
+│   ├─ Defer ZIR 명령어
+│   ├─ 스코프별 defer 추적
+│   └─ 테스트: 12개+
+│
+└─ Step 3: Sema (Defer 리소스 관리)
+    ├─ Defer 순서 검증
+    ├─ 리소스 정리 타입 검사
+    └─ 테스트: 13개+
+```
+
+---
+
+## 🎯 Defer의 의의
+
+### Defer란?
+- **정의**: 현재 블록 또는 함수 종료 시 실행되는 문
+- **목적**: 리소스 정리, RAII 패턴 구현
+- **문법**: `defer expr;`
+- **실행**: LIFO (후입선출) 순서
+
+### Defer 사용 예
+```zig
+// 파일 정리
+const file = try openFile("data.txt");
+defer file.close();
+// 함수 종료 시 file.close() 실행
+
+// 메모리 정리
+const data = try allocator.alloc(u8, 1024);
+defer allocator.free(data);
+// 함수 종료 시 메모리 해제
+
+// 여러 defer (역순 실행)
+defer print("3\n");
+defer print("2\n");
+defer print("1\n");
+// 출력: 1, 2, 3
+```
+
+### RAII 패턴
+```
+Resource Acquisition Is Initialization
+└─ 리소스 획득 = 초기화
+└─ 리소스 정리 = 소멸
+
+defer로 리소스 정리 보장
+```
+
+---
+
+## 📝 Step 1: Parser - Defer 구문 인식
+
+### 목표
+- defer 문 파싱
+- defer 블록 내 식 파싱
+- 리소스 정리 패턴 지원
+
+### 구현 항목
+
+#### 1. AST 노드 확장 (ast.zig)
+
+기존 상태:
+```zig
+pub const Node = struct {
+    pub const Tag = enum {
+        // ... 기존 ...
+    };
+};
+```
+
+추가할 것:
+```zig
+pub const Node = struct {
+    pub const Tag = enum {
+        // ... 기존 ...
+        defer_stmt,  // defer 문
+    };
+
+    pub const Data = union {
+        // ... 기존 ...
+        defer_stmt: struct {
+            expr: *Node,  // defer할 식
+        },
+    };
+};
+```
+
+**변경량**: +8줄
+
+#### 2. Parser 동작
+
+현재 미지원:
+```zig
+// defer는 아직 파싱 불가
+defer file.close();
+```
+
+추가할 기능:
+```zig
+// 1. 기본 defer
+defer file.close();
+
+// 2. 메서드 호출
+defer allocator.free(data);
+
+// 3. 함수 호출
+defer cleanup(ctx);
+
+// 4. 블록 내 defer
+{
+    const x = 10;
+    defer print("{}\n", .{x});
+    // 블록 끝에서 print 실행
+}
+```
+
+**구현**:
+- parseStatement()에 defer 케이스 추가
+- parseExpression()으로 defer 뒤의 식 파싱
+- 간단한 1단계 파싱
+
+**변경량**: +40줄
+
+#### 3. 테스트 (15개 예상)
+
+```zig
+// Group A: 기본 defer (2개)
+test "parser_defer_function_call"
+test "parser_defer_method_call"
+
+// Group B: 다양한 식 (2개)
+test "parser_defer_member_access"
+test "parser_defer_compound_expr"
+
+// Group C: 블록 내 (3개)
+test "parser_defer_in_if_block"
+test "parser_defer_in_while_block"
+test "parser_defer_multiple_defer"
+
+// Group D: 함수 (3개)
+test "parser_defer_in_function"
+test "parser_defer_with_params"
+test "parser_defer_scope_handling"
+
+// Group E: 복합 (2개)
+test "parser_nested_defer"
+test "parser_defer_with_other_stmts"
+
+// Group F: 에러 (1개)
+test "parser_defer_without_expr"
+
+// Group G: 엣지 케이스 (2개)
+test "parser_defer_chain"
+test "parser_defer_complex_expr"
+```
+
+**변경량**: +320줄
+
+---
+
+## 🔄 Step 2: AstGen - Defer 메타데이터
+
+### 목표
+- Defer를 ZIR로 표현
+- 스코프별 defer 추적
+- 실행 순서 메타데이터
+
+### 구현 항목
+
+#### 1. ZIR 명령어 추가 (zir.zig)
+
+```zig
+pub const Instruction = union(enum) {
+    // ... 기존 ...
+
+    // Phase 3.6: Defer & Resource Management
+    defer_stmt: struct {
+        expr: Ref,            // defer할 식
+        scope_id: u32,        // 스코프 ID
+        defer_index: u32,     // 이 스코프 내 몇 번째 defer인가
+    },
+
+    scope_enter: struct {
+        scope_id: u32,
+        deferred_count: u32,  // 이 스코프의 defer 개수
+    },
+
+    scope_exit: struct {
+        scope_id: u32,
+    },
+};
+```
+
+**변경량**: +20줄
+
+#### 2. AstGen 구현 (astgen.zig)
+
+```zig
+fn genDeferStmt(self: *AstGen, node: *const Node) !Zir.Ref {
+    const defer_stmt = node.data.defer_stmt;
+
+    // defer할 식 생성
+    const expr = try self.genNode(defer_stmt.expr);
+
+    // 현재 스코프의 defer 인덱스
+    const defer_index = self.current_scope.defer_count;
+    self.current_scope.defer_count += 1;
+
+    // defer_stmt 명령어 생성
+    return try self.zir.addInstruction(.{
+        .defer_stmt = .{
+            .expr = expr,
+            .scope_id = self.current_scope.id,
+            .defer_index = defer_index,
+        },
+    });
+}
+
+fn enterScope(self: *AstGen) !void {
+    // 스코프 진입 - defer 카운트 초기화
+    self.scope_stack.append(.{
+        .id = self.next_scope_id,
+        .defer_count = 0,
+    });
+    self.next_scope_id += 1;
+}
+
+fn exitScope(self: *AstGen) !void {
+    // 스코프 종료 - defer 개수 기록
+    const scope = self.scope_stack.pop();
+    _ = try self.zir.addInstruction(.{
+        .scope_exit = .{ .scope_id = scope.id },
+    });
+}
+```
+
+**변경량**: +80줄
+
+#### 3. 테스트 (12개 예상)
+
+```zig
+// Group A: 기본 defer ZIR (2개)
+test "astgen_defer_function_call_zir"
+test "astgen_defer_method_call_zir"
+
+// Group B: 스코프 추적 (3개)
+test "astgen_defer_scope_tracking"
+test "astgen_multiple_defers_same_scope"
+test "astgen_nested_scopes_defer"
+
+// Group C: 메타데이터 (2개)
+test "astgen_defer_index_generation"
+test "astgen_defer_count_tracking"
+
+// Group D: 복합 (3개)
+test "astgen_defer_in_function"
+test "astgen_defer_in_block"
+test "astgen_defer_with_other_stmts"
+
+// Group E: 엣지 케이스 (2개)
+test "astgen_multiple_defer_ordering"
+test "astgen_defer_chain_generation"
+```
+
+**변경량**: +300줄
+
+---
+
+## 📊 Step 3: Sema - Defer 리소스 관리
+
+### 목표
+- Defer 타입 검증
+- 실행 순서 검증
+- 리소스 정리 보장
+
+### 구현 항목
+
+#### 1. AirType/AIR 확장 (air.zig)
+
+```zig
+pub const Instruction = union(enum) {
+    // ... 기존 ...
+
+    defer_stmt: struct {
+        expr: Ref,
+        scope_id: u32,
+        defer_index: u32,
+    },
+
+    scope_exit: struct {
+        scope_id: u32,
+        deferred_count: u32,  // 이 스코프의 defer 실행 개수
+    },
+};
+```
+
+**변경량**: +10줄
+
+#### 2. Sema 함수 추가 (sema.zig)
+
+```zig
+fn checkDeferStmt(
+    self: *Sema,
+    expr_ty: AirType,
+) !AirType {
+    // defer 식의 타입이 void여야 함
+    if (expr_ty != .void) {
+        return error.DeferExprMustBeVoid;
+    }
+    return .void;
+}
+
+fn validateDeferOrdering(
+    self: *Sema,
+    defers: []const Zir.Ref,
+) !void {
+    // defer는 선언 순서대로 역순 실행됨
+    // 순환 참조 확인 등
+}
+
+fn trackDeferScope(
+    self: *Sema,
+    scope_id: u32,
+) !void {
+    // 스코프별 defer 개수 추적
+}
+```
+
+**변경량**: +120줄
+
+#### 3. SemanticError 확장
+
+```zig
+pub const SemanticError = union(enum) {
+    // ... 기존 ...
+    defer_expr_not_void: struct {
+        got: AirType,
+        location: Location,
+    },
+    invalid_defer_expr: struct {
+        reason: []const u8,
+        location: Location,
+    },
+};
+```
+
+**변경량**: +10줄
+
+#### 4. 테스트 (13개 예상)
+
+```zig
+// Group A: 타입 검증 (2개)
+test "sema_defer_void_type"
+test "sema_defer_non_void_error"
+
+// Group B: 함수 호출 (3개)
+test "sema_defer_function_call_type"
+test "sema_defer_method_call_type"
+test "sema_defer_invalid_call"
+
+// Group C: 스코프 (3개)
+test "sema_defer_scope_tracking"
+test "sema_nested_defer_scopes"
+test "sema_defer_multiple_same_scope"
+
+// Group D: 순서 (2개)
+test "sema_defer_lifo_order"
+test "sema_defer_execution_order"
+
+// Group E: 복합 (3개)
+test "sema_defer_in_function"
+test "sema_defer_in_block"
+test "sema_defer_with_resources"
+```
+
+**변경량**: +350줄
+
+---
+
+## 📊 예상 코드량
+
+```
+Step 1: Parser
+  ├─ ast.zig: +8줄 (노드 정의)
+  ├─ parser.zig: +40줄 (파싱)
+  └─ test: +320줄
+
+Step 2: AstGen
+  ├─ zir.zig: +20줄 (명령어)
+  ├─ astgen.zig: +80줄 (생성)
+  └─ test: +300줄
+
+Step 3: Sema
+  ├─ air.zig: +10줄 (타입)
+  ├─ sema.zig: +120줄 (검사)
+  └─ test: +350줄
+
+build.zig: +30줄 (테스트 타겟)
+
+────────────────────────────────
+총: 1,668줄
+```
+
+---
+
+## 💡 핵심 개념
+
+### 1. Defer의 실행 순서
+```zig
+defer print("1\n");  // 3번째 실행
+defer print("2\n");  // 2번째 실행
+defer print("3\n");  // 1번째 실행
+
+// 출력: 3, 2, 1 (LIFO)
+```
+
+### 2. 리소스 정리 패턴
+```zig
+const file = try openFile("data.txt");
+defer file.close();
+// 함수 종료 시 항상 file.close() 호출
+```
+
+### 3. 스코프별 Defer
+```zig
+{
+    defer print("inner\n");
+    // 이 블록 끝에서 실행
+}
+defer print("outer\n");
+// 함수 끝에서 실행
+```
+
+---
+
+## 🎯 구현 전략
+
+### 1. Parser 레벨
+- defer 키워드 인식
+- defer 뒤의 식 파싱
+- 스코프 내 defer 관리
+
+### 2. AstGen 레벨
+- defer 식의 ZIR 생성
+- 스코프별 defer 카운팅
+- defer 메타데이터 생성
+
+### 3. Sema 레벨
+- defer 식의 타입 검증 (void만)
+- defer 실행 순서 검증
+- 리소스 정리 타입 확인
+
+---
+
+## ✅ 최종 체크리스트
+
+- [ ] ast.zig 노드 추가
+- [ ] parser.zig defer 파싱
+- [ ] 15개 Parser 테스트
+- [ ] zir.zig 명령어 추가
+- [ ] astgen.zig defer 생성
+- [ ] 12개 AstGen 테스트
+- [ ] air.zig 타입 확장
+- [ ] sema.zig 검사 함수
+- [ ] 13개 Sema 테스트
+- [ ] build.zig 통합
+- [ ] GOGS 푸시
+
+---
+
+## 📈 최종 목표
+
+```
+Phase 3.6 완료 시:
+├─ Defer 문 완전 지원 ✅
+├─ 40개 테스트 통과 ✅
+├─ 1,668줄 코드 추가 ✅
+└─ 전체 20,728줄 프로젝트 (예상)
+
+완성도: 100% (Phase 3.6 후)
+```
+
+---
+
+## 🚀 다음 예정
+
+### Phase 3.7: Error Handling
+- 에러 타입 시스템
+- try-catch 문
+- 에러 전파
+
+### Phase 4: Self-hosting Bootstrap
+- Zig로 Zig 컴파일러 재구현
+
+---
+
+**상태**: 📋 계획 완료 → Step 1 구현 준비
+**다음**: Phase 3.6 Step 1 - Parser Defer 구문 인식 구현 시작
+

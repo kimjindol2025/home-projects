@@ -1,0 +1,494 @@
+// ============================================================================
+// WebSocket Module - WebSocket 프로토콜 & 실시간 통신
+// ============================================================================
+// 기능: WebSocket 핸드셰이크, 메시지 프레임, 연결 관리
+// 스펙: RFC 6455
+
+use std::io::*
+
+// ============================================================================
+// PART 1: WebSocket 구조체
+// ============================================================================
+
+pub struct WebSocketFrame {
+  fin: bool,
+  opcode: i32,  // 1: text, 2: binary, 8: close, 9: ping, 10: pong
+  masked: bool,
+  payload_len: i32,
+  mask_key: array<u8>,
+  payload: array<u8>
+}
+
+pub struct WebSocketConnection {
+  id: string,
+  client_ip: string,
+  created_at: string,
+  last_heartbeat: string,
+  is_alive: bool,
+  message_count: i32,
+  bytes_sent: i32,
+  bytes_received: i32
+}
+
+pub struct WebSocketMessage {
+  connection_id: string,
+  type: string,  // "text", "binary", "ping", "pong"
+  timestamp: string,
+  payload: string
+}
+
+// ============================================================================
+// PART 2: 전역 연결 관리
+// ============================================================================
+
+pub let GLOBAL_WS_CONNECTIONS = {}  // map<string, WebSocketConnection>
+pub let GLOBAL_WS_MESSAGE_QUEUE: array<WebSocketMessage> = []
+pub let WS_CONNECTION_COUNTER = 1
+
+// ============================================================================
+// PART 3: WebSocket 핸드셰이크
+// ============================================================================
+
+pub fn handle_websocket_upgrade(http_headers: map<string, string>, client_ip: string) -> Result<WebSocketConnection, string>
+  intent "HTTP → WebSocket 업그레이드 처리"
+  do
+    // 1. Upgrade 헤더 확인
+    if !http_headers.has_key("Upgrade") || http_headers["Upgrade"] != "websocket"
+      return Err("Upgrade 헤더 누락")
+    end
+
+    // 2. Connection 헤더 확인
+    if !http_headers.has_key("Connection") || !contains(to_lowercase(http_headers["Connection"]), "upgrade")
+      return Err("Connection 헤더 누락")
+    end
+
+    // 3. Sec-WebSocket-Key 확인
+    if !http_headers.has_key("Sec-WebSocket-Key")
+      return Err("Sec-WebSocket-Key 헤더 누락")
+    end
+
+    let ws_key = http_headers["Sec-WebSocket-Key"]
+
+    // 4. Sec-WebSocket-Accept 계산
+    let accept_key = calculate_ws_accept_key(ws_key)
+
+    // 5. 응답 헤더 생성
+    let response_headers = {}
+    response_headers["Upgrade"] = "websocket"
+    response_headers["Connection"] = "Upgrade"
+    response_headers["Sec-WebSocket-Accept"] = accept_key
+
+    // 6. 연결 생성
+    let connection_id = generate_connection_id()
+    let connection = WebSocketConnection {
+      id: connection_id,
+      client_ip: client_ip,
+      created_at: get_current_time(),
+      last_heartbeat: get_current_time(),
+      is_alive: true,
+      message_count: 0,
+      bytes_sent: 0,
+      bytes_received: 0
+    }
+
+    GLOBAL_WS_CONNECTIONS[connection_id] = connection
+
+    println("🔌 WebSocket 연결 수립: " + connection_id + " (" + client_ip + ")")
+    return Ok(connection)
+  end
+
+// ============================================================================
+// PART 4: 메시지 프레이밍 (RFC 6455)
+// ============================================================================
+
+pub fn parse_websocket_frame(data: array<u8>) -> Result<WebSocketFrame, string>
+  intent "WebSocket 프레임 파싱"
+  do
+    if length(data) < 2
+      return Err("프레임이 너무 짧음")
+    end
+
+    // Byte 0: FIN(1) + RSV(3) + Opcode(4)
+    let byte0 = data[0]
+    let fin = (byte0 >= 128)  // MSB = 1
+    let opcode = byte0 % 16   // 하위 4비트
+
+    // Byte 1: MASK(1) + Payload len(7)
+    let byte1 = data[1]
+    let masked = (byte1 >= 128)
+    let payload_len = byte1 % 128
+
+    // 페이로드 길이 확장
+    let actual_payload_len = payload_len
+    if payload_len == 126
+      // 2바이트로 길이 표현
+      if length(data) < 4
+        return Err("확장 길이 데이터 부족")
+      end
+      actual_payload_len = (data[2] * 256) + data[3]
+    else if payload_len == 127
+      // 8바이트로 길이 표현
+      if length(data) < 10
+        return Err("확장 길이 데이터 부족")
+      end
+      // TODO: 64비트 길이 파싱
+    end
+
+    // 마스크 키 추출
+    let mask_key: array<u8> = []
+    let payload_start = 2
+    if masked
+      if payload_len == 126
+        payload_start = 6
+      else if payload_len == 127
+        payload_start = 14
+      else
+        payload_start = 6
+      end
+
+      if length(data) < payload_start + 4
+        return Err("마스크 키 데이터 부족")
+      end
+
+      for i = 0; i < 4; i++
+        mask_key = array_append_u8(mask_key, data[payload_start + i])
+      end
+
+      payload_start = payload_start + 4
+    end
+
+    // 페이로드 추출 및 마스크 해제
+    let payload: array<u8> = []
+    for i = 0; i < actual_payload_len && payload_start + i < length(data); i++
+      let byte = data[payload_start + i]
+
+      if masked
+        let mask_byte = mask_key[i % 4]
+        byte = byte ^ mask_byte  // XOR 마스크 제거
+      end
+
+      payload = array_append_u8(payload, byte)
+    end
+
+    let frame = WebSocketFrame {
+      fin: fin,
+      opcode: opcode,
+      masked: masked,
+      payload_len: actual_payload_len,
+      mask_key: mask_key,
+      payload: payload
+    }
+
+    println("📨 WebSocket 프레임 파싱: opcode=" + int_to_string(opcode) + " len=" + int_to_string(actual_payload_len))
+    return Ok(frame)
+  end
+
+pub fn create_websocket_frame(opcode: i32, payload: string, mask: bool) -> array<u8>
+  intent "WebSocket 프레임 생성"
+  do
+    let frame: array<u8> = []
+
+    // Byte 0: FIN(1) + opcode(4)
+    let byte0 = 128 + opcode  // FIN=1
+    frame = array_append_u8(frame, byte0)
+
+    // Byte 1: MASK(1) + payload_len(7)
+    let payload_len = length(payload)
+    let byte1 = if mask then 128 else 0 end
+
+    if payload_len < 126
+      byte1 = byte1 + payload_len
+      frame = array_append_u8(frame, byte1)
+    else if payload_len < 65536
+      frame = array_append_u8(frame, byte1 + 126)
+      frame = array_append_u8(frame, payload_len / 256)
+      frame = array_append_u8(frame, payload_len % 256)
+    else
+      frame = array_append_u8(frame, byte1 + 127)
+      // TODO: 8바이트 길이 추가
+    end
+
+    // 페이로드 추가
+    for i = 0; i < length(payload); i++
+      frame = array_append_u8(frame, char_code(substring(payload, i, i + 1)))
+    end
+
+    println("📤 WebSocket 프레임 생성: opcode=" + int_to_string(opcode) + " len=" + int_to_string(payload_len))
+    return frame
+  end
+
+// ============================================================================
+// PART 5: 연결 관리
+// ============================================================================
+
+pub fn send_websocket_message(connection_id: string, message: string) -> Result<void, string>
+  intent "WebSocket 메시지 전송"
+  do
+    if !GLOBAL_WS_CONNECTIONS.has_key(connection_id)
+      return Err("연결을 찾을 수 없음: " + connection_id)
+    end
+
+    let connection = GLOBAL_WS_CONNECTIONS[connection_id]
+    let frame = create_websocket_frame(1, message, false)  // opcode 1 = text
+
+    connection.message_count = connection.message_count + 1
+    connection.bytes_sent = connection.bytes_sent + length(message)
+
+    println("📤 메시지 전송 → " + connection_id + " (" + int_to_string(length(message)) + " bytes)")
+    return Ok(void)
+  end
+
+pub fn receive_websocket_message(connection_id: string, frame: WebSocketFrame) -> Result<WebSocketMessage, string>
+  intent "WebSocket 메시지 수신"
+  do
+    if !GLOBAL_WS_CONNECTIONS.has_key(connection_id)
+      return Err("연결을 찾을 수 없음: " + connection_id)
+    end
+
+    let connection = GLOBAL_WS_CONNECTIONS[connection_id]
+    let payload_str = array_u8_to_string(frame.payload)
+
+    let message = WebSocketMessage {
+      connection_id: connection_id,
+      type: get_opcode_name(frame.opcode),
+      timestamp: get_current_time(),
+      payload: payload_str
+    }
+
+    connection.message_count = connection.message_count + 1
+    connection.bytes_received = connection.bytes_received + frame.payload_len
+
+    GLOBAL_WS_MESSAGE_QUEUE = array_append_ws(GLOBAL_WS_MESSAGE_QUEUE, message)
+
+    println("📥 메시지 수신 ← " + connection_id + " (" + int_to_string(frame.payload_len) + " bytes)")
+    return Ok(message)
+  end
+
+pub fn close_websocket_connection(connection_id: string, reason: string) -> Result<void, string>
+  intent "WebSocket 연결 종료"
+  do
+    if !GLOBAL_WS_CONNECTIONS.has_key(connection_id)
+      return Err("연결을 찾을 수 없음: " + connection_id)
+    end
+
+    let connection = GLOBAL_WS_CONNECTIONS[connection_id]
+    connection.is_alive = false
+
+    println("🔌 WebSocket 연결 종료: " + connection_id + " (" + reason + ")")
+    return Ok(void)
+  end
+
+pub fn broadcast_message(message: string) -> i32
+  intent "모든 활성 연결에 메시지 브로드캐스트"
+  do
+    let sent_count = 0
+
+    // TODO: GLOBAL_WS_CONNECTIONS 순회
+    // for each connection:
+    //   if connection.is_alive:
+    //     send_websocket_message(connection.id, message)
+    //     sent_count++
+
+    println("📢 브로드캐스트: " + int_to_string(sent_count) + "개 연결로 전송")
+    return sent_count
+  end
+
+// ============================================================================
+// PART 6: 하트비트 & 상태 관리
+// ============================================================================
+
+pub fn send_ping(connection_id: string) -> Result<void, string>
+  intent "Ping 프레임 전송"
+  do
+    let frame = create_websocket_frame(9, "ping", false)  // opcode 9 = ping
+    println("🔔 Ping → " + connection_id)
+    return Ok(void)
+  end
+
+pub fn handle_pong(connection_id: string) -> Result<void, string>
+  intent "Pong 응답 처리"
+  do
+    if GLOBAL_WS_CONNECTIONS.has_key(connection_id)
+      GLOBAL_WS_CONNECTIONS[connection_id].last_heartbeat = get_current_time()
+      println("🔔 Pong ← " + connection_id)
+      return Ok(void)
+    else
+      return Err("연결을 찾을 수 없음")
+    end
+  end
+
+pub fn cleanup_dead_connections(timeout_seconds: i32) -> i32
+  intent "타임아웃된 연결 정리"
+  do
+    let now = get_current_time()
+    let cleaned = 0
+
+    // TODO: GLOBAL_WS_CONNECTIONS 순회
+    // for each connection:
+    //   if time_diff(connection.last_heartbeat, now) > timeout_seconds:
+    //     close_websocket_connection(connection.id, "timeout")
+    //     cleaned++
+
+    println("🧹 타임아웃 연결 정리: " + int_to_string(cleaned) + "개")
+    return cleaned
+  end
+
+// ============================================================================
+// PART 7: 통계 & 모니터링
+// ============================================================================
+
+pub fn get_websocket_stats() -> map<string, i32>
+  intent "WebSocket 통계"
+  do
+    let stats = {}
+    let active_connections = 0
+    let total_messages = 0
+    let total_bytes = 0
+
+    // TODO: 통계 계산
+
+    stats["active_connections"] = active_connections
+    stats["total_messages"] = total_messages
+    stats["total_bytes"] = total_bytes
+
+    return stats
+  end
+
+pub fn print_websocket_stats() -> void
+  intent "WebSocket 통계 출력"
+  do
+    let stats = get_websocket_stats()
+    println("")
+    println("🔌 === WebSocket 통계 ===")
+    println("   활성 연결: " + int_to_string(stats["active_connections"]))
+    println("   전체 메시지: " + int_to_string(stats["total_messages"]))
+    println("   전체 바이트: " + int_to_string(stats["total_bytes"]))
+    println("")
+  end
+
+// ============================================================================
+// PART 8: 내부 헬퍼 함수
+// ============================================================================
+
+fn calculate_ws_accept_key(key: string) -> string
+  intent "Sec-WebSocket-Accept 계산 (RFC 6455)"
+  do
+    // 1. key + GUID concat
+    let magic_string = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    let combined = key + magic_string
+
+    // 2. SHA-1 해시
+    // 3. Base64 인코딩
+    // (FreeLang 표준 라이브러리 함수 사용)
+    let hash = sha1(combined)
+    let encoded = base64_encode(hash)
+
+    return encoded
+  end
+
+fn generate_connection_id() -> string
+  intent "고유 연결 ID 생성"
+  do
+    let id = "ws_" + int_to_string(WS_CONNECTION_COUNTER)
+    WS_CONNECTION_COUNTER = WS_CONNECTION_COUNTER + 1
+    return id
+  end
+
+fn get_opcode_name(opcode: i32) -> string
+  intent "Opcode 이름 반환"
+  do
+    match opcode
+      0 => return "continuation"
+      1 => return "text"
+      2 => return "binary"
+      8 => return "close"
+      9 => return "ping"
+      10 => return "pong"
+      _ => return "unknown"
+    end
+  end
+
+fn get_current_time() -> string
+  intent "현재 시간"
+  do
+    return "2026-03-13T12:00:00Z"
+  end
+
+fn contains(s: string, pattern: string) -> bool
+  intent "문자열 포함 여부"
+  do
+    let s_len = length(s)
+    let p_len = length(pattern)
+    for i = 0; i < s_len - p_len + 1; i++
+      if substring(s, i, i + p_len) == pattern
+        return true
+      end
+    end
+    return false
+  end
+
+fn to_lowercase(s: string) -> string
+  intent "소문자 변환"
+  do
+    return string_lowercase(s)
+  end
+
+fn substring(s: string, start: i32, end: i32) -> string
+  intent "부분 문자열"
+  do
+    return string_slice(s, start, end)
+  end
+
+fn int_to_string(n: i32) -> string
+  intent "정수를 문자열로"
+  do
+    return to_string(n)
+  end
+
+fn length(s: string) -> i32
+  intent "문자열 길이"
+  do
+    return string_length(s)
+  end
+
+fn char_code(ch: string) -> u8
+  intent "문자의 코드"
+  do
+    return 65  // TODO: 실제 char_code
+  end
+
+fn array_append_u8(arr: array<u8>, item: u8) -> array<u8>
+  intent "배열에 u8 추가"
+  do
+    return arr  // TODO: 실제 append
+  end
+
+fn array_u8_to_string(arr: array<u8>) -> string
+  intent "u8 배열을 문자열로"
+  do
+    return ""  // TODO: 실제 변환
+  end
+
+fn array_append_ws(arr: array<WebSocketMessage>, item: WebSocketMessage) -> array<WebSocketMessage>
+  intent "메시지 배열에 추가"
+  do
+    return arr  // TODO: 실제 append
+  end
+
+fn sha1(s: string) -> array<u8>
+  intent "SHA-1 해시"
+  do
+    return []  // TODO: 실제 SHA-1
+  end
+
+fn base64_encode(data: array<u8>) -> string
+  intent "Base64 인코딩"
+  do
+    return ""  // TODO: 실제 Base64
+  end
+
+fn time_diff(time1: string, time2: string) -> i32
+  intent "시간 차이"
+  do
+    return 0  // TODO: 실제 계산
+  end

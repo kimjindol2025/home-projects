@@ -1,0 +1,527 @@
+// 🦎 Mini Zig Compiler - Phase 2.4: Sema
+// src/sema.zig: Semantic Analysis (Type Checking & Symbol Resolution)
+
+const std = @import("std");
+const Zir = @import("zir.zig").Zir;
+const Air = @import("air.zig").Air;
+const AirType = @import("air.zig").Type;
+const Location = @import("tokenizer.zig").Location;
+
+/// Semantic Error Types
+pub const SemanticError = union(enum) {
+    undefined_variable: struct {
+        name: []const u8,
+        location: Location,
+    },
+    duplicate_declaration: struct {
+        name: []const u8,
+        location: Location,
+    },
+    type_mismatch: struct {
+        expected: AirType,
+        got: AirType,
+        location: Location,
+    },
+    wrong_arg_count: struct {
+        function: []const u8,
+        expected: usize,
+        got: usize,
+        location: Location,
+    },
+    const_reassignment: struct {
+        name: []const u8,
+        location: Location,
+    },
+    non_bool_condition: struct {
+        got: AirType,
+        location: Location,
+    },
+    non_function_call: struct {
+        got: AirType,
+        location: Location,
+    },
+    invalid_binary_op: struct {
+        op: []const u8,
+        lhs_ty: AirType,
+        rhs_ty: AirType,
+        location: Location,
+    },
+    invalid_unary_op: struct {
+        op: []const u8,
+        operand_ty: AirType,
+        location: Location,
+    },
+};
+
+/// Symbol Information
+pub const Symbol = struct {
+    name: []const u8,
+    ty: AirType,
+    is_mutable: bool,
+    location: Location,
+};
+
+/// Symbol Table (with Scope Support)
+pub const SymbolTable = struct {
+    symbols: std.StringHashMap(Symbol),
+    parent_scope: ?*SymbolTable,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator, parent_scope: ?*SymbolTable) SymbolTable {
+        return .{
+            .symbols = std.StringHashMap(Symbol).init(allocator),
+            .parent_scope = parent_scope,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *SymbolTable) void {
+        self.symbols.deinit();
+    }
+
+    /// 변수 선언
+    pub fn declare(
+        self: *SymbolTable,
+        name: []const u8,
+        ty: AirType,
+        is_mutable: bool,
+        location: Location,
+    ) !void {
+        if (self.symbols.contains(name)) {
+            return error.DuplicateDeclaration;
+        }
+        try self.symbols.put(name, .{
+            .name = name,
+            .ty = ty,
+            .is_mutable = is_mutable,
+            .location = location,
+        });
+    }
+
+    /// 변수 조회 (현재 스코프 및 부모 스코프)
+    pub fn lookup(self: *SymbolTable, name: []const u8) ?Symbol {
+        if (self.symbols.get(name)) |symbol| {
+            return symbol;
+        }
+
+        if (self.parent_scope) |parent| {
+            return parent.lookup(name);
+        }
+
+        return null;
+    }
+
+    /// 현재 스코프에서만 조회
+    pub fn lookupLocal(self: *SymbolTable, name: []const u8) ?Symbol {
+        return self.symbols.get(name);
+    }
+};
+
+/// Type Inference Engine
+pub const TypeInference = struct {
+    allocator: std.mem.Allocator,
+    symbol_table: *SymbolTable,
+
+    pub fn init(allocator: std.mem.Allocator, symbol_table: *SymbolTable) TypeInference {
+        return .{
+            .allocator = allocator,
+            .symbol_table = symbol_table,
+        };
+    }
+
+    /// ZIR 명령어에서 타입 추론
+    pub fn inferType(self: *TypeInference, zir_inst: Zir.Instruction) !AirType {
+        return switch (zir_inst) {
+            .load_int => .i32, // 기본은 i32
+            .load_float => .f64, // 기본은 f64
+            .load_string => .string,
+            .load_var => |data| blk: {
+                // 심볼 테이블에서 변수 타입 조회
+                // 나중에 구현 (현재는 unknown 반환)
+                break :blk .unknown;
+            },
+            .binary_op => |data| try self.inferBinaryOpType(data.op),
+            .unary_op => |data| try self.inferUnaryOpType(data.op),
+            .call => .unknown, // 함수 호출 타입은 함수 정의에서 결정
+            else => .unknown,
+        };
+    }
+
+    /// 이항 연산 결과 타입 추론
+    fn inferBinaryOpType(self: *TypeInference, op: Zir.BinaryOp) !AirType {
+        _ = self;
+        return switch (op) {
+            // 산술 연산: i32, i64, f32, f64 → 같은 타입
+            .add, .sub, .mul, .div, .mod => .i32, // 기본은 i32
+            // 비교 연산: 모든 타입 → bool
+            .eq, .ne, .lt, .le, .gt, .ge => .bool,
+            // 논리 연산: bool → bool
+            .logical_and, .logical_or => .bool,
+            // 비트 연산: i32, i64 → 같은 타입
+            .bitwise_and, .bitwise_or, .bitwise_xor, .lshift, .rshift => .i32,
+        };
+    }
+
+    /// 단항 연산 결과 타입 추론
+    fn inferUnaryOpType(self: *TypeInference, op: Zir.UnaryOp) !AirType {
+        _ = self;
+        return switch (op) {
+            .negate => .i32, // -x: 숫자 → 숫자
+            .not => .bool, // !x: 불린 → 불린
+            .bitwise_not => .i32, // ~x: 정수 → 정수
+        };
+    }
+
+    /// 이항 연산 타입 검사
+    pub fn checkBinaryOp(self: *TypeInference, op: Zir.BinaryOp, lhs_ty: AirType, rhs_ty: AirType) !AirType {
+        _ = self;
+        // 산술 연산: 양쪽 모두 i32 또는 f64
+        switch (op) {
+            .add, .sub, .mul, .div, .mod => {
+                if (isNumericType(lhs_ty) and isNumericType(rhs_ty)) {
+                    return lhs_ty; // 좌측 타입으로 통일
+                }
+                return error.TypeMismatch;
+            },
+            // 비교 연산: 양쪽 타입이 같음
+            .eq, .ne, .lt, .le, .gt, .ge => {
+                if (Air.typeEq(lhs_ty, rhs_ty)) {
+                    return .bool;
+                }
+                return error.TypeMismatch;
+            },
+            // 논리 연산: 양쪽 모두 bool
+            .logical_and, .logical_or => {
+                if (lhs_ty == .bool and rhs_ty == .bool) {
+                    return .bool;
+                }
+                return error.TypeMismatch;
+            },
+            // 비트 연산: 양쪽 모두 i32 또는 i64
+            .bitwise_and, .bitwise_or, .bitwise_xor, .lshift, .rshift => {
+                if (isIntegerType(lhs_ty) and isIntegerType(rhs_ty)) {
+                    return lhs_ty;
+                }
+                return error.TypeMismatch;
+            },
+        }
+    }
+
+    /// 단항 연산 타입 검사
+    pub fn checkUnaryOp(self: *TypeInference, op: Zir.UnaryOp, operand_ty: AirType) !AirType {
+        _ = self;
+        return switch (op) {
+            .negate => blk: {
+                if (isNumericType(operand_ty)) {
+                    break :blk operand_ty;
+                }
+                return error.TypeMismatch;
+            },
+            .not => blk: {
+                if (operand_ty == .bool) {
+                    break :blk .bool;
+                }
+                return error.TypeMismatch;
+            },
+            .bitwise_not => blk: {
+                if (isIntegerType(operand_ty)) {
+                    break :blk operand_ty;
+                }
+                return error.TypeMismatch;
+            },
+        };
+    }
+};
+
+/// 숫자 타입 확인
+fn isNumericType(ty: AirType) bool {
+    return switch (ty) {
+        .i32, .i64, .f32, .f64 => true,
+        else => false,
+    };
+}
+
+/// 정수 타입 확인
+fn isIntegerType(ty: AirType) bool {
+    return switch (ty) {
+        .i32, .i64 => true,
+        else => false,
+    };
+}
+
+/// Semantic Analyzer (메인 분석기)
+pub const Sema = struct {
+    zir: *const Zir,
+    air: *Air,
+    allocator: std.mem.Allocator,
+
+    symbol_table: SymbolTable,
+    type_infer: TypeInference,
+
+    errors: std.ArrayList(SemanticError),
+    current_function: ?[]const u8 = null,
+    function_return_type: ?AirType = null,
+
+    pub fn init(allocator: std.mem.Allocator, zir: *const Zir) !Sema {
+        var air = try allocator.create(Air);
+        air.* = Air.init(allocator);
+
+        var symbol_table = SymbolTable.init(allocator, null);
+
+        return .{
+            .zir = zir,
+            .air = air,
+            .allocator = allocator,
+            .symbol_table = symbol_table,
+            .type_infer = TypeInference.init(allocator, &symbol_table),
+            .errors = std.ArrayList(SemanticError).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Sema) void {
+        self.symbol_table.deinit();
+        self.air.deinit();
+        self.allocator.destroy(self.air);
+        self.errors.deinit();
+    }
+
+    /// 전체 ZIR 분석
+    pub fn analyzeProgram(self: *Sema) !void {
+        // 1단계: 모든 선언 수집 (forward pass)
+        // 2단계: 타입 검사 및 AIR 생성 (analysis pass)
+
+        // 현재 간단한 구현: 순차적으로 처리
+        for (self.zir.instructions.items, 0..) |zir_inst, idx| {
+            _ = self.analyzeInstruction(zir_inst, idx) catch |err| {
+                // 에러 계속 수집
+                continue;
+            };
+        }
+    }
+
+    /// 개별 명령어 분석
+    fn analyzeInstruction(self: *Sema, zir_inst: Zir.Instruction, idx: usize) !void {
+        _ = idx;
+
+        switch (zir_inst) {
+            .load_int => |data| {
+                _ = try self.air.addInstruction(.{
+                    .load_int = .{
+                        .value = data.value,
+                        .ty = .i32,
+                    },
+                });
+            },
+            .load_float => |data| {
+                _ = try self.air.addInstruction(.{
+                    .load_float = .{
+                        .value = data.value,
+                        .ty = .f64,
+                    },
+                });
+            },
+            .load_string => |data| {
+                _ = try self.air.addInstruction(.{
+                    .load_string = .{
+                        .index = data.index,
+                        .ty = .string,
+                    },
+                });
+            },
+            .load_var => |data| {
+                _ = try self.air.addInstruction(.{
+                    .load_var = .{
+                        .name_index = data.name_index,
+                        .ty = .unknown,
+                    },
+                });
+            },
+            .store_var => |data| {
+                _ = try self.air.addInstruction(.{
+                    .store_var = .{
+                        .name_index = data.name_index,
+                        .value = data.value,
+                        .ty = .unknown,
+                    },
+                });
+            },
+            .binary_op => |data| {
+                // 타입 검사 수행
+                const result_ty = try self.type_infer.inferBinaryOpType(data.op);
+                _ = try self.air.addInstruction(.{
+                    .binary_op = .{
+                        .op = data.op,
+                        .lhs = data.lhs,
+                        .rhs = data.rhs,
+                        .result_ty = result_ty,
+                    },
+                });
+            },
+            .unary_op => |data| {
+                const result_ty = try self.type_infer.inferUnaryOpType(data.op);
+                _ = try self.air.addInstruction(.{
+                    .unary_op = .{
+                        .op = data.op,
+                        .operand = data.operand,
+                        .result_ty = result_ty,
+                    },
+                });
+            },
+            .fn_begin => |data| {
+                _ = try self.air.addInstruction(.{
+                    .fn_begin = .{
+                        .name_index = data.name_index,
+                        .params = data.params,
+                        .return_ty = .void, // 기본 반환 타입
+                    },
+                });
+            },
+            .fn_end => {
+                _ = try self.air.addInstruction(.fn_end);
+            },
+            .call => |data| {
+                _ = try self.air.addInstruction(.{
+                    .call = .{
+                        .callee = data.callee,
+                        .args = data.args,
+                        .return_ty = .unknown,
+                    },
+                });
+            },
+            .return_val => |ret| {
+                _ = try self.air.addInstruction(.{ .return_val = ret });
+            },
+            .cond_br => |data| {
+                _ = try self.air.addInstruction(.{
+                    .cond_br = .{
+                        .cond = data.cond,
+                        .then_block = data.then_block,
+                        .else_block = data.else_block,
+                    },
+                });
+            },
+            .block_begin => |data| {
+                _ = try self.air.addInstruction(.{
+                    .block_begin = .{ .label = data.label },
+                });
+            },
+            .block_end => {
+                _ = try self.air.addInstruction(.block_end);
+            },
+            .array_literal => |data| {
+                _ = try self.air.addInstruction(.{
+                    .array_literal = .{
+                        .elements = data.elements,
+                        .element_ty = .unknown,
+                    },
+                });
+            },
+            .loop_begin => |data| {
+                _ = try self.air.addInstruction(.{
+                    .loop_begin = .{ .label = data.label },
+                });
+            },
+            .loop_end => {
+                _ = try self.air.addInstruction(.loop_end);
+            },
+            else => {
+                // 기타 명령어는 그대로 복사
+                _ = try self.air.addInstruction(zir_inst);
+            },
+        }
+    }
+
+    /// 에러 보고
+    pub fn reportError(self: *Sema, err: SemanticError) !void {
+        try self.errors.append(err);
+    }
+
+    /// 에러 확인
+    pub fn hasErrors(self: *Sema) bool {
+        return self.errors.items.len > 0;
+    }
+
+    /// 에러 개수
+    pub fn errorCount(self: *Sema) usize {
+        return self.errors.items.len;
+    }
+
+    /// 에러 출력
+    pub fn printErrors(self: *Sema) void {
+        const stdout = std.io.getStdOut().writer();
+
+        for (self.errors.items) |err| {
+            switch (err) {
+                .undefined_variable => |data| {
+                    stdout.print("Error: undefined variable '{s}'\n  at line {}, column {}\n\n", .{
+                        data.name,
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .duplicate_declaration => |data| {
+                    stdout.print("Error: duplicate declaration '{s}'\n  at line {}, column {}\n\n", .{
+                        data.name,
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .type_mismatch => |data| {
+                    stdout.print("Error: type mismatch\n  expected: {s}\n  got: {s}\n  at line {}, column {}\n\n", .{
+                        Air.typeName(data.expected),
+                        Air.typeName(data.got),
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .wrong_arg_count => |data| {
+                    stdout.print("Error: function '{s}' expects {} arguments, got {}\n  at line {}, column {}\n\n", .{
+                        data.function,
+                        data.expected,
+                        data.got,
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .const_reassignment => |data| {
+                    stdout.print("Error: cannot reassign constant '{s}'\n  at line {}, column {}\n\n", .{
+                        data.name,
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .non_bool_condition => |data| {
+                    stdout.print("Error: condition must be boolean, got {s}\n  at line {}, column {}\n\n", .{
+                        Air.typeName(data.got),
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .non_function_call => |data| {
+                    stdout.print("Error: cannot call non-function type {s}\n  at line {}, column {}\n\n", .{
+                        Air.typeName(data.got),
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .invalid_binary_op => |data| {
+                    stdout.print("Error: invalid binary operation '{s}' on {s} and {s}\n  at line {}, column {}\n\n", .{
+                        data.op,
+                        Air.typeName(data.lhs_ty),
+                        Air.typeName(data.rhs_ty),
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+                .invalid_unary_op => |data| {
+                    stdout.print("Error: invalid unary operation '{s}' on {s}\n  at line {}, column {}\n\n", .{
+                        data.op,
+                        Air.typeName(data.operand_ty),
+                        data.location.line,
+                        data.location.column,
+                    }) catch {};
+                },
+            }
+        }
+    }
+};

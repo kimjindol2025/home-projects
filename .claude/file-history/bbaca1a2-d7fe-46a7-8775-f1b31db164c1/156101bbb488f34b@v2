@@ -1,0 +1,647 @@
+# 🦎 Phase 3.8: Pattern Matching - 계획서
+
+**날짜**: 2026-03-12 03:00 UTC+9
+**목표**: 패턴 매칭 완전 지원
+**구현 방식**: 3단계 (Parser → AstGen → Sema)
+
+---
+
+## 📋 전체 계획
+
+```
+Phase 3.8: Pattern Matching
+├─ Step 1: Parser (패턴 구문 인식)
+│   ├─ switch 패턴
+│   ├─ 튜플 분해
+│   ├─ 구조체 분해
+│   └─ 테스트: 15개+
+│
+├─ Step 2: AstGen (패턴 메타데이터)
+│   ├─ Pattern ZIR 명령어
+│   ├─ 패턴 매칭 추적
+│   └─ 테스트: 12개+
+│
+└─ Step 3: Sema (패턴 검증)
+    ├─ 패턴 타입 검증
+    ├─ 완전성 검증 (exhaustiveness)
+    └─ 테스트: 13개+
+```
+
+---
+
+## 🎯 Pattern Matching의 의의
+
+### Pattern Matching이란?
+- **정의**: 값과 패턴을 비교하여 일치하는 경우 처리
+- **목적**: 타입 안전하고 읽기 쉬운 코드
+- **문법**: `switch expr { case pattern => ... }`
+- **특징**: 완전성 검증으로 모든 경우 처리 강제
+
+### Pattern Matching 사용 예
+
+```zig
+// 기본 switch (값 패턴)
+const value = 5;
+switch (value) {
+    1 => print("one"),
+    2 => print("two"),
+    else => print("other"),
+}
+
+// 튜플 분해 (tuple destructuring)
+const tuple = .{ 1, "hello", true };
+switch (tuple) {
+    .{ 1, "hello", true } => print("matched"),
+    else => print("no match"),
+}
+
+// 구조체 분해 (struct destructuring)
+const point = Point{ .x = 10, .y = 20 };
+switch (point) {
+    Point{ .x = 0, .y = 0 } => print("origin"),
+    Point{ .x = x, .y = _ } => print("x = {}", .{x}),
+}
+
+// 타입 패턴
+const value: any = 42;
+switch (type(value)) {
+    i32 => print("integer"),
+    f64 => print("float"),
+    else => print("unknown"),
+}
+
+// 중첩 패턴
+const nested = .{ .{ 1, 2 }, .{ 3, 4 } };
+switch (nested) {
+    .{ .{ a, b }, .{ c, d } } => print("{} {} {} {}", .{ a, b, c, d }),
+    else => print("no match"),
+}
+```
+
+### Pattern Matching vs If-Else
+```
+Pattern Matching 장점:
+├─ 타입 안전 (컴파일 시 검증)
+├─ 완전성 검증 (모든 경우 처리)
+├─ 읽기 쉬운 코드
+└─ 구조 분해 (값 추출)
+
+If-Else 장점:
+├─ 조건 표현 가능
+└─ 간단한 분기
+```
+
+---
+
+## 📝 Step 1: Parser - 패턴 구문 인식
+
+### 목표
+- switch-case 패턴 파싱
+- 튜플 분해 파싱
+- 구조체 분해 파싱
+- 타입 패턴 파싱
+
+### 구현 항목
+
+#### 1. AST 노드 확장 (ast.zig)
+
+기존 상태:
+```zig
+pub const Node = struct {
+    pub const Tag = enum {
+        // ... 기존 ...
+    };
+};
+```
+
+추가할 것:
+```zig
+pub const Node = struct {
+    pub const Tag = enum {
+        // ... 기존 ...
+        switch_expr,      // switch 식
+        case_pattern,     // case pattern => expr
+        pattern,          // 패턴 정의
+        tuple_pattern,    // (a, b, c)
+        struct_pattern,   // Point { x, y }
+        type_pattern,     // Type 패턴
+    };
+
+    pub const Data = union {
+        // ... 기존 ...
+        switch_expr: struct {
+            expr: *Node,
+            cases: []CasePattern,
+        },
+
+        case_pattern: struct {
+            pattern: *Node,
+            value: *Node,
+        },
+
+        pattern: struct {
+            pattern_type: PatternType,
+            data: PatternData,
+        },
+
+        tuple_pattern: struct {
+            elements: []Node,
+            ignore_rest: bool = false,
+        },
+
+        struct_pattern: struct {
+            struct_name: []const u8,
+            fields: []StructPatternField,
+        },
+
+        type_pattern: struct {
+            target_type: *Node,
+        },
+    };
+};
+
+pub const CasePattern = struct {
+    pattern: *Node,
+    value: *Node,
+    loc: Location,
+};
+
+pub const PatternType = enum {
+    literal,
+    tuple,
+    struct,
+    type_pat,
+    wildcard,
+    variable,
+};
+
+pub const PatternData = union {
+    literal: *Node,
+    tuple: []Node,
+    struct: struct {
+        name: []const u8,
+        fields: []StructPatternField,
+    },
+    type_pat: *Node,
+    wildcard: void,
+    variable: []const u8,
+};
+
+pub const StructPatternField = struct {
+    name: []const u8,
+    pattern: ?*Node = null,  // null이면 이름 바인딩
+    loc: Location,
+};
+```
+
+**변경량**: +50줄
+
+#### 2. Parser 동작
+
+현재 미지원:
+```zig
+switch value {
+    1 => print("one"),
+    2 => print("two"),
+    else => print("other"),
+}
+```
+
+추가할 기능:
+```zig
+// 1. 값 패턴
+switch value {
+    1 => print("one"),
+    2, 3 => print("two or three"),
+    else => print("other"),
+}
+
+// 2. 튜플 분해
+switch tuple {
+    .{ a, b } => print("{} {}", .{ a, b }),
+    else => print("no match"),
+}
+
+// 3. 구조체 분해
+switch point {
+    Point{ .x = 0, .y = 0 } => print("origin"),
+    Point{ .x = x, .y = _ } => print("x = {}", .{x}),
+    else => print("other"),
+}
+
+// 4. 타입 패턴
+switch value {
+    i32 => print("int"),
+    f64 => print("float"),
+    else => print("other"),
+}
+
+// 5. 와일드카드
+switch value {
+    0 => print("zero"),
+    1..10 => print("small"),
+    _ => print("other"),
+}
+
+// 6. 변수 바인딩
+switch tuple {
+    .{ a, b } => {
+        const x = a + b;
+        print("{}", .{x});
+    },
+    else => print("no match"),
+}
+```
+
+**구현**:
+- parseStatement()에 switch 케이스 추가
+- parseSwitchExpr()로 switch-case 파싱
+- parsePattern()으로 개별 패턴 파싱
+- 패턴 타입별 처리
+
+**변경량**: +60줄
+
+#### 3. 테스트 (15개 예상)
+
+```zig
+// Group A: 기본 switch (2개)
+test "parser_switch_value_pattern"
+test "parser_switch_multiple_cases"
+
+// Group B: 튜플 분해 (3개)
+test "parser_tuple_pattern"
+test "parser_tuple_destructuring"
+test "parser_tuple_ignore_rest"
+
+// Group C: 구조체 분해 (3개)
+test "parser_struct_pattern"
+test "parser_struct_partial"
+test "parser_struct_nested"
+
+// Group D: 타입 패턴 (2개)
+test "parser_type_pattern"
+test "parser_type_switch"
+
+// Group E: 복합 (3개)
+test "parser_nested_pattern"
+test "parser_pattern_with_guard"
+test "parser_pattern_chain"
+
+// Group F: 엣지 케이스 (2개)
+test "parser_wildcard_pattern"
+test "parser_variable_binding"
+```
+
+**변경량**: +350줄
+
+---
+
+## 🔄 Step 2: AstGen - 패턴 메타데이터
+
+### 목표
+- Pattern을 ZIR로 표현
+- 패턴 매칭 메타데이터
+- 패턴 바인딩 추적
+
+### 구현 항목
+
+#### 1. ZIR 명령어 추가 (zir.zig)
+
+```zig
+pub const Instruction = union(enum) {
+    // ... 기존 ...
+
+    // Phase 3.8: Pattern Matching
+    switch_expr: struct {
+        expr: Ref,
+        cases: []CaseRef,  // 케이스들
+    },
+
+    case_pattern: struct {
+        pattern: Ref,
+        value: Ref,
+    },
+
+    pattern_match: struct {
+        expr: Ref,
+        pattern: Ref,
+    },
+
+    tuple_pattern: struct {
+        elements: []Ref,
+        ignore_count: u32,
+    },
+
+    struct_pattern: struct {
+        struct_name_index: u32,
+        field_count: u32,
+    },
+
+    pattern_binding: struct {
+        pattern_var_index: u32,
+        value: Ref,
+    },
+
+    type_pattern: struct {
+        target_type: Ref,
+    },
+};
+
+pub const CaseRef = struct {
+    pattern: Ref,
+    value: Ref,
+};
+```
+
+**변경량**: +30줄
+
+#### 2. AstGen 구현 (astgen.zig)
+
+```zig
+fn genSwitchExpr(self: *AstGen, node: *const Node) !Zir.Ref {
+    const switch_expr = node.data.switch_expr;
+    const expr = try self.genNode(switch_expr.expr);
+
+    var cases = std.ArrayList(Zir.CaseRef).init(self.allocator);
+    for (switch_expr.cases) |case| {
+        const pat = try self.genNode(case.pattern);
+        const val = try self.genNode(case.value);
+        try cases.append(.{ .pattern = pat, .value = val });
+    }
+
+    return try self.zir.addInstruction(.{
+        .switch_expr = .{
+            .expr = expr,
+            .cases = try self.allocator.dupe(Zir.CaseRef, cases.items),
+        },
+    });
+}
+```
+
+**변경량**: +100줄
+
+#### 3. 테스트 (12개 예상)
+
+```zig
+// Group A: 기본 switch ZIR (2개)
+test "astgen_switch_zir"
+test "astgen_case_generation"
+
+// Group B: 튜플 패턴 (3개)
+test "astgen_tuple_pattern_zir"
+test "astgen_tuple_destructuring"
+test "astgen_tuple_metadata"
+
+// Group C: 구조체 패턴 (2개)
+test "astgen_struct_pattern_zir"
+test "astgen_struct_field_tracking"
+
+// Group D: 메타데이터 (2개)
+test "astgen_pattern_binding"
+test "astgen_case_count"
+
+// Group E: 복합 (3개)
+test "astgen_nested_pattern"
+test "astgen_type_pattern_zir"
+test "astgen_multiple_patterns"
+```
+
+**변경량**: +320줄
+
+---
+
+## 📊 Step 3: Sema - 패턴 검증
+
+### 목표
+- 패턴 타입 검증
+- 완전성 검증 (모든 경우 처리)
+- 패턴 바인딩 검증
+
+### 구현 항목
+
+#### 1. AirType 확장 (air.zig)
+
+```zig
+pub const Type = union(enum) {
+    // ... 기존 ...
+
+    pattern: struct {
+        pattern_type: PatternType,
+        variants: []PatternVariant,
+    },
+};
+
+pub const PatternType = enum {
+    literal,
+    tuple,
+    struct,
+    type_pat,
+    union_variant,
+};
+
+pub const PatternVariant = struct {
+    name: []const u8,
+    field_types: []Type,
+};
+```
+
+**변경량**: +15줄
+
+#### 2. Sema 함수 추가 (sema.zig)
+
+```zig
+fn checkPatternMatch(
+    self: *Sema,
+    expr_ty: AirType,
+    pattern_ty: AirType,
+) !bool {
+    // 패턴이 식 타입과 일치하는지 검증
+    // 서브타입 관계 고려
+}
+
+fn checkExhaustiveness(
+    self: *Sema,
+    expr_ty: AirType,
+    patterns: []const AirType,
+) !void {
+    // 모든 경우가 처리되는지 검증
+    // 완전성 검증 (exhaustiveness check)
+}
+
+fn checkPatternBindings(
+    self: *Sema,
+    pattern: AirType,
+) !void {
+    // 패턴에서 바인드된 변수 추적
+}
+```
+
+**변경량**: +150줄
+
+#### 3. SemanticError 확장
+
+```zig
+pub const SemanticError = union(enum) {
+    // ... 기존 ...
+    non_exhaustive_pattern: struct {
+        missing_cases: [][]const u8,
+        location: Location,
+    },
+    pattern_type_mismatch: struct {
+        expected: AirType,
+        got: AirType,
+        location: Location,
+    },
+    unreachable_pattern: struct {
+        pattern_index: usize,
+        location: Location,
+    },
+};
+```
+
+**변경량**: +15줄
+
+#### 4. 테스트 (13개 예상)
+
+```zig
+// Group A: 패턴 타입 검증 (2개)
+test "sema_switch_type_check"
+test "sema_pattern_type_match"
+
+// Group B: 완전성 검증 (3개)
+test "sema_exhaustive_check"
+test "sema_non_exhaustive_error"
+test "sema_unreachable_pattern"
+
+// Group C: 구조체 패턴 (2개)
+test "sema_struct_field_extraction"
+test "sema_struct_partial_match"
+
+// Group D: 바인딩 (3개)
+test "sema_pattern_binding"
+test "sema_nested_binding"
+test "sema_wildcard_binding"
+
+// Group E: 복합 (3개)
+test "sema_complex_pattern"
+test "sema_pattern_in_function"
+test "sema_pattern_flow_analysis"
+```
+
+**변경량**: +380줄
+
+---
+
+## 📊 예상 코드량
+
+```
+Step 1: Parser
+  ├─ ast.zig: +50줄 (노드 정의)
+  ├─ parser.zig: +60줄 (파싱)
+  └─ test: +350줄
+
+Step 2: AstGen
+  ├─ zir.zig: +30줄 (명령어)
+  ├─ astgen.zig: +100줄 (생성)
+  └─ test: +320줄
+
+Step 3: Sema
+  ├─ air.zig: +15줄 (타입)
+  ├─ sema.zig: +150줄 (검사)
+  └─ test: +380줄
+
+build.zig: +30줄 (테스트 타겟)
+
+────────────────────────────────────
+총: 1,875줄
+```
+
+---
+
+## 💡 핵심 개념
+
+### 1. 패턴 분류
+```zig
+// 리터럴 패턴
+switch value { 1 => ..., 2 => ... }
+
+// 와일드카드 패턴
+switch value { _ => ..., else => ... }
+
+// 변수 바인딩
+switch value { x => print(x), }
+
+// 튜플 분해
+switch tuple { .{ a, b } => ... }
+
+// 구조체 분해
+switch struct { Point{ .x = x, .y = y } => ... }
+
+// 타입 패턴
+switch value { i32 => ..., f64 => ... }
+```
+
+### 2. 완전성 검증
+```zig
+switch value {
+    1 => print("one"),
+    2 => print("two"),
+    // 3..max는 처리되지 않음!
+    // 컴파일 에러: non-exhaustive patterns
+}
+
+switch value {
+    1 => print("one"),
+    _ => print("other"),  // 모든 경우 처리
+    // 완벽함 (exhaustive)
+}
+```
+
+### 3. 패턴 순서
+```zig
+switch value {
+    0..10 => print("small"),  // 먼저 검사
+    5 => print("five"),        // 도달 불가능 (unreachable)
+    _ => print("other"),
+}
+```
+
+---
+
+## ✅ 최종 체크리스트
+
+- [ ] ast.zig 노드 추가
+- [ ] parser.zig 패턴 파싱
+- [ ] 15개 Parser 테스트
+- [ ] zir.zig 명령어 추가
+- [ ] astgen.zig 패턴 생성
+- [ ] 12개 AstGen 테스트
+- [ ] air.zig 타입 확장
+- [ ] sema.zig 검증 함수
+- [ ] 13개 Sema 테스트
+- [ ] build.zig 통합
+- [ ] 완성 보고서
+
+---
+
+## 🎯 구현 전략
+
+### 1. Parser 레벨
+- switch-case 기본 구조
+- 다양한 패턴 형태 인식
+- 중첩 패턴 지원
+
+### 2. AstGen 레벨
+- 패턴 메타데이터 생성
+- 케이스 매핑
+- 바인딩 정보 추적
+
+### 3. Sema 레벨
+- 패턴 타입 일관성
+- 완전성 검증 (exhaustiveness)
+- 도달 불가능 패턴 검증
+
+---
+
+**상태**: 📋 계획 완료 → Step 1 구현 준비
+**다음**: Phase 3.8 Step 1 - Parser Pattern Matching 구문 인식 구현 시작

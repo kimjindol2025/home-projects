@@ -1,0 +1,474 @@
+# 🦎 Zig 컴파일러 완전 분해 & 구현 로드맵
+
+**목표**:
+- 1차: Zig 컴파일러 구조 완전히 이해하기
+- 2차: 자체 Zig 컴파일러 완전 구현하기
+
+**기준**: Zig 0.15+ (self-hosted, Codeberg)
+
+---
+
+## Part 1: 컴파일러 파이프라인 (전체 맵)
+
+```
+.zig source code
+    ↓
+[1] TOKENIZE (Lexing)
+    ↓
+Token stream
+    ↓
+[2] PARSE (Parser)
+    ↓
+AST (Abstract Syntax Tree)
+    ↓
+[3] ASTGEN (AST → ZIR)
+    ↓
+ZIR (Zig Intermediate Representation)
+    ↓
+[4] SEMA (Semantic Analysis)
+    ├─ Type checking
+    ├─ Comptime interpretation
+    ├─ Error set analysis
+    ├─ Inline function resolution
+    └─ Generic instantiation
+    ↓
+AIR (Analyzed Intermediate Representation)
+    ↓
+[5] CODEGEN (Instruction Selection)
+    ├─ x86_64
+    ├─ aarch64
+    ├─ arm
+    ├─ wasm
+    ├─ c (C code generation)
+    └─ llvm (LLVM IR)
+    ↓
+Machine Code / C Code / LLVM IR
+    ↓
+[6] LINK (Linker)
+    ↓
+Executable / Library
+```
+
+---
+
+## Part 2: 각 단계별 상세 분해
+
+### [1] TOKENIZE (Token 생성)
+
+**위치**: `Parser.zig` 내부 + `Tokenizer` 구조
+
+```zig
+// 공식 구조 (Tokenizer)
+pub const Token = struct {
+    tag: Tag,           // IDENTIFIER, INTEGER, LPAREN, ...
+    loc: Loc,           // 소스 위치
+    // Tag enum: 150+ 종류
+};
+
+pub const Tokenizer = struct {
+    buffer: []const u8,
+    index: usize,
+    pending_invalid_token: ?Token,
+
+    pub fn next(self: *Tokenizer) Token { ... }
+};
+```
+
+**핵심 알고리즘**:
+- 상태 머신 기반 (state machine)
+- 한 글자씩 읽으면서 token 경계 판단
+- String literal, integer, comment 등 특별 처리
+
+**구현 시간**: 1주 (token 120+ 종류 정의)
+
+---
+
+### [2] PARSE (AST 생성)
+
+**위치**: `Parser.zig` (3000+ 줄)
+
+```zig
+// 공식 구조 (Parser)
+pub const Parser = struct {
+    source: []const u8,
+    tokens: []Token,
+    current: usize,
+
+    pub fn parseRoot(self: *Parser) Allocator.Error!Ast { ... }
+};
+
+// AST Node 종류 (매우 많음)
+pub const Node = union(enum) {
+    root: Root,
+    fn_decl: FnDecl,
+    var_decl: VarDecl,
+    assignment: Assignment,
+    if_statement: IfStatement,
+    while_loop: WhileLoop,
+    for_loop: ForLoop,
+    // ... 100+ 종류
+};
+```
+
+**핵심 알고리즘**:
+- Recursive Descent Parser (손으로 쓴 파서)
+- 문법 규칙을 함수로 표현:
+  ```zig
+  fn parseExpression(self: *Parser) !Node { ... }
+  fn parsePrimary(self: *Parser) !Node { ... }
+  fn parseBinary(self: *Parser, prec: i32) !Node { ... }
+  ```
+
+**구현 시간**: 2~3주 (Zig 전체 문법 500+ 규칙)
+
+---
+
+### [3] ASTGEN (ZIR 생성)
+
+**위치**: `AstGen.zig` (4000+ 줄)
+
+```zig
+// 공식 구조
+pub const AstGen = struct {
+    tree: *const Ast,
+    instructions: std.ArrayList(Instruction),
+    extra: std.ArrayList(u32),
+
+    pub fn genRootDecls(self: *AstGen) !void { ... }
+};
+
+// ZIR Instruction 예시
+pub const Instruction = union(enum) {
+    add: BinaryOp,
+    sub: BinaryOp,
+    mul: BinaryOp,
+    div: BinaryOp,
+    load: Load,
+    store: Store,
+    call: Call,
+    br: Branch,
+    cond_br: CondBranch,
+    // ... 200+ instruction
+};
+```
+
+**핵심 알고리즘**:
+- Visitor pattern: AST node 종류별로 처리
+- ZIR: untyped bytecode-like IR
+- 기본 블록(basic block) 단위로 명령어 생성
+
+**구현 시간**: 3~4주
+
+---
+
+### [4] SEMA (핵심, 가장 복잡)
+
+**위치**: `Sema.zig` (1.5M 파일!)
+
+```zig
+// 공식 구조
+pub const Sema = struct {
+    /// 현재 분석 중인 함수
+    fn_ctx: ?FnContext,
+    /// 모든 타입/값 풀 (InternPool)
+    intern_pool: *InternPool,
+    /// ZIR instruction
+    zir: *const Zir,
+
+    /// 핵심 함수들
+    pub fn analyzeFnBody(self: *Sema, block: *Block) !void { ... }
+    pub fn analyzeBodyInner(self: *Sema, block: *Block) !void { ... }
+    pub fn resolveType(self: *Sema, zir_ref: Zir.Ref) !Type { ... }
+    pub fn resolveValue(self: *Sema, zir_ref: Zir.Ref) !Value { ... }
+};
+```
+
+**핵심 기능** (순서대로):
+
+#### 4.1 Type Checking (기본)
+```zig
+// ZIR instruction마다 type 결정
+fn analyzeInstAdd(self: *Sema, inst: Zir.Inst.Add) !Zir.Ref {
+    const lhs_type = try self.resolveType(inst.lhs);
+    const rhs_type = try self.resolveType(inst.rhs);
+
+    if (!lhs_type.eql(rhs_type)) {
+        return error.TypeMismatch;
+    }
+
+    return try self.air.addBinaryOp(lhs_type, inst.tag, inst.lhs, inst.rhs);
+}
+```
+
+#### 4.2 Comptime Interpretation (매우 어려움)
+```zig
+// 컴파일타임에 실행 가능한 코드는 즉시 실행
+// 예: const x = 1 + 2; → 컴파일타임에 3으로 계산됨
+fn evaluateConstant(self: *Sema, inst: Zir.Ref) !Value {
+    // Zir instruction을 "해석기"처럼 실행
+    // 이걸 하려면 별도의 VM이 필요함
+
+    // 또는 AIR instruction으로 변환 후 실행
+}
+```
+
+#### 4.3 Generic Instantiation (복잡)
+```zig
+// 함수 generic이면 각 호출 타입마다 새 버전 생성
+fn instantiateGenericFn(
+    self: *Sema,
+    fn_decl: *Decl,
+    args: []const Type,
+) !*Decl {
+    // 함수를 복제해서 타입 파라미터 대체
+    // 다시 Sema 돌리기
+}
+```
+
+#### 4.4 Error Set Analysis
+```zig
+// 함수가 어떤 에러 반환 가능한지 추론
+fn inferErrorSet(self: *Sema, fn_body: *Block) !Type.ErrorSet {
+    // "if (something) return error.Something;"
+    // 이런 패턴들을 찾아서 error set 생성
+}
+```
+
+**구현 시간**: 6개월+ (가장 어려운 부분!)
+
+---
+
+### [5] CODEGEN (기계어 생성)
+
+**위치**: `codegen/` 디렉토리
+
+#### 옵션 A: LLVM Backend (가장 쉬움)
+```zig
+// codegen/llvm.zig
+pub fn generateLLVM(air: *const Air, ...) !void {
+    // AIR instruction → LLVM IR string
+    // "define i32 @add(i32 %a, i32 %b) { ... }"
+}
+```
+
+#### 옵션 B: C Backend (중간)
+```zig
+// codegen/c.zig
+pub fn generateC(air: *const Air, ...) !void {
+    // AIR instruction → C code
+    // "int add(int a, int b) { return a + b; }"
+}
+```
+
+#### 옵션 C: Self-Hosted x86_64 (최고, 가장 어려움)
+```zig
+// codegen/x86_64.zig (2000+ 줄)
+pub fn generateX86_64(air: *const Air, ...) !void {
+    // AIR instruction → x86_64 machine code
+    // mov rax, [rdi]
+    // add rax, [rsi]
+    // ret
+}
+```
+
+**구현 시간**:
+- LLVM: 2주 (LLVM C API 사용)
+- C: 3주 (Zig standard library 활용)
+- x86_64: 4~8주 (복잡한 instruction 선택)
+
+---
+
+### [6] LINK (링커)
+
+**위치**: `link/` 디렉토리
+
+```zig
+// link/Elf.zig (Linux), link/MachO.zig (macOS), link/Coff.zig (Windows)
+pub fn link(comp: *Compilation) !void {
+    // Object file들을 읽어서 executable 생성
+
+    // 1. 섹션(section) 레이아웃 결정
+    // 2. Relocation 처리 (함수 주소 결정)
+    // 3. Symbol table 생성
+    // 4. Binary 쓰기
+}
+```
+
+**구현 시간**: 2~3주 (기존 LLD 포팅 또는 단순화 버전)
+
+---
+
+## Part 3: 핵심 자료구조
+
+### InternPool (매우 중요!)
+
+```zig
+// 모든 타입과 값을 한 곳에 캐싱
+pub const InternPool = struct {
+    types: DenseMap(Type.Key, Type.Index),
+    values: DenseMap(Value.Key, Value.Index),
+
+    // 예: i32 타입을 요청하면 같은 객체 반환
+    fn getIntType(self: *InternPool, signedness: Signedness, bits: u16) !Type.Index {
+        const key = Type.Key{ .int = .{ .signedness = signedness, .bits = bits } };
+        return try self.types.getOrPut(key);
+    }
+};
+```
+
+**왜 중요?**
+- 메모리 효율성 (같은 타입은 1번만 저장)
+- 타입 비교 O(1) (인덱스 비교)
+- Comptime 값 저장
+
+---
+
+## Part 4: 현실적인 구현 로드맵
+
+### 1차 목표: 학습 (2~3개월)
+
+#### Phase 1: 파이프라인 분석 (2주)
+- ✅ Zig 공식 소스 읽기
+- ✅ 각 파일의 구조 이해
+- ✅ 핵심 알고리즘 정리
+
+#### Phase 2: Mini Zig Compiler (3개월)
+**목표**: Zig의 subset으로 컴파일러 만들기
+
+```
+Mini Zig (Zig의 부분집합):
+- 변수 & 함수만 가능
+- Generic & comptime 없음
+- 구조체 & 에러 없음
+- 루프 & 조건문만 가능
+- 정수만 지원
+```
+
+**구현**:
+```
+[Tokenize] (1주) → [Parse] (2주) → [AstGen] (1주) →
+[Sema (간단한 타입만)] (2주) → [LLVM Codegen] (2주) → [Link] (1주)
+```
+
+**결과**: 100~200줄 정도의 Zig 코드를 컴파일 할 수 있는 컴파일러
+
+### 2차 목표: 완전 구현 (6~12개월)
+
+#### Phase 3: Full Sema (6개월)
+- 타입 체크 확장
+- Generic 지원
+- Comptime 기본 지원
+- Error set 분석
+
+#### Phase 4: 고급 기능 (3개월)
+- Comptime 완전 지원
+- 인라인 함수 최적화
+- 모듈/패키지 시스템
+
+#### Phase 5: Self-Hosting (3개월)
+- 자체 컴파일러로 컴파일러 컴파일하기
+- Zig 소스 자체 컴파일 가능하게 만들기
+
+---
+
+## Part 5: 공식 Zig 소스 분석 (2026년 기준)
+
+### 핵심 파일 크기
+
+| 파일 | 크기 | 설명 | 난이도 |
+|------|------|------|--------|
+| `Sema.zig` | 1.5M | 타입 체크, comptime | ⭐⭐⭐⭐⭐ |
+| `InternPool.zig` | 505K | 타입/값 캐싱 | ⭐⭐⭐⭐ |
+| `Compilation.zig` | 317K | 빌드 orchestrator | ⭐⭐⭐ |
+| `Zcu.zig` | 234K | Compilation unit | ⭐⭐⭐ |
+| `Type.zig` | 135K | 타입 시스템 | ⭐⭐⭐ |
+| `Air.zig` | 111K | AIR instruction | ⭐⭐⭐ |
+| `Value.zig` | 105K | 컴파일타임 값 | ⭐⭐⭐ |
+
+### 추천 읽기 순서
+
+1. **Air.zig** - AIR instruction 구조 이해 (2시간)
+2. **Type.zig** + **Value.zig** - 타입/값 표현 (4시간)
+3. **InternPool.zig** - 캐싱 메커니즘 (3시간)
+4. **Sema.zig** - 의미 분석 (매우 길어서 관심사 별로 끊어 읽기)
+   - `analyzeBody` / `analyzeBodyInner` (가장 중요)
+   - `resolveType` / `resolveValue` (기본)
+   - `instantiateGeneric` (복잡)
+5. **Compilation.zig** - 전체 구성 (2시간)
+
+---
+
+## Part 6: 빌드 & 테스트 전략
+
+### Mini Zig Compiler 테스트 예시
+
+```zig
+// test_simple.zig
+fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+pub fn main() void {
+    const x = add(1, 2);
+    // expected: 3
+}
+```
+
+**테스트 파이프라인**:
+```bash
+$ ./my-compiler test_simple.zig -o test_simple
+$ ./test_simple
+$ echo $? # should be 3
+```
+
+### 검증 방법
+1. Zig 공식 컴파일러와 결과 비교
+2. 생성된 LLVM IR 비교
+3. 생성된 Assembly 비교
+
+---
+
+## Part 7: 실전 팁
+
+### 추천 개발 패턴
+
+```
+1주 단위로 기능 추가:
+- 목표: "변수 선언 지원"
+- 3단계 구현:
+  a) tokenize + parse (3일)
+  b) sema 추가 (2일)
+  c) codegen 추가 (2일)
+- 테스트 (매일)
+```
+
+### 디버깅 팁
+
+```zig
+// AST 출력해보기
+std.debug.print("AST: {}\n", .{ast});
+
+// ZIR 출력해보기
+std.debug.print("ZIR: {}\n", .{zir});
+
+// AIR 출력해보기
+std.debug.print("AIR: {}\n", .{air});
+
+// 생성된 C 코드 검증
+// (C backend 사용)
+```
+
+---
+
+## 다음 단계
+
+이 문서를 기반으로:
+1. **파이프라인 상세 분석** (`02-PIPELINE-DETAILED.md`)
+2. **구현 가이드** (`03-IMPLEMENTATION-GUIDE.md`)
+3. **로드맵 & 일정** (`04-PROJECT-ROADMAP.md`)
+
+을 작성할 것.
+
+---
+
+**최종 목표**: **완전한 Zig 컴파일러** (또는 subset) 구현

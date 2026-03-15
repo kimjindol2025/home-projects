@@ -1,0 +1,293 @@
+# 중간 표현 (IR) 명세
+
+## 개요
+
+C 컴파일러는 2층 IR을 사용합니다:
+1. **CIR (C Intermediate Representation)**: AST → CIR. 타입 정보 없음.
+2. **CAIR (C Annotated IR)**: CIR → CAIR. Sema 후 타입 정보 부착.
+
+---
+
+## CIR (Untyped IR)
+
+### 명령어 집합 (30개 opcode)
+
+#### 리터럴 로드
+
+```c
+CIR_LOAD_INT      imm: long long          // 정수 리터럴
+CIR_LOAD_FLOAT    imm: double             // 부동소수 리터럴
+CIR_LOAD_STR      str_idx: uint32_t       // 문자열 리터럴 (인덱스)
+CIR_LOAD_VAR      name_idx: uint32_t      // 변수 로드
+```
+
+#### 메모리 저장
+
+```c
+CIR_STORE_VAR     name_idx: uint32_t, value: CirRef  // 변수에 저장
+CIR_ADDR_OF       operand: CirRef         // 주소 취하기 (&)
+CIR_DEREF         operand: CirRef         // 역참조 (*)
+CIR_INDEX         array: CirRef, idx: CirRef  // 배열 인덱싱
+CIR_MEMBER        object: CirRef, field_idx: int  // 멤버 접근
+```
+
+#### 산술/논리 연산
+
+```c
+CIR_BINARY        op: BinOp, lhs: CirRef, rhs: CirRef
+                  (op: ADD, SUB, MUL, DIV, MOD,
+                       AND, OR, XOR, LSHIFT, RSHIFT,
+                       EQ, NEQ, LT, LE, GT, GE,
+                       LOGIC_AND, LOGIC_OR)
+CIR_UNARY         op: UnOp, operand: CirRef
+                  (op: NEG, NOT, BITWISE_NOT)
+CIR_CAST          operand: CirRef, to_type: CType*
+```
+
+#### 제어 흐름
+
+```c
+CIR_LABEL         label_id: uint32_t      // 라벨 정의
+CIR_JMP           target: uint32_t        // 무조건 분기
+CIR_JMP_IF        cond: CirRef, true_label: uint32_t, false_label: uint32_t
+CIR_RETURN        value: CirRef (NULL for void)
+```
+
+#### 함수 관련
+
+```c
+CIR_FUNC_BEGIN    name_idx: uint32_t, param_count: uint32_t
+CIR_FUNC_END
+CIR_CALL          callee: CirRef, args: CirRef[], arg_count: int
+CIR_ARG           arg_idx: int            // 함수 시작에 파라미터 배치
+```
+
+#### 특수
+
+```c
+CIR_SIZEOF        type_str: char*         // sizeof 연산
+CIR_PHI           refs: CirRef[], count: int  // SSA phi 노드 (Phase 3.6)
+CIR_NOP
+```
+
+### CirRef 패턴
+
+```c
+typedef uint32_t CirRef;  // 명령어 결과의 인덱스 (0-based)
+```
+
+- **0**: null/void 값
+- **1~N**: 명령어 0 ~ N-1의 결과
+
+### 예시: `x = a + b`
+
+```
+a ← CIR_LOAD_VAR(name_idx=0)     [CirRef = 0]
+b ← CIR_LOAD_VAR(name_idx=1)     [CirRef = 1]
+tmp ← CIR_BINARY(ADD, 0, 1)      [CirRef = 2]
+CIR_STORE_VAR(name_idx=2, 2)     [CirRef = 3]
+```
+
+---
+
+## CAIR (Typed IR)
+
+Sema 패스 후 CIR의 각 명령어에 타입 정보를 부착합니다.
+
+### 구조
+
+```c
+struct CAirInst {
+    CirOpcode op;
+    CType    *result_type;        // 이 명령어 결과의 타입
+    union {
+        // ... (CIR의 유니온과 동일)
+    } u;
+};
+```
+
+### 예시: `x = (double)(a + b)`
+
+```
+a ← CIR_LOAD_VAR(name_idx=0)     [Type: int]
+b ← CIR_LOAD_VAR(name_idx=1)     [Type: int]
+tmp ← CIR_BINARY(ADD, 0, 1)      [Type: int]
+cast ← CIR_CAST(2, double*)      [Type: double]
+CIR_STORE_VAR(name_idx=2, 3)     [Type: double]
+```
+
+---
+
+## String Table & Symbol Table
+
+### String Table
+
+CIR의 `str_idx`와 `name_idx`는 전역 스트링 테이블 인덱스입니다.
+
+```c
+struct StringTable {
+    char    **strings;      // 동적 배열
+    uint32_t  count;
+    uint32_t  capacity;
+};
+```
+
+- `str_idx = 0`: `""`
+- `str_idx = 1`: 첫 번째 문자열 리터럴 또는 식별자
+- ...
+
+### Symbol Table
+
+함수 내 변수를 관리합니다.
+
+```c
+struct Symbol {
+    char       *name;
+    CType      *type;
+    int         scope_depth;
+    int         stack_offset;    // rbp - offset (로컬 변수)
+    int         is_global;
+    int         is_const;
+    Symbol     *next;            // 해시 체인
+};
+
+struct SymTable {
+    Symbol    **buckets;         // 해시 테이블
+    int         bucket_count;
+    int         scope_depth;
+    int         stack_size;      // 현재 함수의 스택 사용량
+};
+```
+
+---
+
+## IR 생성 전략
+
+### 2-Pass AstGen
+
+**Pass 1**: 모든 함수와 전역변수 수집 (forward reference 해결)
+```
+ast_node: func_def "add" → 등록 in symbol_table
+ast_node: func_def "main" → 등록 in symbol_table
+```
+
+**Pass 2**: 실제 CIR 명령어 생성
+```
+ast_node: func_def "add" → CIR_FUNC_BEGIN → (body) → CIR_FUNC_END
+ast_node: func_def "main" → CIR_FUNC_BEGIN → (body) → CIR_FUNC_END
+```
+
+### 제어 흐름 정규화
+
+AST의 고수준 제어문을 라벨과 분기로 변환합니다.
+
+#### if 문
+
+```c
+// C 소스
+if (cond) {
+    body1
+} else {
+    body2
+}
+next_stmt
+
+// CIR
+cond_ref ← evaluate(cond)
+JMP_IF(cond_ref, L_body1, L_body2)
+L_body1: ... body1 ... JMP(L_next)
+L_body2: ... body2 ... JMP(L_next)
+L_next: ... next_stmt ...
+```
+
+#### while 루프
+
+```c
+// C 소스
+while (cond) {
+    body
+}
+next_stmt
+
+// CIR
+L_loop:
+  cond_ref ← evaluate(cond)
+  JMP_IF(cond_ref, L_body, L_break)
+L_body: ... body ... JMP(L_loop)
+L_break: ... next_stmt ...
+```
+
+#### for 루프
+
+```c
+// C 소스
+for (init; cond; step) {
+    body
+}
+next_stmt
+
+// CIR
+init_ref ← evaluate(init)
+L_loop:
+  cond_ref ← evaluate(cond)
+  JMP_IF(cond_ref, L_body, L_break)
+L_body: ... body ...
+  step_ref ← evaluate(step)
+  JMP(L_loop)
+L_break: ... next_stmt ...
+```
+
+---
+
+## 스택 오프셋 계산
+
+함수 진입 시 로컬 변수들의 스택 오프셋을 계산합니다.
+
+```
+rbp (base pointer)
+-8:   first local var
+-16:  second local var
+...
+```
+
+### 예시
+
+```c
+void func(int a, int b) {
+    int x;      // offset -8
+    int y;      // offset -16
+    char z;     // offset -24 (align 1)
+}
+```
+
+**스택 크기**: 24 바이트 (16바이트 정렬 적용 시 32바이트 고려)
+
+---
+
+## 최적화 대상
+
+### Phase 2.6 최적화
+
+1. **상수 폴딩 (Constant Folding)**
+   ```
+   CIR_BINARY(ADD, LOAD_INT(2), LOAD_INT(3))
+   → CIR_LOAD_INT(5)
+   ```
+
+2. **상수 전파 (Constant Propagation)**
+   ```
+   STORE_VAR(x, LOAD_INT(5))
+   LOAD_VAR(x) → LOAD_INT(5)
+   ```
+
+3. **Dead Store Elimination**
+   ```
+   STORE_VAR(x, ...) ← 이후 x를 읽지 않음 → 제거
+   ```
+
+### Phase 3.6 최적화
+
+- **레지스터 할당**: 스택 기반 → 선형 스캔 레지스터 할당
+- **불필요한 점프 제거 (Jump Threading)**
+- **함수 인라이닝** (작은 함수)
+
