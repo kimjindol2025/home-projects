@@ -21,7 +21,7 @@
 | **FreeLang Light** | Phase 1-5 완료. Vue/React/Tailwind 예제 | [freelang-light-project.md](./freelang-light-project.md) |
 | **kim-project-cli ✅ v1.0** | 288개 GOGS + 27개 로컬 프로젝트 (315개 총) 통합 관리. JSON 기반 저장소 (Termux 호환), Claude 메모 API (40012), CLI 도구 완성. 최신: dda5096 | [kim-project-cli.md](./kim-project-cli.md) |
 | **c-compiler-from-scratch 🟡** | 19,158줄 C 컴파일러 + VM. Phase 6 프리프로세서 완료, ELF 바이너리 생성, SAI 최적화. Lexer→Parser→Codegen→ELF 파이프라인 완성 | [c-compiler-from-scratch.md](./c-compiler-from-scratch.md) |
-| **freelang-to-c 🟢 (신규)** | FreeLang → C 트랜스파일러. C 백엔드로 네이티브 바이너리 생성. Phase 0 초기화 완료, Phase 1-5 로드맵. 커밋: b799533 | [freelang-to-c.md](./freelang-to-c.md) |
+| **freelang-to-c 🟢 Phase 1-2 ✅** | FreeLang → C 트랜스파일러. Phase 1 완료: 타입 시스템 (i32/f64/string/*T). Phase 2 완료: 구조체 지원 (struct def + member access/assignment). 150줄 코드, 10 테스트, C 컴파일 성공. 커밋: cef6414 | [freelang-to-c-phase12.md](./freelang-to-c-phase12.md) |
 | **C Compiler Learning Phase 1-2 📚** | 하향식 학습: Lexer(토큰) → Parser(AST) → Codegen(x86-64) 분석. 토큰 유니온 설계, 범프 할당, 3주소 코드, 명령어 인코딩, ELF 재배치 학습 | [c-compiler-learning-phase1.md](./c-compiler-learning-phase1.md) + [c-compiler-learning-phase2.md](./c-compiler-learning-phase2.md) |
 | **Marketing Team ✅ Phase 1+3** | 5에이전트(CMO/ContentWriter/Social/Community/Analytics) 초기화 완료. Cron 스케줄링, 메모 시스템, .gitignore 개선. GOGS 커밋 180c5aa7 | [COMPLETION_SUMMARY.md](./COMPLETION_SUMMARY.md) |
 | **FV-Lang 초기화 ✅** | 함수형 프로그래밍 언어 프로젝트 시작. 1,902줄 컴파일러 구현 (렉서/파서/타입/코드생성). 32 토큰, CLI 완성. GOGS 배포 완료 | [FV_LANG_INITIALIZATION.md](./FV_LANG_INITIALIZATION.md) |
