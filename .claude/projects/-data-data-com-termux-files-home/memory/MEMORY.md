@@ -25,6 +25,7 @@
 | **C Compiler Learning Phase 1-2 📚** | 하향식 학습: Lexer(토큰) → Parser(AST) → Codegen(x86-64) 분석. 토큰 유니온 설계, 범프 할당, 3주소 코드, 명령어 인코딩, ELF 재배치 학습 | [c-compiler-learning-phase1.md](./c-compiler-learning-phase1.md) + [c-compiler-learning-phase2.md](./c-compiler-learning-phase2.md) |
 | **Marketing Team ✅ Phase 1+3** | 5에이전트(CMO/ContentWriter/Social/Community/Analytics) 초기화 완료. Cron 스케줄링, 메모 시스템, .gitignore 개선. GOGS 커밋 180c5aa7 | [COMPLETION_SUMMARY.md](./COMPLETION_SUMMARY.md) |
 | **FV-Lang 초기화 ✅** | 함수형 프로그래밍 언어 프로젝트 시작. 1,902줄 컴파일러 구현 (렉서/파서/타입/코드생성). 32 토큰, CLI 완성. GOGS 배포 완료 | [FV_LANG_INITIALIZATION.md](./FV_LANG_INITIALIZATION.md) |
+| **FV-Lang Phase 1 준비 🟡** | Phase 1 (Lexer Testing) 완전 준비. 45개 테스트 (25 lexer + 20 integration), 4 예제, 400줄 문서. 테스트 실행 준비 완료. 커밋: 96bc57d | [FV_LANG_PHASE1_SETUP.md](./FV_LANG_PHASE1_SETUP.md) |
 
 ---
 
