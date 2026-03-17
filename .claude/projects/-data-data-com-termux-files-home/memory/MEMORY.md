@@ -17,6 +17,23 @@
 
 ---
 
+### 🚀 **[NEW] Sovereign Self-Evolving Code Factory v2 - 팀 모드 준비 완료!**
+- **난이도**: ★★★★★ (2026년 최고 수준)
+- **구성**: 5명 AI 에이전트 팀
+  1. Intent Architect - 자연어 파싱
+  2. Graph Orchestrator - 시각화
+  3. Code Generator - 코드 생성
+  4. Healing Surgeon - 버그 자동 수정
+  5. Evolution Tracker - 학습 & 진화
+- **로컬 Git**: 2커밋 완료 (설계 문서 785줄)
+- **Phase 0 계획**: 1주일 (Day 1-7)
+- **다음**: GOGS 배포 → Phase 0 구현
+
+**비전**: 인간 개입 없이 코드가 스스로 진화하는 완전 폐쇄 루프
+**참고**: [sovereign-self-evolving-factory-setup.md](./sovereign-self-evolving-factory-setup.md)
+
+---
+
 | 프로젝트 | 메모 (3줄 이내) | 파일 |
 |---------|----------------|------|
 | **Phase 8 프리랭 중심 설계** | 프리랭 언어 분석: 6개 문제점(성능/병렬화/메모리/시스템/자료구조/컴파일) 파악. 4주 개선 로드맵 수립 | [FREELANG_CORE_ANALYSIS.md](./FREELANG_CORE_ANALYSIS.md) |
