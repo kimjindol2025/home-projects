@@ -21,11 +21,20 @@
 | **FreeLang Light** | Phase 1-5 완료. Vue/React/Tailwind 예제 | [freelang-light-project.md](./freelang-light-project.md) |
 | **kim-project-cli ✅ v1.0** | 288개 GOGS + 27개 로컬 프로젝트 (315개 총) 통합 관리. JSON 기반 저장소 (Termux 호환), Claude 메모 API (40012), CLI 도구 완성. 최신: dda5096 | [kim-project-cli.md](./kim-project-cli.md) |
 | **c-compiler-from-scratch 🟡** | 19,158줄 C 컴파일러 + VM. Phase 6 프리프로세서 완료, ELF 바이너리 생성, SAI 최적화. Lexer→Parser→Codegen→ELF 파이프라인 완성 | [c-compiler-from-scratch.md](./c-compiler-from-scratch.md) |
-| **freelang-to-c 🟢 Phase 1-2 ✅** | FreeLang → C 트랜스파일러. Phase 1 완료: 타입 시스템 (i32/f64/string/*T). Phase 2 완료: 구조체 지원 (struct def + member access/assignment). 150줄 코드, 10 테스트, C 컴파일 성공. 커밋: cef6414 | [freelang-to-c-phase12.md](./freelang-to-c-phase12.md) |
+| **freelang-to-c 🟢 Phase 1-5 ✅** | FreeLang → C 트랜스파일러 완성! Phase 1-4: 기본 기능 (타입/구조체/에러/모듈, 500줄). Phase 5: Advanced (Result<T,E>/Generics/Match, 35줄). 총 2,500줄, 19 테스트 모두 성공. 다음: Phase 6 Self-Hosting (혁명 증명) | [freelang-to-c-phase5.md](./freelang-to-c-phase5.md) |
+| **freelang-to-c 🟢 Phase 6-7 ✅** | Self-Hosting 완전 증명! Phase 6: minicc.c(947줄, C). Phase 7: minicc.fl(471줄, FreeLang) - minicc.c가 minicc.fl 컴파일 성공! 결정론적 테스트 통과. 커밋: dea198f | [freelang-to-c-phase6.md](./freelang-to-c-phase6.md) |
 | **C Compiler Learning Phase 1-2 📚** | 하향식 학습: Lexer(토큰) → Parser(AST) → Codegen(x86-64) 분석. 토큰 유니온 설계, 범프 할당, 3주소 코드, 명령어 인코딩, ELF 재배치 학습 | [c-compiler-learning-phase1.md](./c-compiler-learning-phase1.md) + [c-compiler-learning-phase2.md](./c-compiler-learning-phase2.md) |
 | **Marketing Team ✅ Phase 1+3** | 5에이전트(CMO/ContentWriter/Social/Community/Analytics) 초기화 완료. Cron 스케줄링, 메모 시스템, .gitignore 개선. GOGS 커밋 180c5aa7 | [COMPLETION_SUMMARY.md](./COMPLETION_SUMMARY.md) |
 | **FV-Lang 초기화 ✅** | 함수형 프로그래밍 언어 프로젝트 시작. 1,902줄 컴파일러 구현 (렉서/파서/타입/코드생성). 32 토큰, CLI 완성. GOGS 배포 완료 | [FV_LANG_INITIALIZATION.md](./FV_LANG_INITIALIZATION.md) |
 | **FV-Lang Phase 1 준비 🟡** | Phase 1 (Lexer Testing) 완전 준비. 45개 테스트 (25 lexer + 20 integration), 4 예제, 400줄 문서. 테스트 실행 준비 완료. 커밋: 96bc57d | [FV_LANG_PHASE1_SETUP.md](./FV_LANG_PHASE1_SETUP.md) |
+| **FV-Lang Phase 5 WASM 🟡** | FV-Lang → WASM 브라우저 REPL. Phase 0 완료: wasm32 빌드 성공, REPL HTML 완성, GOGS 저장 (aaf9dbc). 다음: wasm-pack으로 pkg/ 생성 후 브라우저 실행. GOGS: fv-lang-wasm | [fv-lang-wasm-phase5.md](./fv-lang-wasm-phase5.md) |
+| **Personal Code OS ✅ Phase 0** | 브라우저 Self-Hosted OS: WindowManager/OPFS+IDB/Git-VCS/FV-Lang JS 인터프리터/AI(WebLLM)/CodeMirror6. 40/40 테스트. GOGS: kim/personal-code-os (15fe0e5). 다음: FV-Lang Rust WASM Phase 1 | [personal-code-os.md](./personal-code-os.md) |
+| **FreeWire ✅ Phase 1-5** | 노드 기반 시각 프로그래밍→FreeLang. AI 노드 자동 생성기 (15템플릿+브라우저 패널). 137/137 테스트. GOGS: kim/FreeWire (75153d0). 다음: Phase6 WASM | [freewire-phase5.md](./freewire-phase5.md) |
+| **Phase 10 AI Marketing System ✅** | 7-layer 자동화 마케팅 시스템 완성! 11,192줄 (agent-protocol/cataloger/coordinator/strategy/generator/distributor/engagement/metrics). 155개 저장소 관리, 88개 테스트, 8개 커밋. 기록이 증명이다 🚀 | [PHASE10_MARKETING_AI_COMPLETE.md](./PHASE10_MARKETING_AI_COMPLETE.md) |
+| **FreeLang GitHub (FGH) Stage 1 ✅** | The Visualizer 완성! 3개 렌더러 (Tree/Diff/Graph) 4,788줄 (1-1: 968줄, 1-2: 1,070줄, 1-3: 1,138줄) + 30/30 테스트 통과. Git binary → Web JSON/HTML/SVG 변환. API 표준화, 병합 감지, 지연 로딩. 7개 커밋 (70b2afd~c240919). GOGS: freelang-git | [STAGE1_VISUALIZER_COMPLETE.md](./STAGE1_VISUALIZER_COMPLETE.md) |
+| **FreeLang GitHub (FGH) Stage 2 ✅** | Agent Dashboard 완성! 3-panel Web UI: 에이전트 상태 패널 + Approval Workflow UI + Analytics Dashboard. 2,508줄 + 77 테스트 (23+24+30). SVG 도넛 차트, ASCII 막대, Human-in-the-loop 승인. 커밋: 885e4f1~4cdc618 | [STAGE-2-DASHBOARD-COMPLETE.md](in-repo) |
+| **FreeLang GitHub (FGH) Stage 3 ✅** | Live Integration 완성! GOGS API Client + HTTP Server + Live Posting Connector. 2,489줄 + 81 테스트 (27+28+26). 4채널 커넥터(Twitter/LinkedIn/Blog/Reddit), 11개 라우트, 마케팅 우선순위 정렬. 커밋: 5e32923 | [live-gogs-client.fl 등](in-repo) |
+| **FreeLang GitHub Deploy Cycle ✅** | 자율 마케팅 사이클 완성! Stage 1~3 전체 통합. 9-step 파이프라인 (GOGS수집→우선순위→전략→생성→배포→대시보드→ProofScore→리포트). 476줄 + 25 테스트. 커밋: ad92ea5. 누적: 10,588줄 / 213 테스트 | [deploy-cycle.fl](in-repo) |
 
 ---
 
