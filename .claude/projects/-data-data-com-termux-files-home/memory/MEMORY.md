@@ -1,6 +1,21 @@
 # 📚 Project Memory Index
 
 > 자세한 내용은 각 파일 링크에서 확인하세요
+> **최종 업데이트**: 2026-03-18 | **상태**: 37개 프로젝트 완료/진행 중
+
+---
+
+## 🔥 **최근 주요 성과 (3/18)**
+
+### ✨ **freelang-to-c Phase 7: Full Self-Hosting 완료!**
+- **minicc.fl (471줄)**: FreeLang으로 컴파일러 구현
+- **자체호스팅 증명**: minicc.c(C)가 minicc.fl(FL) 컴파일 성공!
+- **결정론적 컴파일**: 3회 반복 테스트 100% 동일 출력 ✅
+- **GOGS 저장**: 커밋 1ad5189 완료 🎉
+
+**의미**: FreeLang이 자신을 컴파일할 수 있음을 증명 (Bootstrap 성공!)
+
+---
 
 | 프로젝트 | 메모 (3줄 이내) | 파일 |
 |---------|----------------|------|
@@ -22,7 +37,7 @@
 | **kim-project-cli ✅ v1.0** | 288개 GOGS + 27개 로컬 프로젝트 (315개 총) 통합 관리. JSON 기반 저장소 (Termux 호환), Claude 메모 API (40012), CLI 도구 완성. 최신: dda5096 | [kim-project-cli.md](./kim-project-cli.md) |
 | **c-compiler-from-scratch 🟡** | 19,158줄 C 컴파일러 + VM. Phase 6 프리프로세서 완료, ELF 바이너리 생성, SAI 최적화. Lexer→Parser→Codegen→ELF 파이프라인 완성 | [c-compiler-from-scratch.md](./c-compiler-from-scratch.md) |
 | **freelang-to-c 🟢 Phase 1-5 ✅** | FreeLang → C 트랜스파일러 완성! Phase 1-4: 기본 기능 (타입/구조체/에러/모듈, 500줄). Phase 5: Advanced (Result<T,E>/Generics/Match, 35줄). 총 2,500줄, 19 테스트 모두 성공. 다음: Phase 6 Self-Hosting (혁명 증명) | [freelang-to-c-phase5.md](./freelang-to-c-phase5.md) |
-| **freelang-to-c 🟢 Phase 6-7 ✅** | Self-Hosting 완전 증명! Phase 6: minicc.c(947줄, C). Phase 7: minicc.fl(471줄, FreeLang) - minicc.c가 minicc.fl 컴파일 성공! 결정론적 테스트 통과. 커밋: dea198f | [freelang-to-c-phase6.md](./freelang-to-c-phase6.md) |
+| **freelang-to-c 🚀 Phase 6-7 ✅** | **혁명 완성!** Self-Hosting 완전 증명. Phase 6: minicc.c(947줄, C). Phase 7: minicc.fl(471줄, FreeLang). minicc.c가 minicc.fl을 컴파일 → 결정론적 출력 증명! 3회 반복 테스트 100% 동일. 커밋: 1ad5189. GOGS 저장 완료 🎉 | [freelang-to-c-phase7.md](./freelang-to-c-phase7.md) |
 | **C Compiler Learning Phase 1-2 📚** | 하향식 학습: Lexer(토큰) → Parser(AST) → Codegen(x86-64) 분석. 토큰 유니온 설계, 범프 할당, 3주소 코드, 명령어 인코딩, ELF 재배치 학습 | [c-compiler-learning-phase1.md](./c-compiler-learning-phase1.md) + [c-compiler-learning-phase2.md](./c-compiler-learning-phase2.md) |
 | **Marketing Team ✅ Phase 1+3** | 5에이전트(CMO/ContentWriter/Social/Community/Analytics) 초기화 완료. Cron 스케줄링, 메모 시스템, .gitignore 개선. GOGS 커밋 180c5aa7 | [COMPLETION_SUMMARY.md](./COMPLETION_SUMMARY.md) |
 | **FV-Lang 초기화 ✅** | 함수형 프로그래밍 언어 프로젝트 시작. 1,902줄 컴파일러 구현 (렉서/파서/타입/코드생성). 32 토큰, CLI 완성. GOGS 배포 완료 | [FV_LANG_INITIALIZATION.md](./FV_LANG_INITIALIZATION.md) |
