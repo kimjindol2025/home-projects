@@ -49,3 +49,11 @@ cp /path/to/website/*.md .
 claude
 claude
 exit
+claude
+ssh -p 22253 kimjin@123.212.111.26
+ssh -p 10053 kimjin@123.212.111.26
+claude
+claude
+claude
+claude
+exit

@@ -31,6 +31,7 @@
 - **Notion Task**: 장기 협업 작업 (블로그 → 소셜 배포)
 - **SendMessage**: 긴급 알림, 일일 리포트
 - **CSV 파일**: 활동 로그 (`/ai-marketing-team/team-log.csv`)
+- **Claude 메모 판**: 팀 활동 기록 및 공유 (claude-code memo system)
 
 ### 3. 메모리 관리
 - 각 에이전트는 `.claude/agent-memory/`의 마크다운 파일 유지
@@ -41,6 +42,9 @@
 - **필수**: 모든 에이전트는 활동을 `team-log.csv`에 기록
 - 형식: `[시간],[에이전트],[활동],[결과],[KPI]`
 - Analytics가 매일 22:00에 수집 & 분석
+- **메모 판**: 중요 마일스톤은 Claude 메모 판에 기록
+- 메모 형식: `[AGENT] [PROJECT] [STATUS] - [BRIEF_DESC] | [DATE]`
+- 예시: `[CMO] FreeLang Marketing Q1 - 5-agent team initialized, GOGS deployment ready | 2026-03-18`
 
 ---
 
@@ -146,7 +150,77 @@
 | **저장소** | GOGS | 코드/문서 버전관리 |
 | **자동화** | cron + bash | 스케줄 실행 |
 | **메모리** | 마크다운 파일 | 에이전트 영속 지식 |
-| **로깅** | CSV | 팀 활동 추적 |
+| **로깅** | CSV | 팀 활동 추적 (내부) |
+| **메모 판** | Claude Code Memo | 팀 마일스톤 기록 (세션 간 공유) |
+
+---
+
+## Claude 메모 판 활용 (3가지 목적)
+
+각 에이전트와 협업자는 Claude Code 메모 판에 3가지 형태로 기록합니다.
+
+### 1️⃣ 작업 기록 (Work Log)
+**목적**: 뭘 했는지 명확하게 남기기
+**형식**: `[WORK] [DATE] [PROJECT] - [WHAT_DONE]`
+
+```
+[WORK] 2026-03-18 FreeLang Marketing - CMO strategic plan finalized, 5 agents onboarded, GOGS setup completed
+[WORK] 2026-03-20 Content Writer - Blog article "Memory Management" (1,200 words) published, 3 code examples tested
+[WORK] 2026-03-19 Analytics - Team-log.csv setup, automated daily reports configured, KPI dashboard active
+```
+
+### 2️⃣ 조언 공유 (Tips & Advice)
+**목적**: 다른 클로드(에이전트)가 배울 수 있도록 조언 남기기
+**형식**: `[TIP] [TOPIC] - [ADVICE_FOR_FUTURE_AGENTS]`
+
+```
+[TIP] Content Writing - Always verify code examples by running them in 2+ environments before publishing. Prevents 40% of runtime errors.
+
+[TIP] Community Engagement - Read entire thread before commenting (3x more effective than quick replies). Show genuine understanding first.
+
+[TIP] GOGS Deployment - Use atomic commits with clear messages. Future teams will thank you when debugging the repo history.
+
+[TIP] CSV Logging - Log immediately after action, not at end of day. Prevents data loss and improves analytics accuracy by 95%.
+```
+
+### 3️⃣ 자랑 기록 (Achievements)
+**목적**: 주요 성과를 명확하게 기록하기
+**형식**: `[ACHIEVEMENT] [DATE] [WHAT] - [METRICS/RESULTS]`
+
+```
+[ACHIEVEMENT] 2026-03-18 Team Launch - 5-agent marketing ops fully operational. 0 bugs in initial deployment.
+
+[ACHIEVEMENT] 2026-03-20 Content Quality - "Memory Management" article: 1,200 words, 3 verified examples, estimated 1,500 views.
+
+[ACHIEVEMENT] 2026-03-19 Automation - Analytics pipeline: 100% automated daily reports, 0 manual errors, 22:00 daily triggers.
+
+[ACHIEVEMENT] 2026-03-21 Community - GeekNews thread: 5 thoughtful comments, 3 upvotes (40% engagement rate, above target).
+```
+
+### 메모 판 접근 방법
+- Claude Code 내 `/memo` 커맨드 사용
+- 제목: `[WORK|TIP|ACHIEVEMENT] [AgentName] - [Title]`
+- 내용: 간결하게, 다른 에이전트가 이해할 수 있도록
+- 빈도: 주요 작업 완료 후 즉시 또는 주 1회 정리
+
+### 활용 시나리오
+```
+상황 1: CMO가 콘텐츠 전략을 수립했다
+→ [ACHIEVEMENT] CMO - Q1 Marketing Strategy finalized with 12-week content calendar
+→ 다른 에이전트가 이를 읽고 자신의 작업에 맞춤
+
+상황 2: Content Writer가 블로그 작성 중 실수를 했다
+→ [TIP] Content Writing - Always test code in fresh environment. IDE cache can hide real bugs.
+→ 다음 Content Writer가 같은 실수를 하지 않음
+
+상황 3: Social Media Manager가 높은 참여율을 달성했다
+→ [ACHIEVEMENT] Social Media - Tweet "FreeLang Performance" achieved 12% engagement (2x target)
+→ 팀 전체가 성공 사례를 배움
+```
+
+---
+
+**핵심**: 메모 판은 에이전트들 간의 **지식 공유 & 성과 축적 플랫폼**입니다.
 
 ---
 

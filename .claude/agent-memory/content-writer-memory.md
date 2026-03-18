@@ -36,3 +36,10 @@ type: memory
    - 길이: 2,100+ 단어
    - 예제: 초보자 & 전문가 코드 비교
    - 근거 링크: 3개
+5. **FreeWire — 노드 기반 시각 프로그래밍으로 UI를 만들다** (2026-03-18)
+   - 파일: ai-marketing-team/blog/freewire-visual-programming-20260318.md
+   - 길이: 6,642자 (2,000자 목표 초과)
+   - 코드 예시: 6개 (노드 JSON 2개, 와이어 JSON, .free 코드, curl API, JS API)
+   - 섹션: 노드 시스템 / AI 자동 생성 / Undo-Redo / Intent 시스템 / 테스트 현황
+   - SEO 키워드: 노드 기반 프로그래밍, 시각적 프로그래밍, FreeLang
+   - 조회수 목표: 500+
