@@ -63,3 +63,5 @@ claude
 claud
 claude
 exit
+exit
+exit
