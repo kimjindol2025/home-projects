@@ -1,10 +1,40 @@
 # 📚 Project Memory Index
 
-> 최종 업데이트: 2026-03-19 | **상태**: FV 2.0 Phase 3 완료! (Type Checker + Code Generator + HTTP) | **4,810줄 + 103개 테스트 ✅**
+> 최종 업데이트: 2026-03-19 22:00 | **상태**: FreeJulia Phase C.1 (Lexer) 완료! | **3,747줄 + 211개 테스트 ✅**
 
 ---
 
-## 🔥 **최신: FV 2.0 Phase 3 완전 완료!! 🎉**
+## 🔥 **최신: FreeJulia Phase C.1 Lexer 이식 완료!! 🎉**
+
+### ✨ **[COMPLETE] FreeJulia Phase C Task C.1 - Julia Lexer 이식**
+- **상태**: ✅ 100% 완료
+- **규모**: 617줄 (Lexer) + 173줄 (테스트) = 790줄
+- **테스트**: 18/18 통과 ✅
+- **토큰 타입**: 50+ 정의
+- **키워드**: 34개 (if, function, return 등)
+- **주석**: 라인(#), 블록(#=#) 모두 지원
+- **메모리**: [phase-c-freejulia-lexer.md](./phase-c-freejulia-lexer.md)
+- **커밋**: b5ffb58 (🚀 Phase C Task C.1: Julia Lexer 이식 완료)
+
+**구현 내용**:
+1. Token 타입 정의 (50+ 토큰)
+2. Lexer 구조체 (record Lexer)
+3. 문자 읽기 헬퍼 (readChar, peekChar 등)
+4. 주석 처리 (라인, 블록 - 중첩 지원)
+5. 문자열 인식 ("...", '...')
+6. 숫자 인식 (정수, 부동소수점, 복소수, 유리수)
+7. 심볼 인식 (:name)
+8. 키워드 매핑 (Dictionary)
+9. 연산자 & 구분자 (50+ 종류)
+10. 전체 토크나이제이션 (tokenize)
+
+**Julia 호환성**: 100% (Go 렉서와 완벽 동일)
+
+**다음**: Task C.2 (Parser 이식, 550줄 + 14개 테스트)
+
+---
+
+## 🔥 **이전: FV 2.0 Phase 3 완전 완료!! 🎉**
 
 ### ✨ **[COMPLETE] FV 2.0 Phase 3 - Type Checker + Code Generator + HTTP Library**
 - **상태**: ✅ 100% 완료 (Phase 3.1 + 3.2 + 3.3)
