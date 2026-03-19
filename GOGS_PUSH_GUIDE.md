@@ -1,141 +1,327 @@
-# 🚀 Freelang Sovereign Network → GOGS 푸시 가이드
+# GOGS 푸시 가이드 📚
 
-## Step 1: GOGS 웹 UI에서 저장소 생성
-
-### URL
-```
-https://gogs.dclub.kr
-```
-
-### 단계
-1. **로그인**: kim 계정
-2. **우측 상단 "+"** 클릭
-3. **"New Repository"** 선택
-4. **정보 입력**:
-   ```
-   Repository name:    freelang-sovereign-network
-   Description:        1인 개발자의 3년 자주 인프라 계획
-                       - Year 1: 기초 (DNS, P2P)
-                       - Year 2: 앱 (메일, 스토리지, PKI)
-                       - Year 3: 최적화 (성능, 보안, 합의)
-
-   Private:            ☐ (체크 해제 - 공개)
-   Initialize:         ☐ (체크 해제)
-   ```
-
-5. **"Create Repository"** 클릭
+**작성일**: 2026-03-19
+**대상**: fv2-lang-go 프로젝트
+**상태**: ✅ 준비 완료
 
 ---
 
-## Step 2: 로컬 저장소 Push
+## 🔑 인증 정보
 
-저장소가 생성되면 다음 명령어를 실행하세요:
+```
+기관: GOGS (Git On Git Service)
+서버: gogs.dclub.kr
+계정: kim
+토큰: 929b266ef2e69d9dcdc4f1b6cbf3141a068258b3
+저장위치: ~/.netrc
+```
 
+---
+
+## 🚀 빠른 시작 (3단계)
+
+### Step 1: 변경사항 스테이징
 ```bash
-cd ~/freelang-sovereign-network
+cd ~/projects/fv2-lang-go
+git add -A
+```
 
-# 상태 확인
+### Step 2: 커밋
+```bash
+git commit -m "✨ 기능 설명"
+```
+
+### Step 3: GOGS에 푸시
+```bash
+git push gogs master
+```
+
+**끝!** ✅
+
+---
+
+## 📋 상세 워크플로우
+
+### 1️⃣ 작업 디렉토리 이동
+```bash
+cd ~/projects/fv2-lang-go
+```
+
+### 2️⃣ 상태 확인
+```bash
+git status
+```
+
+**출력 예시**:
+```
+On branch master
+Changes not staged for commit:
+  modified:   internal/typechecker/checker.go
+
+Untracked files:
+  internal/typechecker/types.go
+```
+
+### 3️⃣ 변경사항 스테이징
+
+**옵션 A: 모든 파일 추가**
+```bash
+git add -A
+```
+
+**옵션 B: 특정 파일만 추가**
+```bash
+git add internal/typechecker/checker.go
+git add internal/typechecker/types.go
+```
+
+**옵션 C: 대화형 추가**
+```bash
+git add -i
+```
+
+### 4️⃣ 커밋
+
+**기본 형식**:
+```bash
+git commit -m "메시지"
+```
+
+**좋은 커밋 메시지 예시**:
+```bash
+git commit -m "✨ Type Checker 구현 완료"
+git commit -m "🐛 파서 오류 수정"
+git commit -m "📚 README 업데이트"
+```
+
+**상세 메시지**:
+```bash
+git commit -m "✨ Phase 3.1: Type Checker 구현
+
+- 16개 테스트 통과
+- 20+ 타입 검사 규칙
+- CLI 통합 완료"
+```
+
+### 5️⃣ GOGS로 푸시
+
+**전용 저장소**:
+```bash
+git push gogs master
+```
+
+**메인 저장소**:
+```bash
+git push origin master
+```
+
+**양쪽 모두**:
+```bash
+git push gogs master && git push origin master
+```
+
+---
+
+## 🌳 저장소 설정
+
+### 현재 Remote 확인
+```bash
 git remote -v
-
-# GOGS에 푸시
-git push -u origin master
-
-# 결과 확인
-git log -1
 ```
+
+### Remote 설명
+
+| 이름 | 용도 | URL |
+|------|------|-----|
+| **gogs** | 👍 추천 (전용) | https://gogs.dclub.kr/kim/fv2-lang-go.git |
+| **origin** | 메인 저장소 | https://gogs.dclub.kr/kim/projects.git |
 
 ---
 
-## Step 3: GOGS에서 확인
+## 📖 실제 사용 예시
 
-### URL
-```
-https://gogs.dclub.kr/kim/freelang-sovereign-network
-```
-
-### 확인 사항
-- ✅ 3개 커밋 표시
-- ✅ 4개 메인 파일 (README.md, 3YEAR_ROADMAP.md, VISUALIZATION.md, PROJECT_INITIALIZED.md)
-- ✅ 3개 마일스톤 파일 (year1-3/MILESTONES.md)
-- ✅ 디렉토리 구조 표시
-
----
-
-## 예상 출력
+### 예시 1: Phase 3.1 완료 후 푸시
 
 ```bash
-$ git push -u origin master
+cd ~/projects/fv2-lang-go
+git status
+git add -A
+git commit -m "✨ Phase 3.1: Type Checker 구현 완료
 
-Counting objects: 9, done.
-Delta compression using up to 8 threads.
-Compressing objects: 100% (8/8), done.
-Writing objects: 100% (9/9), 25.5 KiB | 0 bytes/s, done.
-Total 9 (delta 0), reused 0 (delta 0)
-To https://gogs.dclub.kr/kim/freelang-sovereign-network.git
- * [new branch]      master -> master
-Branch master set up to track remote branch master from origin.
+- types.go: 280줄 (타입 시스템)
+- checker.go: 430줄 (검사 엔진)
+- 16개 테스트 100% 통과
+- CLI 통합"
 
-✅ 완료!
+git push gogs master
+git log --oneline -1
 ```
 
----
+### 예시 2: 버그 수정 후 푸시
 
-## 🎉 최종 확인
-
-push 완료 후, 다음을 확인하세요:
-
-1. **GOGS 웹 UI**
-   ```
-   https://gogs.dclub.kr/kim/freelang-sovereign-network
-   ```
-   - 커밋 3개 표시
-   - README.md 프리뷰 표시
-   - Star/Fork 버튼 활성화
-
-2. **로컬 git**
-   ```bash
-   cd ~/freelang-sovereign-network
-   git log --oneline --all
-   git show-ref
-   ```
-
-3. **원격 확인**
-   ```bash
-   git remote -v
-   ```
-
----
-
-## 📊 이제부터
-
-### Week 1: 구현 시작
-- `src/year1/freelang_v2_3/crypto.fl` 작성 시작
-- 테스트 케이스 정의
-
-### Month 1: Phase 1.1 진행 중
 ```bash
-cd ~/freelang-sovereign-network
-git add src/year1/freelang_v2_3/crypto.fl
-git commit -m "feat(year1-phase1.1): crypto 모듈 구현"
-git push
+cd ~/projects/fv2-lang-go
+git add internal/typechecker/checker.go
+git commit -m "🐛 Type Checker: MatchExpression 타입 추론 수정"
+git push gogs master
 ```
 
-### 월별 리포트
+---
+
+## 🔍 푸시 전 확인
+
+### 커밋 로그 보기
 ```bash
-# 월말에
-git log --oneline --since="2026-03-01" --until="2026-04-01"
-git push
+git log --oneline -5
+git log -1 --stat
+git show HEAD
+```
+
+### 푸시될 커밋 확인
+```bash
+git log origin/master..HEAD
 ```
 
 ---
 
-## 🔗 저장소 링크
+## 🚨 문제 해결
 
+### ❌ 푸시 실패: "fatal: Authentication failed"
+
+**해결**:
+```bash
+cat ~/.netrc                    # 파일 확인
+ls -la ~/.netrc                 # 권한 확인
+chmod 600 ~/.netrc              # 권한 수정
+git push gogs master            # 다시 시도
 ```
-GOGS: https://gogs.dclub.kr/kim/freelang-sovereign-network
-SSH:  git@gogs.dclub.kr:kim/freelang-sovereign-network.git
+
+### ❌ 커밋 실패: "no changes added"
+
+**해결**:
+```bash
+git status
+git add -A
+git commit -m "메시지"
+```
+
+### ❌ 푸시 실패: "updates were rejected"
+
+**해결**:
+```bash
+git pull gogs master            # 원격 먼저 가져오기
+# 충돌이 있으면 해결
+git push gogs master            # 다시 푸시
 ```
 
 ---
 
-**준비 완료! GOGS에서 저장소를 생성하고 push하세요! 🚀**
+## 📊 유용한 명령어
+
+### 상태 관련
+```bash
+git status              # 현재 상태
+git status -s           # 간단한 표시
+git diff                # 변경 내용 보기
+```
+
+### 스테이징 관련
+```bash
+git add .               # 현재 디렉토리 모든 파일
+git add -A              # 전체 변경사항
+git reset               # 스테이징 취소
+```
+
+### 커밋 관련
+```bash
+git commit -m "메시지"  # 커밋
+git log --oneline       # 커밋 로그
+git log -p              # 상세 로그
+```
+
+### 푸시 관련
+```bash
+git push gogs master                # 푸시
+git push origin master              # 메인 저장소 푸시
+git push gogs master && \
+git push origin master              # 양쪽 모두
+```
+
+---
+
+## 💾 체크리스트
+
+**푸시하기 전에**:
+- [ ] `cd ~/projects/fv2-lang-go` 이동
+- [ ] `git status` 확인
+- [ ] `git add -A` 스테이징
+- [ ] `git commit -m "메시지"` 커밋
+- [ ] `git log --oneline -1` 최종 확인
+
+**푸시 후**:
+- [ ] `git push gogs master` 실행
+- [ ] GOGS 웹 확인: https://gogs.dclub.kr/kim/fv2-lang-go
+
+---
+
+## 🎯 Best Practices
+
+### ✅ 좋은 습관
+
+```bash
+git commit -m "✨ 새 기능"       # 명확한 메시지
+git commit -m "🐛 버그 수정"     # 이모지 사용
+git push gogs master            # 자주 푸시 (매일 1-2회)
+git add -A && git commit -m "..." && \
+git push gogs master            # 파이프라인으로 연결
+```
+
+### ❌ 피해야 할 습관
+
+```bash
+git commit -m "수정"             # 애매한 메시지
+git commit -m "작업"             # 무의미한 메시지
+# 푸시하지 않고 여러 커밋 쌓기
+git push --force                # 경고 없이 강제 푸시
+```
+
+---
+
+## 🔗 유용한 링크
+
+| 항목 | URL |
+|------|-----|
+| **GOGS 서버** | https://gogs.dclub.kr |
+| **FV2 저장소** | https://gogs.dclub.kr/kim/fv2-lang-go |
+| **Projects** | https://gogs.dclub.kr/kim/projects |
+
+---
+
+## 📝 커밋 메시지 규칙
+
+```
+타입(범위): 제목
+
+본문
+
+---
+
+타입:
+  ✨ feat     - 새 기능
+  🐛 fix      - 버그 수정
+  📚 docs     - 문서
+  🎨 style    - 코드 스타일
+  🔧 refactor - 리팩토링
+  ⚡ perf     - 성능 개선
+  ✅ test     - 테스트
+  🚀 chore    - 기타
+
+예시:
+  ✨ feat(typechecker): Type Checker 구현
+  🐛 fix(parser): IfExpression 파싱 오류 수정
+  📚 docs: README 업데이트
+```
+
+---
+
+**핵심**: 현재 모든 인증이 완료되어 있으므로, `git push gogs master`만 실행하면 됩니다! 🚀
