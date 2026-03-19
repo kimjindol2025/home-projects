@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 
 	"fv2-lang/internal/lexer"
+	"fv2-lang/internal/parser"
+	"fv2-lang/internal/typechecker"
 )
 
 func main() {
@@ -20,19 +23,39 @@ func main() {
 
 	flag.Parse()
 
+	if os.Getenv("DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "os.Args: %v\n", os.Args)
+		fmt.Fprintf(os.Stderr, "flag.Args(): %v\n", flag.Args())
+	}
+
 	if *help {
 		flag.Usage()
 		os.Exit(0)
 	}
 
 	args := flag.Args()
-	if len(args) == 0 {
+
+	if os.Getenv("DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "args[0]: %q, os.Args[0]: %q, match: %v\n", args[0], os.Args[0], args[0] == os.Args[0])
+	}
+
+	// Skip first arg if it's the program itself (Termux quirk)
+	startIdx := 0
+	if len(args) > 0 && (args[0] == os.Args[0] || strings.HasSuffix(args[0], "/bin/fv2")) {
+		startIdx = 1
+	}
+
+	if len(args)-startIdx <= 0 {
 		fmt.Fprintf(os.Stderr, "Error: No input file specified\n")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	filename := args[0]
+	filename := args[startIdx]
+
+	if os.Getenv("DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "Opening file: %q (%d bytes in arg)\n", filename, len(filename))
+	}
 
 	// Read source file
 	source, err := ioutil.ReadFile(filename)
@@ -43,6 +66,16 @@ func main() {
 
 	// Compile
 	sourceStr := string(source)
+
+	// Debug: Check for null bytes
+	if os.Getenv("DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "File size: %d bytes\n", len(source))
+		for i, b := range source {
+			if b == 0 {
+				fmt.Fprintf(os.Stderr, "Warning: NULL byte at position %d\n", i)
+			}
+		}
+	}
 	if err := compile(sourceStr, *tokenize); err != nil {
 		fmt.Fprintf(os.Stderr, "Compilation error: %v\n", err)
 		os.Exit(1)
@@ -69,13 +102,30 @@ func compile(source string, tokensOnly bool) error {
 		return nil
 	}
 
-	// Step 2: Parser (TODO)
-	// Step 3: Type Checker (TODO)
-	// Step 4: Code Generator (TODO)
+	// Step 2: Parser
+	p := parser.New(tokens)
+	program, err := p.Parse()
+	if err != nil {
+		return fmt.Errorf("parsing failed: %w", err)
+	}
+
+	// Step 3: Type Checker
+	checker := typechecker.New()
+	typeErrors, _ := checker.Check(program)
+	hasTypeErrors := len(typeErrors) > 0
 
 	fmt.Printf("// FV 2.0 Compiler\n")
 	fmt.Printf("// Tokenized %d tokens\n", len(tokens))
-	fmt.Printf("// Parser: NOT YET IMPLEMENTED\n")
+	fmt.Printf("// Parsed: %d definitions, %d statements in main\n", len(program.Definitions), len(program.MainBody))
+
+	if hasTypeErrors {
+		fmt.Printf("// Type checking: %d error(s)\n", len(typeErrors))
+		for _, e := range typeErrors {
+			fmt.Printf("// %s\n", e.String())
+		}
+		return fmt.Errorf("type checking failed")
+	}
+	fmt.Printf("// Type checking: OK\n")
 	fmt.Printf("// C code generation: NOT YET IMPLEMENTED\n")
 
 	return nil
