@@ -67,7 +67,39 @@ let y = map(add(_, 5), x)
 function f(x: Int) = x + 1
 ```
 
-**다음**: Phase A (Julia 문법 상세 분석 + FreeLang 타입 시스템 확장)
+### 🚀 **[IN PROGRESS] Phase A - Task A.1 & A.2 진행 중!**
+
+#### Task A.1: Julia 문법 상세 분석 ✅ (완료)
+- **호환성 평가**: 78% (1단계 기본 기능)
+- **분석 범위**: 기본 타입, 배열, 함수, 다중 디스패치, 연산자, 제어흐름, 구조체, 모듈
+- **매핑**: Julia 문법 → FreeLang 구현 방식
+- **산출물**: phase-a-julia-syntax-analysis.md (550줄)
+- **메모리**: [phase-a-julia-syntax-analysis.md](./phase-a-julia-syntax-analysis.md)
+
+**호환성 상세**:
+| 기능 | 호환성 | 난이도 |
+|------|--------|--------|
+| 기본 타입 | ✅ 100% | 🟢 낮음 |
+| 배열 & 인덱싱 | 🟡 80% | 🟡 중간 |
+| 함수 | ✅ 100% | 🟢 낮음 |
+| 다중 디스패치 | 🟡 70% | 🔴 높음 |
+| 제어 흐름 | ✅ 95% | 🟢 낮음 |
+| 구조체 & 타입 | 🟡 80% | 🟡 중간 |
+
+#### Task A.2: FreeLang 타입 시스템 확장 🟢 (진행 중)
+- **상태**: 50% 완료 (구조 & 기본 구현)
+- **파일**: `src/types_extended.fl` (400줄)
+- **내용**:
+  * Dynamic Type (Any)
+  * Union Types & Option, Result
+  * Type Parameters (Generics)
+  * Protocols (Interfaces)
+  * Implementations
+  * Type Constraints
+  * Test stubs (20 target)
+- **테스트**: 20개 작성 예정
+
+**다음**: Task A.3 (동적 디스패치 엔진 - 다중 디스패치 구현)
 
 ---
 
