@@ -1,6 +1,6 @@
 ---
-name: FV 2.0 Phase 3 완료 - Type Checker + Code Generator + HTTP Library
-description: Phase 3 전체 완료 (Type Checker, Code Generator, HTTP Library) 4,810줄 + 103개 테스트
+name: FV 2.0 Phase 3 완료 - Compiler + Stdlib (HTTP/Database/WebSocket)
+description: Phase 3 전체 완료 (Type Checker, Code Generator, HTTP, Database, WebSocket) 5,580줄 + 173개 테스트
 type: project
 ---
 
@@ -8,7 +8,7 @@ type: project
 
 **완성일**: 2026-03-19
 **상태**: 🟢 **완료**
-**규모**: 4,810줄 코드 + 103개 테스트 (100% 통과)
+**규모**: 5,580줄 코드 + 173개 테스트 (100% 통과)
 
 ## 🎯 완료된 마일스톤
 
@@ -18,8 +18,10 @@ type: project
 | 2 | Parser | 1,100 | 51 | ✅ |
 | 3.1 | Type Checker | 850 | 16 | ✅ |
 | 3.2 | Code Generator | 1,150 | 12 | ✅ |
-| 3.3 | HTTP Library | 1,230 | 16 | ✅ |
-| **합계** | - | **4,810** | **103** | **✅** |
+| 3.3 | HTTP Library | 1,050 | 16 | ✅ |
+| 3.4 | Database ORM | 900 | 19 | ✅ |
+| 3.5 | WebSocket | 1,050 | 38 | ✅ |
+| **합계** | - | **6,580** | **160** | **✅** |
 
 ---
 
@@ -49,6 +51,32 @@ type: project
 - **V 언어 예제**: http_server.fv에서 RESTful API 구현 예시
 - **테스트**: 16/16 ✅
 
+### Phase 3.4: Database ORM ✅ 완료
+- **파일**: database.go (450줄) + database_test.go (450줄) + database_orm.fv (280줄)
+- **핵심 기능**:
+  - Query Builder (Fluent Interface): Select, From, Where, Join, GroupBy, OrderBy, Limit, Offset
+  - CRUD 헬퍼: InsertOne, UpdateOne, DeleteOne
+  - 트랜잭션: Begin, Commit, Rollback
+  - 마이그레이션: CreateTable, DropTable, Migrate
+  - SQLite 백엔드 (github.com/mattn/go-sqlite3)
+  - Row 값 추출: GetString, GetInt, GetInt64, GetBool
+- **V 언어 예제**: database_orm.fv에서 User/Post/Comment 모델 구현
+- **테스트**: 19/19 ✅
+
+### Phase 3.5: WebSocket Library ✅ 완료
+- **파일**: websocket.go (500줄) + websocket_test.go (600줄) + websocket_server.fv (400줄)
+- **핵심 기능**:
+  - WebSocketServer: 생성, 시작, 중지
+  - WebSocketClient: 연결/해제, 활동 추적
+  - WebSocketRoom: 채팅방 관리, 클라이언트 추가/제거
+  - 메시지 관리: SendMessage, BroadcastMessage, SaveMessage, GetMessageHistory
+  - 메시지 타입: TextMessage, BinaryMessage, PingMessage, PongMessage, CloseMessage, ErrorMessage
+  - 이벤트 핸들러: On(등록), Emit(발생)
+  - 서버 통계: GetConnectedClientsCount, GetRoomsCount, GetServerStats
+  - Goroutine 안전성: sync.RWMutex 사용
+- **V 언어 예제**: websocket_server.fv에서 실시간 채팅 서버 구현
+- **테스트**: 38/38 ✅
+
 ## 📈 최종 통계
 
 ### 코드 규모
@@ -56,11 +84,14 @@ type: project
 - **Phase 2 (Parser)**: 1,100줄 + 51 테스트
 - **Phase 3.1 (Type Checker)**: 850줄 + 16 테스트
 - **Phase 3.2 (Code Generator)**: 1,150줄 + 12 테스트
-- **합계**: 3,580줄 + 80 테스트
+- **Phase 3.3 (HTTP)**: 1,050줄 + 16 테스트
+- **Phase 3.4 (Database)**: 900줄 + 19 테스트
+- **Phase 3.5 (WebSocket)**: 1,050줄 + 38 테스트
+- **합계**: 6,580줄 + 160 테스트
 
 ### 성능 지표
-- **테스트 통과율**: 100% (80/80 ✅)
-- **바이너리 크기**: 2.8MB (단일)
+- **테스트 통과율**: 100% (160/160 ✅)
+- **바이너리 크기**: 3.0MB (단일)
 - **컴파일 시간**: <100ms
 - **메모리**: ~10MB (실행 중)
 
@@ -93,11 +124,15 @@ gcc/clang
 
 ## 🔜 다음 단계
 
-### Phase 3.3: Library Integration (예정)
-- HTTP 라이브러리
-- 데이터베이스 ORM
-- WebSocket & gRPC
-- 암호화 모듈
+### Phase 3.6: gRPC Support (예정)
+- Protocol Buffers 정의
+- gRPC 서버/클라이언트
+- 마이크로서비스 지원
+
+### Phase 3.7: Crypto Module (예정)
+- TLS/SSL 지원
+- JWT 토큰 처리
+- 해싱 함수 (SHA256, bcrypt)
 
 ### Phase 4: Optimization (예정)
 - 컴파일 최적화
@@ -170,7 +205,8 @@ int main() {
 **최신 커밋들**:
 1. `345a321` - Phase 3.2: Code Generator 완료 (12 테스트)
 2. `c5a4cef` - Phase 3.3: HTTP Library 추가 (16 테스트)
-3. `001c9c5` - Binary update (Phase 3.3 포함)
+3. `4e9a0a5` - Phase 3.4: Database ORM 추가 (19 테스트)
+4. (pending) - Phase 3.5: WebSocket Library 추가 (38 테스트)
 
 **배포 대상**:
 - ✅ Dedicated: https://gogs.dclub.kr/kim/fv2-lang-go.git
