@@ -24,9 +24,54 @@
 
 ---
 
-## 🔥 **신규: FreeLang Julia Compiler 이식 계획 수립!! 🚀**
+## 🔥 **신규: FreeLang + Julia 통합 전략 수립!! 🚀**
 
-### ✨ **[PLANNING] FreeLang Julia Compiler - Phase 1 계획 완료**
+### ✨ **[STRATEGY] FreeLang + Julia 라이브러리 문법 통합 전략 완료**
+- **상태**: 🟢 10주 통합 전략 수립 완료
+- **비전**: FreeLang 2.0 = FreeLang (언어) + Julia Compiler (흡수) + Julia Stdlib (문법 통합)
+- **기간**: 10주 (2026-03-19 ~ 2026-05-31)
+- **범위**:
+  - **Phase A** (Week 1-2): 기초 & 타입 시스템 확장 (700줄)
+  - **Phase B** (Week 3-6): Julia 라이브러리 문법 통합 (1,750줄)
+    * Arrays (400줄) - 배열 & 인덱싱 & comprehension
+    * Collections (350줄) - Dict, Set, Tuple, Pair
+    * String (300줄) - 문자열 보간 & 정규식
+    * Math (400줄) - 50+ 수학 함수 & 선형대수
+    * IO/System (300줄) - 파일 I/O & 환경
+  - **Phase C** (Week 7-9): Julia 컴파일러 흡수 (1,300줄)
+    * Julia→C 변환 (500줄)
+    * Julia→FreeLang IR (400줄)
+    * 다중 디스패치 (400줄)
+  - **Phase D** (Week 10): 통합 테스트 & 최적화 (300줄)
+- **총 코드량**: 4,250줄 (FreeLang 확장) + 3,590줄 (Julia 컴파일러) = **7,840줄**
+- **테스트**: 290개 (unit + integration + performance)
+- **메모리**: [freelang-julia-integration-strategy.md](./freelang-julia-integration-strategy.md)
+
+**핵심 기능**:
+- ✅ Julia 기본 문법 100% 지원
+- ✅ Julia stdlib 70% 호환 (Arrays, Collections, String, Math, IO)
+- ✅ 다중 디스패치 (Multiple Dispatch) 완전 구현
+- ✅ 동적 타입 시스템
+- ✅ Julia→C 직접 컴파일
+
+**호환성 예시**:
+```julia
+// Julia
+x = [i^2 for i in 1:10]
+y = x .+ 5
+f(x::Int) = x + 1
+
+// FreeLang 2.0 (100% 호환)
+let x = [i^2 | i <- range(1, 10)]
+let y = map(add(_, 5), x)
+function f(x: Int) = x + 1
+```
+
+**다음**: Phase A (Julia 문법 상세 분석 + FreeLang 타입 시스템 확장)
+
+---
+
+### ✨ **[PLANNING] FreeLang Julia Compiler - 이식 계획**
 - **상태**: 🟢 계획 문서 완성 (이식 전략 수립)
 - **목표**: Julia 컴파일러(Go) → FreeLang 재구현
 - **기간**: 6주 (2026-03-19 ~ 2026-04-30)
