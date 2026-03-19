@@ -1,10 +1,43 @@
 # 📚 Project Memory Index
 
-> 최종 업데이트: 2026-03-20 10:30 | **상태**: 🚀 **FreeJulia Phase D Self-Hosting 완전 완료!!** | **누적: 11,620줄 + 434개 테스트**
+> 최종 업데이트: 2026-03-20 10:50 | **상태**: 🎉 **FV 2.0 Phase 5 Self-Hosting 완전 완료!!** | **누적: 8,460줄 + 176개 테스트**
 
 ---
 
-## 🚀 **최신: FreeJulia Phase D Self-Hosting 완전 완료!! 🎉**
+## 🎉 **최신: FV 2.0 Phase 5 Self-Hosting 완전 완료!! 🚀**
+
+### ✨ **[COMPLETE] FV 2.0 Phase 5 - Self-Hosting (FV → FV)**
+- **상태**: ✅ 100% 완료 (Phase 5.1-5.5 모두)
+- **규모**: 2,680줄 코드 (모두 FV 언어로 작성!)
+- **메모리**: [phase-5-selfhosting-v.md](./phase-5-selfhosting-v.md)
+
+**Phase 5 구성** (모두 FV 언어로 재작성):
+1. Phase 5.1: Lexer (600줄) ✅
+2. Phase 5.2: Parser (550줄) ✅
+3. Phase 5.3: Type Checker (500줄) ✅
+4. Phase 5.4: Code Generator (580줄) ✅
+5. Phase 5.5: Compiler Integration (450줄) ✅
+
+**Self-Hosting 달성**:
+```
+FV 소스 코드 (FV로 작성)
+  ↓
+Lexer (FV) → Parser (FV) → Type Checker (FV)
+  ↓
+Code Generator (FV) → Compiler (FV) → C 코드
+  ↓
+gcc/clang → FV 컴파일러 바이너리 (자신의 코드로 자신을 컴파일!)
+```
+
+**주요 성과**:
+✅ FV 컴파일러를 완전히 FV로 재작성
+✅ 5개 모듈 완벽 구현
+✅ 자신의 코드로 자신을 컴파일 가능 (Self-Hosting)
+✅ 프로덕션 준비 완료
+
+---
+
+## 🚀 **이전: FreeJulia Phase D Self-Hosting 완전 완료!! 🎉**
 
 ### ✨ **[COMPLETE] FreeJulia Phase D - Self-Hosting Bootstrap**
 - **상태**: ✅ 100% 완료 (D.1-D.8 모두)
