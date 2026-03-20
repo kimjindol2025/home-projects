@@ -13,7 +13,8 @@ type Generator struct {
 	code          strings.Builder
 	indent        int
 	VarCounter    int
-	functionStack []string // 현재 함수 스택
+	functionStack []string              // 현재 함수 스택
+	varTypes      map[string]string     // Variable name → FV type (i64, f64, string, etc.)
 }
 
 // New creates a new code generator
@@ -21,6 +22,7 @@ func New() *Generator {
 	return &Generator{
 		VarCounter:    0,
 		functionStack: []string{},
+		varTypes:      make(map[string]string),
 	}
 }
 
@@ -31,12 +33,58 @@ func (g *Generator) Generate(program *ast.Program) (string, error) {
 	g.writeLine("#include <stdlib.h>")
 	g.writeLine("#include <string.h>")
 	g.writeLine("#include <stdbool.h>")
+	g.writeLine("#include <ctype.h>")
+
+	// Process imports and write additional headers
+	for _, def := range program.Definitions {
+		// DEBUG: Check type
+		_ = fmt.Sprintf("%T", def)
+		if imp, ok := def.(*ast.ImportStatement); ok {
+			switch imp.Module {
+			case "math":
+				g.writeLine("#include <math.h>")
+			case "stdio":
+				// Already included
+			case "string":
+				// string functions in string.h already included
+			case "stdlib":
+				// stdlib.h already included
+			case "http":
+				// Custom HTTP library (if needed)
+			case "io":
+				// Custom I/O library
+			default:
+				// Unknown import - skip silently
+			}
+		}
+	}
 	g.writeLine("")
 
-	// Forward declarations for functions
+	// Helper functions for stdlib
+	g.writeLine("// FV stdlib helper functions")
+	g.writeLine("static char __fv_str_buf[256];")
+	g.writeLine("static char* fv_to_string_i64(long long val) {")
+	g.writeLine("  snprintf(__fv_str_buf, sizeof(__fv_str_buf), \"%lld\", val);")
+	g.writeLine("  return __fv_str_buf;")
+	g.writeLine("}")
+	g.writeLine("static char* fv_to_string_f64(double val) {")
+	g.writeLine("  snprintf(__fv_str_buf, sizeof(__fv_str_buf), \"%f\", val);")
+	g.writeLine("  return __fv_str_buf;")
+	g.writeLine("}")
+	g.writeLine("static char* fv_to_string_bool(bool val) {")
+	g.writeLine("  return val ? \"true\" : \"false\";")
+	g.writeLine("}")
+	g.writeLine("")
+
+	// Forward declarations for functions (except main) and extern functions
 	for _, def := range program.Definitions {
-		if fn, ok := def.(*ast.FunctionDef); ok {
-			g.writeFunctionDeclaration(fn)
+		switch d := def.(type) {
+		case *ast.FunctionDef:
+			if d.Name != "main" {
+				g.writeFunctionDeclaration(d)
+			}
+		case *ast.ExternDef:
+			g.writeExternDeclaration(d)
 		}
 	}
 	g.writeLine("")
@@ -53,19 +101,32 @@ func (g *Generator) Generate(program *ast.Program) (string, error) {
 	g.writeLine("")
 
 	// Function implementations
+	var mainFunc *ast.FunctionDef
 	for _, def := range program.Definitions {
 		if fn, ok := def.(*ast.FunctionDef); ok {
-			g.writeFunctionDefinition(fn)
-			g.writeLine("")
+			if fn.Name == "main" {
+				mainFunc = fn
+			} else {
+				g.writeFunctionDefinition(fn)
+				g.writeLine("")
+			}
 		}
 	}
 
-	// Main function
+	// Main function (either from definition or generated)
 	g.writeLine("int main() {")
 	g.indent++
 
-	for _, stmt := range program.MainBody {
-		g.generateStatement(stmt)
+	if mainFunc != nil {
+		// Use main function body from definition
+		for _, stmt := range mainFunc.Body {
+			g.generateStatement(stmt)
+		}
+	} else {
+		// Use main body statements
+		for _, stmt := range program.MainBody {
+			g.generateStatement(stmt)
+		}
 	}
 
 	g.writeLine("return 0;")
@@ -80,6 +141,13 @@ func (g *Generator) writeFunctionDeclaration(fn *ast.FunctionDef) {
 	params := g.generateParameterList(fn.Parameters)
 	returnType := g.generateType(fn.ReturnType)
 	g.writeLine(fmt.Sprintf("%s %s(%s);", returnType, fn.Name, params))
+}
+
+// writeExternDeclaration writes extern function declaration
+func (g *Generator) writeExternDeclaration(ext *ast.ExternDef) {
+	params := g.generateParameterList(ext.Parameters)
+	returnType := g.generateType(ext.ReturnType)
+	g.writeLine(fmt.Sprintf("extern %s %s(%s);", returnType, ext.Name, params))
 }
 
 // writeStructDefinition writes struct definition
@@ -199,10 +267,20 @@ func (g *Generator) generateStatement(stmt ast.Statement) {
 
 // generateLetStatement generates let binding
 func (g *Generator) generateLetStatement(let *ast.LetStatement) {
-	varType := "auto" // C11 auto-type inference
+	varType := ""
+	fvType := ""  // FV type name for tracking
+
 	if let.Type != nil {
 		varType = g.generateType(let.Type)
+		fvType = let.Type.Name
+	} else {
+		// Infer type from initial value
+		varType = g.inferTypeFromExpression(let.Init)
+		fvType = g.inferFVTypeFromExpression(let.Init)
 	}
+
+	// Store variable type for later reference (e.g., in println)
+	g.varTypes[let.Name] = fvType
 
 	initValue := g.generateExpression(let.Init)
 	g.writeLine(fmt.Sprintf("%s %s = %s;", varType, let.Name, initValue))
@@ -248,14 +326,23 @@ func (g *Generator) generateIfStatement(ifStmt *ast.IfStatement) {
 // generateForStatement generates for loop
 func (g *Generator) generateForStatement(forStmt *ast.ForStatement) {
 	// for i in iterator -> convert to C for loop
-	// Use a simple counter-based loop for arrays
-	iterator := g.generateExpression(forStmt.Iterator)
+	// Handle array literals with known size vs. variables
+	var loopCondition string
 
-	g.writeLine(fmt.Sprintf("// for %s in %s", forStmt.Variable, iterator))
-	g.writeLine(fmt.Sprintf("for (int _i = 0; _i < sizeof(%s)/sizeof(%s[0]); _i++) {", iterator, iterator))
+	if arrExpr, ok := forStmt.Iterator.(*ast.ArrayExpression); ok {
+		// Array literal with known size at compile time
+		loopCondition = fmt.Sprintf("_i < %d", len(arrExpr.Elements))
+	} else {
+		// Iterator is a variable - length must be provided at runtime
+		iterator := g.generateExpression(forStmt.Iterator)
+		loopCondition = fmt.Sprintf("_i < sizeof(%s)/sizeof(*%s)", iterator, iterator)
+		g.writeLine(fmt.Sprintf("// for %s in %s (array length calculation)", forStmt.Variable, iterator))
+	}
+
+	g.writeLine(fmt.Sprintf("for (int _i = 0; %s; _i++) {", loopCondition))
 	g.indent++
 
-	// Declare loop variable
+	// Declare loop variable as array index
 	g.writeLine(fmt.Sprintf("int %s = _i;", forStmt.Variable))
 
 	// Loop body
@@ -303,13 +390,40 @@ func (g *Generator) generateExpressionStatement(expr *ast.ExpressionStatement) {
 // generateMatchStatement generates match statement (as if-else chain)
 func (g *Generator) generateMatchStatement(match *ast.MatchStatement) {
 	// Convert match to if-else chain
-	_ = g.generateExpression(match.Expression)
+	expr := g.generateExpression(match.Expression)
 
 	for i, arm := range match.Arms {
-		// Generate pattern matching condition
-		// Pattern is an interface, so we always use default condition
-		condition := "1" // default: always true (simplified implementation)
+		// Generate pattern matching condition based on pattern type
+		var condition string
 
+		if arm.Pattern == nil {
+			// No pattern, always true
+			condition = "1"
+		} else {
+			// Type assert pattern to get correct type
+			switch p := arm.Pattern.(type) {
+			case *ast.LiteralPattern:
+				// Literal pattern: compare with expression
+				if p.Value != nil {
+					patternValue := g.generateExpression(p.Value)
+					condition = fmt.Sprintf("%s == %s", expr, patternValue)
+				} else {
+					condition = "1"
+				}
+			case *ast.IdentifierPattern:
+				// Identifier pattern: variable binding
+				// For now, treat as wildcard (would bind in full impl)
+				condition = "1"
+			case *ast.WildcardPattern:
+				// Wildcard: always matches (default case)
+				condition = "1"
+			default:
+				// Unknown pattern, treat as wildcard
+				condition = "1"
+			}
+		}
+
+		// Generate if/else if branch
 		if i == 0 {
 			g.writeLine(fmt.Sprintf("if (%s) {", condition))
 		} else {
@@ -408,7 +522,123 @@ func (g *Generator) generateCallExpression(call *ast.CallExpression) string {
 		args = append(args, g.generateExpression(arg))
 	}
 
+	// Handle builtin functions
+	if fnIdent, ok := call.Function.(*ast.Identifier); ok {
+		switch fnIdent.Name {
+		case "println":
+			if len(args) == 0 {
+				return `printf("\n")`
+			}
+			return g.generatePrintln(call.Arguments[0])
+		case "print":
+			if len(args) == 0 {
+				return `printf("")`
+			}
+			return g.generatePrint(call.Arguments[0])
+		case "len":
+			if len(args) == 1 {
+				return fmt.Sprintf(`(sizeof(%s)/sizeof(*%s))`, args[0], args[0])
+			}
+		case "abs":
+			if len(args) == 1 {
+				return fmt.Sprintf(`llabs(%s)`, args[0])
+			}
+		case "min":
+			if len(args) == 2 {
+				return fmt.Sprintf(`((%s) < (%s) ? (%s) : (%s))`, args[0], args[1], args[0], args[1])
+			}
+		case "max":
+			if len(args) == 2 {
+				return fmt.Sprintf(`((%s) > (%s) ? (%s) : (%s))`, args[0], args[1], args[0], args[1])
+			}
+		case "to_string":
+			// Converts value to string using helper functions
+			if len(args) == 1 {
+				argType := g.inferFVTypeOfExpression(call.Arguments[0])
+				switch argType {
+				case "i64":
+					return fmt.Sprintf(`fv_to_string_i64(%s)`, args[0])
+				case "f64":
+					return fmt.Sprintf(`fv_to_string_f64(%s)`, args[0])
+				case "bool":
+					return fmt.Sprintf(`fv_to_string_bool(%s)`, args[0])
+				case "string":
+					return args[0]  // Already a string
+				default:
+					return args[0]
+				}
+			}
+		case "to_int":
+			if len(args) == 1 {
+				return fmt.Sprintf(`((long long)%s)`, args[0])
+			}
+		case "to_float":
+			if len(args) == 1 {
+				return fmt.Sprintf(`((double)%s)`, args[0])
+			}
+		}
+	}
+
 	return fmt.Sprintf("%s(%s)", fn, strings.Join(args, ", "))
+}
+
+// generatePrintln generates a type-aware println call
+func (g *Generator) generatePrintln(arg ast.Expression) string {
+	argStr := g.generateExpression(arg)
+	fvType := g.inferFVTypeOfExpression(arg)
+
+	// Format based on FV type
+	switch fvType {
+	case "i64":
+		return fmt.Sprintf(`printf("%%lld\n", %s)`, argStr)
+	case "f64":
+		return fmt.Sprintf(`printf("%%f\n", %s)`, argStr)
+	case "string":
+		return fmt.Sprintf(`printf("%%s\n", %s)`, argStr)
+	case "bool":
+		return fmt.Sprintf(`printf("%%s\n", %s ? "true" : "false")`, argStr)
+	case "none":
+		return `printf("none\n")`
+	default:
+		// Default to i64
+		return fmt.Sprintf(`printf("%%lld\n", %s)`, argStr)
+	}
+}
+
+// generatePrint generates a type-aware print call
+func (g *Generator) generatePrint(arg ast.Expression) string {
+	argStr := g.generateExpression(arg)
+	fvType := g.inferFVTypeOfExpression(arg)
+
+	// Format based on FV type
+	switch fvType {
+	case "i64":
+		return fmt.Sprintf(`printf("%%lld", %s)`, argStr)
+	case "f64":
+		return fmt.Sprintf(`printf("%%f", %s)`, argStr)
+	case "string":
+		return fmt.Sprintf(`printf("%%s", %s)`, argStr)
+	case "bool":
+		return fmt.Sprintf(`printf("%%s", %s ? "true" : "false")`, argStr)
+	case "none":
+		return `printf("")`
+	default:
+		// Default to i64
+		return fmt.Sprintf(`printf("%%lld", %s)`, argStr)
+	}
+}
+
+// inferFVTypeOfExpression infers FV type of an expression, checking variable tracking
+func (g *Generator) inferFVTypeOfExpression(expr ast.Expression) string {
+	// First check if it's an identifier whose type we've tracked
+	if ident, ok := expr.(*ast.Identifier); ok {
+		if fvType, exists := g.varTypes[ident.Name]; exists {
+			return fvType
+		}
+	}
+
+	// Otherwise, infer from the expression itself
+	return g.inferFVTypeFromExpression(expr)
 }
 
 // generateArrayExpression generates array literal
@@ -469,6 +699,56 @@ func (g *Generator) endsWithReturn(stmts []ast.Statement) bool {
 
 	_, ok := stmts[len(stmts)-1].(*ast.ReturnStatement)
 	return ok
+}
+
+// inferTypeFromExpression infers C type from AST expression
+func (g *Generator) inferTypeFromExpression(expr ast.Expression) string {
+	switch e := expr.(type) {
+	case *ast.IntegerLiteral:
+		return "long long"
+	case *ast.FloatLiteral:
+		return "double"
+	case *ast.StringLiteral:
+		return "char*"
+	case *ast.BoolLiteral:
+		return "bool"
+	case *ast.NoneLiteral:
+		return "void*"
+	case *ast.ArrayExpression:
+		if len(e.Elements) > 0 {
+			elemType := g.inferTypeFromExpression(e.Elements[0])
+			return fmt.Sprintf("%s*", elemType)
+		}
+		return "void*"
+	default:
+		// Default to long long for unknown types
+		return "long long"
+	}
+}
+
+// inferFVTypeFromExpression infers FV type from AST expression
+func (g *Generator) inferFVTypeFromExpression(expr ast.Expression) string {
+	switch e := expr.(type) {
+	case *ast.IntegerLiteral:
+		return "i64"
+	case *ast.FloatLiteral:
+		return "f64"
+	case *ast.StringLiteral:
+		return "string"
+	case *ast.BoolLiteral:
+		return "bool"
+	case *ast.NoneLiteral:
+		return "none"
+	case *ast.ArrayExpression:
+		if len(e.Elements) > 0 {
+			elemType := g.inferFVTypeFromExpression(e.Elements[0])
+			return fmt.Sprintf("[]%s", elemType)
+		}
+		return "[]unknown"
+	default:
+		// Default to i64 for unknown types
+		return "i64"
+	}
 }
 
 // escapeString escapes special characters in strings

@@ -35,7 +35,30 @@ func (p *Parser) Parse() (*ast.Program, error) {
 			break
 		}
 
-		if p.check(lexer.TknFn) {
+		// Handle import statements
+		if p.check(lexer.TknImport) {
+			def, err := p.parseImportStatement()
+			if err != nil {
+				p.errors = append(p.errors, err.Error())
+				p.synchronize()
+				continue
+			}
+			if def != nil {
+				definitions = append(definitions, def)
+			}
+		} else if p.check(lexer.TknExtern) {
+			// Handle extern function declaration
+			def, err := p.parseExternDef()
+			if err != nil {
+				p.errors = append(p.errors, err.Error())
+				p.synchronize()
+				continue
+			}
+			if def != nil {
+				definitions = append(definitions, def)
+			}
+		} else if p.check(lexer.TknFn) {
+			// Handle regular function definition
 			def, err := p.parseFunctionDef()
 			if err != nil {
 				p.errors = append(p.errors, err.Error())
@@ -1046,4 +1069,88 @@ func (p *Parser) synchronize() {
 
 		p.advance()
 	}
+}
+
+// parseImportStatement parses an import statement
+func (p *Parser) parseImportStatement() (*ast.ImportStatement, error) {
+	if !p.match(lexer.TknImport) {
+		return nil, nil
+	}
+
+	if !p.match(lexer.TknString) {
+		return nil, fmt.Errorf("expected string module name at %d:%d", p.current().Line, p.current().Column)
+	}
+
+	module := p.previous().Text
+	// Lexer already removes quotes, so use Text directly
+	return &ast.ImportStatement{
+		Module: module,
+	}, nil
+}
+
+// parseExternDef parses an extern function declaration
+func (p *Parser) parseExternDef() (*ast.ExternDef, error) {
+	if !p.match(lexer.TknExtern) {
+		return nil, nil
+	}
+
+	// Expect 'fn' keyword
+	if !p.match(lexer.TknFn) {
+		return nil, fmt.Errorf("expected 'fn' after 'extern' at %d:%d", p.current().Line, p.current().Column)
+	}
+
+	name := p.current().Text
+	if !p.match(lexer.TknIdentifier) {
+		return nil, fmt.Errorf("expected function name at %d:%d", p.current().Line, p.current().Column)
+	}
+
+	if !p.match(lexer.TknLParen) {
+		return nil, fmt.Errorf("expected '(' at %d:%d", p.current().Line, p.current().Column)
+	}
+
+	params := []ast.Parameter{}
+	if !p.check(lexer.TknRParen) {
+		for {
+			paramName := p.current().Text
+			if !p.match(lexer.TknIdentifier) {
+				return nil, fmt.Errorf("expected parameter name at %d:%d", p.current().Line, p.current().Column)
+			}
+
+			if !p.match(lexer.TknColon) {
+				return nil, fmt.Errorf("expected ':' at %d:%d", p.current().Line, p.current().Column)
+			}
+
+			typ := p.parseType()
+
+			params = append(params, ast.Parameter{
+				Name: paramName,
+				Type: typ,
+			})
+
+			if !p.check(lexer.TknComma) {
+				break
+			}
+			p.advance()
+		}
+	}
+
+	if !p.match(lexer.TknRParen) {
+		return nil, fmt.Errorf("expected ')' at %d:%d", p.current().Line, p.current().Column)
+	}
+
+	returnType := p.parseType()
+
+	return &ast.ExternDef{
+		Name:       name,
+		Parameters: params,
+		ReturnType: returnType,
+	}, nil
+}
+
+// peekAhead returns the token at offset positions ahead
+func (p *Parser) peekAhead(offset int) *lexer.Token {
+	if p.pos+offset >= len(p.tokens) {
+		return nil
+	}
+	return &p.tokens[p.pos+offset]
 }

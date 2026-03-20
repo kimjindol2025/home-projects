@@ -23,6 +23,51 @@ func New() *Checker {
 	globalScope.Define("bool", &PrimitiveType{Name: "bool"}, "type")
 	globalScope.Define("none", &PrimitiveType{Name: "none"}, "type")
 
+	// Add built-in functions
+	// Note: println/print are variadic and accept any type
+	// For simplicity, we register them as accepting "any" and let codegen handle conversion
+	globalScope.Define("println", &BuiltinFunctionType{
+		Name: "println",
+		IsVariadic: true,
+	}, "function")
+	globalScope.Define("print", &BuiltinFunctionType{
+		Name: "print",
+		IsVariadic: true,
+	}, "function")
+	globalScope.Define("len", &BuiltinFunctionType{
+		Name: "len",
+		IsVariadic: false,
+	}, "function")
+
+	// Math stdlib functions
+	globalScope.Define("abs", &BuiltinFunctionType{
+		Name: "abs",
+		IsVariadic: false,
+	}, "function")
+	globalScope.Define("min", &BuiltinFunctionType{
+		Name: "min",
+		IsVariadic: false,
+	}, "function")
+	globalScope.Define("max", &BuiltinFunctionType{
+		Name: "max",
+		IsVariadic: false,
+	}, "function")
+
+	// Conversion functions - note: return types are simplified
+	// Real implementation would need overloaded types
+	globalScope.Define("to_string", &FunctionType{
+		ParamTypes: []Type{&PrimitiveType{Name: "i64"}},
+		ReturnType: &PrimitiveType{Name: "string"},
+	}, "function")
+	globalScope.Define("to_int", &BuiltinFunctionType{
+		Name: "to_int",
+		IsVariadic: false,
+	}, "function")
+	globalScope.Define("to_float", &BuiltinFunctionType{
+		Name: "to_float",
+		IsVariadic: false,
+	}, "function")
+
 	return &Checker{
 		GlobalScope: globalScope,
 		CurrentScope: globalScope,
@@ -53,6 +98,8 @@ func (c *Checker) checkDefinition(def ast.Definition) {
 	switch d := def.(type) {
 	case *ast.FunctionDef:
 		c.checkFunctionDef(d)
+	case *ast.ExternDef:
+		c.checkExternDef(d)
 	case *ast.StructDef:
 		c.checkStructDef(d)
 	case *ast.TypeDef:
@@ -99,6 +146,26 @@ func (c *Checker) checkFunctionDef(fn *ast.FunctionDef) {
 	prevScope.Define(fn.Name, fnType, "function")
 
 	c.CurrentScope = prevScope
+}
+
+func (c *Checker) checkExternDef(ext *ast.ExternDef) {
+	// Register extern function in scope
+	paramTypes := []Type{}
+	for _, param := range ext.Parameters {
+		paramType := c.astTypeToCheckerType(param.Type)
+		paramTypes = append(paramTypes, paramType)
+	}
+
+	var returnType Type = &PrimitiveType{Name: "none"}
+	if ext.ReturnType != nil {
+		returnType = c.astTypeToCheckerType(ext.ReturnType)
+	}
+
+	fnType := &FunctionType{
+		ParamTypes: paramTypes,
+		ReturnType: returnType,
+	}
+	c.CurrentScope.Define(ext.Name, fnType, "extern_function")
 }
 
 func (c *Checker) checkStructDef(str *ast.StructDef) {
@@ -425,6 +492,19 @@ func (c *Checker) checkCallExpression(call *ast.CallExpression) Type {
 		}
 
 		return ft.ReturnType
+	}
+
+	// Handle built-in functions
+	if bt, ok := fnType.(*BuiltinFunctionType); ok {
+		// Built-in functions like println, print accept any arguments
+		if bt.IsVariadic {
+			// Just check that arguments are valid expressions
+			for _, arg := range call.Arguments {
+				c.checkExpression(arg)
+			}
+			return &PrimitiveType{Name: "none"}
+		}
+		return &PrimitiveType{Name: "none"}
 	}
 
 	c.addError(0, 0, "cannot call non-function")
