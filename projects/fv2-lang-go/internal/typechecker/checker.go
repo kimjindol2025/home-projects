@@ -53,19 +53,14 @@ func New() *Checker {
 		IsVariadic: false,
 	}, "function")
 
-	// Conversion functions - note: return types are simplified
-	// Real implementation would need overloaded types
-	globalScope.Define("to_string", &FunctionType{
-		ParamTypes: []Type{&PrimitiveType{Name: "i64"}},
-		ReturnType: &PrimitiveType{Name: "string"},
-	}, "function")
+	// Conversion functions (cast operations)
 	globalScope.Define("to_int", &BuiltinFunctionType{
 		Name: "to_int",
-		IsVariadic: false,
+		IsVariadic: true,
 	}, "function")
 	globalScope.Define("to_float", &BuiltinFunctionType{
 		Name: "to_float",
-		IsVariadic: false,
+		IsVariadic: true,
 	}, "function")
 
 	return &Checker{
