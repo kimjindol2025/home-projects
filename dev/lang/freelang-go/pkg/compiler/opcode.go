@@ -46,6 +46,7 @@ const (
 	OpAnd
 	OpOr
 	OpNot
+	OpNegate
 
 	// Bitwise operators
 	OpBitAnd
@@ -110,6 +111,7 @@ var opCodeNames = map[OpCode]string{
 	OpAnd:                "AND",
 	OpOr:                 "OR",
 	OpNot:                "NOT",
+	OpNegate:             "NEGATE",
 	OpBitAnd:             "BIT_AND",
 	OpBitOr:              "BIT_OR",
 	OpBitXor:             "BIT_XOR",
@@ -219,7 +221,7 @@ func getOperandCount(opcode OpCode) int {
 
 	case OpTrue, OpFalse, OpNull, OpAdd, OpSubtract, OpMultiply, OpDivide,
 		OpModulo, OpPower, OpEqual, OpNotEqual, OpLessThan, OpLessThanOrEqual,
-		OpGreaterThan, OpGreaterThanOrEqual, OpAnd, OpOr, OpNot, OpBitAnd,
+		OpGreaterThan, OpGreaterThanOrEqual, OpAnd, OpOr, OpNot, OpNegate, OpBitAnd,
 		OpBitOr, OpBitXor, OpBitNot, OpLeftShift, OpRightShift, OpBreak,
 		OpContinue, OpReturn, OpReturnValue, OpPop, OpDup, OpLen, OpPrint,
 		OpType, OpEnterScope, OpExitScope:

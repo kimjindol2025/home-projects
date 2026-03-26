@@ -229,7 +229,13 @@ func (c *Compiler) compileArrayLiteral(expr *ast.ArrayLiteral) {
 func (c *Compiler) compileHashLiteral(expr *ast.HashLiteral) {
 	// Compile each key-value pair
 	for k, v := range expr.Pairs {
-		c.compileExpression(k)
+		// If key is a bare identifier, treat it as a string constant (object property key)
+		if ident, ok := k.(*ast.Identifier); ok {
+			idx := c.addConstant(ident.Value)
+			c.emitInstruction(OpConstant, idx)
+		} else {
+			c.compileExpression(k)
+		}
 		c.compileExpression(v)
 	}
 
@@ -245,7 +251,7 @@ func (c *Compiler) compilePrefixExpression(expr *ast.PrefixExpression) {
 	case "!":
 		c.emitInstruction(OpNot)
 	case "-":
-		c.emitInstruction(OpSubtract) // Negate
+		c.emitInstruction(OpNegate)
 	case "+":
 		// No-op
 	case "~":
