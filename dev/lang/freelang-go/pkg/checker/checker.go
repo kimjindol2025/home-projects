@@ -25,6 +25,11 @@ func (c *Checker) Errors() []string {
 	return c.errors
 }
 
+// GlobalScope returns the global symbol table
+func (c *Checker) GlobalScope() *SymbolTable {
+	return c.symtab
+}
+
 // Check performs type checking on the entire program
 func (c *Checker) Check(program *ast.Program) {
 	for _, stmt := range program.Statements {
