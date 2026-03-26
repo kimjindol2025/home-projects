@@ -1,7 +1,7 @@
 # 🚀 FreeLang Go 포팅 현황
 
-**마지막 업데이트**: 2026-03-26 12:00 UTC+9
-**상태**: ✅ Phase 1-2 완료 (파서 100%)
+**마지막 업데이트**: 2026-03-26 13:00 UTC+9
+**상태**: ✅ Phase 1-3 완료 (Type Checker 100%)
 
 ---
 
@@ -16,9 +16,14 @@ pkg/
 │   └── lexer_test.go         (7 테스트 PASS ✅)
 ├── ast/
 │   └── ast.go                (15개 노드)
-└── parser/
+├── parser/
     ├── parser.go             (완전 구현)
     └── parser_test.go        (21 테스트 PASS ✅)
+└── checker/
+    ├── types.go              (타입 시스템)
+    ├── symbol.go             (심볼 테이블)
+    ├── checker.go            (타입 체커)
+    └── checker_test.go       (17 테스트 PASS ✅)
 
 cmd/
 └── freelang-run/
@@ -33,19 +38,14 @@ STATUS.md                     (이 파일)
 
 | 항목 | 값 |
 |------|-----|
-| Go 코드 | ~2,400줄 |
-| 테스트 커버리지 | 100% (Lexer + Parser) |
-| Pass Rate | 100% ✅ (28/28 테스트) |
-| 완성도 | 40% (전체 대비) |
+| Go 코드 | ~3,700줄 |
+| 테스트 커버리지 | 100% (Lexer + Parser + Checker) |
+| Pass Rate | 100% ✅ (45/45 테스트) |
+| 완성도 | 60% (전체 대비) |
 
 ## 🎯 다음 작업
 
-1. **Type Checker** (3-4일) - Phase 3
-   - Symbol Table 구현
-   - 타입 추론 (Type Inference)
-   - 스코프 관리 (Scope Management)
-
-2. **Compiler** (3-4일) - Phase 4
+1. **Compiler** (3-4일) - Phase 4
    - Bytecode ISA
    - Code Generation
 
@@ -125,7 +125,7 @@ parseExpression(precedence)
 - [x] Parser 기초 (50% 완성)
 - [x] 프로젝트 구조 완성
 
-**다음 목표**: Phase 3 - Type Checker 구현 (2-3주 내 전체 완료 가능)
+**다음 목표**: Phase 4 - Compiler 구현 (1-2주 내 전체 완료 가능)
 
 ---
 
