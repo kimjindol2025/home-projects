@@ -339,11 +339,29 @@ func (c *Checker) checkInfixExpression(expr *ast.InfixExpression) Type {
 	rightType := c.checkExpression(expr.Right)
 
 	switch expr.Operator {
-	case "+", "-", "*", "/", "%":
+	case "+":
+		// + works on same types (numbers with numbers, strings with strings)
+		if isNumber(leftType) && isNumber(rightType) {
+			return leftType
+		}
+		if TypesEqual(leftType, TypeString) && TypesEqual(rightType, TypeString) {
+			return leftType
+		}
+		c.addError("+ operator requires same types (numbers or strings), got %s and %s",
+			leftType.String(), rightType.String())
+		return leftType
+	case "-", "*", "/", "%":
 		// Arithmetic operators require numbers
 		if !isNumber(leftType) || !isNumber(rightType) {
 			c.addError("%s operator requires numbers, got %s and %s",
 				expr.Operator, leftType.String(), rightType.String())
+		}
+		return leftType
+	case "**":
+		// Power operator requires numbers
+		if !isNumber(leftType) || !isNumber(rightType) {
+			c.addError("** operator requires numbers, got %s and %s",
+				leftType.String(), rightType.String())
 		}
 		return leftType
 	case "==", "!=":
@@ -363,6 +381,20 @@ func (c *Checker) checkInfixExpression(expr *ast.InfixExpression) Type {
 				expr.Operator, leftType.String(), rightType.String())
 		}
 		return TypeBool
+	case "&", "|", "^":
+		// Bitwise operators require integers
+		if !TypesEqual(leftType, TypeInt) || !TypesEqual(rightType, TypeInt) {
+			c.addError("%s operator requires integers, got %s and %s",
+				expr.Operator, leftType.String(), rightType.String())
+		}
+		return TypeInt
+	case "<<", ">>":
+		// Shift operators require integers
+		if !TypesEqual(leftType, TypeInt) || !TypesEqual(rightType, TypeInt) {
+			c.addError("%s operator requires integers, got %s and %s",
+				expr.Operator, leftType.String(), rightType.String())
+		}
+		return TypeInt
 	default:
 		c.addError("unknown infix operator: %s", expr.Operator)
 		return TypeAny

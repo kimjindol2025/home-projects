@@ -295,6 +295,16 @@ func (c *Compiler) compileInfixExpression(expr *ast.InfixExpression) {
 		c.emitInstruction(OpAnd)
 	case "||":
 		c.emitInstruction(OpOr)
+	case "&":
+		c.emitInstruction(OpBitAnd)
+	case "|":
+		c.emitInstruction(OpBitOr)
+	case "^":
+		c.emitInstruction(OpBitXor)
+	case "<<":
+		c.emitInstruction(OpLeftShift)
+	case ">>":
+		c.emitInstruction(OpRightShift)
 	default:
 		c.addError("unknown infix operator: %s", expr.Operator)
 	}
