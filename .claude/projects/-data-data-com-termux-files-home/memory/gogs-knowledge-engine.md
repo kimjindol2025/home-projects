@@ -1,0 +1,330 @@
+# Gogs Knowledge Engine 프로젝트 메모리
+
+## 📊 프로젝트 개요
+
+**프로젝트명**: Gogs Knowledge Engine (버전 인식형 지식 엔진)
+**저장소**: https://gogs.dclub.kr/kim/gogs-knowledge-engine.git
+**상태**: ✅ **v1.1-3.0 완성** (2026-02-27)
+**전체 파일**: 44개 | **총 코드 라인**: 10,684줄
+
+---
+
+## 🎯 핵심 철학
+
+> **"기록이 증명이다"** (Your record is your proof)
+
+- **메타데이터 기반**: 모든 문서에 버전(version), 단계(phase), 저장소(repo), 파일 경로 정보 보존
+- **결정론적 처리**: 학습(Learning) 없음 → 규칙 기반 분석만 수행
+- **완전한 추적**: 검색에서 분석까지 모든 단계에서 원본 데이터 연계 가능
+- **시간축 중심**: 1.1-2.0은 검색 중심, 3.0은 진화 분석(시간축) 중심
+
+---
+
+## 📈 버전별 진화
+
+### **1.1 - 최소 기능 RAG** (Minimal Retrieval-Augmented Generation)
+- **커밋**: 0ec780d
+- **파일**: 6개
+- **코드**: 1,100줄+
+- **핵심 모듈**:
+  - `gogs-api.js`: Gogs API 연동 (파일 검색, 메타데이터)
+  - `search.js`: 키워드 검색 및 순위 지정
+  - `llm.js`: Claude API 통합
+  - `validator.js`: 응답 검증 (기록 기반)
+  - `server.js`: Express REST 서버
+  - `tests/test-gogs.js`, `test-search.js`: 테스트
+
+### **1.2 - 청크 기반 검색** (Chunk-Based Search)
+- **특징**: 메타데이터 보존 청크 분할
+- **파일**: 5개
+- **코드**: 1,200줄+
+- **핵심 모듈**:
+  - `chunk.js`: 헤더 기반 분할, 메타데이터 추가
+  - `scorer.js`: BM25 준비 스코링
+  - `metrics.js`: 8가지 검증 메트릭
+  - `tests/test-chunk.js`, `test-metrics.js`: 테스트
+
+### **1.3 - 메타데이터 필터링** (Metadata-Aware Filtering)
+- **특징**: 버전/단계/저장소 기반 필터링
+- **파일**: 5개
+- **코드**: 1,300줄+
+- **핵심 모듈**:
+  - `filter.js`: 다중 필터 (repo, version, phase, file path)
+  - `search-enhanced.js`: 필터+검색 통합
+  - `prompt-builder.js`: 버전/단계 인식 프롬프트
+  - `tests/test-filter.js`: 12개 테스트
+
+### **1.4 - BM25 통계 랭킹** (Statistical Ranking)
+- **특징**: TF-IDF, 문서 길이 정규화
+- **파일**: 6개
+- **코드**: 1,400줄+
+- **핵심 모듈**:
+  - `tokenizer.js`: 한글/영문 토크나이저, stopword 제거
+  - `index-builder.js`: 역인덱스(inverted index) 구축
+  - `bm25-scorer.js`: BM25 알고리즘 (k=1.5, b=0.75)
+  - `search-bm25.js`: 전체 파이프라인
+  - `tests/test-bm25.js`: 12개 테스트
+
+### **2.0 - 의미 기반 하이브리드 검색** (Vector Semantic + BM25 Hybrid)
+- **특징**: 메타데이터 필터 → BM25 → 벡터 재순위
+- **파일**: 6개
+- **코드**: 1,450줄+
+- **핵심 모듈**:
+  - `embedding.js`: Claude Embeddings API (캐싱)
+  - `vector-store.js`: 벡터 저장소 (메타데이터 포함)
+  - `similarity.js`: 코사인 유사도, 유클리드 거리
+  - `search-hybrid.js`: 하이브리드 파이프라인
+  - `tests/test-embedding.js`: 10개 테스트
+
+### **4.0 - 설계 의도 추출 & 아키텍처 변화 지도** ✨ LATEST (Design Intent Extraction)
+- **커밋**: 2f21b2c (2026-02-27)
+- **파일**: 9개
+- **코드**: 2,635줄 신규
+- **핵심 변화**: 진화 분석 → **설계 의도 추출**
+- **5개 핵심 모듈**:
+  - `design-intent-analyzer.js` (308줄): 규칙 기반 1차 분류
+  - `intent-extractor.js` (258줄): LLM 기반 의도 추출
+  - `architecture-graph.js` (386줄): 설계 진화 그래프 구축
+  - `dependency-mapper.js` (354줄): 의존성 자동 추출
+  - `evolution-metrics.js` (318줄): 진화 지표 계산
+- **설정 파일**:
+  - `tests/test-design-intent.js` (412줄): 12개 통합 테스트
+  - `package.json`: npm 스크립트
+  - `.env.example`: 설정 템플릿
+  - `README.md` (524줄): 완전한 문서
+
+### **3.0 - 시간축 진화 추론 엔진** (Temporal Evolution Reasoning)
+- **커밋**: a187885 (2026-02-27)
+- **파일**: 9개
+- **코드**: 2,597줄
+- **핵심**: 검색 중심 → 진화 분석 중심 전환
+- **5개 핵심 모듈**:
+  - `git-dag.js` (328줄): Git DAG 추출, 커밋 그래프, 버전 진화
+  - `commit-parser.js` (295줄): Commit 메시지 파싱, 타입 감지, 버전/단계 추출
+  - `diff-analyzer.js` (274줄): 변화 추적, 패턴 감지, 파일 분류
+  - `evolution-tracker.js` (296줄): 기능 생애 주기, 의존성 분석
+  - `report-generator.js` (330줄): 리포트 생성, 마크다운 변환
+- **설정 파일**:
+  - `tests/test-evolution.js` (414줄): 12개 통합 테스트
+  - `package.json`: npm 스크립트
+  - `.env.example`: 설정 템플릿
+  - `README.md` (594줄): 완전한 문서
+
+---
+
+## 🔧 핵심 아키텍처
+
+### 데이터 흐름 (1.1-2.0)
+```
+Gogs API
+   ↓
+문서 검색 (keyword)
+   ↓
+청크 분할 + 메타데이터
+   ↓
+메타데이터 필터 (version/phase/repo)
+   ↓
+BM25 스코링
+   ↓
+벡터 임베딩 + 유사도
+   ↓
+최종 순위 → Claude API
+   ↓
+응답 검증 (메트릭)
+```
+
+### 데이터 흐름 (3.0)
+```
+Git DAG (커밋 그래프)
+   ↓
+Commit 파싱 (메시지 분석, 타입 감지)
+   ↓
+Diff 분석 (변화 추적, 패턴)
+   ↓
+기능 생애 주기 (introduced → modified → deprecated)
+   ↓
+버전 비교 (v1.0 → v2.0)
+   ↓
+리포트 생성 (설계 의도, 의존성, 속도)
+   ↓
+마크다운 변환
+```
+
+---
+
+## 📝 주요 데이터 구조
+
+### Chunk (1.1-2.0)
+```javascript
+{
+  id: 'unique-id',
+  content: 'chunk text',
+  metadata: {
+    repo: 'repo-name',
+    version: '1.0.0',
+    phase: 2,
+    filePath: 'src/auth.js',
+    lineRange: [10, 50],
+    timestamp: '2026-02-27'
+  }
+}
+```
+
+### Commit (3.0)
+```javascript
+{
+  hash: 'abc1234567',
+  parents: ['def2345678'],
+  timestamp: Date,
+  message: 'feat(auth): implement auth',
+  author: 'alice',
+  email: 'alice@example.com',
+  files: []
+}
+```
+
+### Lifecycle (3.0)
+```javascript
+{
+  name: 'auth',
+  introduced: commit,        // 도입
+  lastModified: commit,      // 마지막 수정
+  stages: [                  // 진화 단계
+    { timestamp, type, commit }
+  ],
+  events: [                  // 주요 이벤트
+    { type, commit, description }
+  ]
+}
+```
+
+---
+
+## 🧪 테스트 전략
+
+### 1.1-2.0 테스트
+- **test-gogs.js**: Gogs API (5개)
+- **test-search.js**: 키워드 검색 (10개)
+- **test-chunk.js**: 청크 분할 (8개)
+- **test-metrics.js**: 메트릭 계산 (8개)
+- **test-filter.js**: 메타데이터 필터 (12개)
+- **test-bm25.js**: BM25 스코링 (12개)
+- **test-embedding.js**: 벡터 임베딩 (10개)
+
+### 3.0 테스트 (12개)
+1. testBuildDAG - DAG 구축
+2. testParseCommitMessage - Commit 메시지 파싱
+3. testCategorizeCommits - Commit 분류
+4. testParseDiffLines - Diff 파싱
+5. testDetectChangePatterns - 변화 패턴
+6. testTraceFeatureLifecycle - 기능 생애 주기
+7. testCalculateEvolutionVelocity - 진화 속도
+8. testAnalyzeVersionEvolution - 버전 비교
+9. testGenerateVersionReport - 리포트 생성
+10. testGenerateDesignIntentReport - 설계 의도
+11. testAnalyzeDependencies - 의존성 분석
+12. testTrackFeaturesByVersion - 버전별 기능
+
+**모두 ✅ 통과**
+
+---
+
+## 🚀 배포 상태
+
+### Gogs 저장소
+- **URL**: https://gogs.dclub.kr/kim/gogs-knowledge-engine.git
+- **1차 커밋**: 0ec780d (1.1-2.0, 35파일, 8,087줄)
+- **2차 커밋**: a187885 (3.0 추가, 9파일, 2,597줄)
+- **3차 커밋**: 2f21b2c (4.0 추가, 9파일, 2,635줄) ✨ NEW
+- **총**: 52파일, 13,269줄
+
+### 로컬 디렉토리
+- `/data/data/com.termux/files/home/gogs-chatbot/` (작업 디렉토리)
+  - `3.0-evolution-reasoning/` (최신)
+
+---
+
+## 💡 설계 의사결정
+
+### 1. 메타데이터 우선
+- **이유**: 완전한 추적과 검증 가능
+- **구현**: 모든 청크, 커밋, 리포트에 원본 정보 유지
+
+### 2. 단계별 진화
+- **1.1-2.0**: 검색 정확도 개선 (키워드 → 통계 → 의미)
+- **3.0**: 패러다임 전환 (검색 → 진화 분석)
+
+### 3. 결정론적 처리
+- **학습 없음**: 규칙 기반만 사용
+- **외부 API 허용**: Claude Embeddings만 사용 (캐싱 가능)
+
+### 4. 테스트 중심
+- **각 버전별**: 10-12개 포괄적 테스트
+- **통합 테스트**: 전체 파이프라인 검증
+
+---
+
+## 📌 사용자 지시사항
+
+### 명시적 지시
+- ✅ "순서대로가자 지시대로만" (엄격한 순서 준수)
+- ✅ "앞으로 그 형식은 제외한다" (다음 단계 미리보기 제외)
+- ✅ "기록 완료" (메모리 저장)
+- ✅ 모든 구현은 정확한 명세를 따를 것
+
+### 구현 패턴
+각 버전마다:
+1. 명세 제공 → 2. 핵심 모듈 구현 → 3. 테스트 파일 → 4. 설정 파일 → 5. README → 6. Gogs 푸시
+
+---
+
+## ✨ 3.0 완성 성과
+
+### 구현 완료 ✅
+- 5개 핵심 모듈 (1,523줄)
+- 12개 테스트 케이스 (414줄)
+- 완전한 문서 (README 594줄 + .env.example 41줄)
+- 통합 설정 (package.json)
+
+### 기술 혁신 ✨
+- Git DAG 기반 시간축 분석
+- Commit 메시지 의도 파싱
+- 변화 패턴 자동 감지
+- 기능 생애 주기 추적
+- 설계 의도 자동 추출
+
+### 검증 ✅
+- 12개 테스트 100% 통과
+- Gogs 저장소에 푸시 완료
+- 메모리에 기록 완료
+
+---
+
+## 🎯 다음 단계 (향후 계획)
+
+### 5.0 계획 (미정)
+- 다중 저장소 통합 분석
+- 교차 저장소 설계 영향 분석
+- 예측적 문제 감지
+- 설계 트렌드 예측
+
+### 현재 상태
+- ✅ v1.1-4.0 완성 (13,269줄)
+- ✅ 메모리 기록
+- 🔄 5.0 및 생태계 분석 계획 중
+
+### 기술 진화 경로
+```
+1.1-2.0: 검색 중심 (keyword → semantic)
+   ↓
+3.0: 진화 분석 중심 (시간축)
+   ↓
+4.0: 설계 의도 추출 (왜 바뀌었는가)
+   ↓
+5.0+: 다중 저장소 생태계 분석
+```
+
+---
+
+**마지막 업데이트**: 2026-02-27 (3.0 완성)
+**프로젝트 철학**: 기록이 증명이다 (Your record is your proof)
