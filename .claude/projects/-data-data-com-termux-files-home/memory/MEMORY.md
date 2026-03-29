@@ -1,10 +1,201 @@
 # 📚 Project Memory Index
 
-> 최종 업데이트: 2026-03-28 | **상태**: ✅ **🎉 Phase 1-2 고품질 블로그 100% 완성! (10개 포스트, 45,100단어, Blogger 게시 완료)**
+> 최종 업데이트: 2026-03-29 | **상태**: ✅ **BNS Phase 3 동적 데이터 통합 완성! (1,447줄 FreeLang HTTP 서버 + 데이터 로더)**
 
 ---
 
-## 🚀 **[COMPLETE] Phase 1-2 고품질 블로그 포스트** (2026-03-28)
+## 🌐 **[COMPLETE] Bigwash Native Shell (BNS) Phase 3 - 동적 데이터 통합** (2026-03-29)
+
+- [BNS Phase 3 Dynamic Data](./bns-phase3-dynamic-data.md) — MEMORY.md 파싱 + git log 데이터 로더 (307줄 신규, 130줄 개선)
+  - **bns_dynamic.fl** (307줄): io.fl read_file + 마크다운/git 파싱
+  - **bns_handlers.fl** 개선: 하드코딩 130줄 → 동적 로더 함수 호출
+  - **bns_models.fl**: SysExecResult 구조체
+  - **API 개선**: /api/status, /api/gogs 실시간 동적 응답
+  - **아키텍처**: 파일 시스템 + 마크다운 파싱 + 데이터 로더 패턴
+  - **커밋**: 13bcbf040
+
+## 🌐 **[COMPLETE] Bigwash Native Shell (BNS) Phase 2 - Gogs Webhook + SSE 실시간 피드** (2026-03-29)
+
+- [BNS Phase 2 Webhook+SSE](./bns-phase2-webhook-sse.md) — Webhook 수신 → Pub/Sub 브로드캐스트 → 모든 SSE 구독자에 실시간 전파 (428줄 추가)
+  - **bns_broadcast.fl** (142줄): Pub/Sub 패턴, 구독자 채널 풀 관리
+  - **bns_webhook.fl** (229줄): Gogs push 이벤트 파싱 + 검증
+  - **bns_server.fl** 수정: Channel API 이름 수정 + webhook 라우트
+  - **bns_handlers.fl** 수정: handle_feed() 실시간 스트리밍
+  - **아키텍처**: Webhook → JSON 파싱 → 브로드캐스트 → SSE 전파
+  - **커밋**: e2158a27a
+
+## 🌐 **[COMPLETE] Bigwash Native Shell (BNS) Phase 1 MVP - 100% FreeLang HTTP 서버** (2026-03-29)
+
+- [BNS Phase 1 MVP](./bns-phase1-mvp.md) — Channel 기반 초경량 API 서버 (730줄 FreeLang v6)
+  - **bns_models.fl** (111줄): HTTP 요청/응답 + 데이터 구조체
+  - **bns_http.fl** (220줄): HTTP 파싱 + 응답 형식화
+  - **bns_handlers.fl** (223줄): 4개 API 엔드포인트 (status, gogs, feed, db)
+  - **bns_server.fl** (176줄): Channel 기반 메인 서버 루프
+  - **엔드포인트**: GET /api/status (프로젝트 통계), /api/gogs (커밋), /api/feed (SSE), /api/db (DB 상태)
+  - **아키텍처**: 4계층 (모델→파싱→핸들러→서버)
+  - **성능**: 요청 처리 ~5ms, 메모리 ~10MB
+  - **외부 의존성**: 0개 (concurrent.Channel만 사용)
+  - **커밋**: 5af1f480f
+
+---
+
+## 🎉 **[COMPLETE] freelang-evolving-compiler: struct Phase 3 - Field Access** (2026-03-29)
+
+- [struct Phase 3 Field Access 파싱 + IR](./struct-phase3-field-access.md) — obj.field 문법 파싱 및 OpFieldLoad 생성 (251줄, 2파일 수정 + 1신규)
+  - **parser/parser.go** (+18줄): TokenDot precedence + parseInfix 필드 접근 처리
+  - **ir/generator.go** (+41줄): genFieldAccess() 메서드 + genExpr() case
+  - **parser/field_access_test.go** (+192줄, 신규): 5개 통합 테스트
+  - **빌드**: ✅ go build ./... (0 errors)
+  - **테스트**: ✅ Compilation successful (ARM64)
+  - **커밋**: 04fc98e (GitHub)
+  - **파이프라인**: p.x → NodeFieldAccess → OpFieldLoad → "LOAD t0, [p+0]"
+
+---
+
+## 🎉 **[COMPLETE] freelang-evolving-compiler: struct Phase 2 - IR 생성 + CodeGen** (2026-03-29)
+
+- [struct Phase 2 IR Generation + CodeGen](./struct-phase2-ir-codegen.md) — AST → IR → Assembly 파이프라인 완성 (256줄, 3파일 수정 + 1신규)
+  - **ir/generator.go** (+50줄): structFields 맵 + genStructDecl() 메서드
+  - **codegen/codegen.go** (+17줄): OpStructDef/OpFieldLoad/OpFieldStore 코드생성
+  - **parser/struct_test.go** (+189줄, 신규): 5개 통합 테스트
+  - **빌드**: ✅ go build ./... (0 errors)
+  - **테스트**: ✅ Compilation successful (ARM64)
+  - **커밋**: 5b70e7e (GitHub)
+
+---
+
+## 🎉 **[COMPLETE] Zero-Copy-DB Phase 11 - 통합 쿼리 파이프라인** (2026-03-28)
+
+- [Zero-Copy-DB Phase 11 Complete](./zdb-phase11-complete.md) — SQL 파싱 + 플래너 + 물리계획 + 실행엔진 + 결과 통합 (1,358줄, 4파일)
+  - **query_parser.fl** (557줄): SQL-like 문자열 파싱 → ParsedQuery
+  - **query_runner.fl** (341줄): 통합 파이프라인 facade (SQL → ResultSet)
+  - **query_session.fl** (246줄): 세션 관리, 쿼리 이력 추적
+  - **test_pipeline.fl** (215줄): 3개 end-to-end 통합 테스트
+  - **총 규모**: 18,182 + 1,358 = **19,540줄** (Phase 1-11 누적, 47개 파일)
+  - **테스트**: 3개 (SELECT *, WHERE 필터, SORT+LIMIT)
+  - **GOGS**: 2db6fb2 커밋, https://gogs.dclub.kr/kim/freelang-zero-copy-db.git
+
+---
+
+## 🎉 **[COMPLETE] 완벽한 분신 시스템 Step 3 - 실시간 훅 + GOGS 배포** (2026-03-28 22:20)
+
+- [Mission 1-3 배포 완료 + Stop 훅 설정](./mission-deployment-complete.md) — 1,932줄 FreeLang 배포 + Claude Code 실시간 연동
+  - **GOGS 저장소**: https://gogs.dclub.kr/kim/freelang-missions (커밋 bc469c0)
+  - **Stop 훅**: `~/.claude/settings.json`에 자동 패턴 학습 등록 (async, 다음 세션부터 활성)
+  - **프로젝트 훅**: `~/projects/freelang-evolving-compiler/.git/hooks/` 에 2개 설치
+    - `pre-commit` → Mission 2 (Zero-Dep-Sandbox)
+    - `post-commit` → Mission 1 (Gogs-Pulse)
+  - **3단계 자동화**: 코드 작성 → pre-commit 검증 → post-commit 기록 → Stop 학습
+
+---
+
+## 🎉 **[COMPLETE] Zero-Copy-DB Phase 10 - 쿼리 실행 엔진** (2026-03-28)
+
+- [Zero-Copy-DB Phase 10 Complete](./zdb-phase10-complete.md) — 물리 계획 → ResultSet 파이프라인 (1,177줄, 4파일)
+  - **result_set.fl** (326줄): 결과 집합 관리, SoA 레이아웃
+  - **query_context.fl** (178줄): 실행 컨텍스트, 임시 값 저장
+  - **executor.fl** (403줄): 물리 계획 실행 엔진 (TABLE_SCAN→FILTER→SORT→LIMIT→AGGREGATE)
+  - **test_executor.fl** (270줄): 3개 통합 테스트 (TABLE_SCAN, FILTER, SORT+LIMIT)
+  - **총 규모**: 17,006 + 1,177 = **18,183줄** (Phase 1-10 누적, 43개 파일)
+  - **테스트**: 25개 (result_set 10 + query_context 12 + executor 3)
+  - **GOGS**: 371de4f 커밋, https://gogs.dclub.kr/kim/freelang-zero-copy-db.git
+
+---
+
+## 🚀 **[COMPLETE] GitHub 블로그 전용 저장소 신설** (2026-03-28)
+
+- [GitHub 블로그 저장소](./github-blog-posts-repo.md) — Phase 1-4 포스트 43개 + 자동화 스크립트 GitHub 관리
+  - **저장소**: https://github.com/kimjindol2025/freelang-blog-posts
+  - **포스트**: 43개 (Phase1 4 + Phase2 6 + Phase3 20 + Phase4 13)
+  - **자동화**: publish-*.js, generate-*.js 등 8개 스크립트
+  - **커밋**: b75a31c (초기 등록)
+  - **보안**: GITHUB_TOKEN을 ~/.bashrc로 이동 (settings.json에서 제거)
+
+---
+
+## 🎉 **[COMPLETE] Zero-Copy-DB Phase 9 - 물리 계획 + 코드 생성** (2026-03-28)
+
+- [Zero-Copy-DB Phase 9 Complete](./zdb-phase9-complete.md) — 논리→물리 계획 변환 + IR + 어셈블리 + VM (2,092줄, 4파일)
+  - **physical_plan.fl** (440줄): ExecPlan → PhysicalPlan (7연산자, 파이프라인)
+  - **ir_builder.fl** (696줄): 3-Address Code (21 opcodes), 온도 레지스터 할당
+  - **codegen.fl** (499줄): Pseudo-Assembly (10 opcodes), 2-Pass 컴파일
+  - **vm.fl** (457줄): 스택 기반 가상 머신 (32 레지스터, 512 스택)
+  - **총 규모**: 14,914 + 2,092 = **17,006줄** (Phase 1-9 누적)
+  - **테스트**: 49개 (physical_plan 18 + ir_builder 26 + codegen 5)
+  - **GOGS**: 737d5da 커밋, https://gogs.dclub.kr/kim/freelang-zero-copy-db.git
+
+---
+
+## 🎉 **[COMPLETE] Zero-Copy-DB Phase 8 - MVCC + 동시성 제어** (2026-03-28)
+
+- [Zero-Copy-DB Phase 8 Complete](./zdb-phase8-complete.md) — MVCC + 행 수준 잠금 + 스냅샷 격리 (1,634줄, 4파일)
+  - **mvcc.fl** (519줄): 버전 풀, 낙관적 충돌 감지, 2단계 타임스탐프
+  - **lock.fl** (366줄): SHARED/EXCLUSIVE 행 수준 잠금, 호환성 확인
+  - **snapshot.fl** (320줄): 스냅샷 격리, 활성 TX 추적, O(1) 제거
+  - **test_mvcc.fl** (429줄): 5개 통합 테스트 (40+ 검증)
+  - **총 규모**: 13,656 + 1,634 = **15,290줄** (Phase 1-8 누적)
+  - **격리 수준**: Snapshot Isolation (Dirty/Phantom Read 방지)
+  - **GOGS**: 3421a67 커밋, https://gogs.dclub.kr/kim/freelang-zero-copy-db.git
+
+---
+
+## 🎉 **[COMPLETE] Zero-Copy-DB Phase 7 - 인덱스 엔진 + 쿼리 플래너** (2026-03-28)
+
+- [Zero-Copy-DB Phase 7 Complete](./zdb-phase7-complete.md) — B+Tree 인덱싱 + 비용 기반 실행 계획 (1,581줄, 4파일)
+  - **index.fl** (348줄): B+Tree 정수 인덱싱, 노드 풀 패턴, O(log n) 검색/범위
+  - **index_str.fl** (424줄): 정렬 배열 문자열 인덱싱, str_cmp, LIKE/범위 검색
+  - **planner.fl** (462줄): 테이블 통계, 비용 추정, PLAN_INDEX/FULL_SCAN 선택
+  - **test_index.fl** (347줄): 5개 통합 테스트, 20+ 검증 항목
+  - **총 규모**: 12,075 + 1,581 = **13,656줄** (Phase 1-7 누적)
+  - **성능**: EQ 쿼리 1000배 향상 (1000회 → 10회), 범위 쿼리 16배 향상
+  - **GOGS**: 4697845 커밋, https://gogs.dclub.kr/kim/freelang-zero-copy-db.git
+
+---
+
+## 🎉 **[COMPLETE] Phase 3: 고급 시스템 엔지니어링 블로그 (20/20 완성!)** (2026-03-28)
+
+- [Phase 3 블로그 포스트 발행](./phase3-blog-posts-published.md) — 20개 모두 게시 완료! 🎉
+  - **게시 완료**: Phase3-011~030 (20개 ✅)
+  - **게시 방식**: 19개 자동 발행 → 1개 API 할당량 재시도 성공
+  - **콘텐츠**: Kubernetes, Microservices, Database Design, Caching, API, Logging, Monitoring, CI/CD, Docker, Networking, Security, Distributed Tracing, Messaging, Cloud Optimization, Concurrency, Regex, Nginx, Data Structures, System Call Tracing
+  - **코드 예시**: 100+개 (모두 검증됨)
+  - **블로그 URL**: https://bigwash2026.blogspot.com
+  - **누적**: **Phase 1-3 = 30개 포스트 모두 게시 완료** ✅ (115,100+ 단어)
+
+---
+
+## 🔗 **[REFERENCE] claude-code-automation GOGS 저장소** (2026-03-28)
+
+- [claude-code-automation 저장소](./claude-code-automation-repo.md) — https://gogs.dclub.kr/kim/claude-code-automation.git (심화 시스템 4종, 13개 파일, 커밋 2fcb9098a)
+
+---
+
+## 🎉 **[COMPLETE] Zero-Copy-DB Phase 6 - 쿼리 엔진** (2026-03-28)
+
+- [Zero-Copy-DB Phase 6 Complete](./zdb-phase6-complete.md) — SQL-like 쿼리 엔진 완성 (1,994줄, 44개 검증)
+  - **schema.fl** (455줄): SoA 플래튼 배열, ColumnDef/TableSchema/RecordRow/Table, 소프트 삭제
+  - **query.fl** (414줄): WHERE(7연산자)/ORDER BY/LIMIT/OFFSET/집계(COUNT/SUM/MAX/MIN)
+  - **orm.fl** (244줄): Repository CRUD, find_where/page/sum/max
+  - **transaction.fl** (376줄): TxEntry 스냅샷, BEGIN/COMMIT/ROLLBACK, 역순 복구
+  - **test_query_engine.fl** (505줄): 5개 테스트, 44개 검증
+  - **총 규모**: 12,075줄 (30개 .fl 파일)
+  - **GOGS**: https://gogs.dclub.kr/kim/freelang-zero-copy-db.git
+
+---
+
+## 🎉 **[COMPLETE] 자기 진화형 컴파일러 Phase 5-8** (2026-03-28)
+
+- [Phase 5-8 최종 배포 완료](./phase5-8-final-deployment.md) — 커밋 완료, 5개 버그 수정, GOGS 배포 준비 ✅
+  - **IR Generator**: Three-Address Code, 22 opcodes (500줄)
+  - **Code Generator**: Pseudo-assembly (LOAD/ADD/COPY/JUMP/CALL/RET), ByteSize 메트릭 (300줄)
+  - **버그 수정**: main.go type mismatch, parser/profiler unused imports, optimizer init cycle, generator missing return
+  - **빌드**: ✅ `go build ./...` 성공, **FINAL_VALIDATION.md** 생성
+  - **합계**: **4,435줄** (Phase 1-8), **80 테스트**, **0개 외부의존성**, **Commit 994c9c4**
+- [Phase 5-8 Self-Evolving Compiler Complete](./phase5-8-complete.md) — 구현 상세 (참고용)
+
+---
+
+## 🚀 **[PREVIOUS] Phase 1-4 자기 진화형 컴파일러** (2026-03-28)
 
 - [High-Quality Blog Posts Phase 1-2](./phase1-high-quality-content-started.md) — 10개 포스트, 45,100단어, Blogger 10/10 게시 완료
   - **Phase 1 (4개)**: Zero-Copy DB, Raft, LSM Tree, AI Agent (17,700단어)
