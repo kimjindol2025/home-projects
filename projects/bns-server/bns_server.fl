@@ -7,6 +7,8 @@ use concurrent;
 use bns_models;
 use bns_http;
 use bns_handlers;
+use bns_broadcast;
+use bns_webhook;
 
 // === 전역 채널 (클라이언트 ↔ 서버 통신) ===
 let g_request_channel: concurrent.Channel;
@@ -15,9 +17,10 @@ let g_server_running: bool = false;
 
 // === 서버 초기화 ===
 fn init_bns_server() {
-    g_request_channel = concurrent.channel_new(64);
-    g_response_channel = concurrent.channel_new(64);
+    g_request_channel = concurrent.chan_new(64);
+    g_response_channel = concurrent.chan_new(64);
     g_server_running = true;
+    bns_broadcast.broadcast_init();
 }
 
 // === 서버 루프 (메인 진입점) ===
@@ -28,10 +31,11 @@ fn bns_server_loop() {
     println("Listening on localhost:28080 (in-process Channel)");
     println("");
     println("Endpoints:");
-    println("  GET  /api/status   - 프로젝트 상태");
-    println("  GET  /api/gogs     - Gogs 커밋");
-    println("  GET  /api/feed     - Server-Sent Events");
-    println("  GET  /api/db       - DB 상태");
+    println("  GET  /api/status      - 프로젝트 상태");
+    println("  GET  /api/gogs        - Gogs 커밋");
+    println("  GET  /api/feed        - Server-Sent Events");
+    println("  GET  /api/db          - DB 상태");
+    println("  POST /webhook/gogs    - Gogs Webhook");
     println("");
 
     let request_count = 0;
@@ -39,9 +43,9 @@ fn bns_server_loop() {
     // 단순 요청 처리 루프 (협동 스케줄링)
     loop {
         // 요청 수신 (논블로킹)
-        let request_str = concurrent.channel_recv(g_request_channel, 0);
+        let (request_str, ok) = g_request_channel.chan_recv();
 
-        if len(request_str) > 0 {
+        if ok && len(request_str) > 0 {
             request_count = request_count + 1;
 
             // HTTP 요청 파싱
@@ -49,14 +53,20 @@ fn bns_server_loop() {
 
             println("[" + to_string(request_count) + "] " + req.method + " " + req.path);
 
-            // 핸들러 호출
-            let response = bns_handlers.handle_request(req);
+            // 라우팅: 핸들러 선택
+            let response: bns_models.HttpResponse;
+
+            if req.method == "POST" && req.path == "/webhook/gogs" {
+                response = bns_webhook.handle_webhook(req);
+            } else {
+                response = bns_handlers.handle_request(req);
+            }
 
             // HTTP 응답 형식화
             let response_str = bns_http.format_http_response(response);
 
             // 응답 전송
-            concurrent.channel_send(g_response_channel, response_str);
+            g_response_channel.chan_send(response_str);
         }
 
         // 협동 양보 (다른 작업에 CPU 할당)
@@ -83,16 +93,17 @@ fn send_http_request(method: string, path: string, body: string) -> string {
     }
 
     // 요청 전송
-    concurrent.channel_send(g_request_channel, request);
+    g_request_channel.chan_send(request);
 
     // 응답 수신 (폴링, max 100 tick)
     let i = 0;
     let response = "";
 
     for i = 0; i < 100; i = i + 1 {
-        response = concurrent.channel_recv(g_response_channel, 0);
+        let (resp, ok) = g_response_channel.chan_recv();
 
-        if len(response) > 0 {
+        if ok && len(resp) > 0 {
+            response = resp;
             break;
         }
 
